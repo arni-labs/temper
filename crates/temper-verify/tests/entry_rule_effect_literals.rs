@@ -107,3 +107,49 @@ fn effect_literal_membership_with_a_covering_guard_passes() {
         "{result:?}"
     );
 }
+
+#[test]
+fn assigned_effect_literal_exposes_the_breaking_input() {
+    let source = SOURCE
+        .replace(
+            "name = \"allowed\"\ntype = \"list\"\ninitial = []",
+            "name = \"allowed\"\ntype = \"string\"\ninitial = ''",
+        )
+        .replace("append(allowed, 'Secret')", "allowed = 'Secret'")
+        .replace("expected in allowed", "expected == allowed");
+    let model = build_model_from_ioa(&source, 2).unwrap();
+    let result = check_model(&model);
+    assert!(result.is_complete, "{result:?}");
+    let found = result
+        .counterexamples
+        .iter()
+        .find(|c| c.property == "EntryRules")
+        .unwrap_or_else(|| panic!("missing assignment-literal entry: {result:?}"));
+    let [(before, Some(write)), (waiting, Some(enter)), (after, None)] = found.trace.as_slice()
+    else {
+        panic!("expected Write then Enter: {:?}", found.trace);
+    };
+    assert_eq!(before.status, "Setup");
+    assert_eq!(write.name, "Write");
+    assert_eq!(write.params["expected"], ParamValue::Str("Secret".into()));
+    assert_eq!(waiting.strings["allowed"], ModelString::from("Secret"));
+    assert_eq!(enter.name, "Enter");
+    assert_eq!(after.status, "BeingMade");
+    let simulated = run_multi_seed_simulation(&model, &SimConfig::default(), 20);
+    assert!(
+        simulated
+            .iter()
+            .any(|s| s.violations.iter().any(|v| v.invariant == "entry"))
+    );
+    let tested = run_prop_tests_on_model(&model, 1000, 10);
+    assert_eq!(
+        tested.failure.as_ref().map(|f| f.invariant.as_str()),
+        Some("entry")
+    );
+    let safe = build_model_from_ioa(&source.replace("== 'Empty'", "== 'Stocked'"), 2).unwrap();
+    let checked = check_model(&safe);
+    assert!(
+        checked.is_complete && checked.all_properties_hold,
+        "{checked:?}"
+    );
+}

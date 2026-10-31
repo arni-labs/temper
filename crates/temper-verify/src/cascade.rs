@@ -20,6 +20,8 @@ use crate::smt::{self, SmtResult};
 
 use temper_runtime::scheduler::FaultConfig;
 
+mod digest;
+
 /// Result of an actor simulation level (Level 2b).
 ///
 /// This is provided by the caller since the actor simulation handler lives
@@ -117,6 +119,11 @@ pub struct CascadeResult {
     /// after it did not run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopped: Option<String>,
+    /// Set when this verdict was not run again but kept: an earlier check
+    /// passed a spec whose levels read the same models with the same
+    /// settings. The digest of what they read ([`VerificationCascade::digest`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept: Option<String>,
 }
 
 /// Serializable summary of a [`crate::composite::CompositeVerificationPlan`].
@@ -703,6 +710,7 @@ fn finish(
         reachable_paths,
         composite_report,
         stopped: None,
+        kept: None,
     }
 }
 

@@ -9,6 +9,7 @@ use tracing::instrument;
 use crate::authz::{require_authenticated_context, require_observe_auth};
 use crate::state::ServerState;
 
+use super::kept;
 use super::types::ValidateIoaRequest;
 
 const DEFAULT_SIM_SEEDS: u64 = 5;
@@ -37,7 +38,14 @@ const BUDGET_STATES: usize = 10_000_000;
 /// hours on a thread nothing can cancel, so every check has a budget
 /// (`budget_ms`, default 30 s). A check that runs out answers 200 with the
 /// level it was in failed, saying so, and `stopped` naming the type.
-#[instrument(skip_all, fields(otel.name = "POST /api/specs/validate-ioa"))]
+///
+/// A passing verdict is kept by the digest of what the levels read, and a
+/// spec with the same digest gets it back at once with `kept` set: a change
+/// to text no level reads, such as an error message, is not checked again.
+#[instrument(
+    skip_all,
+    fields(otel.name = "POST /api/specs/validate-ioa", kept = tracing::field::Empty)
+)]
 pub(crate) async fn handle_validate_ioa(
     State(state): State<ServerState>,
     authenticated: Option<Extension<AuthenticatedRequestContext>>,
@@ -90,21 +98,36 @@ pub(crate) async fn handle_validate_ioa(
         states: BUDGET_STATES,
     };
 
-    let result = tokio::task::spawn_blocking(move || {
+    let check = move || {
         temper_verify::VerificationCascade::from_ioa(&ioa_source)
             .with_sim_seeds(sim_seeds)
             .with_prop_test_cases(prop_test_cases)
             .with_budget(budget)
-            .run()
-    })
-    .await
-    .map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("verification worker failed: {error}"),
-        )
-    })?;
+    };
+    let digest = kept::digest(check.clone()).await;
+    let kept_result = match &digest {
+        Some(digest) => kept::kept(&state, digest).await,
+        None => None,
+    };
+    let result = match kept_result {
+        Some(kept_result) => kept_result,
+        None => {
+            let result = tokio::task::spawn_blocking(move || check().run())
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("verification worker failed: {error}"),
+                    )
+                })?;
+            if let Some(digest) = &digest {
+                kept::keep(&state, digest, &result).await;
+            }
+            result
+        }
+    };
 
+    tracing::Span::current().record("kept", result.kept.is_some());
     if let Some(stopped) = &result.stopped {
         tracing::warn!(budget_ms, stopped = %stopped, "validate-ioa ran out of its budget");
     }

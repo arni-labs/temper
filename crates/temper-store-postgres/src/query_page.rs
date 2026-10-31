@@ -132,15 +132,16 @@ fn postgres_query_field_page_sql(
     )
 }
 
-// Generated filter fragments refer to entity_field_index. Bind that relation
-// locally to the selected physical table, without rewriting the fragment or its
-// literals. With no schema selected, retain the original SQL and query plan.
+// Generated filters and their completeness guards refer to these query
+// relations. Bind both to the selected physical tables without rewriting the
+// fragment or its literals. With no schema selected, retain the original SQL.
 pub(crate) fn field_index_cte(schema: &str) -> String {
     if schema.is_empty() {
         return String::new();
     }
     format!(
-        "WITH entity_field_index AS (SELECT * FROM {schema}entity_field_index WHERE tenant = $1 AND entity_type = $2) "
+        "WITH entity_field_index AS (SELECT * FROM {schema}entity_field_index WHERE tenant = $1 AND entity_type = $2), \
+         entity_catalog AS (SELECT * FROM {schema}entity_catalog WHERE tenant = $1 AND entity_type = $2) "
     )
 }
 

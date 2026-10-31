@@ -265,8 +265,7 @@ assert = "status in ['Shipped'] => migrations_ok && undeclared_flag"
 #[test]
 fn test_invariant_over_undeclared_variable_fails_to_load() {
     let err = build_model_from_ioa(COMPOUND_UNDECLARED_IOA, 2)
-        .err()
-        .expect("undeclared variable must be rejected");
+        .expect_err("undeclared variable must be rejected");
     assert!(
         err.contains("unknown state variable 'undeclared_flag'"),
         "{err}"

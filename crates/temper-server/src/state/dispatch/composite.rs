@@ -198,6 +198,7 @@ impl crate::state::ServerState {
                     prepared.unresolved_params,
                     &sub_agent_ctx,
                     false,
+                    crate::state::write_record::WriteCaller::Kernel,
                     None,
                 )
                 .await?;

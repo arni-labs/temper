@@ -10,13 +10,13 @@
 //!
 //! The invariants:
 //! - A write its policy allows on the state it lands on lands, however many
-//!   writes race it: N allowed moves at once all land, and the count is N.
+//!   writes race it: stale requests are retried by the test client after a
+//!   re-read, and N allowed moves then land with count N.
 //! - No write lands on a state its policy refuses: a move allowed only while
 //!   the record's project is Open never lands after the record was pointed at
 //!   a Closed project, though it was decided while the project was Open.
-//! - A write is never answered "decided on a state that changed": the caller
-//!   gets the answer for the record as it is. The same holds for field updates
-//!   and deletes.
+//! - An outside action answered StaleWrite wrote nothing and carries the
+//!   current version. Field updates and deletes retain their route retry behavior.
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use futures_util::future::join_all;
@@ -30,8 +30,16 @@ mod world;
 
 use world::*;
 
-/// N allowed moves at once on one record: every one lands, and the count is N.
-async fn allowed_moves_race(seed: u64) -> Result<(), String> {
+fn is_stale(status: StatusCode, body: &Value) -> bool {
+    status == StatusCode::CONFLICT
+        && body["error"]["code"] == "StaleWrite"
+        && body["error"]["details"]["current_version"]
+            .as_u64()
+            .is_some()
+}
+
+/// N allowed moves race; the caller re-reads and retries each stale refusal.
+async fn allowed_moves_race(seed: u64) -> Result<bool, String> {
     let _sim = install_deterministic_context(seed);
     let state = server(seed, "moves");
     create(&state, "Projects", json!({ "Id": "p1" })).await?;
@@ -49,18 +57,43 @@ async fn allowed_moves_race(seed: u64) -> Result<(), String> {
     }))
     .await;
 
-    let refused: Vec<String> = who
+    let landed = answers
         .iter()
-        .zip(&answers)
-        .filter(|(_, (status, _))| *status != StatusCode::OK)
-        .map(|(id, (status, body))| format!("{id}: {status} {body}"))
-        .collect();
-    if !refused.is_empty() {
+        .filter(|(status, _)| *status == StatusCode::OK)
+        .count();
+    let count = tally(&state, "t1")
+        .await
+        .counters
+        .get("count")
+        .copied()
+        .unwrap_or_default();
+    if count != landed {
         return Err(format!(
-            "{} of {RACING_MOVES} allowed moves did not land: {}",
-            refused.len(),
-            refused.join("; ")
+            "{landed} first attempts landed but the count is {count}"
         ));
+    }
+    for (id, (status, body)) in who.iter().zip(&answers) {
+        if *status == StatusCode::OK {
+            continue;
+        }
+        if !is_stale(*status, body) {
+            return Err(format!(
+                "{id}: expected a structured stale refusal, got {status} {body}"
+            ));
+        }
+        // This is the caller's retry, after it re-reads the record. The route
+        // must answer the first attempt instead of replaying it itself.
+        let _current = tally(&state, "t1").await;
+        let (status, body) = act(
+            &state,
+            id,
+            "Tallies('t1')/Temper.Stale.Bump",
+            json!({"last": id}),
+        )
+        .await;
+        if status != StatusCode::OK {
+            return Err(format!("{id}: caller retry failed: {status} {body}"));
+        }
     }
     let record = tally(&state, "t1").await;
     let count = record.counters.get("count").copied().unwrap_or_default();
@@ -69,7 +102,7 @@ async fn allowed_moves_race(seed: u64) -> Result<(), String> {
             "{RACING_MOVES} moves landed but the count is {count}"
         ));
     }
-    Ok(())
+    Ok(answers.iter().any(|(status, body)| is_stale(*status, body)))
 }
 
 /// Mallory's moves, each allowed only while the tally's project is Open, race
@@ -93,7 +126,7 @@ async fn linked_record_attack(seed: u64) -> Result<(), String> {
 
     let _faults = install_buggify_context(seed);
     let attempts: Vec<String> = (0..RACING_ATTACKS).map(|i| format!("m{i}")).collect();
-    let (repointed, attacks) = tokio::join!(
+    let (mut repointed, attacks) = tokio::join!(
         act(
             &state,
             "owner",
@@ -110,6 +143,16 @@ async fn linked_record_attack(seed: u64) -> Result<(), String> {
         })),
     );
 
+    if is_stale(repointed.0, &repointed.1) {
+        let _current = tally(&state, "t1").await;
+        repointed = act(
+            &state,
+            "owner",
+            "Tallies('t1')/Temper.Stale.Repoint",
+            json!({"project_id": "p2"}),
+        )
+        .await;
+    }
     let mut trace = vec![format!("repoint: {}", repointed.0)];
     trace.extend(
         attempts
@@ -125,14 +168,16 @@ async fn linked_record_attack(seed: u64) -> Result<(), String> {
             trace.join(", ")
         ));
     }
-    if let Some((last, (status, body))) = attempts
-        .iter()
-        .zip(&attacks)
-        .find(|(_, (status, _))| *status != StatusCode::OK && *status != StatusCode::FORBIDDEN)
+    if let Some((last, (status, body))) =
+        attempts.iter().zip(&attacks).find(|(_, (status, body))| {
+            *status != StatusCode::OK
+                && *status != StatusCode::FORBIDDEN
+                && !is_stale(*status, body)
+        })
     {
         return Err(format!(
             "Mallory's {last} was answered {status} {body}, neither landed nor refused by \
-             the policy; {}",
+             the policy or as stale; {}",
             trace.join(", ")
         ));
     }
@@ -282,12 +327,18 @@ async fn deletes_race(seed: u64) -> Result<(), String> {
 }
 
 #[tokio::test]
-async fn dst_stale_writes_every_allowed_move_on_a_busy_record_lands() {
+async fn dst_stale_writes_allowed_moves_land_after_the_caller_retries_stale_refusals() {
+    let mut saw_stale = false;
     for seed in seeds() {
-        if let Err(violation) = allowed_moves_race(seed).await {
-            panic!("seed {seed}: {violation}");
+        match allowed_moves_race(seed).await {
+            Ok(stale) => saw_stale |= stale,
+            Err(violation) => panic!("seed {seed}: {violation}"),
         }
     }
+    assert!(
+        saw_stale,
+        "outside actions must answer stale instead of resending themselves"
+    );
 }
 
 #[tokio::test]

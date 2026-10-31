@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::DispatchExtOptions;
 use super::owed_writes::{Attempt, OwedKind, OwedTry, OwedWrite};
@@ -60,6 +61,33 @@ impl crate::state::ServerState {
         refs: Vec<(String, String)>,
         fields: &serde_json::Value,
     ) -> RelatedMap {
+        self.resolve_guard_refs(tenant, table, refs, fields, None)
+            .await
+    }
+
+    /// The related references used by the move's guards and invariants.
+    pub(super) fn guard_related_refs(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        action: &str,
+    ) -> Vec<(String, String)> {
+        let registry = self.registry.read().unwrap(); // ci-ok: infallible lock
+        registry
+            .get_spec(tenant, entity_type)
+            .map(|spec| spec.table().related_refs(action))
+            .unwrap_or_default()
+    }
+
+    /// Resolve related statuses, reading the spawning parent's committed result.
+    pub(super) async fn resolve_guard_refs(
+        &self,
+        tenant: &TenantId,
+        table: &TransitionTable,
+        refs: Vec<(String, String)>,
+        fields: &serde_json::Value,
+        committed: Option<&crate::entity_actor::EntityState>,
+    ) -> RelatedMap {
         let mut result = RelatedMap::new();
         for (target_type, id_field) in refs {
             let ids = crate::entity_actor::related::reference_ids(
@@ -69,7 +97,13 @@ impl crate::state::ServerState {
             );
             let mut statuses = Vec::with_capacity(ids.len());
             for id in ids {
-                statuses.push(self.resolve_entity_status(tenant, &target_type, id).await);
+                let status = match committed {
+                    Some(record) if record.entity_type == target_type && record.entity_id == id => {
+                        Some(record.status.clone())
+                    }
+                    _ => self.resolve_entity_status(tenant, &target_type, id).await,
+                };
+                statuses.push(status);
             }
             result.insert((target_type, id_field), Related::Statuses(statuses));
         }
@@ -93,28 +127,24 @@ impl crate::state::ServerState {
         action_params: &serde_json::Value,
         agent_ctx: &AgentContext,
     ) {
+        // Match the preview: independent children run concurrently; each child's
+        // initializers run in effect order, including after a store failure.
+        let mut by_child = std::collections::BTreeMap::<_, Vec<_>>::new();
         for req in spawn_requests {
+            by_child
+                .entry((req.entity_type.clone(), req.entity_id.clone()))
+                .or_default()
+                .push(req.clone());
+        }
+        for ((child_type, child_id), requests) in by_child {
             let state = self.clone();
             let t = tenant.clone();
             let parent_t = parent_type.to_string();
             let parent_i = parent_id.to_string();
-            let child_type = req.entity_type.clone();
-            let child_id = req.entity_id.clone();
-            let initial_action = req.initial_action.clone();
+
             let parent_params = action_params.clone();
-            let copied_fields = req.copied_fields.clone();
-            let request = req.clone();
-            // The child's initial action carries a key of its own, from the
-            // move's key and the child, so every try of it carries the same.
             let mut agent = agent_ctx.clone();
             agent.event_origin = Some(crate::entity_actor::EventOrigin::internal());
-            agent.idempotency_key = agent_ctx.idempotency_key.as_ref().map(|key| {
-                IdempotencyKey::FollowUp(derived_idempotency_key(
-                    key.as_str(),
-                    "spawn",
-                    &format!("{child_type}:{child_id}"),
-                ))
-            });
             let workflow_root_entity_type = agent
                 .workflow_root_entity_type
                 .clone()
@@ -142,125 +172,112 @@ impl crate::state::ServerState {
             tokio::spawn(
                 async move {
                     // determinism-ok: spawn dispatch is a background side-effect
-                    let mut parent_fields = serde_json::Map::new();
-                    parent_fields.insert(
-                        "parent_type".to_string(),
-                        serde_json::Value::String(parent_t.clone()),
-                    );
-                    parent_fields.insert(
-                        "parent_id".to_string(),
-                        serde_json::Value::String(parent_i.clone()),
-                    );
-                    parent_fields.insert(
-                        format!("{}_id", to_snake_case(&parent_t)),
-                        serde_json::Value::String(parent_i.clone()),
-                    );
-                    let child_table = match state.transition_table_for_dispatch(&t, &child_type) {
-                        Ok(table) => table,
-                        Err(error) => {
-                            let error = error.to_string();
-                            state
-                                .refuse_spawn(&t, &parent_t, &parent_i, &request, "spawn", &error)
-                                .await;
-                            return;
-                        }
-                    };
-                    let strict_child = child_table.strict_action_params;
-                    if strict_child && initial_action.is_none() {
-                        state
-                            .refuse_spawn(
-                                &t,
-                                &parent_t,
-                                &parent_i,
-                                &request,
-                                "spawn",
-                                "Strict child requires a declared initializer for its generated fields",
-                            )
-                            .await;
-                        return;
-                    }
-                    let initializer = if let Some(action) = initial_action {
-                        // Copied parent fields fill in what this action's own
-                        // params do not carry; a param wins, so a value the
-                        // spawning action just set is never overwritten by the
-                        // field as it stood before the action.
-                        let mut params = copied_fields;
-                        params.extend(parent_params.as_object().cloned().unwrap_or_default());
-                        params.extend(parent_fields.clone());
-                        match state.prepare_generated_action_params(
-                            &t,
-                            &child_type,
-                            &action,
-                            serde_json::Value::Object(params),
-                        ) {
-                            Ok(params) => Some((action, params)),
-                            Err(error) => {
-                                state
-                                    .refuse_spawn(&t, &parent_t, &parent_i, &request, &action, &error)
-                                    .await;
-                                return;
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    // The child is an entity this chain made, and its initial
-                    // action is the chain's next step. One that would repeat a
-                    // step the chain is already in is a loop (`InlineChain`),
-                    // refused before the child is made: a spawn loop stops at
-                    // its first repeat like a reaction loop.
-                    let mut agent = agent.having_made([(child_type.as_str(), child_id.as_str())]);
-                    if let Some((action, _)) = &initializer {
-                        let step = agent.inline_chain.step(&child_type, &child_id, action);
-                        match agent.inline_chain.then(step) {
-                            Ok(chain) => agent.inline_chain = chain,
-                            Err(repeat) => {
+                    let mut children = Vec::new();
+                    let repeated = requests.len() > 1;
+                    for (index, req) in requests.iter().enumerate() {
+                        // Validation happens in spawn_child, which preserves typed
+                        // store errors so owed writes can be retried.
+                        let plan = match state
+                            .spawn_plan(&t, &parent_t, &parent_i, req, &parent_params, true)
+                            .await
+                        {
+                            Ok(plan) => plan,
+                            Err(refusal) => {
                                 state
                                     .refuse_spawn(
                                         &t,
                                         &parent_t,
                                         &parent_i,
-                                        &request,
-                                        action,
-                                        &format!(
-                                            "spawned {child_type} not made: its initial action \
-                                             would repeat a step its chain is already in \
-                                             ({repeat}), so the chain is a loop"
-                                        ),
+                                        req,
+                                        &refusal.action,
+                                        &refusal.error,
                                     )
                                     .await;
-                                return;
+                                continue;
+                            }
+                        };
+                        let super::spawn_plan::SpawnPlan {
+                            table,
+                            initial_fields,
+                            initializer,
+                        } = plan;
+                        let mut agent = agent.clone();
+                        agent.idempotency_key = agent.idempotency_key.as_ref().map(|key| {
+                            let identity = if repeated {
+                                format!("{child_type}:{child_id}:{index}")
+                            } else {
+                                format!("{child_type}:{child_id}")
+                            };
+                            IdempotencyKey::FollowUp(derived_idempotency_key(
+                                key.as_str(),
+                                "spawn",
+                                &identity,
+                            ))
+                        });
+                        // The child is an entity this chain made, and its initial
+                        // action is the chain's next step. One that would repeat a
+                        // step the chain is already in is a loop (`InlineChain`),
+                        // refused before the child is made: a spawn loop stops at
+                        // its first repeat like a reaction loop.
+                        let mut agent =
+                            agent.having_made([(child_type.as_str(), child_id.as_str())]);
+                        if let Some((action, _)) = &initializer {
+                            let step = agent.inline_chain.step(&child_type, &child_id, action);
+                            match agent.inline_chain.then(step) {
+                                Ok(chain) => agent.inline_chain = chain,
+                                Err(repeat) => {
+                                    state
+                                        .refuse_spawn(
+                                            &t,
+                                            &parent_t,
+                                            &parent_i,
+                                            req,
+                                            action,
+                                            &format!(
+                                                "spawned {child_type} not made: its initial action \
+                                         would repeat a step its chain is already in \
+                                         ({repeat}), so the chain is a loop"
+                                            ),
+                                        )
+                                        .await;
+                                    continue;
+                                }
                             }
                         }
+                        let child = ChildSpawn {
+                            request: req.clone(),
+                            tenant: t.clone(),
+                            parent_type: parent_t.clone(),
+                            parent_id: parent_i.clone(),
+                            child_type: child_type.clone(),
+                            child_id: child_id.clone(),
+                            table,
+                            initial_fields,
+                            initializer,
+                            agent,
+                        };
+                        children.push(child);
                     }
-                    // A strict child's declared initializer accepts its data. The
-                    // spawn effect supplies only identity to generic creation.
-                    let initial_fields = if strict_child {
-                        serde_json::json!({})
-                    } else {
-                        serde_json::Value::Object(parent_fields.clone())
-                    };
-
-                    let child = ChildSpawn {
-                        request,
-                        tenant: t,
-                        parent_type: parent_t,
-                        parent_id: parent_i,
-                        child_type,
-                        child_id,
-                        table: child_table,
-                        initial_fields,
-                        initializer,
-                        agent,
-                    };
-                    if let Attempt::StoreFailed(error) = state.spawn_child(&child).await {
-                        state.keep_child_spawn(child, &error);
+                    let children = Arc::new(ChildSpawns {
+                        children,
+                        next: AtomicUsize::new(0),
+                    });
+                    if let Attempt::StoreFailed(error) = state.spawn_children(&children).await {
+                        state.keep_child_spawns(children, &error);
                     }
                 }
                 .instrument(span),
             );
         }
     }
+}
+
+/// One child's ordered initializers, with the first one not yet answered.
+/// Keep final refusals as well as successes behind this cursor: re-evaluating
+/// a refused initializer after a later one lands could make it succeed.
+struct ChildSpawns {
+    children: Vec<ChildSpawn>,
+    next: AtomicUsize,
 }
 
 /// A child a committed move spawns: created, then sent its initial action.
@@ -432,9 +449,27 @@ impl crate::state::ServerState {
         Err(Attempt::Failed(refused))
     }
 
-    /// Keep a child whose spawn the store failed as an owed write: it is
-    /// spawned again (`owed_writes`) until it lands or fails otherwise.
-    fn keep_child_spawn(&self, child: ChildSpawn, error: &str) {
+    /// Run the initializers in order; a store failure holds the rest back.
+    async fn spawn_children(&self, spawns: &ChildSpawns) -> Attempt {
+        for (index, child) in spawns
+            .children
+            .iter()
+            .enumerate()
+            .skip(spawns.next.load(Ordering::Relaxed))
+        {
+            if let failure @ Attempt::StoreFailed(_) = self.spawn_child(child).await {
+                return failure;
+            }
+            spawns.next.store(index + 1, Ordering::Relaxed);
+        }
+        Attempt::Landed
+    }
+
+    /// Resume at the first unanswered initializer, under its stable key.
+    fn keep_child_spawns(&self, children: Arc<ChildSpawns>, error: &str) {
+        let Some(child) = children.children.first() else {
+            return;
+        };
         let owed = OwedWrite {
             tenant: child.tenant.clone(),
             entity_type: child.child_type.clone(),
@@ -442,32 +477,14 @@ impl crate::state::ServerState {
             kind: OwedKind::Child,
             key: child.agent.idempotency_key.clone(),
         };
-        let child = Arc::new(child);
         self.keep_owed_write(owed, error, move |state| {
-            spawn_child_again(state, Arc::clone(&child))
+            spawn_children_again(state, Arc::clone(&children))
         });
     }
 }
 
-fn spawn_child_again(state: crate::state::ServerState, child: Arc<ChildSpawn>) -> OwedTry {
-    Box::pin(async move { state.spawn_child(&child).await })
-}
-
-fn to_snake_case(value: &str) -> String {
-    let mut result = String::with_capacity(value.len());
-    for (index, ch) in value.chars().enumerate() {
-        match ch {
-            'A'..='Z' => {
-                if index > 0 {
-                    result.push('_');
-                }
-                result.push(ch.to_ascii_lowercase());
-            }
-            '-' | ' ' => result.push('_'),
-            _ => result.push(ch.to_ascii_lowercase()),
-        }
-    }
-    result
+fn spawn_children_again(state: crate::state::ServerState, children: Arc<ChildSpawns>) -> OwedTry {
+    Box::pin(async move { state.spawn_children(&children).await })
 }
 
 #[cfg(test)]

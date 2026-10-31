@@ -2,15 +2,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use temper_spec::automaton::Automaton;
+use temper_spec::automaton::{Automaton, Initial};
 use temper_spec::predicate::{Arg, Effect, Expr, Literal, Name, Operand, Set, VarKind};
 
 use super::rule_asserts;
 
 /// The string variables the verifier tracks: those `[[invariant]]`s and
-/// `[[entry_rule]]`s read, their guards and constraint fields, plus
+/// `[[entry_rule]]`s read, those guards read or effects write, constraint fields, plus
 /// `also_tracked`, plus the string fields constraints tie to tracked parameters.
-/// Specs without entry rules or string invariants explore as before.
 pub(super) fn tracked_strings(
     automaton: &Automaton,
     also_tracked: &BTreeSet<String>,
@@ -39,13 +38,8 @@ pub(super) fn tracked_strings(
             }
         }
     }
-    let predicates = rule_asserts(automaton).chain(
-        automaton
-            .actions
-            .iter()
-            .filter(|_| !automaton.entry_rules.is_empty())
-            .map(|action| &action.guard),
-    );
+    let predicates =
+        rule_asserts(automaton).chain(automaton.actions.iter().map(|action| &action.guard));
     for assert in predicates {
         assert.for_each_name(&mut |name| {
             if let Name::Var(var) = name
@@ -54,6 +48,17 @@ pub(super) fn tracked_strings(
                 tracked.insert(var.to_string());
             }
         });
+    }
+    // Effect-only fields retain their finite initial and written values;
+    // parameter-written fields keep the existing equality-symbol abstraction.
+    for action in &automaton.actions {
+        for effect in &action.effect {
+            if let Effect::Assign { var, .. } = effect
+                && is_string(var)
+            {
+                tracked.insert(var.clone());
+            }
+        }
     }
     loop {
         let before = tracked.len();
@@ -118,10 +123,21 @@ pub(super) fn string_literals(
         }
     }
     let mut literals = BTreeSet::new();
+    for sv in &automaton.state {
+        if tracked.contains(&sv.name)
+            && let Initial::String(value) = &sv.initial
+        {
+            literals.insert(value.clone());
+        }
+    }
     for action in &automaton.actions {
         visit(&action.guard, &mut literals);
         for effect in &action.effect {
             if let Effect::Append {
+                value: Arg::Lit(Literal::Str(text)),
+                ..
+            }
+            | Effect::Assign {
                 value: Arg::Lit(Literal::Str(text)),
                 ..
             } = effect

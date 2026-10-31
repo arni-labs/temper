@@ -96,7 +96,9 @@ fn walk<'a>(model: &TemperModel, t: &'a ResolvedTransition) -> Walked<'a> {
                     Value::Unknown(params) => unsure.extend(params),
                 }
             }
-            ModelEffect::SetBool { .. } | ModelEffect::ListAppend { .. } => {}
+            ModelEffect::SetBool { .. }
+            | ModelEffect::SetString { .. }
+            | ModelEffect::ListAppend { .. } => {}
         }
     }
     for (counter, value) in values {

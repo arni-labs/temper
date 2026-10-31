@@ -73,7 +73,7 @@ pub fn build_model_tracking(
                     items.iter().cloned().map(Into::into).collect(),
                 );
             }
-            // Strings and ints are not modeled.
+            // Tracked strings are initialized below; ints are not modeled.
             Initial::String(_) | Initial::Int(_) => {}
         }
     }
@@ -366,6 +366,7 @@ fn convert_effect(effect: ResolvedEffect) -> Option<ModelEffect> {
         ResolvedEffect::AddCounter { var, value } => ModelEffect::AddCounter { var, value },
         ResolvedEffect::SubCounter { var, value } => ModelEffect::SubCounter { var, value },
         ResolvedEffect::SetBool { var, value } => ModelEffect::SetBool { var, value },
+        ResolvedEffect::SetString { var, value } => ModelEffect::SetString { var, value },
         ResolvedEffect::ListAppend { var, value } => ModelEffect::ListAppend { var, value },
         ResolvedEffect::ListRemoveAt { var, index } => ModelEffect::ListRemoveAt { var, index },
         ResolvedEffect::Dispatch(_)
@@ -384,6 +385,7 @@ pub(crate) fn effect_params(effects: &[ModelEffect]) -> BTreeMap<String, ParamKi
             | ModelEffect::AddCounter { value, .. }
             | ModelEffect::SubCounter { value, .. } => (value, ParamKind::Count),
             ModelEffect::SetBool { value, .. } => (value, ParamKind::Bool),
+            ModelEffect::SetString { .. } => continue,
             ModelEffect::ListAppend { value, .. } => (value, ParamKind::Str),
             ModelEffect::ListRemoveAt { index, .. } => (index, ParamKind::Count),
         };
