@@ -1,12 +1,14 @@
 //! Trying again: building an exporter, and sending a batch that failed.
 //!
 //! The SDK's batch processors send each batch once and drop it when the send
-//! fails. Around a handoff the collector's end resets the connections a
-//! process opens (`Connection reset by peer`, at every staging handoff on 30
-//! October 2026, for one to two seconds), so the spans of a boot's first
-//! second, such as opening the store, were lost for good. [`Retrying`] sends
-//! a failed batch again after each of [`RETRY_DELAYS`], which together
-//! outlast that window, and drops it as before only after the last.
+//! fails. At a handoff, the connections of every app process on the sandbox
+//! are reset at the same moment, not only those of the process being
+//! replaced (`Connection reset by peer`, at every staging handoff on 30 and
+//! 31 October 2026, for one to two seconds). So the spans of a boot's first
+//! second, such as opening the store, and the batch any other running
+//! process sent then were lost for good. [`Retrying`] sends a failed batch
+//! again after each of [`RETRY_DELAYS`], which together outlast that window,
+//! and drops it as before only after the last.
 
 use std::future::ready;
 use std::sync::{Arc, Condvar, Mutex};
@@ -68,7 +70,8 @@ pub(super) const RETRY_DELAYS: [Duration; 4] = [
 
 /// Set once the process starts shutting its telemetry down. A send that
 /// fails after that is not tried again, so a stopping server's last flush
-/// never holds up its exit.
+/// never holds up its exit. That flush is still lost when it lands in a
+/// handoff's reset.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Closing(Arc<(Mutex<bool>, Condvar)>);
 
