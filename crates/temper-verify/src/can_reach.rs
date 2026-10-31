@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use temper_spec::automaton::ActionConstraint;
-use temper_spec::predicate::{Name, VarKind};
+use temper_spec::predicate::{Name, ParamKind, VarKind};
 
 use crate::checker::Counterexample;
 use crate::model::semantics::successors;
@@ -29,18 +29,24 @@ pub(crate) fn unproved_rules(model: &TemperModel) -> Vec<String> {
     let mut unmodeled = BTreeSet::new();
     let mut unchecked = BTreeSet::new();
     for transition in &model.transitions {
-        transition.guard.for_each_name(&mut |name| {
-            match name {
-                Name::Var(var) if model.var_kinds.get(var) == Some(&VarKind::Num) => {
-                    unmodeled.insert(var.to_string());
-                }
-                // Exploration tests the guard before choosing the inputs;
-                // it does not establish that those choices satisfy it.
-                Name::Param(param) => {
-                    unmodeled.insert(format!("params.{param}"));
-                }
-                _ => {}
+        // Entry-rule mode checks the combined guard after choosing inputs.
+        // A missing input (or a Fresh string placeholder) still reads unknown.
+        let checked_input = |name: &str| {
+            !model.entry_rules.is_empty()
+                && (transition.string_params.iter().any(|p| p.name == name)
+                    || matches!(
+                        transition.params.get(name),
+                        Some(ParamKind::Count | ParamKind::Bool)
+                    ))
+        };
+        transition.guard.for_each_name(&mut |name| match name {
+            Name::Var(var) if model.var_kinds.get(var) == Some(&VarKind::Num) => {
+                unmodeled.insert(var.to_string());
             }
+            Name::Param(param) if !checked_input(param) => {
+                unmodeled.insert(format!("params.{param}"));
+            }
+            _ => {}
         });
         for constraint in &transition.constraints {
             let enforced = transition.string_params.iter().any(|param| {
@@ -57,7 +63,21 @@ pub(crate) fn unproved_rules(model: &TemperModel) -> Vec<String> {
                         ActionConstraint::ParamGreaterThanField { .. } => false,
                     }
             });
-            if !enforced {
+            // String constraints are enforced while generating choices in
+            // either mode. Entry mode also checks numeric/boolean comparisons
+            // when both the selected input and its source field are modeled.
+            let checked_comparison = checked_input(constraint.param())
+                && constraint.field().is_some_and(|field| {
+                    matches!(
+                        (
+                            transition.params.get(constraint.param()),
+                            model.var_kinds.get(field)
+                        ),
+                        (Some(ParamKind::Count), Some(VarKind::Counter))
+                            | (Some(ParamKind::Bool), Some(VarKind::Bool))
+                    )
+                });
+            if !enforced && !checked_comparison {
                 unchecked.insert(format!("{}: {constraint:?}", transition.name));
             }
         }
