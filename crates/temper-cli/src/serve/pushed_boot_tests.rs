@@ -7,7 +7,6 @@ use std::path::Path;
 use temper_platform::os_apps::add_os_apps_dir;
 use temper_platform::state::PlatformState;
 use temper_runtime::tenant::TenantId;
-use temper_server::platform_store::PlatformStore as _;
 use temper_server::storage::StorageStack;
 use temper_store_turso::TursoEventStore;
 
