@@ -123,7 +123,6 @@ impl OtelGuard {
     /// Flush pending telemetry and shut down all providers. A batch that
     /// fails from here on is sent once, not again.
     pub fn shutdown(self) {
-        self.closing.close();
         if let Err(e) = self.tracer_provider.shutdown() {
             eprintln!("tracer provider shutdown error: {e}");
         }
