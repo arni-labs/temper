@@ -10,6 +10,7 @@
 //! 3. **Property-based tests** — random action sequences with invariant checking
 
 pub mod budget;
+pub mod can_reach;
 pub mod cascade;
 pub mod checker;
 pub mod composite;
@@ -18,6 +19,7 @@ pub mod lost_places;
 pub mod model;
 pub mod paths;
 pub mod proptest_gen;
+mod reach;
 pub mod simulation;
 pub mod smt;
 

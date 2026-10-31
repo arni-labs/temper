@@ -186,6 +186,9 @@ pub struct ResolvedTransition {
     /// one. Entry-rule models also choose guard inputs and list inputs here
     /// to retain identity and evaluate the guard with the chosen assignment.
     pub string_params: Vec<StringParam>,
+    /// Original input constraints. Route proofs must identify any that
+    /// string parameter exploration does not enforce.
+    pub constraints: Vec<temper_spec::automaton::ActionConstraint>,
 }
 
 /// A string parameter of an action, with what the action's constraints allow
@@ -246,6 +249,13 @@ pub enum LivenessKind {
     /// From any `from` state, there is always at least one enabled action.
     /// This is actually a safety property (always has actions).
     NoDeadlock { from: Vec<String> },
+    /// From every reachable state in one of `from` (any state when it is
+    /// empty), some moves lead to one of `targets`. Checked on the model
+    /// check's whole walk, after a complete exploration.
+    CanReach {
+        from: Vec<String>,
+        targets: Vec<String>,
+    },
 }
 
 /// A resolved liveness property.
@@ -289,8 +299,9 @@ pub struct TemperModel {
     pub(crate) initial_lists: BTreeMap<String, Vec<ModelString>>,
     /// Initial values of the tracked string variables.
     pub(crate) initial_strings: BTreeMap<String, ModelString>,
-    /// The string variables the verifier tracks: those guards/invariants read or effects write,
-    /// and those whose value reaches one through a constraint or a reaction.
+    /// The string variables the verifier tracks: those guards/invariants read
+    /// or effects write, and those whose value reaches one through a
+    /// constraint or a reaction.
     pub tracked_strings: BTreeSet<String>,
     /// Concrete initial, predicate and effect literals for tracked string inputs,
     /// including literals tied to them indirectly through related statuses.
