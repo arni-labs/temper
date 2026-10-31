@@ -275,7 +275,8 @@ pub struct TemperModel {
     /// Initial values of the tracked string variables.
     pub(crate) initial_strings: BTreeMap<String, ModelString>,
     /// The string variables the verifier tracks: those an invariant reads,
-    /// and those whose value reaches one through a constraint or a reaction.
+    /// those a guard reads when checking `can_reach`, and those whose value
+    /// reaches one through a constraint or a reaction.
     pub tracked_strings: BTreeSet<String>,
     /// String literals each tracked variable is compared with in a guard or
     /// invariant: the values worth choosing for it besides `''` and others'.

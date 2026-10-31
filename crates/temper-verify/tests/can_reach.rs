@@ -249,6 +249,148 @@ fn a_record_whose_future_goes_past_a_bound_gives_a_bounded_pass() {
     assert!(l1.summary.contains("bounded"), "{}", l1.summary);
 }
 
+/// No invariant reads `token`: the only route must be decided from its
+/// actual local value, rather than an unknown guard that might hold.
+const TOKEN: &str = r#"
+[automaton]
+name = "Token"
+states = ["Waiting", "Done"]
+initial = "Waiting"
+
+[[state]]
+name = "token"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Finish"
+from = ["Waiting"]
+to = "Done"
+guard = "token == 'ok'"
+
+[[liveness]]
+name = "can_finish"
+from = ["Waiting"]
+can_reach = ["Done"]
+"#;
+
+#[test]
+fn an_impossible_local_string_guard_cannot_prove_a_route() {
+    let l1 = model_check(TOKEN);
+    let (moves, place, _) = broken(&l1, "can_finish");
+    assert!(
+        moves.is_empty(),
+        "the initial record already breaks the rule"
+    );
+    assert_eq!(place, "Waiting");
+    let verification = l1.verification.as_ref().unwrap();
+    assert!(verification.is_complete);
+    assert!(verification.bounded_by.is_empty());
+    let counterexample = &verification.counterexamples[0];
+    assert_eq!(counterexample.never_reaches, ["Done"]);
+    assert_eq!(counterexample.trace[0].0.strings["token"], "".into());
+}
+
+#[test]
+fn a_true_local_string_guard_keeps_the_route() {
+    let spec = TOKEN.replace("initial = \"\"", "initial = \"ok\"");
+    let l1 = model_check(&spec);
+    assert!(l1.passed, "{}", l1.summary);
+    assert!(l1.verification.as_ref().unwrap().is_complete);
+}
+
+/// A locally enabled route can be closed by a later input value. The
+/// refusal must retain the input and the record it stranded.
+#[test]
+fn changing_a_guard_only_string_can_close_the_route() {
+    let spec = format!(
+        "{}{}",
+        TOKEN.replace("initial = \"\"", "initial = \"ok\""),
+        r#"
+[[action]]
+name = "ReplaceToken"
+from = ["Waiting"]
+to = "Waiting"
+params = [{ name = "token", type = "string" }]
+"#
+    );
+    // An unrestricted replacement can always restore 'ok'.
+    let l1 = model_check(&spec);
+    assert!(l1.passed, "{}", l1.summary);
+    // A one-shot replacement can strand the record instead.
+    let spec = format!(
+        "{}\n[[state]]\nname = \"replaced\"\ntype = \"bool\"\ninitial = false\n",
+        spec.replace(
+            "params = [{ name = \"token\", type = \"string\" }]",
+            "params = [{ name = \"token\", type = \"string\" }]\nguard = \"!replaced\"\neffect = [\"replaced = true\"]"
+        )
+    );
+    let l1 = model_check(&spec);
+    let (moves, place, _) = broken(&l1, "can_finish");
+    assert_eq!(moves, ["ReplaceToken"]);
+    assert_eq!(place, "Waiting");
+    let counterexample = &l1.verification.as_ref().unwrap().counterexamples[0];
+    let action = counterexample.trace[0].1.as_ref().unwrap();
+    let last = &counterexample.trace.last().unwrap().0;
+    assert_ne!(last.strings["token"], "ok".into());
+    assert_eq!(
+        action.params["token"],
+        temper_verify::ParamValue::Str(last.strings["token"].clone())
+    );
+}
+
+/// The constraint's source is not read by a guard or invariant, but its
+/// value decides whether any input can open the route.
+#[test]
+fn a_guard_only_string_keeps_its_constraint_dependencies() {
+    let spec = format!(
+        "{TOKEN}{}",
+        r#"
+[[state]]
+name = "source"
+type = "string"
+initial = ""
+
+[[action]]
+name = "CopyToken"
+from = ["Waiting"]
+to = "Waiting"
+params = [{ name = "token", type = "string" }]
+
+[[action.constraints]]
+kind = "param_equals_field"
+param = "token"
+field = "source"
+"#
+    );
+    let l1 = model_check(&spec);
+    let (moves, place, _) = broken(&l1, "can_finish");
+    assert!(moves.is_empty());
+    assert_eq!(place, "Waiting");
+    // Copying a usable source really does open the route from the same
+    // initially empty token, including after every copy.
+    let enabled = spec.replace(
+        "name = \"source\"\ntype = \"string\"\ninitial = \"\"",
+        "name = \"source\"\ntype = \"string\"\ninitial = \"ok\"",
+    );
+    assert_ne!(spec, enabled);
+    let l1 = model_check(&enabled);
+    assert!(l1.passed, "{}", l1.summary);
+    // A source that starts empty can also be supplied with 'ok'.
+    let writable = format!(
+        "{spec}{}",
+        r#"
+[[action]]
+name = "SupplySource"
+from = ["Waiting"]
+to = "Waiting"
+params = [{ name = "source", type = "string" }]
+"#
+    );
+    let l1 = model_check(&writable);
+    assert!(l1.passed, "{}", l1.summary);
+}
+
 fn load(rule: &str) -> String {
     let spec = format!("{CUP}\n[[liveness]]\nname = \"rule\"\n{rule}\n");
     parse_automaton_with_liveness(&spec, LivenessEnforcement::WarnOnly)

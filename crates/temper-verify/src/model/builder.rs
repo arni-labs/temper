@@ -9,15 +9,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use temper_spec::automaton::{
-    ActionConstraint, ActionKind, Automaton, Initial, ResolvedEffect, translate_actions,
-};
-use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Name, Operand, ParamKind, Set, VarKind};
+use temper_spec::automaton::{ActionKind, Automaton, Initial, ResolvedEffect, translate_actions};
+use temper_spec::predicate::{Arg, Expr, Literal, Operand, ParamKind, Set};
 
 use super::types::{
-    LivenessKind, ModelEffect, ResolvedInvariant, ResolvedLiveness, ResolvedTransition,
-    StringParam, TemperModel,
+    LivenessKind, ModelEffect, ResolvedInvariant, ResolvedLiveness, ResolvedTransition, TemperModel,
 };
+
+mod strings;
+
+use strings::{string_literals, string_params, tracked_strings};
 
 /// Build a `TemperModel` from I/O Automaton TOML source.
 ///
@@ -65,7 +66,7 @@ pub fn build_model_tracking(
             Initial::List(items) => {
                 initial_lists.insert(sv.name.clone(), items.clone());
             }
-            // Strings and ints are not modeled.
+            // Strings are initialized below; ints are not modeled.
             Initial::String(_) | Initial::Int(_) => {}
         }
     }
@@ -198,160 +199,6 @@ fn resolve_transitions(
             }
         })
         .collect()
-}
-
-/// The parameters of `action` that write a tracked string variable, or that
-/// a constraint ties to one (`failed_commit` must equal `commit`), with the
-/// action's constraints on each. The model needs the value of the second
-/// kind to decide whether the record takes the action, though it writes
-/// nothing it tracks.
-fn string_params(
-    action: &temper_spec::automaton::Action,
-    tracked_strings: &BTreeSet<String>,
-) -> Vec<StringParam> {
-    let tied = |name: &str| {
-        action.constraints.iter().any(|c| {
-            c.param() == name
-                && matches!(
-                    c,
-                    ActionConstraint::ParamEqualsField { .. }
-                        | ActionConstraint::ParamNotEqualsField { .. }
-                )
-                && c.field()
-                    .is_some_and(|field| tracked_strings.contains(field))
-        })
-    };
-    action
-        .params
-        .iter()
-        .map(|param| param.name())
-        .filter(|name| tracked_strings.contains(*name) || tied(name))
-        .map(|name| {
-            let mut param = StringParam {
-                name: name.to_string(),
-                writes: tracked_strings.contains(name),
-                nonempty: false,
-                equals: Vec::new(),
-                not_equals: Vec::new(),
-            };
-            for constraint in action.constraints.iter().filter(|c| c.param() == name) {
-                match constraint {
-                    ActionConstraint::ParamNonempty { .. } => param.nonempty = true,
-                    ActionConstraint::ParamEqualsField { field, .. } => {
-                        param.equals.push(field.clone());
-                    }
-                    ActionConstraint::ParamNotEqualsField { field, .. } => {
-                        param.not_equals.push(field.clone());
-                    }
-                    _ => {}
-                }
-            }
-            param
-        })
-        .collect()
-}
-
-/// The string variables the verifier tracks: those `[[invariant]]`s read,
-/// plus `also_tracked`, plus every string variable a constraint ties the
-/// parameter of a tracked one to (its value decides what the tracked one may
-/// become). Strings no invariant can see stay unmodeled, so a spec whose
-/// invariants read none explores exactly as before.
-fn tracked_strings(automaton: &Automaton, also_tracked: &BTreeSet<String>) -> BTreeSet<String> {
-    let kinds: BTreeMap<&str, VarKind> = automaton
-        .state
-        .iter()
-        .map(|sv| (sv.name.as_str(), sv.var_type.kind()))
-        .collect();
-    let is_string = |name: &str| kinds.get(name) == Some(&VarKind::Str);
-    let mut tracked: BTreeSet<String> = also_tracked
-        .iter()
-        .filter(|name| is_string(name))
-        .cloned()
-        .collect();
-    for inv in &automaton.invariants {
-        inv.assert.for_each_name(&mut |name| {
-            if let Name::Var(var) = name
-                && is_string(var)
-            {
-                tracked.insert(var.to_string());
-            }
-        });
-    }
-    loop {
-        let before = tracked.len();
-        for action in &automaton.actions {
-            for constraint in &action.constraints {
-                if !tracked.contains(constraint.param()) {
-                    continue;
-                }
-                if let Some(field) = constraint.field()
-                    && is_string(field)
-                {
-                    tracked.insert(field.to_string());
-                }
-            }
-        }
-        if tracked.len() == before {
-            return tracked;
-        }
-    }
-}
-
-/// For each tracked string variable, the literals a guard or invariant
-/// compares it with (`v == 'x'`, `v in ['x', 'y']`).
-fn string_literals(
-    automaton: &Automaton,
-    tracked: &BTreeSet<String>,
-) -> BTreeMap<String, BTreeSet<String>> {
-    fn visit(
-        expr: &Expr,
-        tracked: &BTreeSet<String>,
-        out: &mut BTreeMap<String, BTreeSet<String>>,
-    ) {
-        match expr {
-            Expr::Not(inner) => visit(inner, tracked, out),
-            Expr::And(parts) | Expr::Or(parts) => {
-                parts.iter().for_each(|part| visit(part, tracked, out));
-            }
-            Expr::Implies(a, b) => {
-                visit(a, tracked, out);
-                visit(b, tracked, out);
-            }
-            Expr::Compare {
-                lhs,
-                op: CmpOp::Eq | CmpOp::Ne,
-                rhs,
-            } => {
-                for (var, lit) in [(lhs, rhs), (rhs, lhs)] {
-                    if let (Operand::Var(var), Operand::Lit(Literal::Str(text))) = (var, lit)
-                        && tracked.contains(var)
-                    {
-                        out.entry(var.clone()).or_default().insert(text.clone());
-                    }
-                }
-            }
-            Expr::In {
-                value: Operand::Var(var),
-                set: Set::List(items),
-                ..
-            } if tracked.contains(var) => {
-                for item in items {
-                    if let Literal::Str(text) = item {
-                        out.entry(var.clone()).or_default().insert(text.clone());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut out = BTreeMap::new();
-    for action in &automaton.actions {
-        visit(&action.guard, tracked, &mut out);
-    }
-    for inv in &automaton.invariants {
-        visit(&inv.assert, tracked, &mut out);
-    }
-    out
 }
 
 /// The largest non-negative integer literal each counter, or each list's
