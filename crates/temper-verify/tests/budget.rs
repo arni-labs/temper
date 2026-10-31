@@ -195,7 +195,8 @@ fn a_move_with_too_many_parameter_choices_fails_its_check_instead_of_panicking()
 #[test]
 fn a_huge_counter_bound_is_counted_not_built() {
     // `x = 1000000000` raises the bound for parameters whose effects use x:
-    // building those choices would allocate a billion values.
+    // building those choices would allocate a billion values. The rule reads
+    // x, so it is not left out of the model as unread.
     let spec = r#"
 [automaton]
 name = "Big"
@@ -219,6 +220,10 @@ kind = "input"
 from = ["On"]
 params = ["n"]
 effect = ["x += params.n"]
+
+[[invariant]]
+name = "Counted"
+assert = "x >= 0"
 "#;
     let started = Instant::now();
     let result = VerificationCascade::from_ioa(spec).run();

@@ -26,3 +26,10 @@ action = [
 name = "HeavyFeed"
 states = ["Resting", "Running"]
 initial = "Resting"
+
+# Always true. The model check leaves out a counter no guard or rule reads,
+# so without a rule reading them the five counters would not multiply the
+# states.
+[[invariant]]
+name = "Counted"
+assert = "offered >= 0 && kept >= 0 && calls >= 0 && tokens >= 0 && next >= 0"
