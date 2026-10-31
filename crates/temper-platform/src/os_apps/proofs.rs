@@ -125,7 +125,10 @@ fn proofs() -> &'static Mutex<Proofs> {
 }
 
 fn blob_key(digest: &str) -> String {
-    format!("joint-verdict/{digest}")
+    format!(
+        "{}joint-verdict/{digest}",
+        temper_server::blob_store::KERNEL_BLOB_PREFIX
+    )
 }
 
 /// The verdict of the walk `digest` names: one this install already waited

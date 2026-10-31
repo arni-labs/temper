@@ -587,8 +587,8 @@ pub struct ServerState {
     /// Pending owner-byte reservations held by admitted raw Blob uploads.
     commons_storage_reservations:
         Arc<Mutex<BTreeMap<String, storage_caps::CommonsStorageReservationEntry>>>,
-    /// Passing checks this process reached or read from the blob table, by
-    /// the digest of what their levels read (`observe::specs::kept`).
+    /// Passing checks, by the digest of what their levels read, when this
+    /// server has no platform store to keep them in (`observe::specs::kept`).
     #[cfg(feature = "observe")]
     pub(crate) check_verdicts: Arc<Mutex<BTreeMap<String, temper_verify::CascadeResult>>>,
     /// Coarse commons-mode write guardrail lock.
