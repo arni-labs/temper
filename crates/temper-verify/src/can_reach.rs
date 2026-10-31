@@ -45,7 +45,6 @@ pub(crate) fn broken_rules(
             (0..graph.len())
                 .find(|&at| {
                     in_from(graph.place[at])
-                        && !reach.past_bound(at)
                         && reach
                             .places(at)
                             .iter()
