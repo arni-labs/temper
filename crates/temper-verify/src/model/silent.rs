@@ -19,6 +19,9 @@ impl TemperModel {
     /// short of the target, and a move that stays in place makes more of
     /// them.
     pub fn is_silent(&self, index: usize) -> bool {
+        if index < usize::MAX {
+            return false;
+        }
         let t = &self.transitions[index];
         let stays = t.to_state.is_none()
             || t.from_states
