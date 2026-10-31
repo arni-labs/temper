@@ -28,6 +28,7 @@ mod install_guard;
 mod module_review_step;
 mod policy_rows;
 mod proofs;
+mod pushed;
 mod reconcile;
 mod runtime_heal;
 mod system_files;
@@ -36,8 +37,8 @@ mod wasm_replacement;
 pub(super) use app_catalog::catalog;
 pub use app_catalog::{
     DirApps, add_os_apps_dir, add_os_apps_dir_preferred, add_tenant_os_apps_dir, get_os_app,
-    list_os_apps, list_startup_os_apps, list_tenant_os_apps, reload_os_apps, set_os_apps_dir,
-    tenant_app_guide, tenant_os_app,
+    list_os_apps, list_startup_os_apps, list_tenant_os_apps, reload_os_apps,
+    remove_tenant_os_apps_dir, set_os_apps_dir, tenant_app_guide, tenant_os_app,
 };
 pub use closure_bootstrap::{
     ClosureBootstrapResult, OS_APP_CLOSURE_RESOLVER_VERSION, OsAppClosure,
@@ -50,6 +51,9 @@ use entity_aliases::{
 };
 #[cfg(test)]
 pub(super) use policy_rows::os_app_policy_row_id;
+pub use pushed::{
+    PushRefused, PushedFile, PushedInstall, install_pushed_app, restore_pushed_app_roots,
+};
 pub(crate) use reconcile::{
     InstallOrigin, tenant_has_active_policies_for_bundle, tenant_has_registered_wasm_for_bundle,
 };

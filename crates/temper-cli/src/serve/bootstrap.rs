@@ -699,6 +699,12 @@ pub(super) async fn bootstrap_installed_apps(
             "  Restored Genesis app cache roots: service={restored_genesis_caches}, registry={restored_genesis_registry_caches}"
         );
     }
+    // The version of an app last pushed to this server resolves ahead of its
+    // files in the catalog, so the installs below install that version.
+    let restored_pushed = temper_platform::os_apps::restore_pushed_app_roots(state);
+    if restored_pushed > 0 {
+        tracing::info!(restored_pushed, "restored pushed app versions");
+    }
 
     for ((tenant, app_name), source) in requested {
         if skip_unavailable_tenant(state, &tenant, &format!("app '{app_name}'")) {
