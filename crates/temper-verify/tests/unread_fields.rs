@@ -131,9 +131,9 @@ fn a_counter_copied_into_a_read_one_is_held() {
     );
 }
 
-/// A parent whose `Close` tells its child to mark itself only when `pings`
-/// is below zero, which a counter never is. No guard or rule of the parent
-/// reads `pings`; only that trigger does.
+/// A parent whose `Close` tells its child to mark itself once it has been
+/// pinged. No guard or rule of the parent reads `pings`; only that trigger
+/// does.
 const PARENT: &str = r#"
 [automaton]
 name = "Parent"
@@ -163,7 +163,7 @@ kind = "entity"
 principal = "mark"
 target_entity = "Child"
 target_action = "Mark"
-guard = "pings < 0"
+guard = "pings >= 1"
 
 [action.triggers.resolve_target]
 kind = "same_id"
@@ -194,9 +194,9 @@ permit(principal == Agent::"service:mark", action == Action::"Mark", resource is
 "#;
 
 /// The joint model decides a trigger's guard on its sender's fields, so a
-/// field only a trigger's guard reads is held there. Left out, the guard
-/// could go either way and the child would be marked after its parent
-/// closed.
+/// field only a trigger's guard reads is held there, and a ping then a close
+/// marks the child after its parent closed. Left out, `pings` would read as
+/// 0, the trigger would never fire and the break would go unseen.
 #[test]
 fn a_field_only_a_trigger_reads_is_held_in_the_joint_model() {
     let automatons: Vec<Automaton> = [PARENT, CHILD]
@@ -213,7 +213,7 @@ fn a_field_only_a_trigger_reads_is_held_in_the_joint_model() {
     let results = verify_joint_invariants(&refs, Some(&analysis), bound);
     assert_eq!(results.len(), 1);
     assert!(
-        !matches!(results[0].outcome, JointOutcome::Broken { .. }),
+        matches!(results[0].outcome, JointOutcome::Broken { .. }),
         "{}",
         results[0]
     );

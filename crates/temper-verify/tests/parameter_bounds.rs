@@ -35,6 +35,11 @@ effect = ["y = params.a", "z = params.b"]
 name = "Bump"
 from = ["On"]
 effect = ["x += 1"]
+
+# The model holds only the fields some rule reads.
+[[invariant]]
+name = "Held"
+assert = "y >= 0 && z >= 0"
 "#;
 
 #[test]
@@ -106,6 +111,11 @@ effect = ["remove_at(items, params.index)"]
 name = "Append"
 from = ["On"]
 effect = ["append(items, 'new')"]
+
+# The model holds only the fields some rule reads.
+[[invariant]]
+name = "Held"
+assert = "len(items) >= 0"
 "#;
 
 #[test]
