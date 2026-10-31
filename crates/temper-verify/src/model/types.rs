@@ -30,12 +30,12 @@ pub struct TemperModelState {
     pub booleans: BTreeMap<String, bool>,
     /// Named list variables (e.g. `tags`, `labels`).
     pub lists: BTreeMap<String, Vec<String>>,
-    /// The string variables an invariant reads, as symbols: `''`, a literal
+    /// The string variables guards/invariants read or effects write, as symbols: `''`, a literal
     /// the spec compares the variable with, or `#n`, a value that is equal
     /// only to itself. The verifier tracks which strings are equal, not what
     /// they say, so `#n` are renumbered in order of first use after every
     /// step ([`super::semantics::canonical_strings`]). Empty for a spec whose
-    /// invariants read no string.
+    /// guards, invariants and effects use no string.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub strings: BTreeMap<String, ModelString>,
 }
@@ -154,6 +154,8 @@ pub enum ModelEffect {
     SubCounter { var: String, value: Arg },
     /// `var = value` on a bool.
     SetBool { var: String, value: Arg },
+    /// `var = 'literal'` on a string, including the empty string.
+    SetString { var: String, value: String },
     /// `append(var, value)`.
     ListAppend { var: String, value: Arg },
     /// `remove_at(var, index)`; out of range is a no-op.
@@ -267,10 +269,10 @@ pub struct TemperModel {
     pub(crate) initial_lists: BTreeMap<String, Vec<String>>,
     /// Initial values of the tracked string variables.
     pub(crate) initial_strings: BTreeMap<String, ModelString>,
-    /// The string variables the verifier tracks: those an invariant reads,
+    /// The string variables the verifier tracks: those guards/invariants read or effects write,
     /// and those whose value reaches one through a constraint or a reaction.
     pub tracked_strings: BTreeSet<String>,
-    /// String literals each tracked variable is compared with in a guard or
+    /// String literals written by effects or compared with a tracked variable in a guard or
     /// invariant: the values worth choosing for it besides `''` and others'.
     pub(crate) string_literals: BTreeMap<String, BTreeSet<String>>,
     /// Per-counter upper bounds for bounded exploration.
