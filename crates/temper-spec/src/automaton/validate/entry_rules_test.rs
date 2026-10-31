@@ -92,3 +92,36 @@ fn entry_assertions_cannot_silently_read_unmodeled_numbers() {
         );
     }
 }
+
+#[test]
+fn entry_assertions_cannot_silently_read_unmodeled_emptiness() {
+    for assertion in [
+        "!empty(reference)",
+        "empty(reference)",
+        "true && !empty(reference)",
+        "false || !empty(reference)",
+        "true => !empty(reference)",
+        "!empty(reference) && Topping[reference].status == 'Stocked'",
+    ] {
+        let source = spec("['Inside', 'Outside']", "", "")
+            .replace("assert = \"false\"", &format!("assert = \"{assertion}\""));
+        let error = parse_automaton_with_liveness(&source, LivenessEnforcement::WarnOnly)
+            .expect_err("the verifier cannot evaluate emptiness of an undeclared field")
+            .to_string();
+        assert!(
+            error.contains("entry rule 'entry'") && error.contains("cannot model"),
+            "{error}"
+        );
+        assert!(error.contains("empty(reference)"), "{error}");
+    }
+}
+
+#[test]
+fn entry_assertions_can_read_undeclared_reference_statuses() {
+    let source = spec("['Inside', 'Outside']", "", "").replace(
+        "assert = \"false\"",
+        "assert = \"Topping[reference].status != null\"",
+    );
+    parse_automaton_with_liveness(&source, LivenessEnforcement::WarnOnly)
+        .expect("a related status is modeled even when its reference field is undeclared");
+}

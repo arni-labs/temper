@@ -426,3 +426,69 @@ fn local_enablement_requires_satisfied_inputs_and_a_local_guard() {
         );
     }
 }
+
+#[test]
+fn earlier_inputs_can_equal_a_later_place() {
+    for (setup, waiting, inside) in [("Setup", "Waiting", "Inside"), ("Draft", "Ready", "Active")] {
+        let source = format!(
+            r#"
+[automaton]
+name = "Entry"
+states = ["{setup}", "{waiting}", "{inside}"]
+initial = "{setup}"
+[[state]]
+name = "expected"
+type = "string"
+initial = "Other"
+[[state]]
+name = "topping"
+type = "string"
+initial = "one"
+[[action]]
+name = "Write"
+from = ["{setup}"]
+to = "{waiting}"
+params = [{{ name = "expected", type = "string" }}]
+[[action]]
+name = "Enter"
+from = ["{waiting}"]
+to = "{inside}"
+guard = "(expected == '{setup}' && Topping[topping].status == 'Stocked') || (expected == status && Topping[topping].status == 'Empty')"
+[[entry_rule]]
+name = "entry"
+place = "{inside}"
+assert = "Topping[topping].status == 'Stocked'"
+"#
+        );
+        refuses(&source);
+        let model = build_model_from_ioa(&source, 2).unwrap();
+        let checked = check_model(&model);
+        let found = checked
+            .counterexamples
+            .iter()
+            .find(|c| c.property == "EntryRules")
+            .unwrap();
+        let [
+            (before, Some(write)),
+            (waiting_state, Some(enter)),
+            (after, None),
+        ] = found.trace.as_slice()
+        else {
+            panic!("missing two-move witness: {:?}", found.trace);
+        };
+        assert_eq!(before.status, setup);
+        assert_eq!(write.name, "Write");
+        assert_eq!(write.params["expected"], ParamValue::Str(waiting.into()));
+        assert_eq!(waiting_state.status, waiting);
+        assert_eq!(waiting_state.strings["expected"], waiting.into());
+        assert_eq!(enter.name, "Enter");
+        assert_eq!(after.status, inside);
+        // The equivalent literal form must expose the same input.
+        refuses(&source.replace("expected == status", &format!("expected == '{waiting}'")));
+        // A guard which enforces stock at every entry is still safe.
+        passes(&source.replace(
+            "Topping[topping].status == 'Empty'",
+            "Topping[topping].status == 'Stocked'",
+        ));
+    }
+}

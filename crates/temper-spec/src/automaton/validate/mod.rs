@@ -171,7 +171,7 @@ pub(super) fn validate(automaton: &Automaton) -> Result<(), AutomatonParseError>
 
 /// Name- and type-check every predicate, and check `terminal` states exist.
 fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError> {
-    use crate::predicate::{Name, Scope, VarKind, check, check_effects};
+    use crate::predicate::{Scope, VarKind, check, check_effects};
 
     let vars: std::collections::BTreeMap<String, VarKind> = automaton
         .state
@@ -279,22 +279,12 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
         check(&rule.assert, Scope::State(&vars)).map_err(|e| invalid(slot.clone(), e))?;
         no_params(&rule.assert, slot.clone())?;
         no_related_field(&rule.assert, slot.clone())?;
-        // Entry assertions have the same modeled reads as guards, including
-        // null related statuses and membership of a local value in a list.
-        // Guard unknowns can offer both branches, but an assertion on a
-        // value we never model would silently pass without checking it.
-        let mut unsupported = None;
-        rule.assert.for_each_name(&mut |name| {
-            if let Name::Var(var) = name
-                && vars.get(var) == Some(&VarKind::Num)
-            {
-                unsupported = Some(var.to_string());
-            }
-        });
-        if let Some(var) = unsupported {
+        // Entry checks share the assertion read contract, with nullable
+        // statuses and local membership modeled by the shared move environment.
+        if let Some(culprit) = crate::predicate::unverifiable_entry(&rule.assert, &vars) {
             return Err(invalid(
                 slot,
-                format!("`{var}` reads a value the verification cascade cannot model"),
+                format!("`{culprit}` reads a value the verification cascade cannot model"),
             ));
         }
         // A rule no move is checked against proves nothing.

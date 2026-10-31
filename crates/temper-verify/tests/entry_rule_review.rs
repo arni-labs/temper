@@ -456,3 +456,18 @@ effect = ["append(left, params.a)", "append(right, params.b)"]
             && s.lists["left"][0] != s.lists["right"][0]
     }));
 }
+
+#[test]
+fn declared_reference_emptiness_is_checked() {
+    for (kind, initial, assertion) in [
+        ("string", "''", "!empty(reference)"),
+        ("string", "'one'", "empty(reference)"),
+        ("list", "[]", "!empty(reference)"),
+        ("list", "['one']", "empty(reference)"),
+    ] {
+        let state =
+            format!("\n[[state]]\nname = 'reference'\ntype = '{kind}'\ninitial = {initial}\n");
+        refuses(&spec(&state, "", assertion), false);
+        passes(&spec(&state, "", &format!("!({assertion})")));
+    }
+}
