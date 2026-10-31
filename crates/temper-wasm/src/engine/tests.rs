@@ -200,6 +200,7 @@ pub(super) fn make_context() -> WasmInvocationContext {
         workflow_root_entity_id: None,
         workflow_run_id: None,
         http_request: None,
+        trigger_principal: None,
     }
 }
 

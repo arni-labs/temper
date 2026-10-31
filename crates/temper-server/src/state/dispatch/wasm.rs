@@ -667,6 +667,7 @@ impl crate::state::ServerState {
                     workflow_root_entity_id: ctx.agent_ctx.workflow_root_entity_id.clone(),
                     workflow_run_id: ctx.agent_ctx.workflow_run_id.clone(),
                     http_request: None,
+                    trigger_principal: None,
                 };
                 (authz_ctx, inv_ctx)
             },

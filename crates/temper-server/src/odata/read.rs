@@ -1443,6 +1443,7 @@ async fn handle_stream_get(
         workflow_root_entity_id: None,
         workflow_run_id: None,
         http_request: None,
+        trigger_principal: None,
     };
 
     let wasm_result = match state
