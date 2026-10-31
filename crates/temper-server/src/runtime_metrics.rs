@@ -43,6 +43,7 @@ struct RuntimeMetrics {
     scheduler_pending_timers: Gauge<u64>,
     // ADR-0056: re-arm on actor hydration.
     state_timeout_armed_on_hydration_total: Counter<u64>,
+    state_timer_record_unreadable_total: Counter<u64>,
     operator_credentials_active: Gauge<u64>,
     // nerdsane/temper#351: params an action does not declare.
     undeclared_action_params_total: Counter<u64>,
@@ -188,6 +189,12 @@ fn metrics() -> &'static RuntimeMetrics {
             state_timeout_reset_total: meter
                 .u64_counter("temper_state_timeout_reset_total")
                 .with_description("ADR-0049: timers re-armed via reset_on.")
+                .build(),
+            state_timer_record_unreadable_total: meter
+                .u64_counter("temper_state_timer_record_unreadable_total")
+                .with_description(
+                    "Records a timer walk could not read; each is tried again without its type.",
+                )
                 .build(),
             timer_fire_withheld_total: meter
                 .u64_counter("temper_timer_fire_withheld_total")
@@ -687,6 +694,18 @@ pub fn record_state_timeout_cancelled(tenant: &str, entity_type: &str, state: &s
             KeyValue::new("tenant", tenant.to_string()),
             KeyValue::new("entity_type", entity_type.to_string()),
             KeyValue::new("state", state.to_string()),
+        ],
+    );
+}
+
+/// Record a record of a timed type that a timer walk (boot or install) could
+/// not read. The walk finishes its type and tries the record again without it.
+pub fn record_state_timer_record_unreadable(tenant: &str, entity_type: &str) {
+    metrics().state_timer_record_unreadable_total.add(
+        1,
+        &[
+            KeyValue::new("tenant", tenant.to_string()),
+            KeyValue::new("entity_type", entity_type.to_string()),
         ],
     );
 }
