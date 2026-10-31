@@ -21,6 +21,7 @@ pub mod types;
 mod withheld;
 
 pub use dispatcher::ReactionDispatcher;
+pub(crate) use principal::{effective_trigger_security_context, resolve_trigger_principal};
 pub use registry::ReactionRegistry;
 pub use sim_dispatcher::SimReactionSystem;
 pub use types::{

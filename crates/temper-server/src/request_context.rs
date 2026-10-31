@@ -211,6 +211,26 @@ impl AgentContext {
         next
     }
 
+    /// The context a `spawn` effect's child is created and first moved as.
+    ///
+    /// The child runs as the principal that spawned it. Its idempotency key is
+    /// its own, derived from the parent's and the child, so a retry of the
+    /// parent is answered with the child's first reply instead of creating it
+    /// again. The permit check calls this for the same reason it calls
+    /// [`Self::for_scheduled_follow_on`]: the principal is whatever this
+    /// function returns.
+    pub(crate) fn for_spawned_child(&self, child_type: &str, child_id: &str) -> Self {
+        let mut agent = self.clone();
+        agent.idempotency_key = self.idempotency_key.as_ref().map(|key| {
+            IdempotencyKey::FollowUp(crate::idempotency::derived_idempotency_key(
+                key.as_str(),
+                "spawn",
+                &format!("{child_type}:{child_id}"),
+            ))
+        });
+        agent
+    }
+
     /// Create a system-level agent context for internal operations.
     ///
     /// Marks the provenance as `"system"` so that trajectories and events

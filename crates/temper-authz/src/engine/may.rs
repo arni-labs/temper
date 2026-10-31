@@ -149,4 +149,42 @@ impl SendAnalysis {
             May::Maybe
         }
     }
+
+    /// Service principals a permit names (`Agent::"service:<name>"`).
+    ///
+    /// A service named only by a forbid is not included: forbidding a
+    /// principal that never sends a move changes nothing. The platform's own
+    /// policies are in this set too; they name no service principal.
+    pub fn permit_services(&self) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        for (effect, policy) in &self.policies {
+            if *effect == Effect::Permit {
+                collect_service_principals(policy, &mut names);
+            }
+        }
+        names
+    }
+}
+
+/// `Agent::"service:<name>"` entities anywhere in `value`.
+fn collect_service_principals(value: &Json, names: &mut BTreeSet<String>) {
+    if let Some(("Agent", id)) = json::entity_parts(value)
+        && let Some(name) = id.strip_prefix("service:")
+        && !name.is_empty()
+    {
+        names.insert(name.to_string());
+    }
+    match value {
+        Json::Array(items) => {
+            for item in items {
+                collect_service_principals(item, names);
+            }
+        }
+        Json::Object(map) => {
+            for item in map.values() {
+                collect_service_principals(item, names);
+            }
+        }
+        Json::Null | Json::Bool(_) | Json::Number(_) | Json::String(_) => {}
+    }
 }

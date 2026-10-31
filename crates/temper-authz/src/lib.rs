@@ -12,7 +12,7 @@ mod metrics;
 mod policy_gen;
 pub mod statements;
 
-pub use cause::{MoveCause, ReactionHop, TimerArm};
+pub use cause::{MoveCause, ReactionHop, TimerArm, cause_context};
 pub use context::{
     AuthenticatedRequestContext, Principal, PrincipalKind, SecurityContext,
     is_cedar_authority_context_key, platform_keys,

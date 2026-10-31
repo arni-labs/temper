@@ -353,6 +353,75 @@ pub(super) fn timer_strands(
     warnings
 }
 
+/// Refuse an install whose automatic moves this kernel would run as a
+/// principal Cedar cannot permit, and warn where the answer depends on the
+/// record.
+///
+/// The principal comes from the dispatcher's own functions
+/// ([`temper_server::automatic_moves::check`]). It runs when the install
+/// brings specs or Cedar, over the tenant's specs with the bundle's on top.
+/// A policy that does not parse was already refused. An empty policy permits
+/// every move.
+///
+/// FOLLOW-UP(kernel-upgrade-recheck): ADR-0184. Not run for apps already
+/// installed when the kernel binary changes.
+pub(super) fn automatic_move_permits(
+    state: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+    specs: &[(String, String)],
+    new_specs: bool,
+    policies: Option<&str>,
+) -> Result<Vec<InstallWarning>, String> {
+    if !new_specs && policies.is_none() {
+        return Ok(Vec::new());
+    }
+    let policy_text = policies.map_or_else(
+        || super::cached_or_active_tenant_policy_text(state, tenant),
+        str::to_string,
+    );
+    let mut sources: BTreeMap<String, String> = BTreeMap::new();
+    let tenant_id = TenantId::new(tenant);
+    let registry = state
+        .registry
+        .read()
+        .map_err(|_| format!("os-app '{app_name}': the spec registry lock is poisoned"))?;
+    for entity_type in registry.entity_types(&tenant_id) {
+        if let Some(spec) = registry.get_spec(&tenant_id, entity_type) {
+            sources.insert(entity_type.to_string(), spec.ioa_source.clone());
+        }
+    }
+    drop(registry);
+    for (entity_type, source) in specs {
+        sources.insert(entity_type.clone(), source.clone());
+    }
+    let pairs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(entity_type, source)| (entity_type.as_str(), source.as_str()))
+        .collect();
+    let report = temper_server::automatic_moves::check(&pairs, &policy_text)
+        .map_err(|error| format!("os-app '{app_name}' was not installed. {error}"))?;
+    if !report.errors.is_empty() {
+        let lines = report
+            .errors
+            .iter()
+            .map(|finding| finding.detail.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(format!(
+            "os-app '{app_name}' was not installed. Automatic moves this kernel would refuse:\n{lines}"
+        ));
+    }
+    Ok(report
+        .warnings
+        .into_iter()
+        .map(|finding| {
+            let detail = serde_json::to_value(&finding).unwrap_or(serde_json::Value::Null);
+            InstallWarning::automatic_move(finding.detail, detail)
+        })
+        .collect())
+}
+
 /// Check each new version in `specs`, when the install writes specs, against
 /// the records stored under the version installed for its type, before
 /// anything is written (see temper-server's `spec_change`): refuse it when it

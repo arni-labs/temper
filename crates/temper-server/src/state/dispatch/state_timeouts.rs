@@ -793,7 +793,7 @@ impl ArmedTimer {
 /// the entity has already recorded that key, so the fire would be answered as
 /// a duplicate and never run. Nor does it keep the mark of a timer fire that
 /// armed it: each fire is marked with its own arming (`ArmedTimer::fire_context`).
-pub(super) fn timer_agent(armed_by: &AgentContext) -> AgentContext {
+pub(crate) fn timer_agent(armed_by: &AgentContext) -> AgentContext {
     let mut agent = armed_by.for_background_task();
     agent.idempotency_key = None;
     agent.fires_state_timer = None;
