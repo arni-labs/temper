@@ -12,6 +12,7 @@
 use crate::budget::{Budget, Spending, ran_out, too_many_choices};
 use crate::checker::{self, VerificationResult};
 use crate::diagnostics;
+use crate::lost_places::LostPlace;
 use crate::model::{self, TemperModel};
 use crate::proptest_gen::{self, PropTestResult};
 use crate::simulation::{self, SimConfig, SimulationResult};
@@ -457,10 +458,22 @@ impl VerificationCascade {
     fn run_model_check(&self, model: &TemperModel) -> LevelResult {
         let verification = checker::check_model(model);
         let passed = verification.all_properties_hold;
-        let summary = if passed {
+        let summary = if passed && verification.bounded_by.is_empty() {
             format!(
                 "L1 Model Check PASSED: {} states explored, all properties hold",
                 verification.states_explored,
+            )
+        } else if passed {
+            let bounds: Vec<String> = verification
+                .bounded_by
+                .iter()
+                .map(|(name, bound)| format!("{name} up to {bound}"))
+                .collect();
+            format!(
+                "L1 Model Check PASSED, bounded: {} states explored; every property holds with {}, \
+                 and a move can go past that, which was not explored, so this is not a proof",
+                verification.states_explored,
+                bounds.join(", "),
             )
         } else {
             let mut parts = Vec::new();
@@ -481,6 +494,19 @@ impl VerificationCascade {
                 "L1 Model Check FAILED: {} states explored, {}",
                 verification.states_explored,
                 parts.join("; "),
+            )
+        };
+        let summary = if verification.lost_places.is_empty() {
+            summary
+        } else {
+            let found: Vec<String> = verification
+                .lost_places
+                .iter()
+                .map(LostPlace::describe)
+                .collect();
+            format!(
+                "{summary}. Not a failure, but worth a look: {}. If that is intended, nothing to do.",
+                found.join("; "),
             )
         };
 

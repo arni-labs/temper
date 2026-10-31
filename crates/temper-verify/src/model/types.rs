@@ -277,6 +277,9 @@ pub struct TemperModel {
     pub(crate) counter_bounds: BTreeMap<String, usize>,
     /// Default upper bound for counters not in counter_bounds.
     pub(crate) default_max_counter: usize,
+    /// Per-list upper bounds on length for bounded exploration; a list not
+    /// here is explored to `default_max_counter`.
+    pub(crate) list_bounds: BTreeMap<String, usize>,
     /// String literals each list is compared against (`'x' in list`) in any
     /// guard or invariant: the values worth choosing for `append(list, params.p)`.
     pub(crate) list_literals: BTreeMap<String, BTreeSet<String>>,

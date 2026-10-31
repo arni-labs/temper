@@ -49,6 +49,7 @@ pub mod ots;
 mod policy;
 mod policy_approval;
 mod policy_replace;
+mod projection_delta;
 mod projection_freshness;
 mod projection_repair;
 mod projection_rows;
@@ -128,13 +129,12 @@ impl TursoEventStore {
         let copy = SyncCopy::open(local_path, sync_url, auth_token)
             .await
             .map_err(storage_error)?;
-        let store = Self::open(Database::synced(copy.clone()), false, Some(copy.clone())).await?;
+        let store = Self::open(Database::synced(copy.clone()), false, Some(copy)).await?;
         store.require_primary_keys().await?;
-        // Schema made by this start goes out now; an answer pushes anything
-        // still left before it confirms a write.
-        if let Err(error) = copy.push_committed().await {
-            tracing::warn!(%error, "turso.sync push after migration failed");
-        }
+        // What this start adds to the schema goes out with the next push, as
+        // anything else it commits does: a start never waits on the remote to
+        // build an index over every record (2.7 s for 1,800 records of
+        // 120 KB on staging, 30 Oct 2026).
         Ok(store)
     }
 
@@ -269,6 +269,9 @@ impl TursoEventStore {
             .await
             .map_err(storage_error)?;
         conn.execute(schema::CREATE_SNAPSHOTS_TABLE, ())
+            .await
+            .map_err(storage_error)?;
+        conn.execute(schema::CREATE_SNAPSHOTS_CHECKPOINT_INDEX, ())
             .await
             .map_err(storage_error)?;
         conn.execute(schema::CREATE_SNAPSHOT_HISTORY_TABLE, ())
@@ -533,6 +536,9 @@ impl TursoEventStore {
         let _ = conn
             .execute(schema::ALTER_ENTITY_CATALOG_ADD_STATE, ())
             .await;
+        conn.execute(schema::CREATE_ENTITY_CATALOG_CHECKPOINT_INDEX, ())
+            .await
+            .map_err(storage_error)?;
 
         // Entity field index — EAV table for OData filter push-down.
         conn.execute(schema::CREATE_ENTITY_FIELD_INDEX_TABLE, ())
@@ -544,6 +550,8 @@ impl TursoEventStore {
         conn.execute(schema::CREATE_ENTITY_FIELD_INDEX_STATUS, ())
             .await
             .map_err(storage_error)?;
+
+        projection_delta::migrate_delta(&conn).await?;
 
         // Entity key index (ADR-0153) — declared composite-key -> entity_id, the
         // negative-existence access path co-committed with the journal append.

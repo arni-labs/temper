@@ -1,6 +1,6 @@
 //! The identity a durable timer row keeps, so a timer re-armed after a restart
-//! fires as whoever armed it. State timer rows and scheduled-action rows keep
-//! it in the same form.
+//! fires as whoever armed it, with what they could read when they set it.
+//! State timer rows and scheduled-action rows keep it in the same form.
 
 use std::collections::BTreeMap;
 
@@ -27,6 +27,10 @@ struct ArmedBy {
     workflow_run_id: Option<String>,
     #[serde(default)]
     observation_metadata: BTreeMap<String, String>,
+    /// Absent from rows written before timers kept it, and ignored by a
+    /// binary that predates it: such a timer fires as it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    read_when_set: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     scheduled_follow_on: Option<ScheduledFollowOn>,
 }
@@ -69,6 +73,7 @@ fn armed_by(agent: &AgentContext) -> ArmedBy {
         workflow_root_entity_id: agent.workflow_root_entity_id.clone(),
         workflow_run_id: agent.workflow_run_id.clone(),
         observation_metadata: agent.observation_metadata.clone(),
+        read_when_set: agent.read_when_set,
         scheduled_follow_on: None,
     }
 }
@@ -93,6 +98,7 @@ pub(crate) fn decode_armed_by(armed_by: &str) -> Result<AgentContext, serde_json
         workflow_root_entity_id: armed_by.workflow_root_entity_id,
         workflow_run_id: armed_by.workflow_run_id,
         observation_metadata: armed_by.observation_metadata,
+        read_when_set: armed_by.read_when_set,
         ..AgentContext::default()
     })
 }

@@ -318,13 +318,27 @@ impl crate::state::ServerState {
         if let Err(attempt) = self.check_child_initializer(child).await {
             return attempt;
         }
+        // Its first state's timer keeps whether its creator could read it.
+        let creator = match self
+            .created_with_read_when_set(
+                tenant,
+                child_type,
+                child_id,
+                &child.initial_fields,
+                &child.agent,
+            )
+            .await
+        {
+            Ok(creator) => creator,
+            Err(error) => return Attempt::StoreFailed(error),
+        };
         let created = match self
             .get_or_create_tenant_entity_by(
                 tenant,
                 child_type,
                 child_id,
                 child.initial_fields.clone(),
-                &child.agent,
+                &creator,
             )
             .await
         {
@@ -353,14 +367,8 @@ impl crate::state::ServerState {
         let Some((action, params)) = &child.initializer else {
             // A child with no initial action stays in its first state: arm
             // that state's timer here.
-            self.arm_state_timeouts_on_creation(
-                tenant,
-                child_type,
-                child_id,
-                &created,
-                &child.agent,
-            )
-            .await;
+            self.arm_state_timeouts_on_creation(tenant, child_type, child_id, &created, &creator)
+                .await;
             return Attempt::Landed;
         };
         let options = DispatchExtOptions {
@@ -382,14 +390,8 @@ impl crate::state::ServerState {
         if let Attempt::Failed(error) = &attempt {
             // The child stays in its first state: arm that state's timer, as
             // for no initializer.
-            self.arm_state_timeouts_on_creation(
-                tenant,
-                child_type,
-                child_id,
-                &created,
-                &child.agent,
-            )
-            .await;
+            self.arm_state_timeouts_on_creation(tenant, child_type, child_id, &created, &creator)
+                .await;
             self.record_generated_callback_refusal(child.parent(), action, error);
         }
         attempt

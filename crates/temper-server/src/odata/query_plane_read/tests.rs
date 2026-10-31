@@ -20,6 +20,8 @@ use temper_store_turso::TursoEventStore;
 mod count_telemetry;
 mod dst_projection_lag;
 mod empty_match;
+mod equality_delta;
+mod equality_probe;
 mod keyed_existence;
 mod paging;
 mod point_read_freshness;
@@ -225,6 +227,7 @@ async fn row_authorized_count_over_budget_returns_413() {
         QueryPlaneReadError::AuthorizationDenied(_) => {
             panic!("test state should allow collection reads")
         }
+        QueryPlaneReadError::ReadUnavailable => panic!("authoritative read should be available"),
         QueryPlaneReadError::InvalidContinuation => {
             panic!("no $skiptoken was supplied")
         }
@@ -445,7 +448,13 @@ async fn projection_lagged_actor_write_repairs_missing_catalog_row() {
         .expect("create local turso db");
     let mut state = build_order_state("query-plane-lag-repair");
     create_orders(&state, 1).await;
-    state.set_storage_stack(StorageStack::from_turso(store.clone()));
+    // The journal's own database read as a separate query plane: the server
+    // writes its rows after each commit, as over Postgres, so a record's row
+    // can be missing. Over Turso alone the commit writes it.
+    let mut stack = StorageStack::from_turso(store.clone());
+    stack.query_plane = Some(std::sync::Arc::new(store.clone()));
+    assert!(!stack.entity_rows_in_commit());
+    state.set_storage_stack(stack);
     let tenant = TenantId::default();
 
     let security_ctx = SecurityContext::system();

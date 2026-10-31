@@ -211,6 +211,7 @@ impl TursoEventStore {
 
         let mut catalog_upserts = Vec::new();
         let mut changed_indexes = Vec::new();
+        let mut applied_projections = Vec::new();
         for projection in &projections {
             let fields_json = serde_json::to_string(&projection.fields)
                 .map_err(|error| PersistenceError::Serialization(error.to_string()))?;
@@ -225,6 +226,7 @@ impl TursoEventStore {
             if existing_row.is_some_and(|existing| existing.sequence_nr() > sequence_nr) {
                 continue;
             }
+            applied_projections.push(*projection);
             let entity = [
                 tenant,
                 projection.entity_type.as_str(),
@@ -348,6 +350,15 @@ impl TursoEventStore {
             }
         }
 
+        for projection in applied_projections {
+            super::projection_delta::applied(
+                &tx,
+                [tenant, &projection.entity_type, &projection.entity_id],
+                projection.sequence_nr,
+                &projection.fields,
+            )
+            .await?;
+        }
         tx.commit().await.map_err(storage_error)?;
         Ok(())
     }
@@ -506,10 +517,13 @@ impl TursoEventStore {
         let field_placeholders = std::iter::repeat_n("?", requested_fields.len())
             .collect::<Vec<_>>()
             .join(", ");
+        // Each record's field rows are found by its key: the engine otherwise
+        // searches `idx_efi_status` by tenant and type, reading every field
+        // row of the type for each record (`driver/plan_check.rs`).
         let sql = format!(
             "SELECT c.entity_id, c.status, f.field_name, f.field_value \
              FROM entity_catalog c \
-             LEFT JOIN entity_field_index f \
+             LEFT JOIN entity_field_index f INDEXED BY sqlite_autoindex_entity_field_index_1 \
                ON c.tenant = f.tenant \
               AND c.entity_type = f.entity_type \
               AND c.entity_id = f.entity_id \

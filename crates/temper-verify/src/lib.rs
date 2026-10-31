@@ -14,6 +14,7 @@ pub mod cascade;
 pub mod checker;
 pub mod composite;
 pub mod diagnostics;
+pub mod lost_places;
 pub mod model;
 pub mod paths;
 pub mod proptest_gen;
@@ -25,6 +26,7 @@ pub use budget::Budget;
 pub use cascade::{ActorSimResult, CascadeLevel, CascadeResult, LevelResult, VerificationCascade};
 pub use checker::{VerificationResult, check_model};
 pub use composite::{CompositePlanError, CompositeVerificationPlan};
+pub use lost_places::LostPlace;
 pub use model::{
     ModelEffect, ParamValue, ResolvedTransition, TemperModel, TemperModelAction, TemperModelState,
     build_model_from_ioa,

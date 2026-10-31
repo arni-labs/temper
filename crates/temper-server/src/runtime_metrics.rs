@@ -34,8 +34,11 @@ struct RuntimeMetrics {
     dispatch_ask_error_total: Counter<u64>,
     // --- ADR-0049: state-entry timeouts -----------------------------------
     state_timeout_fired_total: Counter<u64>,
+    reaction_withheld_total: Counter<u64>,
     state_timeout_cancelled_total: Counter<u64>,
     state_timeout_reset_total: Counter<u64>,
+    // A timer acts with its setter's current standing.
+    timer_fire_withheld_total: Counter<u64>,
     scheduler_overdue_on_replay_total: Counter<u64>,
     scheduler_pending_timers: Gauge<u64>,
     // ADR-0056: re-arm on actor hydration.
@@ -170,6 +173,10 @@ fn metrics() -> &'static RuntimeMetrics {
                      stopped, send_failed, panicked, init_failed, max_restarts_exceeded).",
                 )
                 .build(),
+            reaction_withheld_total: meter
+                .u64_counter("temper_reaction_withheld_total")
+                .with_description("Reactions withheld because Cedar refused the move on their target.")
+                .build(),
             state_timeout_fired_total: meter
                 .u64_counter("temper_state_timeout_fired_total")
                 .with_description("ADR-0049: state_timeout declarations that fired.")
@@ -181,6 +188,13 @@ fn metrics() -> &'static RuntimeMetrics {
             state_timeout_reset_total: meter
                 .u64_counter("temper_state_timeout_reset_total")
                 .with_description("ADR-0049: timers re-armed via reset_on.")
+                .build(),
+            timer_fire_withheld_total: meter
+                .u64_counter("temper_timer_fire_withheld_total")
+                .with_description(
+                    "Timer fires whose move was not made because the timer's setter may no \
+                     longer read the record.",
+                )
                 .build(),
             scheduler_overdue_on_replay_total: meter
                 .u64_counter("temper_scheduler_overdue_on_replay_total")
@@ -639,6 +653,19 @@ pub fn record_dispatch_error(
 // ADR-0049: state-entry timeouts.
 // ============================================================================
 
+/// Record a reaction Cedar refused on its target. Identity belongs in the
+/// warning, not these bounded labels; app_id comes from the meter resource.
+pub fn record_reaction_withheld(tenant: &str, entity_type: &str, action: &str) {
+    metrics().reaction_withheld_total.add(
+        1,
+        &[
+            KeyValue::new("tenant", tenant.to_string()),
+            KeyValue::new("entity_type", entity_type.to_string()),
+            KeyValue::new("action", action.to_string()),
+        ],
+    );
+}
+
 /// Record that a state_timeout fired for a specific (entity, state, action).
 pub fn record_state_timeout_fired(tenant: &str, entity_type: &str, state: &str, action: &str) {
     metrics().state_timeout_fired_total.add(
@@ -678,6 +705,19 @@ pub fn record_state_timeout_reset(
             KeyValue::new("entity_type", entity_type.to_string()),
             KeyValue::new("state", state.to_string()),
             KeyValue::new("reset_action", reset_action.to_string()),
+        ],
+    );
+}
+
+/// Record a timer fire, a state timer's or a scheduled action's, whose move
+/// was not made because its setter may no longer read the record.
+pub fn record_timer_fire_withheld(tenant: &str, entity_type: &str, action: &str) {
+    metrics().timer_fire_withheld_total.add(
+        1,
+        &[
+            KeyValue::new("tenant", tenant.to_string()),
+            KeyValue::new("entity_type", entity_type.to_string()),
+            KeyValue::new("action", action.to_string()),
         ],
     );
 }

@@ -473,8 +473,8 @@ impl ServerState {
 
             if !target_id.is_empty()
                 && let Some(status) = self
-                    .resolve_entity_status(tenant, &ce.entity_type, target_id)
-                    .await
+                    .try_resolve_entity_status(tenant, &ce.entity_type, target_id)
+                    .await?
             {
                 resource_attrs.insert(
                     format!("ctx_{}_status", ce.name),

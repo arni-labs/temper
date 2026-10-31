@@ -131,6 +131,7 @@ impl ServerState {
     /// that declares a timeout follow its state, arming a record left in a
     /// timed state with no row, and count the records that wait for a caller
     /// into `counts`, which it logs.
+    #[tracing::instrument(skip_all, fields(otel.name = "boot.timed_type_walk"))]
     pub(super) async fn follow_timed_types(
         &self,
         callers: BootCallers,

@@ -107,7 +107,24 @@ pub fn build_model_tracking(
             *bound = (*bound).max(*initial);
         }
     }
+    // A list is explored at least as long as it starts.
+    let mut list_bounds: BTreeMap<String, usize> = initial_lists
+        .iter()
+        .map(|(name, items)| (name.clone(), max_counter.max(items.len())))
+        .collect();
     let invariants = resolve_invariants(automaton);
+    // A counter, or a list's length, is explored one past every literal a
+    // guard or invariant compares it with, so a rule about a count passing a
+    // threshold is checked at the threshold, not passed because the count
+    // never got there.
+    let guards = transitions.iter().map(|t| &t.guard);
+    let asserts = invariants.iter().map(|inv| &inv.assert);
+    for (name, literal) in compared_literals(guards.chain(asserts)) {
+        let bound = counter_bounds.get_mut(&name).or(list_bounds.get_mut(&name));
+        if let Some(bound) = bound {
+            *bound = (*bound).max(literal.saturating_add(1));
+        }
+    }
     let liveness = resolve_liveness(automaton);
     let var_kinds = automaton
         .state
@@ -131,6 +148,7 @@ pub fn build_model_tracking(
         tracked_strings,
         counter_bounds,
         default_max_counter: max_counter,
+        list_bounds,
         list_literals: list_literals(automaton),
         limit: None,
     }
@@ -333,6 +351,50 @@ fn string_literals(
     for inv in &automaton.invariants {
         visit(&inv.assert, tracked, &mut out);
     }
+    out
+}
+
+/// The largest non-negative integer literal each counter, or each list's
+/// length, is compared with in `exprs` (`v < 4`, `4 <= v`, `v in [1, 4]`,
+/// `len(l) < 4`), by the variable's name.
+fn compared_literals<'a>(exprs: impl Iterator<Item = &'a Expr>) -> BTreeMap<String, usize> {
+    fn note(var: &str, literal: &Literal, out: &mut BTreeMap<String, usize>) {
+        if let Literal::Int(n) = literal
+            && let Ok(n) = usize::try_from(*n)
+        {
+            let largest = out.entry(var.to_string()).or_default();
+            *largest = (*largest).max(n);
+        }
+    }
+    fn visit(expr: &Expr, out: &mut BTreeMap<String, usize>) {
+        match expr {
+            Expr::Not(inner) => visit(inner, out),
+            Expr::And(parts) | Expr::Or(parts) => {
+                parts.iter().for_each(|part| visit(part, out));
+            }
+            Expr::Implies(a, b) => {
+                visit(a, out);
+                visit(b, out);
+            }
+            Expr::Compare { lhs, rhs, .. } => {
+                for (var, literal) in [(lhs, rhs), (rhs, lhs)] {
+                    if let (Operand::Var(var) | Operand::Len(var), Operand::Lit(literal)) =
+                        (var, literal)
+                    {
+                        note(var, literal, out);
+                    }
+                }
+            }
+            Expr::In {
+                value: Operand::Var(var) | Operand::Len(var),
+                set: Set::List(items),
+                ..
+            } => items.iter().for_each(|item| note(var, item, out)),
+            _ => {}
+        }
+    }
+    let mut out = BTreeMap::new();
+    exprs.for_each(|expr| visit(expr, &mut out));
     out
 }
 

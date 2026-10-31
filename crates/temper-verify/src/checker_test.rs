@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use super::*;
 use crate::model::build_model_from_ioa;
 
@@ -253,7 +255,7 @@ fn states_contains_status(model: &TemperModel, status: &str) -> bool {
             return true;
         }
         for transition in &model.transitions {
-            for next in step(model, transition, &state) {
+            for next in step(model, transition, &state, &mut BTreeMap::new()) {
                 if visited.insert(next.clone()) {
                     queue.push_back(next);
                 }
@@ -404,7 +406,7 @@ fn string_products_spend_the_per_record_budget() {
         ));
         let model = Spending::start(budget).limit(build_model_from_ioa(&spec, 2).unwrap());
         let result = check_model(&model);
-        assert!(find_dead_transitions(&model).is_none());
+        assert!(walk(&model).is_none());
         assert!(!result.is_complete);
         assert!(!result.all_properties_hold);
         assert!(result.dead_transitions.is_empty());

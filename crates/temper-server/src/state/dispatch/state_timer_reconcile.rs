@@ -198,16 +198,31 @@ impl ServerState {
         // the process never armed it (the move's answer was lost, or the
         // actor rebuilt from its journal). Read even with a live arm: a
         // committed reset can have superseded it without post-dispatch work.
-        let Ok(row) = self
-            .committed_state_timer_row(tenant, entity_type, entity_id)
-            .await
-        else {
+        // A withheld task releases its live arm but keeps its row. When no
+        // task is live, recover that row even in stores that write it after
+        // commit, so an install never replaces its setter with the service.
+        let row = if armed.is_none() {
+            self.stored_state_timer_row(tenant, entity_type, entity_id)
+                .await
+        } else {
+            self.committed_state_timer_row(tenant, entity_type, entity_id)
+                .await
+        };
+        let Ok(row) = row else {
             // An unread row may hold the committed arm: a timer built from the
             // record's fields now would replace its deadline, arguments and
             // caller. Leave the record's timer as it is.
             return TimerFollow::RetryRead;
         };
-        let row = row.filter(|row| row.state == st.state && row.sequence_nr <= current.sequence_nr);
+        // A row written after commit can lag a reset. Reuse it only for
+        // the current state clock; a committed row is authoritative itself.
+        let row = row.filter(|row| {
+            row.state == st.state
+                && row.sequence_nr <= current.sequence_nr
+                && (self.entity_rows_follow_commits()
+                    || DateTime::parse_from_rfc3339(&row.started_at)
+                        .is_ok_and(|start| start == started_at))
+        });
         let committed = row.as_ref().and_then(|row| {
             match super::state_timer_rows::armed_timer(
                 tenant,
@@ -265,7 +280,7 @@ impl ServerState {
             deadline(timer.started_at, st.after_seconds),
             woke_for,
         );
-        if self.start_armed_timer(timer, delay, reservation).await {
+        if self.start_armed_timer(timer, reservation).await {
             crate::runtime_metrics::record_state_timeout_armed_on_hydration(
                 tenant.as_str(),
                 entity_type,

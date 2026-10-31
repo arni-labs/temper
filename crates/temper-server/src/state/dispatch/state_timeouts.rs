@@ -235,6 +235,20 @@ impl StateTimeoutTracker {
         Some(entry.seq)
     }
 
+    /// Release an ended task's live arm without losing its journal fence or
+    /// boot gate. A replacement, even for the same durable arm, owns its own
+    /// cancellation value and must remain armed.
+    pub(super) fn release(&self, timer: &ArmedTimer, armed_seq: u64) {
+        let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
+        let mut map = self.seqs.lock().expect("state_timeout tracker poisoned");
+        if let Some(entry) = map.get_mut(&key)
+            && entry.seq == armed_seq
+        {
+            entry.seq += 1;
+            entry.armed = None;
+        }
+    }
+
     fn boot_gate(&self, key: &EntityKey) -> Option<Arc<Semaphore>> {
         self.seqs
             .lock()
@@ -452,9 +466,7 @@ impl crate::state::ServerState {
             // timer's row under this id (`committed_timer_row`).
             timer.arm_id = super::entity_rows::timer_arm_id(&st.state, response.state.sequence_nr);
         }
-        let delay = remaining_budget(started_at, st.after_seconds, now);
-        self.start_armed_timer(timer, delay, Reservation::Fresh)
-            .await;
+        self.start_armed_timer(timer, Reservation::Fresh).await;
     }
 
     /// Arm the timers of a record created straight into a timed state.
@@ -491,7 +503,6 @@ impl crate::state::ServerState {
     pub(super) async fn start_armed_timer(
         &self,
         mut timer: ArmedTimer,
-        delay: Duration,
         reservation: Reservation,
     ) -> bool {
         let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
@@ -520,7 +531,7 @@ impl crate::state::ServerState {
             return false;
         }
         let gate = timer.boot_gate.clone();
-        self.spawn_state_timer(timer, delay, gate, armed_seq);
+        self.spawn_state_timer(timer, gate, armed_seq);
         true
     }
 
@@ -1020,7 +1031,7 @@ mod tests {
         server.state_timer_rows = Some(rows.clone());
         assert!(
             !server
-                .start_armed_timer(timer("Old", 1), Duration::from_secs(60), Reservation::Fresh)
+                .start_armed_timer(timer("Old", 1), Reservation::Fresh)
                 .await
         );
         assert_eq!(rows.writes.load(Ordering::SeqCst), 2);
@@ -1113,6 +1124,39 @@ mod tests {
             "a record found in another state gets that state's timer"
         );
         assert_eq!(t.armed(&k).map(|armed| armed.state), Some("B".to_string()));
+    }
+
+    #[test]
+    fn releasing_an_ended_task_preserves_newer_arms_and_the_journal_fence() {
+        let tracker = StateTimeoutTracker::new();
+        let k = key();
+        let original = timer("A", 5);
+        let first = tracker.reserve(&original, Reservation::Committed).unwrap();
+        tracker.release(&original, first);
+        assert!(!tracker.has_armed(&k), "the ended task is no longer live");
+        assert_eq!(
+            tracker.reserve(&timer("A", 4), Reservation::Fresh),
+            None,
+            "release must retain the journal fence"
+        );
+
+        let rearmed = tracker.reserve(&original, Reservation::Committed).unwrap();
+        tracker.release(&original, first);
+        assert_eq!(tracker.current(&k), rearmed);
+        assert!(
+            tracker.has_armed(&k),
+            "a new task for the same row stays armed"
+        );
+
+        let newer = timer("B", 6);
+        let replaced = tracker.reserve(&newer, Reservation::Fresh).unwrap();
+        tracker.release(&original, rearmed);
+        assert_eq!(tracker.current(&k), replaced);
+        assert_eq!(
+            tracker.armed(&k).unwrap().arm_id,
+            newer.arm_id,
+            "a newer transition's arm stays armed"
+        );
     }
 
     #[test]

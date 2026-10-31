@@ -428,6 +428,15 @@ impl EventStore for TursoEventStore {
         .await
         .map_err(storage_error)?;
 
+        tx.execute("INSERT INTO entity_projection_delta (tenant, entity_type, entity_id, sequence_nr)
+            SELECT ?1, ?2, ?3, ?4 WHERE NOT EXISTS (
+                SELECT 1 FROM entity_catalog c INDEXED BY idx_entity_catalog_checkpoint LEFT JOIN entity_catalog_counters k
+                    ON k.tenant = c.tenant AND k.entity_type = c.entity_type AND k.entity_id = c.entity_id
+                WHERE c.tenant = ?1 AND c.entity_type = ?2 AND c.entity_id = ?3
+                    AND COALESCE(k.sequence_nr, c.sequence_nr) >= ?4)
+            ON CONFLICT (tenant, entity_type, entity_id) DO UPDATE SET sequence_nr = MAX(sequence_nr, excluded.sequence_nr)",
+            params![tenant, entity_type, entity_id, sequence_nr as i64]).await.map_err(storage_error)?;
+
         let mut segment_rows = tx
             .query(
                 "SELECT COALESCE(MAX(segment_index), 0)
