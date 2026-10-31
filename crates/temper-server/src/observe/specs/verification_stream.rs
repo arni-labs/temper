@@ -164,9 +164,9 @@ pub(super) fn build_verification_stream_response(
                         .with_prop_test_cases(100)
                 }
             };
-            let digest = kept::digest(check.clone()).await;
-            let kept_result = match &digest {
-                Some(digest) => kept::kept(&state_for_task, digest).await,
+            let key = kept::key(check.clone()).await;
+            let kept_result = match &key {
+                Some(key) => kept::kept(&state_for_task, key).await,
                 None => None,
             };
             let result: Result<temper_verify::CascadeResult, String> =
@@ -181,10 +181,10 @@ pub(super) fn build_verification_stream_response(
                         .await
                         .map_err(|e| e.to_string())
                 };
-            if let (Ok(result), Some(digest)) = (&result, &digest)
+            if let (Ok(result), Some(key)) = (&result, &key)
                 && result.kept.is_none()
             {
-                kept::keep(&state_for_task, digest, result).await;
+                kept::keep(&state_for_task, &key.digest, result).await;
             }
 
             let level_labels = [
