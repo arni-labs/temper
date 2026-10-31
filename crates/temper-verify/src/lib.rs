@@ -38,3 +38,6 @@ pub use simulation::{
     run_multi_seed_simulation_from_ioa, run_simulation_from_ioa,
 };
 pub use smt::{SmtResult, verify_symbolic};
+
+/// Measurement only (scratch branch).
+pub mod never_loses;
