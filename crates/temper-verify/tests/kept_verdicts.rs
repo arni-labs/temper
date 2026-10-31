@@ -1,5 +1,5 @@
 //! A check's verdict is kept by the digest of what its levels read
-//! ([`VerificationCascade::digest`]): a change none of them reads keeps it,
+//! ([`VerificationCascade::kept_key`]): a change none of them reads keeps it,
 //! one they read does not, and a rule over several records is still decided
 //! by the joint check, which reads every type's source.
 
@@ -21,7 +21,7 @@ fn check(ioa: &str) -> VerificationCascade {
 }
 
 fn digest(ioa: &str) -> String {
-    check(ioa).digest().expect("the fixture parses")
+    check(ioa).kept_key().expect("the fixture parses").digest
 }
 
 /// The one joint invariant of `parent` and `child`, under the fixture's Cedar.
@@ -59,7 +59,10 @@ fn a_change_a_level_reads_changes_the_digest() {
         digest(NOTE),
         "a rule's name, which a verdict reports"
     );
-    let more_seeds = check(NOTE).with_sim_seeds(6).digest();
+    let more_seeds = check(NOTE)
+        .with_sim_seeds(6)
+        .kept_key()
+        .map(|key| key.digest);
     assert_ne!(more_seeds, Some(digest(NOTE)), "how far a level goes");
 }
 
@@ -86,8 +89,8 @@ fn a_rule_reading_a_related_record_keeps_the_digest_whatever_its_type_is_called(
 fn a_check_that_reads_more_than_its_models_has_no_digest() {
     let scoped = check(NOTE)
         .with_composite_scope(vec![parse_automaton(NOTE).expect("fixture parses")], "Note");
-    assert_eq!(scoped.digest(), None);
-    assert_eq!(check("not a spec").digest(), None);
+    assert_eq!(scoped.kept_key(), None);
+    assert_eq!(check("not a spec").kept_key(), None);
 }
 
 /// The parent's word changes from one its child's rule allows to one it

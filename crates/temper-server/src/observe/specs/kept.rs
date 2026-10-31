@@ -1,5 +1,5 @@
 //! Passing checks, kept by the digest of what their levels read
-//! ([`temper_verify::VerificationCascade::digest`]).
+//! ([`temper_verify::VerificationCascade::kept_key`]).
 //!
 //! A spec whose levels read what an earlier passing check's levels read gets
 //! that verdict back instead of running them again, so a change to text no
@@ -12,7 +12,7 @@
 
 use std::sync::PoisonError;
 
-use temper_verify::{CascadeResult, VerificationCascade};
+use temper_verify::{CascadeResult, KeptKey, VerificationCascade};
 
 use crate::blob_store::KERNEL_BLOB_PREFIX;
 use crate::state::ServerState;
@@ -21,19 +21,21 @@ fn blob_key(digest: &str) -> String {
     format!("{KERNEL_BLOB_PREFIX}check-verdict/{digest}")
 }
 
-/// The digest of what `cascade`'s levels read, worked out on a blocking
+/// The key of what `cascade`'s levels read, worked out on a blocking
 /// thread: it builds the models.
-pub(super) async fn digest(
+pub(super) async fn key(
     cascade: impl FnOnce() -> VerificationCascade + Send + 'static,
-) -> Option<String> {
-    tokio::task::spawn_blocking(move || cascade().digest())
+) -> Option<KeptKey> {
+    tokio::task::spawn_blocking(move || cascade().kept_key())
         .await
         .ok()
         .flatten()
 }
 
-/// The passing verdict kept under `digest`, with `kept` set, if any.
-pub(super) async fn kept(state: &ServerState, digest: &str) -> Option<CascadeResult> {
+/// The passing verdict kept under `key`, with `kept` set, if any and if it
+/// stands for the spec `key` is of ([`KeptKey::fits`]).
+pub(super) async fn kept(state: &ServerState, key: &KeptKey) -> Option<CascadeResult> {
+    let digest = key.digest.as_str();
     let result = match state.platform_metadata_store() {
         Some(store) => match store.get_blob(&blob_key(digest)).await {
             Ok(bytes) => serde_json::from_slice(&bytes?).ok()?,
@@ -49,6 +51,9 @@ pub(super) async fn kept(state: &ServerState, digest: &str) -> Option<CascadeRes
             .get(digest)
             .cloned()?,
     };
+    if !key.fits(&result) {
+        return None;
+    }
     Some(CascadeResult {
         kept: Some(digest.to_string()),
         ..result
