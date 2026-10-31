@@ -65,25 +65,35 @@ pub(super) async fn dispatch_action_bridge_result(
         "HttpEndpoint action bridge dispatching configured action"
     );
 
-    let dispatch = state
-        .dispatch_outside_action(crate::state::DispatchCommand {
-            tenant: &tenant_id,
-            entity_type: &bridge.entity_type,
-            entity_id: &entity_id,
-            action: &bridge.action,
-            params: action_params,
-            agent_ctx: &agent_ctx,
-            await_integration: true,
-            // Await reactions like the OData action path
-            // (dispatch_bound_action) does, so a composite action
-            // dispatched through the bridge — git wire IngestPack,
-            // PR merge — has its declared sub-write reactions applied
-            // before the protocol response is returned. Without this
-            // the reaction is spawned in the background and its
-            // sub_writes are silently dropped.
-            await_reactions: true,
-        })
-        .await;
+    // The record's checks run in the dispatch, on the record as it is. A
+    // dispatch decided on a record that changed first is decided again on it
+    // (`state::redecide`).
+    let mut redecide = crate::state::redecide::Redecide::start(&state);
+    let dispatch = loop {
+        let dispatch = state
+            .dispatch_outside_action(crate::state::DispatchCommand {
+                tenant: &tenant_id,
+                entity_type: &bridge.entity_type,
+                entity_id: &entity_id,
+                action: &bridge.action,
+                params: action_params.clone(),
+                agent_ctx: &agent_ctx,
+                await_integration: true,
+                // Await reactions like the OData action path
+                // (dispatch_bound_action) does, so a composite action
+                // dispatched through the bridge — git wire IngestPack,
+                // PR merge — has its declared sub-write reactions applied
+                // before the protocol response is returned. Without this
+                // the reaction is spawned in the background and its
+                // sub_writes are silently dropped.
+                await_reactions: true,
+            })
+            .await;
+        let stale = matches!(dispatch, Err(crate::state::DispatchError::StaleWrite(_)));
+        if !redecide.again(stale, "action_bridge") {
+            break dispatch;
+        }
+    };
 
     match dispatch {
         Ok(response) if response.success => {

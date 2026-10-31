@@ -72,6 +72,12 @@ jobs:
   # A pull request or a merge group: only the packages its changes can reach (lane "pr"),
   # see scripts/ci/affected.py. A merge group's changes are those of every pull request in it.
   # A push whose tree already passed in a merge group: nothing to test, like a docs-only change.
+  # Every test runs once, in the merge group (Rita, 31 Oct 2026: "CI 2 times is insane"): a pull
+  # request only compiles and lints (Compile & Lint, Integrity, Instrumentation Hygiene, the
+  # SDK's type check), so its author sees a broken build in about four minutes, and every job
+  # that runs tests is skipped on it (output tests=false). To run on a branch, before queueing
+  # it, exactly what its merge group will:
+  #   gh workflow run ci.yml -R arni-labs/temper --ref <branch> -f changed="$(git diff --name-only origin/main...)"
   # Jobs with nothing to do are skipped here rather than started; a skipped job satisfies
   # a required check. The DST cells always start, because a matrix job skipped before it
   # expands reports none of the cell names the branch rules require.
@@ -90,6 +96,7 @@ jobs:
       rust: ${{ steps.affected.outputs.rust }}
       sdk_ts: ${{ steps.affected.outputs.sdk_ts }}
       shards: ${{ steps.affected.outputs.shards }}
+      tests: ${{ steps.affected.outputs.tests }}
       specs: ${{ steps.affected.outputs.specs }}
       dst_matrix: ${{ steps.dst.outputs.matrix }}
     steps:
@@ -185,9 +192,8 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --check
 
-      - name: cargo check --workspace
-        run: cargo check --locked --workspace
-
+      # clippy --all-targets type-checks every target cargo check --workspace did, and the tests,
+      # benches and examples too; a separate check cost 64 s before it (31 Oct 2026).
       - name: cargo clippy --workspace --all-targets
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
@@ -213,6 +219,7 @@ jobs:
       - name: Type check
         run: npx tsc --noEmit
       - name: Tests
+        if: needs.changes.outputs.tests == 'true'
         run: npx vitest run
 
   # ─────────────────────────────────────────────────────
@@ -374,7 +381,7 @@ jobs:
   test-shards:
     name: Tests (${{ matrix.name }})
     needs: changes
-    if: needs.changes.outputs.lane == 'pr' && needs.changes.outputs.mode != 'none'
+    if: needs.changes.outputs.lane == 'pr' && needs.changes.outputs.mode != 'none' && needs.changes.outputs.tests == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
@@ -483,7 +490,7 @@ jobs:
   workspaces:
     name: Other workspaces
     needs: changes
-    if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.mode != 'none'
+    if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.mode != 'none' && needs.changes.outputs.tests == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -503,7 +510,8 @@ jobs:
   # Gate 3: Full test suite (minutes)
   # The required "Tests" check. Full lane (push, schedule, plain dispatch): the
   # whole workspace on one machine, exactly as before. Pull-request lane: passes
-  # when every test shard above passed, or nothing needed testing. Either lane also
+  # when every test shard above passed, or nothing needed testing, or on a pull
+  # request, which runs no tests (its merge group runs them). Either lane also
   # needs Other workspaces to have passed, or to have had nothing to test.
   # ─────────────────────────────────────────────────────
   test:
@@ -538,7 +546,11 @@ jobs:
           SHARDS: ${{ needs.test-shards.result }}
           PACKAGES: ${{ needs.changes.outputs.packages }}
         run: |
-          echo "Packages tested: ${PACKAGES:-none}"
+          if [ "${{ needs.changes.outputs.tests }}" != true ]; then
+            echo "A pull request only compiles and lints; its merge group runs the tests of: ${PACKAGES:-none}"
+          else
+            echo "Packages tested: ${PACKAGES:-none}"
+          fi
           echo "changes: $CHANGES; test shards: $SHARDS"
           [ "$CHANGES" = success ] || exit 1
           case "$SHARDS" in success|skipped) ;; *) exit 1 ;; esac
@@ -659,7 +671,7 @@ jobs:
   postgres-migrations:
     name: Postgres rollback migrations
     needs: changes
-    if: needs.changes.outputs.packages != ''
+    if: needs.changes.outputs.packages != '' && needs.changes.outputs.tests == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:
@@ -742,10 +754,10 @@ jobs:
       matrix: ${{ fromJSON(needs.changes.outputs.dst_matrix) }}
     # The cells always run so each required check reports; when no change reaches a
     # package, or the tree already passed in its merge group, their steps are skipped.
-    # A pull request runs only core: the merge queue runs every suite on the same change
+    # A pull request runs none: the merge queue runs every suite on the same change
     # before it lands, and main takes nothing that has not passed there.
     env:
-      DST_NEEDED: ${{ needs.changes.outputs.test_args != '' && (matrix.suite == 'core' || github.event_name != 'pull_request') }}
+      DST_NEEDED: ${{ needs.changes.outputs.test_args != '' && needs.changes.outputs.tests == 'true' }}
     steps:
       - name: Not affected
         if: env.DST_NEEDED != 'true'
@@ -810,7 +822,7 @@ jobs:
     # repository. The full lane runs them; the pr lane runs them when a spec file
     # changed (scripts/ci/affected.py, SPEC_FILES). The Tests shards also run them
     # whenever a change reaches temper-cli.
-    if: needs.changes.outputs.specs == 'true'
+    if: needs.changes.outputs.specs == 'true' && needs.changes.outputs.tests == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

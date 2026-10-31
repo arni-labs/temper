@@ -76,7 +76,7 @@ permit(principal == Agent::"service:chain", action, resource) when {
     .unwrap();
     let model = JointModel::new(
         &by_name,
-        BTreeSet::from(["A".into(), "B".into(), "C".into()]),
+        &BTreeSet::from(["A".into(), "B".into(), "C".into()]),
         "A",
         &[],
         Sending {

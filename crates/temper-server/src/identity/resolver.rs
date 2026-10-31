@@ -252,6 +252,13 @@ impl IdentityResolver {
         )
         .map_err(|_| IdentityError::Invalid)?;
 
+        // "service" is the kernel's own role: the kernel treats a principal
+        // with it as internal (`EventOrigin::from_caller`, `names_a_caller`),
+        // so no token may claim it.
+        if claims.role.as_deref() == Some("service") {
+            return Err(IdentityError::Invalid);
+        }
+
         // Sign-out-everywhere: reject a token whose generation is older than the
         // principal's current generation (ARN-255 option A), keyed on the human
         // `sub` so signing a human out also invalidates agents acting for them.
