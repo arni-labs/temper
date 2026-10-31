@@ -104,8 +104,8 @@ pub fn guard_may_hold(
 /// counts up to as far as the move's effects can carry them inside the
 /// bounds (`count_bounds`), both booleans, and for list elements every literal a
 /// guard or invariant compares that list against plus one fresh string.
-/// Assignments that grow a counter past its bound (or a list past the
-/// default bound) are pruned, as in bounded exploration.
+/// Assignments that grow a counter or a list past its bound are pruned, as
+/// in bounded exploration.
 pub fn successors(
     model: &TemperModel,
     t: &ResolvedTransition,
@@ -335,6 +335,15 @@ pub(crate) fn counter_bound(model: &TemperModel, var: &str) -> usize {
         .unwrap_or(model.default_max_counter)
 }
 
+/// The longest list `var` is explored up to.
+pub(crate) fn list_bound(model: &TemperModel, var: &str) -> usize {
+    model
+        .list_bounds
+        .get(var)
+        .copied()
+        .unwrap_or(model.default_max_counter)
+}
+
 /// Whether `next` stays within the exploration bounds, or at least grew no
 /// counter or list beyond them.
 pub(crate) fn within_bounds(
@@ -347,7 +356,7 @@ pub(crate) fn within_bounds(
             || *value <= before.counters.get(var).copied().unwrap_or(0)
     });
     let lists_ok = next.lists.iter().all(|(var, items)| {
-        items.len() <= model.default_max_counter
+        items.len() <= list_bound(model, var)
             || items.len() <= before.lists.get(var).map_or(0, Vec::len)
     });
     counters_ok && lists_ok
@@ -367,7 +376,7 @@ fn outgrown<'a>(
         (*value > bound && grew).then(|| (var.clone(), bound))
     });
     let lists = next.lists.iter().filter_map(move |(var, items)| {
-        let bound = model.default_max_counter;
+        let bound = list_bound(model, var);
         let grew = items.len() > before.lists.get(var).map_or(0, Vec::len);
         (items.len() > bound && grew).then(|| (var.clone(), bound))
     });

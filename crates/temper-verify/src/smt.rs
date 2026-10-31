@@ -26,7 +26,7 @@ use stateright::Model;
 use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Operand, Set, Truth, unmodelable};
 
 use crate::model::builder::build_model_from_ioa;
-use crate::model::semantics::{collect_list_contains_pairs, counter_bound, truth};
+use crate::model::semantics::{collect_list_contains_pairs, counter_bound, list_bound, truth};
 use crate::model::types::{ModelEffect, ResolvedTransition, TemperModel};
 
 /// Result of symbolic verification.
@@ -88,8 +88,8 @@ pub fn verify_symbolic(ioa_toml: &str, max_counter: usize) -> SmtResult {
     let approximation_notes = approximation_notes(&model);
     let approximate = !approximation_notes.is_empty();
 
-    let guard_sat = check_guard_satisfiability(&model, max_counter);
-    let (inductive, not_proved) = check_invariant_induction(&model, max_counter);
+    let guard_sat = check_guard_satisfiability(&model);
+    let (inductive, not_proved) = check_invariant_induction(&model);
     let unreachable = check_unreachable_states(&model);
 
     // Unreachable states are warnings, not failures — specs may declare states
@@ -136,7 +136,7 @@ fn reads_related_entities(guard: &Expr) -> bool {
 ///
 /// A guard is satisfiable if there exists an assignment of counter values
 /// (each up to its bound) and boolean values that makes the guard true.
-fn check_guard_satisfiability(model: &TemperModel, max_counter: usize) -> Vec<(String, bool)> {
+fn check_guard_satisfiability(model: &TemperModel) -> Vec<(String, bool)> {
     model
         .transitions
         .iter()
@@ -154,7 +154,7 @@ fn check_guard_satisfiability(model: &TemperModel, max_counter: usize) -> Vec<(S
             // Create Z3 variables for each counter, over the values L1 explores
             let counter_vars = make_counter_vars(model, &solver);
             let bool_vars = make_bool_vars(model);
-            let list_vars = make_list_vars(model, &solver, max_counter, "");
+            let list_vars = make_list_vars(model, &solver, "");
             let status_var = make_status_var(model, &solver);
 
             if !t.from_states.is_empty() {
@@ -204,10 +204,7 @@ type NotProvedInvariants = Vec<(String, NotProved)>;
 /// not proved. `TypeInvariant` and `Terminal(..)` are
 /// structural: every target is a declared state, and no transition leaves a
 /// terminal state.
-fn check_invariant_induction(
-    model: &TemperModel,
-    max_counter: usize,
-) -> (Vec<(String, bool)>, NotProvedInvariants) {
+fn check_invariant_induction(model: &TemperModel) -> (Vec<(String, bool)>, NotProvedInvariants) {
     let mut not_proved: BTreeMap<usize, NotProved> = BTreeMap::new();
     let inits = model.init_states();
     let mut candidates = Vec::new();
@@ -224,19 +221,10 @@ fn check_invariant_induction(
         }
     }
 
-    // A list longer than L1 explores is reachable only from a longer
-    // initial list.
-    let list_bound = model
-        .initial_lists
-        .values()
-        .map(Vec::len)
-        .max()
-        .unwrap_or(0)
-        .max(max_counter);
     loop {
         let mut dropped = BTreeSet::new();
         for t in &model.transitions {
-            for index in broken_by(model, t, &candidates, list_bound) {
+            for index in broken_by(model, t, &candidates) {
                 not_proved
                     .entry(index)
                     .or_insert_with(|| NotProved::BrokenBy(t.name.clone()));
@@ -282,12 +270,7 @@ fn check_invariant_induction(
 /// states and its guard, to a post-state (its effects applied, as L1 applies
 /// them) where the invariant is false. A solver that cannot decide counts as
 /// a break: L0 proves nothing it has not shown.
-fn broken_by(
-    model: &TemperModel,
-    t: &ResolvedTransition,
-    candidates: &[usize],
-    list_bound: usize,
-) -> Vec<usize> {
+fn broken_by(model: &TemperModel, t: &ResolvedTransition, candidates: &[usize]) -> Vec<usize> {
     if candidates.is_empty() {
         return Vec::new();
     }
@@ -310,7 +293,7 @@ fn broken_by(
             )
         })
         .collect();
-    let pre_lists = make_list_vars(model, &solver, list_bound, "pre:");
+    let pre_lists = make_list_vars(model, &solver, "pre:");
     let pre_status = make_status_var(model, &solver);
 
     // Apply the effects in order, as L1 does; `params.p` is a fresh unknown
@@ -368,7 +351,7 @@ fn broken_by(
             }
         }
     }
-    let changed = make_list_vars(model, &solver, list_bound, "post:");
+    let changed = make_list_vars(model, &solver, "post:");
     let mut post_lists = pre_lists.clone();
     for var in &changed_lists {
         if let (Some(len), Some(elements)) = (changed.len_vars.get(var), changed.elem_vars.get(var))
@@ -460,24 +443,21 @@ struct ListSymbolicVars {
     value_atoms: BTreeMap<String, i64>,
 }
 
-/// Create exact bounded symbolic list variables, named after `prefix`:
+/// Create exact bounded symbolic list variables, named after `prefix`, for
+/// each list up to the length L1 explores it to (its bound):
 /// - its length, in `[0, bound]`
 /// - one element per position below `bound`
 ///
 /// Every string a guard or invariant tests for membership, and every initial
 /// element, gets its own atom, so `'v' in list` is never decided by default.
-fn make_list_vars(
-    model: &TemperModel,
-    solver: &Solver,
-    bound: usize,
-    prefix: &str,
-) -> ListSymbolicVars {
+fn make_list_vars(model: &TemperModel, solver: &Solver, prefix: &str) -> ListSymbolicVars {
     let zero = Int::from_i64(0);
-    let max_val = Int::from_i64(bound as i64);
     let mut len_vars = BTreeMap::new();
     let mut elem_vars = BTreeMap::new();
 
     for name in model.initial_lists.keys() {
+        let bound = list_bound(model, name);
+        let max_val = Int::from_i64(i64::try_from(bound).unwrap_or(i64::MAX));
         let len_var = Int::new_const(var_name(prefix, "len", name));
         solver.assert(len_var.ge(&zero));
         solver.assert(len_var.le(&max_val));

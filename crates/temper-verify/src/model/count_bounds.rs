@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use temper_spec::predicate::{Arg, Literal};
 
-use super::semantics::counter_bound;
+use super::semantics::{counter_bound, list_bound};
 use super::types::{ModelEffect, ResolvedTransition, TemperModel};
 
 /// The values one count parameter of a move is explored over: `0..=largest`.
@@ -217,13 +217,6 @@ fn widest(model: &TemperModel) -> usize {
         .counter_bounds
         .values()
         .copied()
-        .chain(model.initial_lists.keys().map(|var| list_bound(model, var)))
+        .chain(model.list_bounds.values().copied())
         .fold(model.default_max_counter, usize::max)
-}
-
-fn list_bound(model: &TemperModel, var: &str) -> usize {
-    // Removals can be no-ops, so retain a conservative length through them.
-    model
-        .default_max_counter
-        .max(model.initial_lists.get(var).map_or(0, Vec::len))
 }
