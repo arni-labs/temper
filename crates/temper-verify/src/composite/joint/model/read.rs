@@ -116,18 +116,6 @@ pub(super) fn tracked(
             }
         }
         for reaction in &reactions {
-            // A trigger's guard is decided on its sender's fields.
-            if let Some(guard) = &reaction.guard {
-                let from = &models[&reaction.from];
-                guard.for_each_name(&mut |name| {
-                    if let Name::Var(field) = name
-                        && from.var_kinds.get(field) != Some(&VarKind::Str)
-                        && !from.holds(field)
-                    {
-                        grew |= track(&reaction.from, field);
-                    }
-                });
-            }
             if let Some(TargetResolver::CreateIfMissing { id_field }) = &reaction.resolve {
                 grew |= track(&reaction.from, id_field);
             }
