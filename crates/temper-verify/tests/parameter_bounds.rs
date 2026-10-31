@@ -35,6 +35,10 @@ effect = ["y = params.a", "z = params.b"]
 name = "Bump"
 from = ["On"]
 effect = ["x += 1"]
+
+[[invariant]]
+name = "Read"
+assert = "y >= 0 && z >= 0"
 "#;
 
 #[test]
