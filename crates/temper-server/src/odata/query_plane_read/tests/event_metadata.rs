@@ -19,12 +19,50 @@ async fn compound_event_metadata_filters_count_only_matching_rows() {
         ("b", "request", "2026-01-02T00:00:00.000000000Z"),
         ("c", "request", "2026-01-03T00:00:00.000000000Z"),
     ] {
-        store.upsert_query_projection_with_state(tenant.as_str(), "Order", id, "Created", &serde_json::json!({"Id":id}),
-            &serde_json::json!({"status":"Created", "last_event_via":via, "first_event_at":first}), 1).await.unwrap();
+        let by = match id {
+            "b" => Some("alice"),
+            "c" => Some("bob"),
+            _ => None,
+        };
+        store
+            .upsert_query_projection_with_state(
+                tenant.as_str(),
+                "Order",
+                id,
+                "Created",
+                &serde_json::json!({"Id": id, "Notes": "queue"}),
+                &serde_json::json!({
+                    "status": "Created", "last_event_via": via, "first_event_at": first,
+                    "last_event_at": first, "last_event_by": by,
+                }),
+                1,
+            )
+            .await
+            .unwrap();
     }
-    for filter in [
-        "Status eq 'Created' and last_event_via eq 'timer'",
-        "Status eq 'Created' and first_event_at eq '2026-01-01T01:00:00%2B01:00'",
+    // Metadata is stored outside entity_field_index. It must remain a residual
+    // filter even when an indexed application field narrows the candidates.
+    for (filter, expected_id) in [
+        ("Status eq 'Created' and last_event_via eq 'timer'", "a"),
+        (
+            "Status eq 'Created' and first_event_at eq '2026-01-01T01:00:00%2B01:00'",
+            "a",
+        ),
+        (
+            "Status eq 'Created' and last_event_at eq '2026-01-02T01:00:00%2B01:00'",
+            "b",
+        ),
+        ("Status eq 'Created' and last_event_by eq 'alice'", "b"),
+        ("Notes eq 'queue' and last_event_via eq 'timer'", "a"),
+        (
+            "Notes eq 'queue' and first_event_at eq '2026-01-01T01:00:00%2B01:00'",
+            "a",
+        ),
+        (
+            "Notes eq 'queue' and last_event_at eq '2026-01-02T01:00:00%2B01:00'",
+            "b",
+        ),
+        ("Notes eq 'queue' and last_event_by eq 'alice'", "b"),
     ] {
         let query_options =
             parse_query_options(&format!("$filter={filter}&$top=1&$count=true")).unwrap();
@@ -44,6 +82,6 @@ async fn compound_event_metadata_filters_count_only_matching_rows() {
         .unwrap_or_else(|_| panic!("read failed: {filter}"));
         assert_eq!(result.count, Some(1), "{filter}");
         assert_eq!(result.entities.len(), 1);
-        assert_eq!(result.entities[0]["entity_id"], "a");
+        assert_eq!(result.entities[0]["entity_id"], expected_id, "{filter}");
     }
 }
