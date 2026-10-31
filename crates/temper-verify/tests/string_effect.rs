@@ -238,11 +238,13 @@ fn sequential_string_parameters_share_comparison_literals() {
             "{comparison}: {result:#?}"
         );
 
+        // An invariant that reads x keeps x, and the y it is compared with,
+        // tracked: Equal is reachable only with both 'special'.
         let unsafe_source = source
             + r#"
 [[invariant]]
-name = "NeverEqual"
-assert = "status != 'Equal'"
+name = "EqualOnlyEmpty"
+assert = "status != 'Equal' || empty(x)"
 "#;
         assert_sequential_special_counterexample(&unsafe_source);
     }
@@ -257,6 +259,128 @@ name = "NeverEqualSpecial"
 assert = "status != 'Equal' || y != 'special'"
 "#;
     assert_sequential_special_counterexample(&source);
+}
+
+/// A guard that reads only strings parameters write leaves them unmodeled, as
+/// before string effects, so it adds no states to check.
+#[test]
+fn a_guard_on_parameter_written_strings_adds_no_states() {
+    let spec = |guard: &str| {
+        format!(
+            r#"
+[automaton]
+name = "Asked"
+states = ["Draft", "Ready", "Done"]
+initial = "Draft"
+terminal = ["Done"]
+[[state]]
+name = "source"
+type = "string"
+initial = ""
+[[state]]
+name = "asked"
+type = "string"
+initial = ""
+[[state]]
+name = "tries"
+type = "counter"
+initial = 0
+[[action]]
+name = "Describe"
+from = ["Draft", "Ready"]
+to = "Ready"
+params = ["source", "asked"]
+guard = "tries < 3"
+effect = ["tries += 1"]
+[[action]]
+name = "Finish"
+from = ["Ready"]
+to = "Done"
+{guard}
+"#
+        )
+    };
+    let explored =
+        |source: &str| check_model(&build_model_from_ioa(source, 2).unwrap()).states_explored;
+    assert_eq!(
+        explored(&spec("guard = \"source != 'asked' || asked != ''\"")),
+        explored(&spec(""))
+    );
+}
+
+/// A string never compared with the status takes no place name as a choice:
+/// to it a place is no different from any other value, so declaring more
+/// places adds no states.
+#[test]
+fn places_add_no_choices_to_a_string_never_compared_with_status() {
+    let spec = |places: &str| {
+        format!(
+            r#"
+[automaton]
+name = "Release"
+states = ["Draft", "Live"{places}]
+initial = "Draft"
+[[state]]
+name = "released"
+type = "string"
+initial = ""
+[[state]]
+name = "tries"
+type = "counter"
+initial = 0
+[[action]]
+name = "GoLive"
+from = ["Draft", "Live"]
+to = "Live"
+params = ["released"]
+guard = "tries < 3"
+effect = ["tries += 1"]
+[[invariant]]
+name = "DraftHasNoRelease"
+assert = "status in ['Draft'] => released == ''"
+"#
+        )
+    };
+    let explored =
+        |source: &str| check_model(&build_model_from_ioa(source, 2).unwrap()).states_explored;
+    assert_eq!(
+        explored(&spec(r#", "Paused", "Stuck", "Done""#)),
+        explored(&spec(""))
+    );
+}
+
+/// A string compared with the status still takes every place name as a
+/// choice: a move can save `'Live'` and the record then go `Live`.
+#[test]
+fn a_string_compared_with_status_takes_place_names() {
+    let source = r#"
+[automaton]
+name = "Release"
+states = ["Draft", "Live"]
+initial = "Draft"
+[[state]]
+name = "released"
+type = "string"
+initial = ""
+[[action]]
+name = "GoLive"
+from = ["Draft"]
+to = "Live"
+params = ["released"]
+[[invariant]]
+name = "ReleaseIsNotAPlace"
+assert = "released != status"
+"#;
+    let result = check_model(&build_model_from_ioa(source, 2).unwrap());
+    assert!(
+        result.counterexamples.iter().any(|example| {
+            example.property == "Invariants"
+                && example.trace.last().is_some_and(|(state, _)| {
+                    state.strings["released"] == temper_verify::model::ModelString::from("Live")
+                })
+        }),
+        "{result:#?}"
+    );
 }
 
 fn assert_sequential_special_counterexample(source: &str) {
