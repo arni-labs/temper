@@ -35,27 +35,6 @@ pub(super) fn leave_out_unread_counters(automaton: &Automaton, model: &mut Tempe
     }
     // Every variable but a counter is kept, so what an effect on one reads
     // is read; a counter's effects count once the counter is read.
-    loop {
-        let before = read.len();
-        for effect in model.transitions.iter().flat_map(|t| &t.effects) {
-            let (var, value) = match effect {
-                ModelEffect::SetCounter { var, value }
-                | ModelEffect::AddCounter { var, value }
-                | ModelEffect::SubCounter { var, value }
-                | ModelEffect::SetBool { var, value }
-                | ModelEffect::ListAppend { var, value } => (var, value),
-                ModelEffect::ListRemoveAt { var, index } => (var, index),
-            };
-            if (read.contains(var) || !counters.contains(var.as_str()))
-                && let Arg::Var(source) = value
-            {
-                read.insert(source.clone());
-            }
-        }
-        if read.len() == before {
-            break;
-        }
-    }
     let unread = |name: &String| counters.contains(name.as_str()) && !read.contains(name);
     model.initial_counters.retain(|name, _| !unread(name));
     model.counter_bounds.retain(|name, _| !unread(name));
