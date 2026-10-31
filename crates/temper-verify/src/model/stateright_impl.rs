@@ -19,7 +19,16 @@ use super::types::{
 /// a walk, so a walk cut short can report it falsely.
 pub(crate) const REACHES_TERMINAL: &str = "ReachesTerminal";
 
+/// The property that no move breaks an entry rule. It is read in the state
+/// before the move, so its path ends with that move.
+pub(crate) const ENTRY_RULES: &str = "EntryRules";
+
 // -- Property condition functions (bare fn pointers) -------------------------
+
+/// Check that no move enabled here enters a place with its entry rule false.
+fn check_entry_rules(model: &TemperModel, state: &TemperModelState) -> bool {
+    super::entry::entry_broken(model, state).is_none()
+}
 
 /// Check that the current status is a declared state.
 fn check_status_in_set(model: &TemperModel, state: &TemperModelState) -> bool {
@@ -194,6 +203,9 @@ impl Model for TemperModel {
         props.push(Property::always("TypeInvariant", check_status_in_set));
         if !self.invariants.is_empty() {
             props.push(Property::always("Invariants", check_invariants));
+        }
+        if !self.entry_rules.is_empty() {
+            props.push(Property::always(ENTRY_RULES, check_entry_rules));
         }
         if !self.terminal.is_empty() {
             props.push(Property::always("Terminal", check_terminal));

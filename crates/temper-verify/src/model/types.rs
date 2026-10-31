@@ -210,6 +210,21 @@ pub struct ResolvedInvariant {
     pub assert: Expr,
 }
 
+/// A rule on entering a place: every move into `place` from one of `from`
+/// must have `assert` true just before it fires (`model/entry.rs`).
+#[derive(Clone, Debug)]
+pub struct ResolvedEntryRule {
+    /// The rule name.
+    pub name: String,
+    /// The place it guards.
+    pub place: String,
+    /// The places whose moves into `place` it covers, never `place` itself
+    /// unless the spec names it.
+    pub from: Vec<String>,
+    /// The assertion, read in the state before the move.
+    pub assert: Expr,
+}
+
 // ---------------------------------------------------------------------------
 // Liveness properties
 // ---------------------------------------------------------------------------
@@ -251,6 +266,8 @@ pub struct TemperModel {
     pub transitions: Vec<ResolvedTransition>,
     /// Pre-resolved safety invariants (accessible to property fn pointers via &self).
     pub invariants: Vec<ResolvedInvariant>,
+    /// Rules every move into a place must meet as it fires.
+    pub entry_rules: Vec<ResolvedEntryRule>,
     /// Pre-resolved liveness properties.
     pub liveness: Vec<ResolvedLiveness>,
     /// States from which no transition may be enabled.

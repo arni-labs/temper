@@ -57,6 +57,7 @@ pub(super) fn slice(mut model: TemperModel, read: BTreeSet<String>) -> TemperMod
         model.list_literals.remove(name);
     }
     model.invariants.clear();
+    model.entry_rules.clear();
     model.liveness.clear();
     for t in &mut model.transitions {
         t.effects.retain(|e| !dropped.contains(effect_var(e)));

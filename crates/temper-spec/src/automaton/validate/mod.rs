@@ -265,6 +265,38 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
             ));
         }
     }
+    for rule in &automaton.entry_rules {
+        let slot = format!("entry rule '{}'", rule.name);
+        for place in std::iter::once(&rule.place).chain(&rule.from) {
+            if !automaton.automaton.states.contains(place) {
+                return Err(invalid(slot, format!("'{place}' is not a declared state")));
+            }
+        }
+        check(&rule.assert, Scope::State(&vars)).map_err(|e| invalid(slot.clone(), e))?;
+        no_params(&rule.assert, slot.clone())?;
+        no_related_field(&rule.assert, slot.clone())?;
+        if let Some(culprit) = crate::predicate::unverifiable(&rule.assert, &vars) {
+            return Err(invalid(
+                slot,
+                format!("`{culprit}` reads a value the verification cascade cannot model"),
+            ));
+        }
+        // A rule no move is checked against proves nothing.
+        let covered = |from: &String| {
+            from != &rule.place && (rule.from.is_empty() || rule.from.contains(from))
+        };
+        if !automaton.actions.iter().any(|a| {
+            a.to.as_ref() == Some(&rule.place) && (a.from.is_empty() || a.from.iter().any(covered))
+        }) {
+            return Err(invalid(
+                slot,
+                format!(
+                    "no action moves into '{}' from a place it covers",
+                    rule.place
+                ),
+            ));
+        }
+    }
     for live in &automaton.liveness {
         let slot = format!("liveness '{}'", live.name);
         let Some(eventually) = &live.eventually else {

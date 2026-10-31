@@ -398,6 +398,9 @@ fn check_invariants_on_state(
             violated(inv.name.clone());
         }
     }
+    if let Some(rule) = crate::model::broken_by_action(model, action_name, state_before) {
+        violated(rule.name.clone());
+    }
 
     if model.terminal.contains(&state_after.status) {
         let mut actions = Vec::new();

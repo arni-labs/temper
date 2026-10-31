@@ -14,6 +14,7 @@ use temper_spec::automaton::{
 };
 use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Name, Operand, ParamKind, Set, VarKind};
 
+use super::entry::resolve_entry_rules;
 use super::types::{
     LivenessKind, ModelEffect, ResolvedInvariant, ResolvedLiveness, ResolvedTransition,
     StringParam, TemperModel,
@@ -113,13 +114,13 @@ pub fn build_model_tracking(
         .map(|(name, items)| (name.clone(), max_counter.max(items.len())))
         .collect();
     let invariants = resolve_invariants(automaton);
+    let entry_rules = resolve_entry_rules(automaton);
     // A counter, or a list's length, is explored one past every literal a
-    // guard or invariant compares it with, so a rule about a count passing a
+    // guard or rule compares it with, so a rule about a count passing a
     // threshold is checked at the threshold, not passed because the count
     // never got there.
     let guards = transitions.iter().map(|t| &t.guard);
-    let asserts = invariants.iter().map(|inv| &inv.assert);
-    for (name, literal) in compared_literals(guards.chain(asserts)) {
+    for (name, literal) in compared_literals(guards.chain(rule_asserts(automaton))) {
         let bound = counter_bounds.get_mut(&name).or(list_bounds.get_mut(&name));
         if let Some(bound) = bound {
             *bound = (*bound).max(literal.saturating_add(1));
@@ -136,6 +137,7 @@ pub fn build_model_tracking(
         states,
         transitions,
         invariants,
+        entry_rules,
         liveness,
         terminal: automaton.automaton.terminal.clone(),
         var_kinds,
@@ -154,14 +156,21 @@ pub fn build_model_tracking(
     }
 }
 
-/// `'x' in list` literals per list, across every guard and invariant.
+/// The asserts of the spec's invariants and entry rules: what the model
+/// checks beyond the guards.
+fn rule_asserts(automaton: &Automaton) -> impl Iterator<Item = &Expr> {
+    let invariants = automaton.invariants.iter().map(|inv| &inv.assert);
+    invariants.chain(automaton.entry_rules.iter().map(|rule| &rule.assert))
+}
+
+/// `'x' in list` literals per list, across every guard and rule.
 fn list_literals(automaton: &Automaton) -> BTreeMap<String, BTreeSet<String>> {
     let mut pairs = BTreeSet::new();
     for action in &automaton.actions {
         super::semantics::collect_list_contains_pairs(&action.guard, &mut pairs);
     }
-    for inv in &automaton.invariants {
-        super::semantics::collect_list_contains_pairs(&inv.assert, &mut pairs);
+    for assert in rule_asserts(automaton) {
+        super::semantics::collect_list_contains_pairs(assert, &mut pairs);
     }
     let mut literals: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (list, value) in pairs {
@@ -251,11 +260,11 @@ fn string_params(
         .collect()
 }
 
-/// The string variables the verifier tracks: those `[[invariant]]`s read,
-/// plus `also_tracked`, plus every string variable a constraint ties the
-/// parameter of a tracked one to (its value decides what the tracked one may
-/// become). Strings no invariant can see stay unmodeled, so a spec whose
-/// invariants read none explores exactly as before.
+/// The string variables the verifier tracks: those `[[invariant]]`s and
+/// `[[entry_rule]]`s read, plus `also_tracked`, plus every string variable a
+/// constraint ties the parameter of a tracked one to (its value decides what
+/// the tracked one may become). Strings no rule can see stay unmodeled, so a
+/// spec whose rules read none explores exactly as before.
 fn tracked_strings(automaton: &Automaton, also_tracked: &BTreeSet<String>) -> BTreeSet<String> {
     let kinds: BTreeMap<&str, VarKind> = automaton
         .state
@@ -268,8 +277,8 @@ fn tracked_strings(automaton: &Automaton, also_tracked: &BTreeSet<String>) -> BT
         .filter(|name| is_string(name))
         .cloned()
         .collect();
-    for inv in &automaton.invariants {
-        inv.assert.for_each_name(&mut |name| {
+    for assert in rule_asserts(automaton) {
+        assert.for_each_name(&mut |name| {
             if let Name::Var(var) = name
                 && is_string(var)
             {
@@ -297,8 +306,8 @@ fn tracked_strings(automaton: &Automaton, also_tracked: &BTreeSet<String>) -> BT
     }
 }
 
-/// For each tracked string variable, the literals a guard or invariant
-/// compares it with (`v == 'x'`, `v in ['x', 'y']`).
+/// For each tracked string variable, the literals a guard or rule compares
+/// it with (`v == 'x'`, `v in ['x', 'y']`).
 fn string_literals(
     automaton: &Automaton,
     tracked: &BTreeSet<String>,
@@ -348,8 +357,8 @@ fn string_literals(
     for action in &automaton.actions {
         visit(&action.guard, tracked, &mut out);
     }
-    for inv in &automaton.invariants {
-        visit(&inv.assert, tracked, &mut out);
+    for assert in rule_asserts(automaton) {
+        visit(assert, tracked, &mut out);
     }
     out
 }
