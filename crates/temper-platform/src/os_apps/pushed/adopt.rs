@@ -9,6 +9,16 @@
 //! later. Adoption runs no checks and refuses nothing: the version is already
 //! serving, and a version whose files fail today's checks must keep serving
 //! until its owner pushes a new one, not stop at a restart.
+//!
+//! This is a migration path for apps that predate pushes. Delete it, and its
+//! call at boot in temper-cli `serve/bootstrap.rs`, once every production app
+//! has a pushed root (tracked on the Katagami hub as "Remove adoption once
+//! every prod app has a pushed root"). Katagami's start script stops pointing
+//! the boot catalog at an app's old checkout at the same point.
+//!
+//! The whole app directory is copied, so a `COMMIT` file the catalog's copy
+//! holds (Katagami writes `<app>/COMMIT` into the checkout it adopts) names the
+//! adopted version's commit, as it does for a pushed one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

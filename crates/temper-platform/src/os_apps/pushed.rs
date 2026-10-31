@@ -252,6 +252,14 @@ pub fn waiting_line(app: &str, tenant: &str) -> String {
     format!("  App '{app}' waits for its first install for '{tenant}'")
 }
 
+/// The line this server prints at boot for an `--app` it has no files for but
+/// whose install it stored: the specs it stored serve, though nothing is
+/// installed until the app's next install. Never the waiting line, which says
+/// the server serves nothing for the app.
+pub fn stored_line(app: &str, tenant: &str) -> String {
+    format!("  App '{app}' serves its stored specs for '{tenant}'; no files to install")
+}
+
 /// Make the version each app installed last by push resolve for its tenant
 /// again, ahead of the shared catalog, so the boot install of the app installs
 /// it rather than the app's files in the catalog. Returns how many it restored.

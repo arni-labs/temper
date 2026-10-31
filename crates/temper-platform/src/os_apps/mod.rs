@@ -53,7 +53,7 @@ use entity_aliases::{
 pub(super) use policy_rows::os_app_policy_row_id;
 pub use pushed::{
     PushRefused, PushedFile, PushedInstall, adopt_catalog_app, install_pushed_app, installed_line,
-    restore_pushed_app_roots, waiting_line,
+    restore_pushed_app_roots, stored_line, waiting_line,
 };
 pub(crate) use reconcile::{
     InstallOrigin, tenant_has_active_policies_for_bundle, tenant_has_registered_wasm_for_bundle,

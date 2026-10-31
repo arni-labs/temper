@@ -8,7 +8,7 @@ use temper_platform::os_apps::{add_os_apps_dir, remove_tenant_os_apps_dir};
 use temper_platform::state::PlatformState;
 use temper_runtime::tenant::TenantId;
 
-use super::bootstrap::bootstrap_installed_apps;
+use super::bootstrap::{bootstrap_installed_apps, missing_app_line};
 
 const ORDER_IOA: &str = include_str!("../../../../test-fixtures/specs/order.ioa.toml");
 const ORDER_CSDL: &str = include_str!("../../../../test-fixtures/specs/model.csdl.xml");
@@ -76,6 +76,8 @@ async fn a_catalog_app_is_adopted_and_served_on_later_boots_whatever_the_catalog
     let data_dir = tempfile::tempdir().expect("data dir");
     let served = format!("{ORDER_IOA}\n# the version served before pushes\n");
     write_app(apps_root.path(), &app, &served);
+    let commit = "0123456789abcdef0123456789abcdef01234567\n";
+    std::fs::write(apps_root.path().join(&app).join("COMMIT"), commit).expect("write COMMIT"); // determinism-ok: test fixture
     add_os_apps_dir(apps_root.path().to_path_buf());
 
     let first = server(data_dir.path());
@@ -91,6 +93,11 @@ async fn a_catalog_app_is_adopted_and_served_on_later_boots_whatever_the_catalog
         std::fs::read_to_string(root.join(&app).join("specs/order.ioa.toml"))
             .expect("adopted spec"), // determinism-ok: test reads the server's files
         served
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(&app).join("COMMIT")).expect("adopted COMMIT"), // determinism-ok: test reads the server's files
+        commit,
+        "the adopted version names the catalog's commit"
     );
 
     // The catalog moves on; a restart (a new process, so no tenant installs
@@ -113,4 +120,18 @@ async fn a_catalog_app_is_adopted_and_served_on_later_boots_whatever_the_catalog
     );
 
     remove_tenant_os_apps_dir(TENANT, &root);
+}
+
+/// With no files for an `--app`, boot says it waits only when it serves
+/// nothing for the app; an app whose install it stored serves those specs.
+#[test]
+fn a_missing_app_waits_only_when_nothing_was_stored_for_it() {
+    assert_eq!(
+        missing_app_line("shop", TENANT, false),
+        "  App 'shop' waits for its first install for 'default'"
+    );
+    assert_eq!(
+        missing_app_line("shop", TENANT, true),
+        "  App 'shop' serves its stored specs for 'default'; no files to install"
+    );
 }

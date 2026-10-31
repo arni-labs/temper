@@ -331,6 +331,10 @@ fn the_install_and_waiting_lines_read_as_the_control_plane_reads_them() {
         crate::os_apps::waiting_line("shop", "default"),
         "  App 'shop' waits for its first install for 'default'"
     );
+    assert_eq!(
+        crate::os_apps::stored_line("shop", "default"),
+        "  App 'shop' serves its stored specs for 'default'; no files to install"
+    );
 }
 
 /// An app served from the boot catalog is adopted as its first pushed

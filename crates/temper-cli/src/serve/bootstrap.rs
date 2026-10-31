@@ -3,7 +3,7 @@
 //! Each function represents an explicit phase of the startup pipeline.
 //! The `run` coordinator in `mod.rs` calls these in sequence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -626,6 +626,17 @@ enum AppBootstrapSource {
     Cli,
 }
 
+/// What boot prints for an `--app` it has no files for: the specs it stored
+/// for the app still serve, or, with none stored, it serves nothing for the
+/// app and waits for its first install.
+pub(super) fn missing_app_line(app: &str, tenant: &str, stored: bool) -> String {
+    if stored {
+        temper_platform::os_apps::stored_line(app, tenant)
+    } else {
+        temper_platform::os_apps::waiting_line(app, tenant)
+    }
+}
+
 /// Phase 8b: Restore persisted local apps and apply explicit `--app` requests.
 ///
 /// Why this exists:
@@ -657,6 +668,10 @@ pub(super) async fn bootstrap_installed_apps(
             }
         }
     }
+
+    // Apps whose install this server stored: their specs come back from its
+    // database at boot, so it serves them even with no files for them anywhere.
+    let stored: BTreeSet<(String, String)> = requested.keys().cloned().collect();
 
     for app_name in apps {
         requested
@@ -722,16 +737,14 @@ pub(super) async fn bootstrap_installed_apps(
             );
             continue;
         }
-        // An app asked for by `--app` with no files anywhere yet is a server
-        // waiting for its first push (`POST /api/os-apps/{name}/install`); from
-        // that push on, its pushed version is what resolves here.
+        // An app asked for by `--app` with no files anywhere yet has nothing to
+        // install until its first push (`POST /api/os-apps/{name}/install`);
+        // from that push on, its pushed version is what resolves here.
         if matches!(source, AppBootstrapSource::Cli)
             && temper_platform::os_apps::tenant_os_app(&tenant, &app_name).is_none()
         {
-            println!(
-                "{}",
-                temper_platform::os_apps::waiting_line(&app_name, &tenant)
-            );
+            let was_stored = stored.contains(&(tenant.clone(), app_name.clone()));
+            println!("{}", missing_app_line(&app_name, &tenant, was_stored));
             continue;
         }
 
