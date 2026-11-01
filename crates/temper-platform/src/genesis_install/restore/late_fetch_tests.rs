@@ -262,3 +262,96 @@ async fn late_dependency_retries_the_parent_runtime_recovery() {
         );
     }
 }
+
+/// Local apps also replay during boot, outside Genesis cache restoration.
+/// Their registry dependencies may still be fetching when that replay runs.
+#[tokio::test]
+async fn late_dependency_retries_a_persisted_local_parent() {
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let local = tempfile::tempdir().expect("local apps");
+    let remote = tempfile::tempdir().expect("registry files");
+    let ps = Arc::new(store());
+    let platform = server_on(data_dir.path(), &ps);
+    let tenant = format!("{TENANT}-late-local-dependency");
+    let version = "2".repeat(40);
+
+    write_parent(local.path());
+    crate::os_apps::add_tenant_written_apps(
+        &tenant,
+        local.path().to_path_buf(),
+        written::read(local.path()).expect("local file list"),
+    );
+    let notes = InstalledAppRecord {
+        tenant: tenant.clone(),
+        app_name: "notes".to_string(),
+        source_kind: "local".to_string(),
+        bundle_digest: written_digest(local.path(), "notes"),
+        status: "installed".to_string(),
+        ..Default::default()
+    };
+    ps.record_installed_app_metadata(&notes).await.unwrap();
+    write_app(remote.path(), "tags", "tags v2");
+    let (registry, arrivals) = Registry::serve(vec![bundle(remote.path(), "tags", &version)]).await;
+    let tags = InstalledAppRecord {
+        registry_url: registry.url.clone(),
+        ..record(remote.path(), &tenant, "tags", &version)
+    };
+    ps.record_installed_app_metadata(&tags).await.unwrap();
+
+    let recovery = tokio::time::timeout(
+        Duration::from_secs(5),
+        start_genesis_registry_cache_recovery(&platform),
+    )
+    .await
+    .expect("boot returns while the local app's dependency is still fetching");
+    assert_eq!(
+        recovery.restored, 0,
+        "local apps are not registry cache entries"
+    );
+    tokio::time::timeout(Duration::from_secs(10), arrivals[0].requested.notified())
+        .await
+        .expect("the dependency fetch starts");
+    crate::os_apps::restore_os_app(&platform, &tenant, "notes")
+        .await
+        .expect_err("the local parent's boot replay cannot yet find its dependency");
+    assert!(
+        platform
+            .server
+            .authz
+            .get_tenant_policy_text(&tenant)
+            .is_none()
+    );
+
+    arrivals[0].release.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), recovery.fetching.finished())
+            .await
+            .expect("dependency recovery finishes"),
+        CacheFetchSummary {
+            fetched: 1,
+            failed: 0
+        }
+    );
+    assert!(
+        platform
+            .server
+            .authz
+            .get_tenant_policy_text(&tenant)
+            .unwrap_or_default()
+            .contains("ReadNotes"),
+        "the delayed registry dependency must revive the local parent's runtime policy"
+    );
+    assert_eq!(
+        ps.get_installed_app(&tenant, "notes")
+            .await
+            .unwrap()
+            .unwrap()
+            .source_kind,
+        "local",
+        "retry preserves the parent's local provenance"
+    );
+    assert_eq!(
+        ps.get_installed_app(&tenant, "tags").await.unwrap(),
+        Some(tags)
+    );
+}

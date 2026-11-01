@@ -8,7 +8,7 @@
 //! its own apps up, so an app whose files arrive late still runs. A fetch that
 //! fails says so at WARN, and when all are done a summary says how many were
 //! restored and how many were not. Every arrival retries the tenant's apps
-//! still awaiting replay, including apps whose files came from disk.
+//! still awaiting replay, regardless of their install source.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -72,7 +72,7 @@ pub(super) fn spawn(
     platform: &PlatformState,
     ps: Arc<dyn PlatformStore>,
     pending: Vec<Pending>,
-    cached: Vec<(String, String)>,
+    installed: Vec<(String, String)>,
 ) -> CacheFetches {
     if pending.is_empty() {
         return CacheFetches::none();
@@ -81,7 +81,9 @@ pub(super) fn spawn(
     CacheFetches(Some(tokio::spawn(async move {
         let mut fetches = JoinSet::new();
         let mut replays: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for (tenant, app) in cached {
+        // Local apps can also fail boot replay while a registry dependency
+        // is still fetching. Seed every persisted install, whatever its source.
+        for (tenant, app) in installed {
             replays.entry(tenant).or_default().insert(app);
         }
         let mut replays: BTreeMap<_, Arc<Mutex<_>>> = replays
@@ -307,7 +309,7 @@ async fn publish_if_current(
     Ok(names.into_iter().collect())
 }
 
-/// Bring installed app `app_name` up from the files just registered: restore
+/// Bring installed app `app_name` up from the catalog: restore
 /// its runtime state when its stored install matches them, and replay its
 /// install otherwise. An app in the fetched closure with no install record of
 /// its own is left to whoever installs it.
@@ -328,7 +330,7 @@ async fn bring_up(
                 tenant,
                 app = %app_name,
                 error = %error,
-                "Could not read the install record of a fetched Genesis app; it is not brought up"
+                "Could not read the install record of a pending app; it is not brought up"
             );
             return false;
         }
@@ -349,7 +351,7 @@ async fn bring_up(
                     tenant,
                     app = %app_name,
                     error = %error,
-                    "A fetched Genesis app's stored install did not replay"
+                    "A pending app's stored install did not replay"
                 );
                 return false;
             }
@@ -363,7 +365,7 @@ async fn bring_up(
                 tenant,
                 app = %app_name,
                 outcome = ?outcome,
-                "A fetched Genesis app could not be brought up"
+                "A pending app could not be brought up"
             );
             false
         }

@@ -190,8 +190,7 @@ pub async fn start_genesis_registry_cache_recovery(
     let mut restored = 0usize;
     let mut seen = BTreeSet::new();
     let mut pending = Vec::new();
-    let mut cached = Vec::new();
-    for (tenant, app_name) in installed {
+    for (tenant, app_name) in installed.iter().cloned() {
         let record = match ps.get_installed_app(&tenant, &app_name).await {
             Ok(Some(record)) => record,
             Ok(None) => continue,
@@ -245,7 +244,6 @@ pub async fn start_genesis_registry_cache_recovery(
         if let Some((stored, apps)) =
             first_matching_install(ps.as_ref(), &candidates, &record, recorded).await
         {
-            cached.extend(apps.iter().map(|(name, _)| (tenant.clone(), name.clone())));
             register_written_apps(&tenant, stored, apps);
             restored += 1;
             continue;
@@ -277,7 +275,7 @@ pub async fn start_genesis_registry_cache_recovery(
 
     GenesisCacheRecovery {
         restored,
-        fetching: fetch::spawn(platform, ps, pending, cached),
+        fetching: fetch::spawn(platform, ps, pending, installed),
     }
 }
 
