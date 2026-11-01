@@ -16,30 +16,8 @@ use temper_server::registry::VerificationStatus;
 use crate::os_apps;
 use crate::state::PlatformState;
 
-/// Runtime-only outcome for installed-app warm restart recovery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstalledAppRuntimeRecoveryOutcome {
-    /// Specs were already registered and marked usable.
-    Ready,
-    /// Specs were registered and the durable bundle digest matched; runtime
-    /// verification readiness was repaired without reinstalling app content.
-    Healed,
-    /// The app should be reconciled by the digest-aware app reconcile path.
-    NeedsReconcile,
-    /// The durable installed-app row points at an app that is not in the catalog.
-    MissingBundle,
-    /// Durable metadata could not be read, so the caller should reconcile.
-    StoreError,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct InstalledAppsRuntimeRecoverySummary {
-    pub ready: usize,
-    pub healed: usize,
-    pub needs_reconcile: usize,
-    pub missing_bundle: usize,
-    pub store_error: usize,
-}
+mod summary;
+pub use summary::{InstalledAppRuntimeRecoveryOutcome, InstalledAppsRuntimeRecoverySummary};
 
 /// Recover Cedar policies from the platform store into memory.
 ///
@@ -324,6 +302,7 @@ pub async fn recover_installed_apps_runtime_state(
             InstalledAppRuntimeRecoveryOutcome::StoreError => summary.store_error += 1,
         }
     }
+    summary.report();
     summary
 }
 

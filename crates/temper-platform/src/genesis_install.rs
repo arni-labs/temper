@@ -49,7 +49,10 @@ pub(crate) use registry::configured_registry;
 use registry::{RegistryUrl, registry_client};
 pub(crate) use restore::installed_version_files;
 use restore::rollback_to_prior;
-pub use restore::{restore_genesis_app_cache_roots, restore_genesis_registry_cache_roots};
+pub use restore::{
+    CacheFetchSummary, CacheFetches, GenesisCacheRecovery, restore_genesis_app_cache_roots,
+    restore_genesis_registry_cache_roots, start_genesis_registry_cache_recovery,
+};
 use written::Written;
 
 use crate::genesis_install_verify::{
@@ -850,6 +853,9 @@ impl BoundActionHook for GenesisInstallHook {
         .await?;
         let materialized_apps: Vec<String> = written.iter().map(|(app, _)| app.clone()).collect();
         let app_dir = app_cache_dir(&cache_root, &name)?;
+        // Late boot recovery uses the same turn when checking current records
+        // and publishing files. Keep publication and provenance in one turn.
+        let _turn = temper_server::host_turn::take().await?;
         register_written_apps(&target_tenant, cache_root, written);
 
         let mut platform = self.platform.clone();
