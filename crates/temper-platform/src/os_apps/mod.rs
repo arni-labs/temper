@@ -629,6 +629,9 @@ async fn install_once(
             app_dir.display()
         )
     })?;
+    if plan.specs && origin == InstallOrigin::Request {
+        install_checks::trigger_target_args(app_name, &bundle.specs)?;
+    }
     if origin == InstallOrigin::Replay {
         reconcile::ensure_replay_bundle_is_recorded(state, tenant, app_name, &bundle).await?;
     }
