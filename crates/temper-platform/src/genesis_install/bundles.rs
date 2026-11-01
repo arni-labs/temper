@@ -18,6 +18,12 @@ use super::{
 
 pub(super) const MAX_GENESIS_BUNDLE_FILES: usize = 4096;
 pub(super) const MAX_GENESIS_BUNDLE_APPS: usize = 256;
+
+/// Build output and repository metadata: a bundle never carries a path with
+/// one of these components, so an export never needs to read them.
+pub(super) fn is_generated_component(part: &std::ffi::OsStr) -> bool {
+    part == "target" || part == ".git"
+}
 pub(super) const MAX_GENESIS_BUNDLE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 // Raised from 64 MiB. A real app closure did not fit: dsf-factory alone is
 // ~52 MB of legitimate compiled WASM (59 modules, one per resource operation),
@@ -234,7 +240,7 @@ pub(super) fn safe_bundle_relative_path(path: &str) -> Result<PathBuf, String> {
     for component in rel.components() {
         match component {
             Component::Normal(part) => {
-                if part == "target" || part == ".git" {
+                if is_generated_component(part) {
                     return Err(format!(
                         "bundle file path '{}' contains forbidden component '{}'",
                         path,
@@ -412,7 +418,7 @@ fn collect_bundle_file_paths(
             .strip_prefix(root)
             .map_err(|error| format!("strip bundle path '{}': {error}", path.display()))?;
         if rel.components().any(|component| {
-            matches!(component, Component::Normal(part) if part == "target" || part == ".git")
+            matches!(component, Component::Normal(part) if is_generated_component(part))
         }) {
             if file_type.is_dir() {
                 tracing::warn!(
