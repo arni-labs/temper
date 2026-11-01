@@ -1,18 +1,19 @@
 //! The one install every source of app files ends in.
 //!
-//! A source only puts an app closure's files in a cache directory: the
-//! registry fetches a pinned Genesis closure, a push writes the files its
-//! caller sent. From there every install is the same: each spec is checked,
-//! the directory becomes what the tenant resolves, the closure reconciles and
-//! is verified runtime-ready, and the install commits with its records or goes
-//! back to the version installed before it.
+//! A source only puts an app closure's files in a cache directory and names
+//! each app's files: the registry fetches a pinned Genesis closure, a push
+//! writes the files its caller sent. From there every install is the same:
+//! each spec is checked, the named files become what the tenant resolves, the
+//! closure reconciles and is verified runtime-ready, and the install commits
+//! with its records or goes back to the version installed before it. Nothing
+//! here lists the directory the source just wrote.
 
 use std::time::Duration;
 
 use temper_verify::CascadeResult;
 
 use super::*;
-use crate::os_apps::{find_ioa_files, installed_line, resolve_materialized_app_closure};
+use crate::os_apps::{AppFiles, find_ioa_files, installed_line, resolve_materialized_app_closure};
 
 /// Where an installed closure came from, as its install records name it.
 pub(super) struct ClosureSource<'a> {
@@ -30,12 +31,19 @@ pub(super) struct MaterializedClosure<'a> {
     /// The closure's root app.
     pub(super) root: RegistryAppRef,
     /// Every app this source materialized at its version, the root among
-    /// them. Dependencies already in the tenant catalog are resolved by the
-    /// core before any checks; they retain their own source provenance.
-    pub(super) refs: Vec<RegistryAppRef>,
+    /// them. The core resolves dependencies already in the tenant catalog
+    /// before checking or mutating anything; they retain their own source.
+    pub(super) apps: Vec<MaterializedApp>,
     pub(super) source: ClosureSource<'a>,
     /// Time each spec's check may take.
     pub(super) budget: Duration,
+}
+
+/// One app of a closure: its version, and the files its source wrote for it
+/// at `<cache root>/<name>`.
+pub(super) struct MaterializedApp {
+    pub(super) version: RegistryAppRef,
+    pub(super) files: AppFiles,
 }
 
 /// A closure installed and recorded.
@@ -43,8 +51,7 @@ pub(super) struct ClosureInstalled {
     /// What the installer did for the root app.
     pub(super) install: InstallResult,
     pub(super) closure_id: String,
-    /// The names of every app in the resolved closure, including dependencies
-    /// read from the tenant's existing catalog.
+    /// The names of every app in the closure.
     pub(super) materialized: Vec<String>,
     /// Each spec's check, by its path: the root app's relative to it, every
     /// other app's under its name.
@@ -71,15 +78,18 @@ pub(super) async fn install_materialized_closure(
     cache_root: &Path,
     closure: MaterializedClosure<'_>,
 ) -> Result<ClosureInstalled, ClosureRefused> {
-    // A push materializes only its root; its dependencies still resolve from
-    // the tenant's catalog. Resolve that entire closure before mutation, and
-    // use the same order for checks, snapshots, reconcile and verification.
-    let roots: Vec<String> = closure.refs.iter().map(|r| r.name.clone()).collect();
-    let apps = resolve_materialized_app_closure(tenant, cache_root, &roots)
+    // Keep the source's explicit paths, including through dependency
+    // resolution: a fresh install never relies on listing its new directory.
+    let written: Vec<(String, AppFiles)> = closure
+        .apps
+        .iter()
+        .map(|app| (app.version.name.clone(), app.files.clone()))
+        .collect();
+    let apps = resolve_materialized_app_closure(tenant, cache_root, &written)
         .map_err(ClosureRefused::Failed)?;
     let materialized: Vec<String> = apps.iter().map(|(name, _)| name.clone()).collect();
 
-    // Checked before anything changes, so a refusal leaves the tenant as it was.
+    // One complete order drives checks, snapshots, reconcile and verification.
     let checks = check_closure_specs(platform, &closure.root.name, &apps, closure.budget)
         .await
         .map_err(ClosureRefused::Failed)?;
@@ -116,11 +126,7 @@ pub(super) async fn install_materialized_closure(
         .find(|record| record.app_name == closure.root.name)
         .cloned();
 
-    register_install_cache(
-        tenant,
-        cache_root.to_path_buf(),
-        DirApps::Only(materialized.iter().cloned().collect()),
-    );
+    register_written_apps(tenant, cache_root.to_path_buf(), written);
 
     let reconcile_started = Instant::now();
     let reconcile_result =
@@ -224,7 +230,7 @@ pub(super) async fn record_closure(
         closure.app_ref,
         root_hash.trim_start_matches('@')
     );
-    for materialized_ref in &closure.refs {
+    for materialized_ref in closure.apps.iter().map(|app| &app.version) {
         let Some(version_hash) = materialized_ref.version_hash.as_deref() else {
             continue;
         };
@@ -279,24 +285,20 @@ pub(super) async fn record_closure(
 async fn check_closure_specs(
     platform: &PlatformState,
     root_app: &str,
-    apps: &[(String, PathBuf)],
+    apps: &[(String, AppFiles)],
     budget: Duration,
 ) -> Result<BTreeMap<String, CascadeResult>, String> {
     let mut checks = BTreeMap::new();
-    for (app, app_dir) in apps {
-        for (_, path) in find_ioa_files(app_dir) {
-            let relative = path
-                .strip_prefix(app_dir)
-                .ok()
-                .and_then(Path::to_str)
-                .ok_or_else(|| format!("spec '{}' is outside its app", path.display()))?;
-            let key = if app == root_app {
-                relative.to_string()
+    for (name, files) in apps {
+        for path in find_ioa_files(files) {
+            let key = if name == root_app {
+                path.clone()
             } else {
-                format!("{app}/{relative}")
+                format!("{name}/{path}")
             };
-            let source = std::fs::read_to_string(&path)
-                .map_err(|error| format!("spec '{key}' could not be read: {error}"))?;
+            let source = files
+                .read_text(&path)
+                .map_err(|error| format!("spec '{key}': {error}"))?;
             let check = temper_server::observe::check_ioa(
                 &platform.server,
                 source,

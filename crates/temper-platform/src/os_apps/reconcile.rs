@@ -8,7 +8,7 @@ use temper_server::platform_store::InstalledAppRecord;
 use super::app_catalog::AppCatalog;
 use super::{
     AppBundle, AppEntry, OsAppBundleDigest, OsAppInstallPlan, OsAppReconcileResult, catalog,
-    get_os_app, install_os_app_with_plan, load_app_bundle, os_app_dependencies,
+    get_os_app, install_os_app_with_plan, load_app_bundle, load_tenant_os_app, os_app_dependencies,
     restore_app_specs_from_matching_digest, tenant_has_ready_app_specs_for_bundle, tenant_os_app,
 };
 use crate::state::PlatformState;
@@ -118,7 +118,7 @@ pub fn os_app_dir_bundle_digest(dir: &Path, app_name: &str) -> Option<OsAppBundl
         return None;
     }
     let installed = AppCatalog::from_dir(dir.to_path_buf());
-    let bundle = load_app_bundle(installed.app_dir(None, app_name)?).ok()?;
+    let bundle = load_app_bundle(installed.app_files(None, app_name)?).ok()?;
     Some(digest_entry_bundle(
         app_name,
         installed.app_entry(None, app_name),
@@ -138,7 +138,7 @@ pub fn os_app_dir_bundle_digests(dir: &Path) -> Option<Vec<OsAppBundleDigest>> {
         .app_entries(None)
         .iter()
         .filter_map(|entry| {
-            let bundle = load_app_bundle(installed.app_dir(None, &entry.name)?).ok()?;
+            let bundle = load_app_bundle(installed.app_files(None, &entry.name)?).ok()?;
             Some(digest_entry_bundle(&entry.name, Some(entry), &bundle))
         })
         .collect();
@@ -546,8 +546,7 @@ pub async fn reconcile_os_app(
     tenant: &str,
     app_name: &str,
 ) -> Result<OsAppReconcileResult, String> {
-    let bundle =
-        tenant_os_app(tenant, app_name).ok_or_else(|| format!("OS app '{app_name}' not found"))?;
+    let bundle = load_tenant_os_app(tenant, app_name)?;
     let digest = digest_app_bundle(Some(tenant), app_name, &bundle);
 
     if let Some(ps) = state

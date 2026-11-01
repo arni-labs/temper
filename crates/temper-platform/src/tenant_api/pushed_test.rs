@@ -18,7 +18,7 @@ use temper_server::platform_store::{
 use tower::ServiceExt;
 
 use crate::genesis_install::{adopt_catalog_app, restore_genesis_registry_cache_roots};
-use crate::os_apps::tenant_os_app;
+use crate::os_apps::{app_files_seam, tenant_os_app};
 use crate::state::PlatformState;
 use crate::tenant_api::tenant_api_router;
 
@@ -574,6 +574,140 @@ async fn an_adopted_catalog_version_is_the_version_a_push_builds_on() {
 
 /// The app's files with one spec in the old syntax this kernel refuses: a
 /// bool written as a string, as TemperPaw's paw-patrol has it.
+/// The sentinel spec `tenant` has registered with the server.
+fn registered_spec(state: &PlatformState, tenant: &str) -> String {
+    state
+        .registry
+        .read()
+        .expect("registry")
+        .get_spec(&TenantId::new(tenant), "SentinelMonitor")
+        .map(|spec| spec.ioa_source.clone())
+        .expect("the sentinel spec is registered")
+}
+
+/// The installer reads the files a push names, never a listing of the folder
+/// the push just wrote. Here every folder under the server's data folder
+/// lists empty, as a folder just renamed into place can on some drives, and
+/// the push still checks every spec, installs, and serves them.
+#[tokio::test]
+async fn a_push_installs_the_files_it_named_when_its_folder_lists_empty() {
+    let tenant = unique_tenant("lists-empty");
+    let server = server(&tenant);
+    app_files_seam::list_empty_under(server.data_dir.path());
+    let files = with_comment("named, not listed");
+    let specs = files
+        .keys()
+        .filter(|path| path.ends_with(".ioa.toml"))
+        .count();
+    let (status, body) = send(
+        &server.state,
+        push(&tenant, serde_json::json!({ "files": files })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["checks"].as_object().map(serde_json::Map::len),
+        Some(specs),
+        "every pushed spec is checked: {body}"
+    );
+    assert_eq!(body["checks"][SPEC]["all_passed"], true, "{body}");
+    assert!(resolved_spec(&tenant).contains("# named, not listed"));
+    assert!(registered_spec(&server.state, &tenant).contains("# named, not listed"));
+    let digest = body["digest"].as_str().expect("digest");
+    let recorded = record(&server.ps, &tenant).await.expect("recorded");
+    assert_eq!(recorded.app_ref, format!("pushed/{APP}@{digest}"));
+}
+
+/// A re-push whose folder lists empty serves its own version. Were the new
+/// folder registered by listing it, it would hold no app, the version before
+/// would stay what the tenant resolves, and that version would be installed
+/// under the new digest.
+#[tokio::test]
+async fn a_re_push_whose_folder_lists_empty_serves_its_own_version() {
+    let tenant = unique_tenant("re-push-lists-empty");
+    let server = server(&tenant);
+    let (status, body) = send(
+        &server.state,
+        push(
+            &tenant,
+            serde_json::json!({ "files": with_comment("first") }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    app_files_seam::list_empty_under(server.data_dir.path());
+    let (status, body) = send(
+        &server.state,
+        push(
+            &tenant,
+            serde_json::json!({ "files": with_comment("second") }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let digest = body["digest"].as_str().expect("digest").to_string();
+
+    let resolved = resolved_spec(&tenant);
+    assert!(resolved.contains("# second") && !resolved.contains("# first"));
+    let registered = registered_spec(&server.state, &tenant);
+    assert!(registered.contains("# second") && !registered.contains("# first"));
+    let recorded = record(&server.ps, &tenant).await.expect("recorded");
+    assert_eq!(recorded.app_ref, format!("pushed/{APP}@{digest}"));
+    let served = listed_for(&server.state, &tenant).await.expect("listed");
+    assert_eq!(served.version_hash, digest);
+    assert!(
+        std::fs::read_to_string(Path::new(&served.dir).join(SPEC))
+            .expect("the served spec")
+            .contains("# second")
+    );
+}
+
+/// A file the push names that cannot be read refuses the push with the
+/// file's path, and the version before keeps serving.
+#[tokio::test]
+async fn a_named_file_that_cannot_be_read_refuses_the_push_naming_it() {
+    let tenant = unique_tenant("unreadable");
+    let server = server(&tenant);
+    let (status, body) = send(
+        &server.state,
+        push(&tenant, serde_json::json!({ "files": app_files() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let installed = record(&server.ps, &tenant).await.expect("recorded");
+    let spec_before = resolved_spec(&tenant);
+    let listed_before = listed_for(&server.state, &tenant).await.expect("listed");
+
+    // Only the new version has this policy, so the version before still reads.
+    app_files_seam::unreadable_under(server.data_dir.path(), "policies/unreadable.cedar");
+    let mut files = with_comment("has a file that cannot be read");
+    files.insert(
+        "policies/unreadable.cedar".to_string(),
+        "permit(principal, action, resource is SentinelMonitor);".to_string(),
+    );
+    let (status, body) = send(
+        &server.state,
+        push(&tenant, serde_json::json!({ "files": files })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("policies/unreadable.cedar could not be read"),
+        "{body}"
+    );
+
+    let after = record(&server.ps, &tenant).await.expect("still recorded");
+    assert_eq!(after.app_ref, installed.app_ref);
+    assert_eq!(after.bundle_digest, installed.bundle_digest);
+    assert_eq!(resolved_spec(&tenant), spec_before);
+    assert_eq!(
+        listed_for(&server.state, &tenant).await,
+        Some(listed_before)
+    );
+}
+
 fn old_syntax_files() -> BTreeMap<String, String> {
     let mut files = app_files();
     let spec = files.get_mut(SPEC).expect("sentinel spec");
@@ -608,60 +742,75 @@ async fn a_push_with_an_old_syntax_spec_is_refused_with_its_problem() {
     assert!(listed_for(&server.state, &tenant).await.is_none());
 }
 
-/// The same spec from a Genesis registry: the registry route answers 422
-/// naming the spec and why, and installs nothing.
+/// A registry install takes the install a push takes, from the files its
+/// bundle named. An old-syntax spec is refused with 422 naming the spec and
+/// why, and installs nothing. A good version installs and serves its specs
+/// even when every folder it wrote lists empty.
+///
+/// One test, because the registry is a process setting: two tests setting it
+/// at once would each fetch from the other's registry.
 #[tokio::test]
-async fn a_registry_install_with_an_old_syntax_spec_is_refused_with_its_problem() {
+async fn a_registry_install_reads_the_files_its_bundle_named() {
     use base64::Engine as _;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+    const OLD: &str = "0123456789abcdef0123456789abcdef01234567";
+    const GOOD: &str = "89abcdef0123456789abcdef0123456789abcdef";
     let registry = MockServer::start().await;
-    let files: Vec<serde_json::Value> = old_syntax_files()
-        .into_iter()
-        .map(|(path, text)| {
-            serde_json::json!({
-                "path": path,
-                "content_base64": base64::engine::general_purpose::STANDARD.encode(text),
+    for (hash, files) in [
+        (OLD, old_syntax_files()),
+        (GOOD, with_comment("from the registry")),
+    ] {
+        let files: Vec<serde_json::Value> = files
+            .into_iter()
+            .map(|(path, text)| {
+                serde_json::json!({
+                    "path": path,
+                    "content_base64": base64::engine::general_purpose::STANDARD.encode(text),
+                })
             })
-        })
-        .collect();
-    Mock::given(method("GET"))
-        .and(path(format!(
-            "/api/genesis/apps/acme/{APP}/versions/{HASH}/bundle"
-        )))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "app_ref": format!("acme/{APP}@{HASH}"),
-            "registry_tenant": "default",
-            "apps": [{ "owner": "acme", "name": APP, "version_hash": HASH, "files": files }],
-        })))
-        .mount(&registry)
-        .await;
+            .collect();
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/genesis/apps/acme/{APP}/versions/{hash}/bundle"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "app_ref": format!("acme/{APP}@{hash}"),
+                "registry_tenant": "default",
+                "apps": [{ "owner": "acme", "name": APP, "version_hash": hash, "files": files }],
+            })))
+            .mount(&registry)
+            .await;
+    }
     // SAFETY: the only test in this crate that sets the registry; the others
     // that read it pass with any value.
     unsafe { std::env::set_var("TEMPER_GENESIS_REGISTRY_URL", registry.uri()) };
 
-    let tenant = unique_tenant("old-syntax-registry");
+    let tenant = unique_tenant("registry");
     let server = server(&tenant);
-    let mut request = Request::post("/genesis/apps/install")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({
-                "tenant": tenant,
-                "app_ref": format!("acme/{APP}@{HASH}"),
-                "follow_policy": "pinned",
-            })
-            .to_string(),
-        ))
-        .expect("request should build");
-    request
-        .extensions_mut()
-        .insert(AuthenticatedRequestContext::new(
-            TenantId::new(&tenant),
-            SecurityContext::from_resolved_identity("agent-1", "operator", None),
-        ));
-    let (status, body) = send(&server.state, request).await;
+    let install = |hash: &str| {
+        let mut request = Request::post("/genesis/apps/install")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "tenant": tenant,
+                    "app_ref": format!("acme/{APP}@{hash}"),
+                    "follow_policy": "pinned",
+                })
+                .to_string(),
+            ))
+            .expect("request should build");
+        request
+            .extensions_mut()
+            .insert(AuthenticatedRequestContext::new(
+                TenantId::new(&tenant),
+                SecurityContext::from_resolved_identity("agent-1", "operator", None),
+            ));
+        request
+    };
+
+    let (status, body) = send(&server.state, install(OLD)).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     let error = body["error"].as_str().unwrap_or_default();
     assert!(
@@ -672,4 +821,13 @@ async fn a_registry_install_with_an_old_syntax_spec_is_refused_with_its_problem(
     );
     assert!(record(&server.ps, &tenant).await.is_none());
     assert!(listed_for(&server.state, &tenant).await.is_none());
+
+    app_files_seam::list_empty_under(server.data_dir.path());
+    let (status, body) = send(&server.state, install(GOOD)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(resolved_spec(&tenant).contains("# from the registry"));
+    assert!(registered_spec(&server.state, &tenant).contains("# from the registry"));
+    let recorded = record(&server.ps, &tenant).await.expect("recorded");
+    assert_eq!(recorded.source_kind, "genesis");
+    assert_eq!(recorded.app_ref, format!("acme/{APP}@{GOOD}"));
 }

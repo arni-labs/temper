@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use temper_verify::CascadeResult;
 
-use super::closure_install::{ClosureRefused, ClosureSource, MaterializedClosure};
+use super::closure_install::{ClosureRefused, ClosureSource, MaterializedApp, MaterializedClosure};
 use super::*;
-use crate::os_apps::{read_app_guide, read_app_manifest, tenant_os_app_dir};
+use crate::os_apps::{AppFiles, read_app_guide, read_app_manifest, tenant_os_app_dir};
 
 mod files;
 
@@ -135,6 +135,9 @@ async fn install_in_turn(
     };
 
     let app_dir = root.join(app);
+    // The installer reads exactly these files, by name: a folder just renamed
+    // into place can list short, and is never listed here.
+    let written = AppFiles::written(app_dir.clone(), files.keys().cloned());
     let named = read_app_manifest(&app_dir).is_some_and(|manifest| manifest.name == app);
     if !named || read_app_guide(&app_dir).is_none() {
         discard();
@@ -148,7 +151,7 @@ async fn install_in_turn(
         platform,
         tenant,
         &root,
-        closure(&app_ref, app, &digest, budget),
+        closure(&app_ref, app, &digest, budget, written),
     )
     .await;
     match installed {
@@ -223,13 +226,10 @@ pub async fn adopt_catalog_app(
         files::materialize(&root, app, &tree)
             .map_err(|error| format!("the files of '{app}' could not be copied: {error}"))?;
     }
-    register_install_cache(
-        tenant,
-        root,
-        DirApps::Only(BTreeSet::from([app.to_string()])),
-    );
+    let written = AppFiles::written(root.join(app), tree.keys().cloned());
+    register_written_apps(tenant, root, vec![(app.to_string(), written.clone())]);
     let app_ref = pushed_ref(app, &digest);
-    let adopted = closure(&app_ref, app, &digest, Duration::ZERO);
+    let adopted = closure(&app_ref, app, &digest, Duration::ZERO, written);
     closure_install::record_closure(platform, tenant, &adopted).await?;
     Ok(Some(digest))
 }
@@ -268,6 +268,7 @@ fn closure<'a>(
     app: &str,
     digest: &str,
     budget: Duration,
+    files: AppFiles,
 ) -> MaterializedClosure<'a> {
     let version = RegistryAppRef {
         owner: SOURCE_KIND.to_string(),
@@ -277,7 +278,7 @@ fn closure<'a>(
     MaterializedClosure {
         app_ref,
         root: version.clone(),
-        refs: vec![version],
+        apps: vec![MaterializedApp { version, files }],
         source: ClosureSource {
             source_kind: SOURCE_KIND,
             registry_url: "",

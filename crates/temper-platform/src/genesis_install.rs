@@ -54,9 +54,10 @@ use crate::genesis_install_verify::{
     restore_prior_install, verify_install_closure_runtime_ready, verify_install_runtime_ready,
 };
 use crate::os_apps::{
-    AppManifest, DirApps, InstallResult, InstallWarning, OsAppReconcileResult,
-    add_os_apps_dir_preferred, add_tenant_os_apps_dir, reconcile_os_app,
-    resolve_tenant_os_app_install_order, tenant_os_app_bundle_digest,
+    AppFiles, AppManifest, DirApps, InstallResult, InstallWarning, OsAppReconcileResult,
+    add_os_apps_dir_preferred, add_tenant_os_apps_dir, add_tenant_written_apps,
+    add_written_apps_preferred, reconcile_os_app, resolve_tenant_os_app_install_order,
+    tenant_os_app_bundle_digest,
 };
 use crate::state::PlatformState;
 
@@ -310,7 +311,7 @@ pub async fn install_genesis_app_from_registry(
     })?;
 
     let materialize_started = Instant::now();
-    let materialized_refs = match materialize_registry_app_closure_via_bundle(
+    let materialized_apps = match materialize_registry_app_closure_via_bundle(
         &registry,
         &registry_tenant,
         root_ref.clone(),
@@ -318,15 +319,15 @@ pub async fn install_genesis_app_from_registry(
     )
     .await
     {
-        Ok(refs) => {
+        Ok(apps) => {
             log_genesis_install_phase(
                 &request.app_ref,
                 "materialize_bundle",
                 materialize_started,
-                refs.len(),
+                apps.len(),
                 0,
             );
-            refs
+            apps
         }
         Err(error) if genesis_git_fallback_enabled() => {
             tracing::warn!(
@@ -345,7 +346,14 @@ pub async fn install_genesis_app_from_registry(
                 refs.len(),
                 0,
             );
-            refs
+            // A git clone writes each app in place and names no files, so
+            // this admin-only recovery path reads them by listing.
+            refs.into_iter()
+                .map(|version| {
+                    let files = AppFiles::Listed(app_cache_dir(&cache_root, &version.name)?);
+                    Ok(closure_install::MaterializedApp { version, files })
+                })
+                .collect::<Result<Vec<_>, String>>()?
         }
         Err(error) => {
             return Err(format!(
@@ -364,7 +372,7 @@ pub async fn install_genesis_app_from_registry(
         closure_install::MaterializedClosure {
             app_ref: &request.app_ref,
             root: root_ref.clone(),
-            refs: materialized_refs,
+            apps: materialized_apps,
             source: closure_install::ClosureSource {
                 source_kind: "genesis",
                 registry_url: &registry_url,
@@ -1800,7 +1808,19 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
 ///
 /// The platform tenant's installs are the shared catalog; every other
 /// tenant's are its own, so they never change what another tenant or a
-/// shared app resolves.
+/// shared app resolves. Each app is registered with the files its install
+/// wrote, so nothing lists the directory that install just wrote.
+fn register_written_apps(tenant: &str, cache_root: PathBuf, apps: Vec<(String, AppFiles)>) {
+    if tenant == TenantId::default().as_str() {
+        add_written_apps_preferred(cache_root, apps);
+    } else {
+        add_tenant_written_apps(tenant, cache_root, apps);
+    }
+}
+
+/// Register `apps` of `cache_root` for `tenant`, found by listing it: for
+/// boot and rollback, which read long after the files were written. An
+/// install registers the files it wrote with [`register_written_apps`].
 fn register_install_cache(tenant: &str, cache_root: PathBuf, apps: DirApps) {
     if tenant == TenantId::default().as_str() {
         add_os_apps_dir_preferred(cache_root, apps);
@@ -2313,7 +2333,8 @@ mod tests {
             }],
         };
 
-        write_bundle_app(&temp_dir, &app).expect("bundle should materialize");
+        let written = write_bundle_app(&temp_dir, &app).expect("bundle should materialize");
+        assert_eq!(written, vec!["app.toml".to_string()]);
         assert_eq!(
             std::fs::read_to_string(temp_dir.join("app.toml")).unwrap(),
             "name = \"notes\"\n"
