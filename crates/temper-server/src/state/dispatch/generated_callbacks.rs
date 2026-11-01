@@ -118,7 +118,9 @@ impl ServerState {
         self.record_answer_refusal(entity, action, error, &Value::Null);
     }
 
-    /// A refused answer, journaled and logged with the values it carried.
+    /// A refused answer. The entity's observe stream gets the values it
+    /// carried; the log gets only their names, since an answer's values can
+    /// be anything an integration returned.
     pub(super) fn record_answer_refusal(
         &self,
         entity: WasmEntityRef<'_>,
@@ -141,8 +143,12 @@ impl ServerState {
                 "action":action, "error":error, "params":params,
             }),
         );
+        let param_names: Vec<&str> = params
+            .as_object()
+            .map(|fields| fields.keys().map(String::as_str).collect())
+            .unwrap_or_default();
         tracing::warn!(tenant=%entity.tenant, entity_type=entity.entity_type,
-            entity_id=entity.entity_id, action, error, %params, "integration callback rejected");
+            entity_id=entity.entity_id, action, error, ?param_names, "integration callback rejected");
     }
 
     /// Send an answer of a `source` integration ("WASM" or "adapter"): `sent`
