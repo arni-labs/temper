@@ -24,7 +24,7 @@ pub mod simulation;
 pub mod smt;
 
 // Re-export key types.
-pub use budget::Budget;
+pub use budget::{Budget, Clock};
 pub use cascade::{
     ActorSimResult, CascadeLevel, CascadeResult, KeptKey, LevelResult, VerificationCascade,
 };

@@ -471,7 +471,8 @@ mod tests {
                     [[liveness]]\nname = \"KeepsMoving\"\nfrom = [\"On\"]\nhas_actions = true\n";
         let mut model = build_model_from_ioa(spec, 2).unwrap();
         model.limit = Some(crate::model::ExploreLimit {
-            until: std::time::Instant::now(),
+            elapsed: crate::budget::Elapsed::start(crate::budget::Clock::Wall),
+            time: std::time::Duration::ZERO,
             states: 1,
             lifted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),

@@ -18,6 +18,7 @@ mod strings;
 use fields::read_fields;
 use strings::{string_literals, string_params, tracked_strings};
 
+use super::counters::leave_out_unread_counters;
 use super::entry::resolve_entry_rules;
 use super::types::{
     LivenessKind, ModelEffect, ModelString, ResolvedInvariant, ResolvedLiveness,
@@ -36,9 +37,12 @@ pub fn build_model_from_ioa(ioa_toml: &str, max_counter: usize) -> Result<Temper
     Ok(build_model_from_automaton(&automaton, max_counter))
 }
 
-/// Build a `TemperModel` directly from a parsed [`Automaton`].
+/// Build a `TemperModel` directly from a parsed [`Automaton`], without the
+/// counters nothing reads.
 pub fn build_model_from_automaton(automaton: &Automaton, max_counter: usize) -> TemperModel {
-    build_model_tracking(automaton, max_counter, &BTreeSet::new())
+    let mut model = build_model_tracking(automaton, max_counter, &BTreeSet::new());
+    leave_out_unread_counters(automaton, &mut model);
+    model
 }
 
 /// [`build_model_from_automaton`], also tracking the string variables in

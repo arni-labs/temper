@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Instant;
 
 use std::collections::BTreeSet;
 
@@ -324,9 +323,12 @@ pub struct TemperModel {
 /// How far one model may be explored: a [`crate::Budget`] in force.
 #[derive(Clone, Debug)]
 pub(crate) struct ExploreLimit {
-    /// Past this instant the model offers no actions, so every walk of it
-    /// (model check, simulation, property tests) ends at once.
-    pub(crate) until: Instant,
+    /// The time the budget has used. Past `time` the model offers no
+    /// actions, so every walk of it (model check, simulation, property
+    /// tests) ends at once.
+    pub(crate) elapsed: crate::budget::Elapsed,
+    /// The budget's time.
+    pub(crate) time: std::time::Duration,
     /// States the model check may generate before it stops (a state reached
     /// twice counts twice).
     pub(crate) states: usize,
@@ -353,6 +355,11 @@ impl ExploreLimit {
 
     pub(crate) fn lift(&self) {
         self.lifted.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the budget's time is spent.
+    pub(crate) fn past_time(&self) -> bool {
+        self.elapsed.now() >= self.time
     }
 }
 
@@ -428,7 +435,7 @@ impl TemperModel {
     pub fn out_of_time(&self) -> bool {
         self.limit.as_ref().is_some_and(|limit| {
             !limit.lifted.load(Ordering::Relaxed)
-                && (Instant::now() >= limit.until || limit.exhausted.load(Ordering::Relaxed))
+                && (limit.past_time() || limit.exhausted.load(Ordering::Relaxed))
         })
     }
 }
