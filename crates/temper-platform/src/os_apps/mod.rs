@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use serde::Serialize;
@@ -21,10 +21,15 @@ use crate::state::PlatformState;
 
 mod agent_bootstrap;
 mod app_catalog;
+mod app_files;
+mod apps_dir;
+mod bundle_files;
 mod closure_bootstrap;
 mod entity_aliases;
 mod install_checks;
 mod install_guard;
+mod install_lines;
+mod materialized_closure;
 mod module_review_step;
 mod policy_rows;
 mod proofs;
@@ -35,9 +40,18 @@ mod types;
 mod wasm_replacement;
 pub(super) use app_catalog::catalog;
 pub use app_catalog::{
-    DirApps, add_os_apps_dir, add_os_apps_dir_preferred, add_tenant_os_apps_dir, get_os_app,
-    list_os_apps, list_startup_os_apps, list_tenant_os_apps, reload_os_apps, set_os_apps_dir,
-    tenant_app_guide, tenant_os_app,
+    add_os_apps_dir, add_tenant_written_apps, add_written_apps_preferred, get_os_app, list_os_apps,
+    list_startup_os_apps, list_tenant_os_apps, reload_os_apps, set_os_apps_dir, tenant_app_guide,
+    tenant_os_app,
+};
+pub(crate) use app_catalog::{load_tenant_os_app, tenant_os_app_dir};
+pub use app_files::AppFiles;
+#[cfg(test)]
+pub(crate) use app_files::seam as app_files_seam;
+pub(crate) use bundle_files::find_ioa_files;
+use bundle_files::{
+    find_adrs, find_agents, find_app_skills, find_cedar_policies, find_csdl, find_seed_data,
+    find_wasm_modules,
 };
 pub use closure_bootstrap::{
     ClosureBootstrapResult, OS_APP_CLOSURE_RESOLVER_VERSION, OsAppClosure,
@@ -48,14 +62,16 @@ use entity_aliases::{
     content_sha256, ensure_created_file_initialized, ensure_entity_field_aliases,
     file_already_contains, slug_fragment,
 };
+pub use install_lines::{installed_line, stored_line, waiting_line};
+pub(crate) use materialized_closure::resolve_materialized_app_closure;
 #[cfg(test)]
 pub(super) use policy_rows::os_app_policy_row_id;
 pub(crate) use reconcile::{
     InstallOrigin, tenant_has_active_policies_for_bundle, tenant_has_registered_wasm_for_bundle,
 };
 pub use reconcile::{
-    os_app_bundle_digest, os_app_dir_bundle_digest, os_app_dir_bundle_digests, reconcile_os_app,
-    resolve_os_app_install_order, resolve_tenant_os_app_install_order, tenant_os_app_bundle_digest,
+    os_app_bundle_digest, reconcile_os_app, resolve_os_app_install_order,
+    resolve_tenant_os_app_install_order, tenant_os_app_bundle_digest, written_apps_bundle_digests,
 };
 pub(crate) use runtime_heal::{
     restore_app_specs_from_matching_digest, tenant_has_ready_app_specs_for_bundle,
@@ -63,7 +79,7 @@ pub(crate) use runtime_heal::{
 pub use types::*;
 use wasm_replacement::{UploadedWasmReplacementContext, uploaded_wasm_replacement_context};
 
-fn read_app_manifest(app_dir: &Path) -> Option<AppManifest> {
+pub(crate) fn read_app_manifest(app_dir: &Path) -> Option<AppManifest> {
     let path = app_dir.join("app.toml");
     let content = std::fs::read_to_string(&path).ok()?;
     toml::from_str(&content).ok()
@@ -210,129 +226,6 @@ struct SeedFile {
 pub type OsAppEntry = AppEntry;
 pub type OsAppBundle = AppBundle;
 
-/// Find all IOA spec files in an app directory.
-///
-/// Handles both layouts:
-/// - Root-level: `app-name/*.ioa.toml` + `app-name/model.csdl.xml`
-/// - Specs subdir: `app-name/specs/*.ioa.toml` + `app-name/specs/model.csdl.xml`
-///
-/// Returns `(entity_type_hint, path)` pairs. The entity type is extracted
-/// from the IOA file's `[automaton] name` field, not the filename.
-fn find_ioa_files(app_dir: &Path) -> Vec<(String, PathBuf)> {
-    let mut results = Vec::new();
-    let mut seen_names = std::collections::HashSet::new();
-
-    // Scan root first (takes priority for dedup).
-    scan_dir_for_ioa(app_dir, &mut results, &mut seen_names);
-
-    // Then scan specs/ subdirectory.
-    let specs_dir = app_dir.join("specs");
-    if specs_dir.is_dir() {
-        scan_dir_for_ioa(&specs_dir, &mut results, &mut seen_names);
-    }
-
-    results
-}
-
-/// Scan a single directory for `*.ioa.toml` files.
-fn scan_dir_for_ioa(
-    dir: &Path,
-    results: &mut Vec<(String, PathBuf)>,
-    seen: &mut std::collections::HashSet<String>,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut files: Vec<_> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".ioa.toml"))
-        .collect();
-    files.sort_by_key(|e| e.file_name());
-
-    for entry in files {
-        let path = entry.path();
-        let fname = entry.file_name().to_string_lossy().to_string();
-        // Use filename as dedup key.
-        if !seen.insert(fname) {
-            continue;
-        }
-        results.push((String::new(), path));
-    }
-}
-
-/// Find the CSDL model file in an app directory.
-fn find_csdl(app_dir: &Path) -> Option<PathBuf> {
-    // Root-level first.
-    let root = app_dir.join("model.csdl.xml");
-    if root.exists() {
-        return Some(root);
-    }
-    // Then specs/.
-    let specs = app_dir.join("specs").join("model.csdl.xml");
-    if specs.exists() {
-        return Some(specs);
-    }
-    // Then a dedicated csdl/ directory.
-    let csdl_dir = app_dir.join("csdl");
-    if csdl_dir.is_dir() {
-        let Ok(entries) = std::fs::read_dir(&csdl_dir) else {
-            return None;
-        };
-        let mut files: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".csdl.xml"))
-            .map(|e| e.path())
-            .collect();
-        files.sort();
-        if let Some(first) = files.into_iter().next() {
-            return Some(first);
-        }
-    }
-    None
-}
-
-/// Find all Cedar policy files in an app directory.
-fn find_cedar_policies(app_dir: &Path) -> Vec<PathBuf> {
-    let policies_dir = app_dir.join("policies");
-    if !policies_dir.is_dir() {
-        return Vec::new();
-    }
-    let Ok(entries) = std::fs::read_dir(&policies_dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".cedar"))
-        .map(|e| e.path())
-        .collect();
-    files.sort();
-    files
-}
-
-fn find_commons_cedar_policies(app_dir: &Path) -> Vec<PathBuf> {
-    let policies_dir = app_dir.join("policies").join("commons");
-    if !policies_dir.is_dir() {
-        return Vec::new();
-    }
-    let Ok(entries) = std::fs::read_dir(&policies_dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".cedar"))
-        .map(|e| e.path())
-        .collect();
-    files.sort();
-    files
-}
-
-fn app_relative_path(app_dir: &Path, path: &Path) -> String {
-    path.strip_prefix(app_dir)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
 fn effective_app_deployment_mode(manifest: &AppManifest) -> AppDeploymentMode {
     let app_key = manifest
         .name
@@ -355,347 +248,6 @@ fn effective_app_deployment_mode(manifest: &AppManifest) -> AppDeploymentMode {
         Some("operator") | Some("Operator") | Some("OPERATOR") => AppDeploymentMode::Operator,
         _ => manifest.mode,
     }
-}
-
-/// Find compiled WASM module binaries in an app directory.
-///
-/// Scans packaged artifacts copied next to the module first, then falls back
-/// to manifest-selected target outputs and common WASM release outputs.
-fn find_wasm_modules(
-    app_dir: &Path,
-    module_configs: &BTreeMap<String, WasmModuleManifest>,
-) -> BTreeMap<String, Vec<u8>> {
-    let mut modules = BTreeMap::new();
-    let wasm_dir = app_dir.join("wasm");
-    if !wasm_dir.is_dir() {
-        return modules;
-    }
-
-    let declared: Vec<_> = module_configs.keys().cloned().collect();
-    if declared.is_empty() {
-        warn_undeclared_wasm_artifacts(&wasm_dir, module_configs);
-        return modules;
-    }
-
-    for module_name in declared {
-        let module_dir = wasm_dir.join(&module_name);
-        if !module_dir.is_dir() {
-            continue;
-        }
-        // Prefer packaged sibling artifacts because they are the deployable
-        // copy left after Docker target pruning. Target output remains a local
-        // development fallback.
-        let dashed_name = module_name.replace('_', "-");
-        let candidates: Vec<PathBuf> = if let Some(config) = module_configs.get(&module_name)
-            && let Some(ref target) = config.target
-        {
-            vec![
-                module_dir.join(format!("{module_name}.wasm")),
-                module_dir.join(format!("{dashed_name}.wasm")),
-                wasm_dir.join(format!("{module_name}.wasm")),
-                wasm_dir.join(format!("{dashed_name}.wasm")),
-                module_dir
-                    .join("target")
-                    .join(target)
-                    .join("release")
-                    .join(format!("{module_name}.wasm")),
-                module_dir
-                    .join("target")
-                    .join(target)
-                    .join("release")
-                    .join(format!("{dashed_name}.wasm")),
-            ]
-        } else {
-            vec![
-                module_dir.join(format!("{module_name}.wasm")),
-                module_dir.join(format!("{dashed_name}.wasm")),
-                wasm_dir.join(format!("{module_name}.wasm")),
-                wasm_dir.join(format!("{dashed_name}.wasm")),
-                module_dir
-                    .join("target")
-                    .join("wasm32-unknown-unknown")
-                    .join("release")
-                    .join(format!("{module_name}.wasm")),
-                module_dir
-                    .join("target")
-                    .join("wasm32-wasip1")
-                    .join("release")
-                    .join(format!("{module_name}.wasm")),
-                module_dir
-                    .join("target")
-                    .join("wasm32-unknown-unknown")
-                    .join("release")
-                    .join(format!("{dashed_name}.wasm")),
-                module_dir
-                    .join("target")
-                    .join("wasm32-wasip1")
-                    .join("release")
-                    .join(format!("{dashed_name}.wasm")),
-            ]
-        };
-
-        for wasm_path in candidates {
-            if !wasm_path.exists() {
-                continue;
-            }
-            match std::fs::read(&wasm_path) {
-                Ok(bytes) => {
-                    tracing::debug!(
-                        module = %module_name,
-                        path = %wasm_path.display(),
-                        size = bytes.len(),
-                        "Found WASM module in OS app"
-                    );
-                    modules.insert(module_name.clone(), bytes);
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        module = %module_name,
-                        path = %wasm_path.display(),
-                        error = %e,
-                        "Failed to read WASM module binary"
-                    );
-                }
-            }
-        }
-    }
-
-    warn_undeclared_wasm_artifacts(&wasm_dir, module_configs);
-    modules
-}
-
-fn warn_undeclared_wasm_artifacts(
-    wasm_dir: &Path,
-    module_configs: &BTreeMap<String, WasmModuleManifest>,
-) {
-    let Ok(entries) = std::fs::read_dir(wasm_dir) else {
-        return;
-    };
-    for entry in entries.filter_map(|entry| entry.ok()) {
-        if !entry.path().is_dir() {
-            continue;
-        }
-        let module_name = entry.file_name().to_string_lossy().to_string();
-        if module_name == "target" || module_configs.contains_key(&module_name) {
-            continue;
-        }
-        let sibling = entry.path().join(format!("{module_name}.wasm"));
-        if sibling.exists() {
-            tracing::warn!(
-                module = %module_name,
-                path = %sibling.display(),
-                "Ignoring undeclared bundled WASM artifact; declare it in app.toml [[wasm_modules]] to install it"
-            );
-        }
-    }
-}
-
-// ── Agent / Skill / Seed Data discovery ─────────────────────────────
-
-/// Discover agent definitions from `agents/{name}/` subdirectories.
-///
-/// Each subdirectory is one agent. All `.md` files within it are collected,
-/// sorted alphabetically, and concatenated. The platform is filename-agnostic —
-/// conventions like SOUL.md, STYLE.md, AGENT.md are for humans.
-fn find_agents(app_dir: &Path) -> Vec<AgentDefinition> {
-    let agents_dir = app_dir.join("agents");
-    if !agents_dir.is_dir() {
-        return Vec::new();
-    }
-    let Ok(entries) = std::fs::read_dir(&agents_dir) else {
-        return Vec::new();
-    };
-
-    let mut dirs: Vec<_> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .collect();
-    dirs.sort_by_key(|e| e.file_name());
-
-    let mut results = Vec::new();
-    for dir_entry in dirs {
-        let agent_name = dir_entry.file_name().to_string_lossy().to_string();
-        let agent_dir = dir_entry.path();
-
-        // Collect all .md files, sorted alphabetically.
-        let mut md_files: Vec<PathBuf> = std::fs::read_dir(&agent_dir)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .ends_with(".md")
-            })
-            .map(|e| e.path())
-            .collect();
-        md_files.sort();
-
-        if md_files.is_empty() {
-            continue;
-        }
-
-        let has_soul = md_files
-            .iter()
-            .any(|p| p.file_name().map(|f| f == "SOUL.md").unwrap_or(false));
-
-        let mut content = String::new();
-        for path in &md_files {
-            if !content.is_empty() {
-                content.push_str("\n\n");
-            }
-            if let Ok(text) = std::fs::read_to_string(path) {
-                content.push_str(&text);
-            }
-        }
-
-        let description =
-            extract_description(&content).unwrap_or_else(|| format!("Agent: {agent_name}"));
-
-        results.push(AgentDefinition {
-            name: agent_name,
-            content,
-            has_soul,
-            description,
-        });
-    }
-    results
-}
-
-/// Discover skill definitions from the app's directory tree.
-///
-/// Scans two locations:
-/// - `system/skills/{name}/` → system-level skills (agent_name = None)
-/// - `agents/{agent}/skills/{name}/` → agent-scoped skills (agent_name = Some)
-///
-/// Each subdirectory must contain a `SKILL.md` file as the main document.
-/// All other files are collected as companion files.
-fn find_app_skills(app_dir: &Path) -> Vec<AppSkillDefinition> {
-    let mut results = Vec::new();
-
-    // 1. System skills: system/skills/{name}/
-    let system_skills_dir = app_dir.join("system").join("skills");
-    if system_skills_dir.is_dir() {
-        scan_skill_dirs(&system_skills_dir, None, &mut results);
-    }
-
-    // 2. Agent-scoped skills: agents/{agent}/skills/{name}/
-    let agents_dir = app_dir.join("agents");
-    if agents_dir.is_dir()
-        && let Ok(entries) = std::fs::read_dir(&agents_dir)
-    {
-        let mut dirs: Vec<_> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .collect();
-        dirs.sort_by_key(|e| e.file_name());
-
-        for agent_entry in dirs {
-            let agent_name = agent_entry.file_name().to_string_lossy().to_string();
-            let agent_skills_dir = agent_entry.path().join("skills");
-            if agent_skills_dir.is_dir() {
-                scan_skill_dirs(&agent_skills_dir, Some(&agent_name), &mut results);
-            }
-        }
-    }
-
-    results
-}
-
-/// Scan a directory of skill subdirectories and collect definitions.
-fn scan_skill_dirs(
-    skills_dir: &Path,
-    agent_name: Option<&str>,
-    results: &mut Vec<AppSkillDefinition>,
-) {
-    let Ok(entries) = std::fs::read_dir(skills_dir) else {
-        return;
-    };
-
-    let mut dirs: Vec<_> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .collect();
-    dirs.sort_by_key(|e| e.file_name());
-
-    for dir_entry in dirs {
-        let skill_name = dir_entry.file_name().to_string_lossy().to_string();
-        let skill_dir = dir_entry.path();
-
-        // Main skill document.
-        let skill_path = skill_dir.join("SKILL.md");
-        let content = match std::fs::read_to_string(&skill_path) {
-            Ok(c) => c,
-            Err(_) => continue, // Skip directories without SKILL.md
-        };
-
-        // Extract frontmatter (YAML or TOML).
-        let frontmatter = extract_frontmatter(&content);
-
-        let description = frontmatter
-            .description
-            .or_else(|| extract_description(&content))
-            .unwrap_or_else(|| format!("Skill: {skill_name}"));
-
-        // Collect companion files (everything except SKILL.md).
-        let companion_files = collect_companion_files(&skill_dir);
-
-        results.push(AppSkillDefinition {
-            name: skill_name,
-            content,
-            description,
-            agent_name: agent_name.map(String::from),
-            companion_files,
-        });
-    }
-}
-
-/// Discover app-local ADR markdown files from `adrs/*.md`.
-fn find_adrs(app_dir: &Path) -> Vec<AdrEntry> {
-    let adrs_dir = app_dir.join("adrs");
-    if !adrs_dir.is_dir() {
-        return Vec::new();
-    }
-    let Ok(entries) = std::fs::read_dir(&adrs_dir) else {
-        return Vec::new();
-    };
-
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-        })
-        .collect();
-    files.sort();
-
-    let mut results = Vec::new();
-    for path in files {
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let name = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or(file_name)
-            .to_string();
-        results.push(AdrEntry {
-            name,
-            file_name: file_name.to_string(),
-            content,
-        });
-    }
-    results
 }
 
 /// Parsed frontmatter from a SKILL.md file.
@@ -762,46 +314,6 @@ fn extract_frontmatter(content: &str) -> SkillFrontmatter {
     }
 }
 
-/// Recursively collect companion files from a skill directory (excluding SKILL.md).
-fn collect_companion_files(skill_dir: &Path) -> Vec<CompanionFile> {
-    let mut files = Vec::new();
-    collect_companions_recursive(skill_dir, skill_dir, &mut files);
-    files
-}
-
-fn collect_companions_recursive(
-    base_dir: &Path,
-    current_dir: &Path,
-    results: &mut Vec<CompanionFile>,
-) {
-    let Ok(entries) = std::fs::read_dir(current_dir) else {
-        return;
-    };
-    let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-    sorted.sort_by_key(|e| e.file_name());
-
-    for entry in sorted {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_companions_recursive(base_dir, &path, results);
-        } else if path.file_name().map(|f| f != "SKILL.md").unwrap_or(true)
-            && let Ok(content) = std::fs::read(&path)
-        {
-            let rel_path = path
-                .strip_prefix(base_dir)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .to_string();
-            let mime_type = mime_from_extension(&path);
-            results.push(CompanionFile {
-                name: rel_path,
-                content,
-                mime_type,
-            });
-        }
-    }
-}
-
 /// Infer MIME type from file extension.
 fn mime_from_extension(path: &Path) -> String {
     match path.extension().and_then(|e| e.to_str()) {
@@ -817,53 +329,8 @@ fn mime_from_extension(path: &Path) -> String {
     }
 }
 
-/// Discover seed data instances from `seed-data/*.toml` files.
-///
-/// Each TOML file contains `[[instance]]` blocks that declare entities
-/// to create on first install.
-fn find_seed_data(app_dir: &Path) -> Vec<SeedInstance> {
-    let seed_dir = app_dir.join("seed-data");
-    if !seed_dir.is_dir() {
-        return Vec::new();
-    }
-    let Ok(entries) = std::fs::read_dir(&seed_dir) else {
-        return Vec::new();
-    };
-
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".toml"))
-        .map(|e| e.path())
-        .collect();
-    files.sort();
-
-    let mut all_instances = Vec::new();
-    for path in &files {
-        match std::fs::read_to_string(path) {
-            Ok(content) => match toml::from_str::<SeedFile>(&content) {
-                Ok(seed_file) => all_instances.extend(seed_file.instances),
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "Failed to parse seed data file"
-                    );
-                }
-            },
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "Failed to read seed data file"
-                );
-            }
-        }
-    }
-    all_instances
-}
-
 /// Read the app guide markdown (APP.md/app.md first, then skill.md/SKILL.md fallback).
-fn read_app_guide(app_dir: &Path) -> Option<String> {
+pub(crate) fn read_app_guide(app_dir: &Path) -> Option<String> {
     for name in &["APP.md", "app.md", "skill.md", "SKILL.md"] {
         let path = app_dir.join(name);
         if let Ok(content) = std::fs::read_to_string(&path) {
@@ -908,53 +375,54 @@ fn extract_description(guide: &str) -> Option<String> {
 
 // ── Public API ──────────────────────────────────────────────────────
 
-/// Load a complete app bundle from a directory on disk, or say why not.
-fn load_app_bundle(app_dir: &Path) -> Result<AppBundle, String> {
+/// Load a complete app bundle from its files, or say why not. A file the
+/// app has that cannot be read is an error naming it.
+fn load_app_bundle(files: &AppFiles) -> Result<AppBundle, String> {
+    let app_dir = files.dir();
     let manifest = read_app_manifest(app_dir).ok_or("its app.toml is missing or invalid")?;
     let deployment_mode = effective_app_deployment_mode(&manifest);
-    let legacy_reaction_paths = [
-        app_dir.join("reactions").join("reactions.toml"),
-        app_dir.join("specs").join("reactions.toml"),
-    ];
-    if let Some(path) = legacy_reaction_paths.iter().find(|path| path.exists()) {
+    let legacy_reaction_paths = ["reactions/reactions.toml", "specs/reactions.toml"];
+    if let Some(path) = legacy_reaction_paths.iter().find(|path| files.has(path)) {
         tracing::error!(
-            path = %path.display(),
+            path = %app_dir.join(path).display(),
             "legacy reactions.toml is no longer supported; migrate this app to inline [[action.triggers]]"
         );
         return Err("legacy reactions.toml is no longer supported".to_string());
     }
-    let ioa_files = find_ioa_files(app_dir);
 
     // Read IOA specs, extracting entity type from the parsed automaton name.
     let mut specs = Vec::new();
-    for (_hint, path) in &ioa_files {
-        let source = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    for path in find_ioa_files(files) {
+        let source = files.read_text(&path)?;
         let parsed = automaton::parse_automaton(&source)
-            .map_err(|error| format!("{} is refused: {error}", app_relative_path(app_dir, path)))?;
+            .map_err(|error| format!("{path} is refused: {error}"))?;
         specs.push((parsed.automaton.name, source));
     }
 
-    // Read CSDL (optional — apps without specs won't have CSDL).
-    let csdl = find_csdl(app_dir).and_then(|p| std::fs::read_to_string(&p).ok());
-    let cross_invariants_toml =
-        std::fs::read_to_string(app_dir.join("specs").join("cross-invariants.toml")).ok();
+    // Read CSDL (optional: apps without specs won't have CSDL).
+    let csdl = find_csdl(files)
+        .map(|path| files.read_text(&path))
+        .transpose()?;
+    let cross_invariants = "specs/cross-invariants.toml";
+    let cross_invariants_toml = if files.has(cross_invariants) {
+        Some(files.read_text(cross_invariants)?)
+    } else {
+        None
+    };
 
     // Read Cedar policies.
-    let mut cedar_policy_files = find_cedar_policies(app_dir);
+    let mut cedar_policy_files = find_cedar_policies(files, "policies");
     if deployment_mode == AppDeploymentMode::Commons {
-        cedar_policy_files.extend(find_commons_cedar_policies(app_dir));
+        cedar_policy_files.extend(find_cedar_policies(files, "policies/commons"));
     }
-    let cedar_policy_sources: Vec<CedarPolicySource> = cedar_policy_files
-        .into_iter()
-        .filter_map(|path| {
-            let text = std::fs::read_to_string(&path).ok()?;
-            let relative_path = app_relative_path(app_dir, &path);
-            Some(CedarPolicySource {
-                text: policy_rows::labelled_policy_text(&manifest.name, &relative_path, text),
-                relative_path,
-            })
-        })
-        .collect();
+    let mut cedar_policy_sources = Vec::new();
+    for relative_path in cedar_policy_files {
+        let text = files.read_text(&relative_path)?;
+        cedar_policy_sources.push(CedarPolicySource {
+            text: policy_rows::labelled_policy_text(&manifest.name, &relative_path, text),
+            relative_path,
+        });
+    }
     let cedar_policies: Vec<String> = cedar_policy_sources
         .iter()
         .map(|source| source.text.clone())
@@ -968,14 +436,14 @@ fn load_app_bundle(app_dir: &Path) -> Result<AppBundle, String> {
         .collect();
 
     // Read WASM module binaries, respecting declared targets from app.toml.
-    let wasm_modules = find_wasm_modules(app_dir, &wasm_module_configs);
+    let wasm_modules = find_wasm_modules(files, &wasm_module_configs)?;
 
     // Discover agents, skills, and seed data.
-    let agents = find_agents(app_dir);
-    let skills = find_app_skills(app_dir);
-    let adrs = find_adrs(app_dir);
-    let system_files = system_files::find_system_files(app_dir);
-    let seed_instances = find_seed_data(app_dir);
+    let agents = find_agents(files)?;
+    let skills = find_app_skills(files)?;
+    let adrs = find_adrs(files)?;
+    let system_files = system_files::find_system_files(files)?;
+    let seed_instances = find_seed_data(files)?;
 
     // Read app guide to check if there's anything at all.
     let app_guide = read_app_guide(app_dir);
@@ -1017,7 +485,11 @@ fn load_app_bundle(app_dir: &Path) -> Result<AppBundle, String> {
 fn os_app_dependencies(tenant: Option<&str>, name: &str) -> Vec<String> {
     // Check manifest first.
     let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-    if let Some(entry) = cat.app_entry(tenant, name)
+    dependencies_for_entry(name, cat.app_entry(tenant, name))
+}
+
+fn dependencies_for_entry(name: &str, entry: Option<&AppEntry>) -> Vec<String> {
+    if let Some(entry) = entry
         && !entry.dependencies.is_empty()
     {
         return entry
@@ -1130,15 +602,16 @@ async fn install_once(
 ) -> Result<ControlFlow<InstallResult, proofs::Wait>, String> {
     install_checks::refuse_unavailable_tenant(state, tenant, app_name)?;
     let mut install = install_guard::tenant(&state.server, tenant).await;
-    let app_dir = {
+    let app_files = {
         let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-        cat.app_dir(Some(tenant), app_name)
+        cat.app_files(Some(tenant), app_name)
             .cloned()
             .ok_or_else(|| {
                 format!("OS app '{app_name}' not found in catalog for tenant '{tenant}'")
             })?
     };
-    let bundle = load_app_bundle(&app_dir).map_err(|why| {
+    let app_dir = app_files.dir();
+    let bundle = load_app_bundle(&app_files).map_err(|why| {
         format!(
             "OS app '{app_name}' is registered at '{}' but its bundle failed to load: {why}",
             app_dir.display()
@@ -1274,7 +747,7 @@ async fn install_once(
     // Jev reads the changed modules beside the install's writes; joined
     // before it answers. It starts once no proof is left to wait for, since
     // a try that waits drops it, and its paid calls with it.
-    let review = module_review_step::start(state, tenant, &app_dir, &bundle, plan.wasm).await;
+    let review = module_review_step::start(state, tenant, app_dir, &bundle, plan.wasm).await;
     if plan.policies {
         policy_rows::rewrite_primary_snapshot(state, tenant, &superseded).await?;
     }
