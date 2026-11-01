@@ -94,8 +94,6 @@ struct InstalledAppView {
     last_reconciled_at: Option<String>,
     /// The absolute path of the folder the tenant serves the app from (its
     /// `specs/`, its `COMMIT`), or `""` when only its stored specs serve.
-    /// Katagami's sandbox scripts read it with `grep -o '"dir":"[^"]*"'`, so
-    /// it is always a path JSON writes without escaping (`plain_dir`).
     dir: String,
 }
 
@@ -117,25 +115,20 @@ impl InstalledAppView {
     }
 }
 
-/// The folder `tenant` serves `app` from, as an absolute path JSON writes with
-/// no escaping, or `""` when no folder holds it. Cache folder names are
-/// sanitized and app names are plain identifiers, so only a data directory
-/// whose own path holds such characters is refused, saying so.
-fn plain_dir(tenant: &str, app: &str) -> Result<String, String> {
+/// The absolute path of the folder `tenant` serves `app` from, or `""` when
+/// no folder holds it.
+fn served_dir(tenant: &str, app: &str) -> Result<String, String> {
     let Some(dir) = crate::os_apps::tenant_os_app_dir(tenant, app) else {
         return Ok(String::new());
     };
     let dir = std::path::absolute(&dir)
         .map_err(|error| format!("the folder of '{app}' has no absolute path: {error}"))?;
-    let text = dir
-        .to_str()
-        .ok_or_else(|| format!("the folder of '{app}' ({}) is not UTF-8", dir.display()))?;
-    if serde_json::to_string(text).ok().as_deref() != Some(format!("\"{text}\"").as_str()) {
-        return Err(format!(
-            "the folder of '{app}' ({text}) has characters JSON must escape; set TEMPER_DATA_DIR to a plain path"
-        ));
-    }
-    Ok(text.to_string())
+    dir.into_os_string().into_string().map_err(|dir| {
+        format!(
+            "the folder of '{app}' ({}) is not UTF-8",
+            dir.to_string_lossy()
+        )
+    })
 }
 
 /// Authorize a read of the credential tenant's app installs and return that
@@ -209,7 +202,7 @@ async fn installed_apps_in_tenant(
         }
         // None: the row has no metadata, e.g. it was removed between the reads.
         if let Some(record) = platform_store.get_installed_app(tenant, &app_name).await? {
-            let dir = plain_dir(tenant, &app_name)?;
+            let dir = served_dir(tenant, &app_name)?;
             apps.push(InstalledAppView::new(record, dir));
         }
     }

@@ -1,13 +1,14 @@
 //! The files of one app folder, and how the loader and the catalog find
 //! them.
 //!
-//! An install knows every file it wrote, so it names them, and nothing it
-//! installs depends on listing the folder it just wrote. A listing that comes
-//! back short is not an error, so a folder that lists short (on some drives a
-//! folder can list empty for a while after it is renamed into place) would
-//! otherwise install as an app with fewer specs, or none, and pass zero
-//! checks. Boot and the static apps folder list their folders once, long
-//! after they were written.
+//! An install knows every file it wrote, so it names them and keeps their
+//! list beside them, and nothing it installs, restores at boot or rolls back
+//! to depends on listing a folder. A listing that comes back short is not an
+//! error, so a folder that lists short (on some drives a folder can list empty
+//! for a while after it is renamed into place) would otherwise install as an
+//! app with fewer specs, or none, and pass zero checks. Only the static apps
+//! folders (`TEMPER_OS_APPS_DIR`, and folders added whole), which no install
+//! wrote and which have no list, are found by listing.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

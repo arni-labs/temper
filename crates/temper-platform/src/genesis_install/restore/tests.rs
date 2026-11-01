@@ -3,8 +3,9 @@
 
 use std::sync::Arc;
 
+use super::super::written;
 use super::*;
-use crate::os_apps::os_app_dir_bundle_digest;
+use crate::os_apps::written_apps_bundle_digests;
 use temper_server::platform_store::{SimPlatformFaultConfig, SimPlatformStore};
 
 const TENANT: &str = "restore-test-tenant";
@@ -32,6 +33,17 @@ fn write_app_needing(root: &Path, app_name: &str, marker: &str, dependencies: &[
         format!("# {app_name}\n\n{marker}\n"),
     )
     .expect("APP.md");
+    written::keep_app(root, app_name, &["app.toml", "APP.md"]);
+}
+
+/// `app_name`'s bundle digest as `root`'s list names its files.
+pub(super) fn written_digest(root: &Path, app_name: &str) -> String {
+    let apps = written::read(root).expect("the list");
+    written_apps_bundle_digests(root, apps)
+        .into_iter()
+        .find(|digest| digest.app_name == app_name)
+        .expect("digest")
+        .bundle_digest
 }
 
 /// `app_name`'s record as installed from `root` now.
@@ -40,9 +52,7 @@ fn recorded(root: &Path, app_name: &str) -> InstalledAppRecord {
         tenant: TENANT.to_string(),
         app_name: app_name.to_string(),
         source_kind: "genesis".to_string(),
-        bundle_digest: os_app_dir_bundle_digest(root, app_name)
-            .expect("digest")
-            .bundle_digest,
+        bundle_digest: written_digest(root, app_name),
         ..Default::default()
     }
 }
@@ -55,28 +65,32 @@ fn names(apps: &[&str]) -> BTreeSet<String> {
     apps.iter().map(ToString::to_string).collect()
 }
 
+/// The apps a cache directory serves, by name.
+async fn matching(
+    ps: &SimPlatformStore,
+    root: &Path,
+    record: &InstalledAppRecord,
+) -> Option<BTreeSet<String>> {
+    let only = std::slice::from_ref(record);
+    let apps = cached_apps_matching_records(ps, root, record, only).await?;
+    Some(apps.into_iter().map(|(app, _)| app).collect())
+}
+
 #[tokio::test]
 async fn a_cache_directory_is_reused_only_while_it_holds_the_recorded_version() {
     let root = tempfile::tempdir().expect("cache root");
     write_app(root.path(), "notes", "first version");
     let record = recorded(root.path(), "notes");
     let ps = store();
-    let only = std::slice::from_ref(&record);
     assert_eq!(
-        cached_apps_matching_records(&ps, root.path(), &record, only).await,
+        matching(&ps, root.path(), &record).await,
         Some(names(&["notes"]))
     );
 
     write_app(root.path(), "notes", "another version");
-    assert_eq!(
-        cached_apps_matching_records(&ps, root.path(), &record, only).await,
-        None
-    );
+    assert_eq!(matching(&ps, root.path(), &record).await, None);
     let gone = root.path().join("gone");
-    assert_eq!(
-        cached_apps_matching_records(&ps, &gone, &record, only).await,
-        None
-    );
+    assert_eq!(matching(&ps, &gone, &record).await, None);
 }
 
 #[tokio::test]
@@ -89,15 +103,14 @@ async fn a_cache_directory_serves_only_the_apps_that_match_their_records() {
     ps.record_installed_app_metadata(&recorded(root.path(), "tags"))
         .await
         .expect("record tags");
-    let only = std::slice::from_ref(&notes);
     assert_eq!(
-        cached_apps_matching_records(&ps, root.path(), &notes, only).await,
+        matching(&ps, root.path(), &notes).await,
         Some(names(&["notes", "tags"]))
     );
 
     write_app(root.path(), "tags", "another version");
     assert_eq!(
-        cached_apps_matching_records(&ps, root.path(), &notes, only).await,
+        matching(&ps, root.path(), &notes).await,
         Some(names(&["notes"])),
         "a dependency at another version than its record is left out, not the directory"
     );
@@ -105,7 +118,7 @@ async fn a_cache_directory_serves_only_the_apps_that_match_their_records() {
     write_app(root.path(), "tags", "first version");
     write_app(root.path(), "unrecorded", "no record names it");
     assert_eq!(
-        cached_apps_matching_records(&ps, root.path(), &notes, only).await,
+        matching(&ps, root.path(), &notes).await,
         Some(names(&["notes", "tags"])),
         "an app no record names is left out"
     );
@@ -340,6 +353,3 @@ async fn an_app_comes_back_beside_a_dependency_upgraded_on_its_own() {
 
 #[path = "rollback_tests.rs"]
 mod rollback_tests;
-
-#[path = "legacy_cache_tests.rs"]
-mod legacy_cache_tests;

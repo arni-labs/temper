@@ -13,7 +13,10 @@ use std::time::Duration;
 use temper_verify::CascadeResult;
 
 use super::*;
-use crate::os_apps::{AppFiles, find_ioa_files, installed_line};
+use crate::os_apps::{
+    AppFiles, find_ioa_files, installed_line, local_os_app_dependency_name, read_app_manifest,
+    tenant_dependency_files,
+};
 
 /// Where an installed closure came from, as its install records name it.
 pub(super) struct ClosureSource<'a> {
@@ -32,6 +35,11 @@ pub(super) struct MaterializedClosure<'a> {
     pub(super) root: RegistryAppRef,
     /// Every app the directory holds at its version, the root among them.
     pub(super) apps: Vec<MaterializedApp>,
+    /// The dependencies of `apps` the source did not write, as the tenant
+    /// resolves them now, each with its files. They are part of the closure
+    /// for every phase but registering and recording: checked, snapshotted
+    /// for rollback, reconciled and verified with the rest.
+    pub(super) resolved: Vec<(String, AppFiles)>,
     pub(super) source: ClosureSource<'a>,
     /// Time each spec's check may take.
     pub(super) budget: Duration,
@@ -81,9 +89,16 @@ pub(super) async fn install_materialized_closure(
         .iter()
         .map(|app| app.version.name.clone())
         .collect();
+    let whole: Vec<(String, AppFiles)> = closure
+        .apps
+        .iter()
+        .map(|app| (app.version.name.clone(), app.files.clone()))
+        .chain(closure.resolved.iter().cloned())
+        .collect();
+    let every: Vec<String> = whole.iter().map(|(name, _)| name.clone()).collect();
 
     // Checked before anything changes, so a refusal leaves the tenant as it was.
-    let checks = check_closure_specs(platform, &closure.root.name, &closure.apps, closure.budget)
+    let checks = check_closure_specs(platform, &closure.root.name, &whole, closure.budget)
         .await
         .map_err(ClosureRefused::Failed)?;
     if checks
@@ -101,7 +116,7 @@ pub(super) async fn install_materialized_closure(
     let ps = platform_store(platform);
     let mut prior_records: Vec<InstalledAppRecord> = Vec::new();
     if let Some(ps) = &ps {
-        for app_name in &materialized {
+        for app_name in &every {
             match ps.get_installed_app(tenant, app_name).await {
                 Ok(Some(record)) => prior_records.push(record),
                 Ok(None) => {}
@@ -137,7 +152,7 @@ pub(super) async fn install_materialized_closure(
     // store-less behavior).
     let new_version_ready = match (&reconcile_result, &ps) {
         (Ok(_), Some(ps)) => {
-            verify_install_closure_runtime_ready(platform, ps.as_ref(), tenant, &materialized).await
+            verify_install_closure_runtime_ready(platform, ps.as_ref(), tenant, &every).await
         }
         (Ok(_), None) => true,
         _ => false,
@@ -277,26 +292,46 @@ pub(super) async fn record_closure(
     Ok(root_closure_id)
 }
 
+/// The dependencies `written` apps name that none of them is, with theirs,
+/// as `tenant` resolves them now: the rest of the closure the install
+/// reconciles. An error names a dependency the tenant does not resolve.
+pub(super) fn resolved_dependencies(
+    tenant: &str,
+    written: &[(String, AppFiles)],
+) -> Result<Vec<(String, AppFiles)>, String> {
+    let is_written = |name: &str| written.iter().any(|(app, _)| app == name);
+    let needed: Vec<String> = written
+        .iter()
+        .filter_map(|(_, files)| read_app_manifest(files.dir()))
+        .flat_map(|manifest| manifest.dependencies)
+        .filter_map(|dependency| local_os_app_dependency_name(&dependency))
+        .filter(|name| !is_written(name))
+        .collect();
+    let resolved = tenant_dependency_files(tenant, &needed)?;
+    Ok(resolved
+        .into_iter()
+        .filter(|(name, _)| !is_written(name))
+        .collect())
+}
+
 /// Check every spec the installer will read from the closure, through the
 /// budgeted cascade `POST /api/specs/validate-ioa` runs. A spec whose levels
 /// read what an earlier passing check read gets that kept verdict back at once.
 async fn check_closure_specs(
     platform: &PlatformState,
     root_app: &str,
-    apps: &[MaterializedApp],
+    apps: &[(String, AppFiles)],
     budget: Duration,
 ) -> Result<BTreeMap<String, CascadeResult>, String> {
     let mut checks = BTreeMap::new();
-    for app in apps {
-        let name = &app.version.name;
-        for path in find_ioa_files(&app.files) {
+    for (name, files) in apps {
+        for path in find_ioa_files(files) {
             let key = if name == root_app {
                 path.clone()
             } else {
                 format!("{name}/{path}")
             };
-            let source = app
-                .files
+            let source = files
                 .read_text(&path)
                 .map_err(|error| format!("spec '{key}': {error}"))?;
             let check = temper_server::observe::check_ioa(

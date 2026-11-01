@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock, RwLockReadGuard};
 
@@ -14,9 +14,9 @@ use super::{
 pub(crate) struct AppCatalog {
     /// Directory containing app bundles.
     apps_dir: PathBuf,
-    /// Additional app directories merged into the catalog, with the apps
-    /// taken from each.
-    additional_dirs: Vec<(PathBuf, DirApps)>,
+    /// What was merged into the catalog after its static folder, in order,
+    /// so a reload merges the same again.
+    added: Vec<Added>,
     /// Catalog entries (lightweight metadata).
     entries: Vec<AppEntry>,
     /// Mapping from app name to its folder and files.
@@ -30,55 +30,46 @@ pub(crate) struct AppCatalog {
     tenant_installs: BTreeMap<String, TenantInstalls>,
 }
 
-/// Which of a directory's apps the catalog takes from it.
-///
-/// An install directory holds an app's whole closure. When a dependency in it
-/// was installed again separately, the directory still serves the apps that
-/// match their records, and the dependency resolves from its own install.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DirApps {
-    /// Every app in the directory.
-    Every,
-    /// Only the named apps; the directory's other apps are left out.
-    Only(BTreeSet<String>),
+/// Apps merged into the catalog after its static folder.
+#[derive(Clone)]
+enum Added {
+    /// Every app of a folder, found by listing it ([`add_os_apps_dir`]).
+    Folder(PathBuf),
+    /// Apps of an install's directory, each with the files the install
+    /// wrote; they win over apps of the same name merged before them.
+    Written(PathBuf, Vec<(String, AppFiles)>),
 }
 
-impl DirApps {
-    /// The apps either selection takes.
-    fn union(self, other: DirApps) -> DirApps {
-        match (self, other) {
-            (DirApps::Only(mut a), DirApps::Only(b)) => {
-                a.extend(b);
-                DirApps::Only(a)
-            }
-            _ => DirApps::Every,
-        }
-    }
+/// `earlier` apps of a directory added again with `apps`: the earlier ones
+/// this adds no files for, then these.
+fn merged(
+    mut earlier: Vec<(String, AppFiles)>,
+    apps: &[(String, AppFiles)],
+) -> Vec<(String, AppFiles)> {
+    earlier.retain(|(name, _)| !apps.iter().any(|(added, _)| added == name));
+    earlier.extend(apps.iter().cloned());
+    earlier
 }
 
 /// The apps one tenant installed; a later install of a name replaces an earlier one.
 #[derive(Default)]
 struct TenantInstalls {
-    /// Install directories in the order they were added, with the apps taken
-    /// from each.
-    dirs: Vec<(PathBuf, DirApps)>,
+    /// Install directories in the order they were added, with the apps of each.
+    written: Vec<(PathBuf, Vec<(String, AppFiles)>)>,
     entries: BTreeMap<String, AppEntry>,
     paths: BTreeMap<String, AppFiles>,
 }
 
 impl TenantInstalls {
-    /// Add `installed`, taken from its directory as `apps` says. A directory
-    /// added again moves last and takes what it took before as well.
-    fn add(&mut self, installed: AppCatalog, apps: DirApps) {
-        let apps = match self
-            .dirs
-            .iter()
-            .position(|(dir, _)| dir == &installed.apps_dir)
-        {
-            Some(index) => self.dirs.remove(index).1.union(apps),
-            None => apps,
+    /// Add `installed`, whose apps are `apps`, over what this tenant has. A
+    /// directory added again moves last.
+    fn add(&mut self, installed: AppCatalog, apps: &[(String, AppFiles)]) {
+        let dir = installed.apps_dir;
+        let earlier = match self.written.iter().position(|(known, _)| known == &dir) {
+            Some(index) => self.written.remove(index).1,
+            None => Vec::new(),
         };
-        self.dirs.push((installed.apps_dir, apps));
+        self.written.push((dir, merged(earlier, apps)));
         self.paths.extend(installed.paths);
         for entry in installed.entries {
             self.entries.insert(entry.name.clone(), entry);
@@ -173,92 +164,76 @@ pub fn set_os_apps_dir(dir: PathBuf) {
 /// Use this to register reference apps or project-specific apps alongside
 /// the main os-apps directory.
 pub fn add_os_apps_dir(dir: PathBuf) {
-    let additional = AppCatalog::from_dir(dir);
-    let cat = catalog();
-    let mut lock = cat.write().unwrap(); // ci-ok: infallible lock
-    lock.merge_catalog(additional, DirApps::Every);
+    let mut lock = catalog().write().unwrap(); // ci-ok: infallible lock
+    lock.merge_catalog(AppCatalog::from_dir(dir.clone()));
+    lock.added.push(Added::Folder(dir));
 }
 
-/// Add `apps` of an app directory and prefer them over existing catalog entries.
+/// Add the apps an install wrote into `dir`, each its folder name and the
+/// files the install named, and prefer them over existing catalog entries.
 ///
 /// Every tenant resolves these apps. Genesis installs into the platform
 /// tenant use this path because a pinned registry closure is the source of
 /// truth for the requested install: development/local app catalogs must not
 /// shadow the pinned Genesis bundle when both expose the same app name.
-pub fn add_os_apps_dir_preferred(dir: PathBuf, apps: DirApps) {
-    prefer(AppCatalog::from_dir(dir).taking(&apps), apps);
-}
-
-/// Add the apps an install wrote into `dir`, each its folder name and its
-/// files, and prefer them as [`add_os_apps_dir_preferred`] does. The install
-/// names the files it wrote, so nothing lists the folder it just wrote.
 pub fn add_written_apps_preferred(dir: PathBuf, apps: Vec<(String, AppFiles)>) {
-    prefer(AppCatalog::from_apps(dir, apps), DirApps::Every);
-}
-
-fn prefer(additional: AppCatalog, apps: DirApps) {
     let mut lock = catalog().write().unwrap(); // ci-ok: infallible lock
-    lock.merge_catalog_preferred(additional, apps);
+    lock.merge_catalog_preferred(AppCatalog::from_apps(dir.clone(), apps.clone()));
+    let mut earlier = Vec::new();
+    lock.added.retain(|added| match added {
+        Added::Written(known, apps) if known == &dir => {
+            earlier = apps.clone();
+            false
+        }
+        _ => true,
+    });
+    lock.added.push(Added::Written(dir, merged(earlier, &apps)));
 }
 
-/// Make `apps` of `dir` resolve for `tenant` only, ahead of the shared catalog.
+/// Make the apps an install wrote into `dir` resolve for `tenant` only, ahead
+/// of the shared catalog.
 ///
 /// Genesis installs into a tenant other than the platform tenant use this: a
 /// pinned closure is what that tenant asked to run, so for that tenant it wins
 /// over a shared app of the same name, and no other tenant sees it.
-pub fn add_tenant_os_apps_dir(tenant: &str, dir: PathBuf, apps: DirApps) {
-    add_for_tenant(tenant, AppCatalog::from_dir(dir).taking(&apps), apps);
-}
-
-/// Add the apps an install wrote into `dir` for `tenant` only, as
-/// [`add_written_apps_preferred`] adds them for every tenant.
 pub fn add_tenant_written_apps(tenant: &str, dir: PathBuf, apps: Vec<(String, AppFiles)>) {
-    add_for_tenant(tenant, AppCatalog::from_apps(dir, apps), DirApps::Every);
-}
-
-fn add_for_tenant(tenant: &str, installed: AppCatalog, apps: DirApps) {
+    let installed = AppCatalog::from_apps(dir, apps.clone());
     let mut lock = catalog().write().unwrap(); // ci-ok: infallible lock
     lock.tenant_installs
         .entry(tenant.to_string())
         .or_default()
-        .add(installed, apps);
+        .add(installed, &apps);
 }
 
 /// Re-scan the OS apps directory and refresh the catalog.
 ///
 /// Call this after modifying app files on disk to pick up changes
-/// without restarting the server.
+/// without restarting the server. Folders added whole are listed again; an
+/// install's apps are read again from the files it named.
 pub fn reload_os_apps() {
     let cat = catalog().read().unwrap(); // ci-ok: infallible lock
     let dir = cat.apps_dir.clone();
-    let additional_dirs: Vec<(PathBuf, DirApps)> = cat
-        .additional_dirs
-        .iter()
-        .filter(|(dir, _)| dir.is_dir())
-        .cloned()
-        .collect();
-    let tenant_dirs: Vec<(String, Vec<(PathBuf, DirApps)>)> = cat
+    let added = cat.added.clone();
+    let tenant_written: Vec<(String, Vec<(PathBuf, Vec<(String, AppFiles)>)>)> = cat
         .tenant_installs
         .iter()
-        .map(|(tenant, installs)| {
-            let dirs = installs
-                .dirs
-                .iter()
-                .filter(|(dir, _)| dir.is_dir())
-                .cloned();
-            (tenant.clone(), dirs.collect())
-        })
+        .map(|(tenant, installs)| (tenant.clone(), installs.written.clone()))
         .collect();
     drop(cat);
     let mut new = AppCatalog::from_dir(dir);
-    for (additional_dir, apps) in additional_dirs {
-        let additional = AppCatalog::from_dir(additional_dir).taking(&apps);
-        new.merge_catalog(additional, apps);
+    for added in &added {
+        match added {
+            Added::Folder(dir) => new.merge_catalog(AppCatalog::from_dir(dir.clone())),
+            Added::Written(dir, apps) => {
+                new.merge_catalog_preferred(AppCatalog::from_apps(dir.clone(), apps.clone()));
+            }
+        }
     }
-    for (tenant, dirs) in tenant_dirs {
+    new.added = added;
+    for (tenant, written) in tenant_written {
         let installs = new.tenant_installs.entry(tenant).or_default();
-        for (dir, apps) in dirs {
-            installs.add(AppCatalog::from_dir(dir).taking(&apps), apps);
+        for (dir, apps) in written {
+            installs.add(AppCatalog::from_apps(dir, apps.clone()), &apps);
         }
     }
     *catalog().write().unwrap() = new; // ci-ok: infallible lock
@@ -325,8 +300,8 @@ impl AppCatalog {
         }
     }
 
-    /// The apps of `dir`, found by listing it: for boot and the static apps
-    /// folder, which read long after their files were written.
+    /// The apps of `dir`, found by listing it: only for a static apps folder,
+    /// which no install wrote and which has no list of its files.
     pub(super) fn from_dir(dir: PathBuf) -> Self {
         if !dir.is_dir() {
             tracing::warn!("Failed to read apps directory {}", dir.display());
@@ -418,45 +393,14 @@ impl AppCatalog {
 
         Self {
             apps_dir: dir,
-            additional_dirs: Vec::new(),
+            added: Vec::new(),
             entries,
             paths,
             tenant_installs: BTreeMap::new(),
         }
     }
 
-    /// The apps of this catalog that `apps` takes.
-    fn taking(mut self, apps: &DirApps) -> Self {
-        if let DirApps::Only(names) = apps {
-            self.entries.retain(|entry| names.contains(&entry.name));
-            let kept: BTreeSet<PathBuf> = self
-                .entries
-                .iter()
-                .filter_map(|entry| self.paths.get(&entry.name))
-                .map(|files| files.dir().to_path_buf())
-                .collect();
-            self.paths.retain(|_, files| kept.contains(files.dir()));
-        }
-        self
-    }
-
-    /// Remember `dir` and the apps taken from it, so a reload takes the same.
-    fn remember_dir(&mut self, dir: &PathBuf, apps: DirApps) {
-        if !dir.is_dir() {
-            return;
-        }
-        match self
-            .additional_dirs
-            .iter_mut()
-            .find(|(known, _)| known == dir)
-        {
-            Some((_, taken)) => *taken = std::mem::replace(taken, DirApps::Every).union(apps),
-            None => self.additional_dirs.push((dir.clone(), apps)),
-        }
-    }
-
-    fn merge_catalog(&mut self, additional: AppCatalog, apps: DirApps) {
-        self.remember_dir(&additional.apps_dir, apps);
+    fn merge_catalog(&mut self, additional: AppCatalog) {
         for (name, path) in additional.paths {
             self.paths.entry(name).or_insert(path);
         }
@@ -471,8 +415,7 @@ impl AppCatalog {
         }
     }
 
-    fn merge_catalog_preferred(&mut self, additional: AppCatalog, apps: DirApps) {
-        self.remember_dir(&additional.apps_dir, apps);
+    fn merge_catalog_preferred(&mut self, additional: AppCatalog) {
         for (name, path) in additional.paths {
             self.paths.insert(name, path);
         }

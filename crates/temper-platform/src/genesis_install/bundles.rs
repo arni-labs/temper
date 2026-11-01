@@ -12,6 +12,7 @@ use super::cache_paths::{
 };
 use super::closure_install::MaterializedApp;
 use super::registry::{RegistryUrl, registry_client};
+use super::written::{self, Written};
 use super::{
     GenesisRegistryBundleApp, GenesisRegistryBundleFile, GenesisRegistryBundleResponse,
     RegistryAppRef, parse_registry_app_ref,
@@ -80,9 +81,11 @@ pub(super) async fn materialize_registry_app_closure_via_bundle(
         .map_err(|error| format!("create staged Genesis bundle cache: {error}"))?;
 
     let mut apps = Vec::new();
+    let mut written = Written::new();
     for app in bundle.apps {
         validate_identity_component("owner", &app.owner)?;
         let paths = write_bundle_app(&app_cache_dir(staged_cache.path(), &app.name)?, &app)?;
+        written.insert(app.name.clone(), paths.iter().cloned().collect());
         // Where the app is once the staged closure is renamed into place.
         let files = AppFiles::written(app_cache_dir(cache_root, &app.name)?, paths);
         let version = RegistryAppRef {
@@ -92,6 +95,7 @@ pub(super) async fn materialize_registry_app_closure_via_bundle(
         };
         apps.push(MaterializedApp { version, files });
     }
+    written::keep(staged_cache.path(), &written)?;
     replace_directory(staged_cache.keep(), cache_root)?;
     Ok(apps)
 }
@@ -353,23 +357,35 @@ impl GenesisBundleBudget {
     }
 }
 
+/// Read `paths` of `app_dir`, the files its Genesis tree named, as bundle
+/// files. Files under a generated folder (`target`, `.git`) are left out.
 pub(super) fn collect_bundle_files(
     app_dir: &Path,
+    paths: &BTreeSet<String>,
     budget: &mut GenesisBundleBudget,
 ) -> Result<Vec<GenesisRegistryBundleFile>, String> {
-    let mut paths = Vec::new();
-    collect_bundle_file_paths(app_dir, app_dir, &mut paths, budget.files_remaining)?;
-    paths.sort();
+    let file_budget = budget.files_remaining;
     let mut files = Vec::new();
-    for path in paths {
-        let rel = path
-            .strip_prefix(app_dir)
-            .map_err(|error| format!("strip bundle path '{}': {error}", path.display()))?
-            .to_string_lossy()
-            .replace('\\', "/");
+    let generated = |rel: &&String| {
+        rel.split('/')
+            .any(|part| part == "target" || part == ".git")
+    };
+    for rel in paths.iter().filter(|rel| !generated(rel)) {
+        if files.len() >= file_budget {
+            return Err(format!(
+                "Genesis bundle file count exceeded budget {MAX_GENESIS_BUNDLE_FILES}"
+            ));
+        }
+        let path = app_dir.join(rel);
         let metadata = std::fs::symlink_metadata(&path)
             .map_err(|error| format!("stat bundle file '{}': {error}", path.display()))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "Genesis bundle entry '{}' must not be a symbolic link",
+                path.display()
+            ));
+        }
+        if !metadata.is_file() {
             return Err(format!(
                 "Genesis bundle path '{}' must be a regular file",
                 path.display()
@@ -389,66 +405,11 @@ pub(super) fn collect_bundle_files(
             ));
         }
         files.push(GenesisRegistryBundleFile {
-            path: rel,
+            path: rel.clone(),
             content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
         });
     }
     Ok(files)
-}
-
-fn collect_bundle_file_paths(
-    root: &Path,
-    dir: &Path,
-    paths: &mut Vec<PathBuf>,
-    file_budget: usize,
-) -> Result<(), String> {
-    let mut entries: Vec<_> = std::fs::read_dir(dir)
-        .map_err(|error| format!("read bundle directory '{}': {error}", dir.display()))?
-        .filter_map(|entry| entry.ok())
-        .collect();
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("stat Genesis bundle entry '{}': {error}", path.display()))?;
-        if file_type.is_symlink() {
-            return Err(format!(
-                "Genesis bundle entry '{}' must not be a symbolic link",
-                path.display()
-            ));
-        }
-        let rel = path
-            .strip_prefix(root)
-            .map_err(|error| format!("strip bundle path '{}': {error}", path.display()))?;
-        if rel.components().any(|component| {
-            matches!(component, Component::Normal(part) if part == "target" || part == ".git")
-        }) {
-            if file_type.is_dir() {
-                tracing::warn!(
-                    path = %path.display(),
-                    "Skipping forbidden generated directory in Genesis bundle export"
-                );
-            }
-            continue;
-        }
-        if file_type.is_dir() {
-            collect_bundle_file_paths(root, &path, paths, file_budget)?;
-        } else if file_type.is_file() {
-            if paths.len() >= file_budget {
-                return Err(format!(
-                    "Genesis bundle file count exceeded budget {MAX_GENESIS_BUNDLE_FILES}"
-                ));
-            }
-            paths.push(path);
-        } else {
-            return Err(format!(
-                "Genesis bundle entry '{}' must be a regular file or directory",
-                path.display()
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

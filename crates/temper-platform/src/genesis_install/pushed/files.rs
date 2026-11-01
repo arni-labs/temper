@@ -8,6 +8,7 @@ use base64::Engine as _;
 use sha2::{Digest as _, Sha256};
 
 use super::{PushRefused, PushedFile};
+use crate::genesis_install::written::{self, Written};
 
 /// Refuse a path that is not a plain relative path inside the app: absolute,
 /// with an empty, `.` or `..` part, or with a NUL byte. A `.` part would let
@@ -96,9 +97,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// Write `files` as `<root>/<app>/`. They are written to a directory beside
-/// `root` and renamed into place, so a directory with a version's name always
-/// holds all of that version's files.
+/// Write `files` as `<root>/<app>/`, with their list ([`written`]). They are
+/// written to a directory beside `root` and renamed into place, so a directory
+/// with a version's name always holds all of that version's files.
 pub(super) fn materialize(
     root: &Path,
     app: &str,
@@ -119,6 +120,9 @@ pub(super) fn materialize(
         }
         std::fs::write(&file, bytes)?;
     }
+    let paths = files.keys().cloned().collect();
+    written::keep(staging.path(), &Written::from([(app.to_string(), paths)]))
+        .map_err(std::io::Error::other)?;
     std::fs::rename(staging.path(), root)?;
     // Renamed into place: nothing is left for the staging guard to remove.
     let _ = staging.keep();

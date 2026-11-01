@@ -39,8 +39,7 @@ mod types;
 mod wasm_replacement;
 pub(super) use app_catalog::catalog;
 pub use app_catalog::{
-    DirApps, add_os_apps_dir, add_os_apps_dir_preferred, add_tenant_os_apps_dir,
-    add_tenant_written_apps, add_written_apps_preferred, get_os_app, list_os_apps,
+    add_os_apps_dir, add_tenant_written_apps, add_written_apps_preferred, get_os_app, list_os_apps,
     list_startup_os_apps, list_tenant_os_apps, reload_os_apps, set_os_apps_dir, tenant_app_guide,
     tenant_os_app,
 };
@@ -69,8 +68,9 @@ pub(crate) use reconcile::{
     InstallOrigin, tenant_has_active_policies_for_bundle, tenant_has_registered_wasm_for_bundle,
 };
 pub use reconcile::{
-    os_app_bundle_digest, os_app_dir_bundle_digest, os_app_dir_bundle_digests, reconcile_os_app,
-    resolve_os_app_install_order, resolve_tenant_os_app_install_order, tenant_os_app_bundle_digest,
+    os_app_bundle_digest, reconcile_os_app, resolve_os_app_install_order,
+    resolve_tenant_os_app_install_order, tenant_dependency_files, tenant_os_app_bundle_digest,
+    written_apps_bundle_digests,
 };
 pub(crate) use runtime_heal::{
     restore_app_specs_from_matching_digest, tenant_has_ready_app_specs_for_bundle,
@@ -501,7 +501,7 @@ fn os_app_dependencies(tenant: Option<&str>, name: &str) -> Vec<String> {
     }
 }
 
-fn local_os_app_dependency_name(dependency: &str) -> Option<String> {
+pub(crate) fn local_os_app_dependency_name(dependency: &str) -> Option<String> {
     let unpinned = dependency
         .trim()
         .split_once('@')

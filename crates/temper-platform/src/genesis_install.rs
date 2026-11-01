@@ -25,6 +25,7 @@ mod object_lookup;
 mod pushed;
 mod registry;
 mod restore;
+mod written;
 use blob_materialization::{
     MAX_GENESIS_TREE_CANONICAL_BYTES, blob_content_len, canonical_field_len, git_object_body,
     materialize_blob_content_field, read_canonical_field_bounded,
@@ -48,16 +49,16 @@ pub(crate) use registry::configured_registry;
 use registry::{RegistryUrl, registry_client};
 use restore::rollback_to_prior;
 pub use restore::{restore_genesis_app_cache_roots, restore_genesis_registry_cache_roots};
+use written::Written;
 
 use crate::genesis_install_verify::{
     InstallVerifyDecision, classify_install_verify, mark_install_failed, platform_store,
     restore_prior_install, verify_install_closure_runtime_ready, verify_install_runtime_ready,
 };
 use crate::os_apps::{
-    AppFiles, AppManifest, DirApps, InstallResult, InstallWarning, OsAppReconcileResult,
-    add_os_apps_dir_preferred, add_tenant_os_apps_dir, add_tenant_written_apps,
-    add_written_apps_preferred, reconcile_os_app, resolve_tenant_os_app_install_order,
-    tenant_os_app_bundle_digest,
+    AppFiles, AppManifest, InstallResult, InstallWarning, OsAppReconcileResult,
+    add_tenant_written_apps, add_written_apps_preferred, reconcile_os_app,
+    resolve_tenant_os_app_install_order, tenant_os_app_bundle_digest,
 };
 use crate::state::PlatformState;
 
@@ -337,23 +338,16 @@ pub async fn install_genesis_app_from_registry(
                 "Genesis bundle fetch failed; falling back to git clone because TEMPER_GENESIS_INSTALL_GIT_FALLBACK is enabled"
             );
             let git_started = Instant::now();
-            let refs =
+            let apps =
                 materialize_registry_app_closure(&registry, root_ref.clone(), &cache_root).await?;
             log_genesis_install_phase(
                 &request.app_ref,
                 "materialize_git_fallback",
                 git_started,
-                refs.len(),
+                apps.len(),
                 0,
             );
-            // A git clone writes each app in place and names no files, so
-            // this admin-only recovery path reads them by listing.
-            refs.into_iter()
-                .map(|version| {
-                    let files = AppFiles::Listed(app_cache_dir(&cache_root, &version.name)?);
-                    Ok(closure_install::MaterializedApp { version, files })
-                })
-                .collect::<Result<Vec<_>, String>>()?
+            apps
         }
         Err(error) => {
             return Err(format!(
@@ -364,6 +358,11 @@ pub async fn install_genesis_app_from_registry(
     };
     // Every source ends in the same install: checks, register, reconcile,
     // verify, then commit or go back to the version before.
+    let written: Vec<_> = materialized_apps
+        .iter()
+        .map(|app| (app.version.name.clone(), app.files.clone()))
+        .collect();
+    let resolved = closure_install::resolved_dependencies(&request.tenant, &written)?;
     let turn = temper_server::host_turn::take().await?;
     let installed = closure_install::install_materialized_closure(
         platform,
@@ -373,6 +372,7 @@ pub async fn install_genesis_app_from_registry(
             app_ref: &request.app_ref,
             root: root_ref.clone(),
             apps: materialized_apps,
+            resolved,
             source: closure_install::ClosureSource {
                 source_kind: "genesis",
                 registry_url: &registry_url,
@@ -684,14 +684,17 @@ async fn materialize_git_registry_app(
     }
 }
 
+/// Clone `root_ref`'s closure from the registry's git into `cache_root`, and
+/// keep its list ([`written`]): each app's files as its commit names them.
 async fn materialize_registry_app_closure(
     registry: &RegistryUrl,
     root_ref: RegistryAppRef,
     cache_root: &Path,
-) -> Result<Vec<RegistryAppRef>, String> {
+) -> Result<Vec<closure_install::MaterializedApp>, String> {
     let mut stack = vec![root_ref];
     let mut seen = BTreeSet::new();
     let mut materialized_refs = Vec::new();
+    let mut materialized = Written::new();
 
     while let Some(app_ref) = stack.pop() {
         let key = format!("{}/{}", app_ref.owner, app_ref.name);
@@ -713,6 +716,14 @@ async fn materialize_registry_app_closure(
             name: app_ref.name.clone(),
             version_hash: Some(resolved_hash),
         });
+        // What the checked-out commit holds, from git itself, not a listing.
+        let tree = run_git(
+            Some(app_dir.as_path()),
+            &["ls-tree", "-r", "-z", "--name-only", "HEAD"],
+        )
+        .await?;
+        let paths = tree.split('\0').filter(|path| !path.is_empty());
+        materialized.insert(app_ref.name.clone(), paths.map(str::to_string).collect());
 
         for dependency in read_manifest_dependencies(&app_dir)?.into_iter().rev() {
             let dependency = parse_dependency_ref(&dependency, &app_ref.owner);
@@ -724,7 +735,18 @@ async fn materialize_registry_app_closure(
         }
     }
 
-    Ok(materialized_refs)
+    written::keep(cache_root, &materialized)?;
+    let mut files: BTreeMap<_, _> = written::app_files(cache_root, materialized)?
+        .into_iter()
+        .collect();
+    materialized_refs
+        .into_iter()
+        .map(|version| {
+            let files = files.remove(&version.name);
+            let files = files.ok_or_else(|| format!("{} has no files", version.name))?;
+            Ok::<_, String>(closure_install::MaterializedApp { version, files })
+        })
+        .collect()
 }
 
 fn registry_git_url(registry: &RegistryUrl, owner: &str, name: &str) -> String {
@@ -824,7 +846,7 @@ impl BoundActionHook for GenesisInstallHook {
             },
             &app_ref,
         );
-        let materialized_apps = materialize_app_closure(
+        let written = materialize_app_closure(
             state,
             tenant,
             &cache_root,
@@ -836,8 +858,9 @@ impl BoundActionHook for GenesisInstallHook {
             },
         )
         .await?;
+        let materialized_apps: Vec<String> = written.iter().map(|(app, _)| app.clone()).collect();
         let app_dir = app_cache_dir(&cache_root, &name)?;
-        register_install_cache(&target_tenant, cache_root, DirApps::Every);
+        register_written_apps(&target_tenant, cache_root, written);
 
         let mut platform = self.platform.clone();
         platform.server = state.clone();
@@ -1268,7 +1291,7 @@ pub async fn export_genesis_registry_bundle_for(
     for app in closure {
         let app_dir = app_cache_dir(&cache_root, &app.name)?;
         let started = Instant::now();
-        materialize_commit_tree(
+        let paths = materialize_commit_tree(
             &platform.server,
             &tenant,
             &app.repository_id,
@@ -1277,7 +1300,7 @@ pub async fn export_genesis_registry_bundle_for(
             &mut materialization_budget,
         )
         .await?;
-        let files = collect_bundle_files(&app_dir, &mut bundle_budget)?;
+        let files = collect_bundle_files(&app_dir, &paths, &mut bundle_budget)?;
         tracing::info!(
             registry_tenant = %registry_tenant,
             app = %app.name,
@@ -1403,15 +1426,18 @@ async fn resolve_genesis_app_closure(
     Ok(closure)
 }
 
+/// Write `root`'s closure from this server's Genesis objects into
+/// `cache_root`, each app at `<cache_root>/<name>`, and keep its list
+/// ([`written`]). Returns each app with the files it was written with.
 async fn materialize_app_closure(
     state: &ServerState,
     tenant: &TenantId,
     cache_root: &Path,
     root: GenesisAppBundle,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<(String, AppFiles)>, String> {
     let mut stack = vec![root];
     let mut admission = GenesisClosureAdmission::default();
-    let mut materialized = Vec::new();
+    let mut materialized = Written::new();
     let mut materialization_budget = GenesisBundleBudget::new();
 
     while let Some(app) = stack.pop() {
@@ -1420,7 +1446,7 @@ async fn materialize_app_closure(
         }
 
         let app_dir = app_cache_dir(cache_root, &app.name)?;
-        materialize_commit_tree(
+        let paths = materialize_commit_tree(
             state,
             tenant,
             &app.repository_id,
@@ -1429,7 +1455,7 @@ async fn materialize_app_closure(
             &mut materialization_budget,
         )
         .await?;
-        materialized.push(app.name.clone());
+        materialized.insert(app.name.clone(), paths);
 
         for dependency in read_manifest_dependencies(&app_dir)?.into_iter().rev() {
             let dependency = resolve_genesis_dependency(state, tenant, &app.owner, &dependency)
@@ -1444,7 +1470,8 @@ async fn materialize_app_closure(
         }
     }
 
-    Ok(materialized)
+    written::keep(cache_root, &materialized)?;
+    written::app_files(cache_root, materialized)
 }
 
 fn read_manifest_dependencies(app_dir: &Path) -> Result<Vec<String>, String> {
@@ -1607,7 +1634,7 @@ async fn materialize_commit_tree(
     version_hash: &str,
     app_dir: &Path,
     budget: &mut GenesisBundleBudget,
-) -> Result<(), String> {
+) -> Result<BTreeSet<String>, String> {
     let commit_id = validate_git_object_id(version_hash)?;
     let commit = load_genesis_object(state, tenant, "Commit", repository_id, commit_id)
         .await?
@@ -1630,7 +1657,7 @@ async fn materialize_commit_tree(
         .prefix(".genesis-tree-")
         .tempdir_in(parent)
         .map_err(|error| format!("create staged Genesis app cache: {error}"))?;
-    materialize_tree(
+    let paths = materialize_tree(
         state,
         tenant,
         repository_id,
@@ -1639,7 +1666,8 @@ async fn materialize_commit_tree(
         budget,
     )
     .await?;
-    replace_directory(staged.keep(), app_dir)
+    replace_directory(staged.keep(), app_dir)?;
+    Ok(paths)
 }
 
 async fn materialize_tree(
@@ -1649,7 +1677,8 @@ async fn materialize_tree(
     tree_sha: &str,
     dir: &Path,
     budget: &mut GenesisBundleBudget,
-) -> Result<(), String> {
+) -> Result<BTreeSet<String>, String> {
+    let mut written = BTreeSet::new();
     let mut stack = vec![(tree_sha.to_string(), dir.to_path_buf(), 0usize)];
     while let Some((current_tree, current_dir, depth)) = stack.pop() {
         std::fs::create_dir_all(&current_dir)
@@ -1679,6 +1708,8 @@ async fn materialize_tree(
                 stack.push((entry.object_sha, path, entry_depth));
                 continue;
             }
+            let relative = path.strip_prefix(dir).map_err(|e| e.to_string())?;
+            written.insert(relative.to_string_lossy().replace('\\', "/"));
             let blob = load_genesis_object(state, tenant, "Blob", repository_id, &entry.object_sha)
                 .await?
                 .ok_or_else(|| {
@@ -1718,7 +1749,7 @@ async fn materialize_tree(
             })?;
         }
     }
-    Ok(())
+    Ok(written)
 }
 
 #[derive(Debug)]
@@ -1799,23 +1830,12 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
 /// The platform tenant's installs are the shared catalog; every other
 /// tenant's are its own, so they never change what another tenant or a
 /// shared app resolves. Each app is registered with the files its install
-/// wrote, so nothing lists the directory that install just wrote.
+/// wrote ([`written`]), so nothing lists the directory.
 fn register_written_apps(tenant: &str, cache_root: PathBuf, apps: Vec<(String, AppFiles)>) {
     if tenant == TenantId::default().as_str() {
         add_written_apps_preferred(cache_root, apps);
     } else {
         add_tenant_written_apps(tenant, cache_root, apps);
-    }
-}
-
-/// Register `apps` of `cache_root` for `tenant`, found by listing it: for
-/// boot and rollback, which read long after the files were written. An
-/// install registers the files it wrote with [`register_written_apps`].
-fn register_install_cache(tenant: &str, cache_root: PathBuf, apps: DirApps) {
-    if tenant == TenantId::default().as_str() {
-        add_os_apps_dir_preferred(cache_root, apps);
-    } else {
-        add_tenant_os_apps_dir(tenant, cache_root, apps);
     }
 }
 
@@ -2018,7 +2038,8 @@ mod tests {
         );
     }
 
-    fn write_catalog_app(root: &Path, app_name: &str, marker: &str) {
+    /// `app_name` written into `root`, as an install names it.
+    fn write_catalog_app(root: &Path, app_name: &str, marker: &str) -> Vec<(String, AppFiles)> {
         let app_dir = root.join(app_name);
         std::fs::create_dir_all(&app_dir).expect("app dir");
         std::fs::write(app_dir.join("app.toml"), format!("name = \"{app_name}\"\n"))
@@ -2028,18 +2049,20 @@ mod tests {
             format!("# {app_name}\n\n{marker}\n"),
         )
         .expect("APP.md");
+        let paths = ["app.toml".to_string(), "APP.md".to_string()];
+        vec![(app_name.to_string(), AppFiles::written(app_dir, paths))]
     }
 
     #[test]
     fn the_platform_tenants_installs_are_the_shared_catalog() {
         let app_name = format!("shared-install-{}", uuid::Uuid::new_v4());
         let root = tempfile::tempdir().expect("cache root");
-        write_catalog_app(root.path(), &app_name, "PLATFORM-INSTALL");
+        let written = write_catalog_app(root.path(), &app_name, "PLATFORM-INSTALL");
 
-        register_install_cache(
+        register_written_apps(
             TenantId::default().as_str(),
             root.path().to_path_buf(),
-            DirApps::Every,
+            written,
         );
 
         let other_tenant = format!("tenant-{}", uuid::Uuid::new_v4());
@@ -2053,16 +2076,16 @@ mod tests {
     fn a_tenant_install_does_not_change_another_tenants_app() {
         let app_name = format!("tenant-install-{}", uuid::Uuid::new_v4());
         let shared = tempfile::tempdir().expect("shared root");
-        write_catalog_app(shared.path(), &app_name, "SHARED");
-        add_os_apps_dir_preferred(shared.path().to_path_buf(), DirApps::Every);
+        let written = write_catalog_app(shared.path(), &app_name, "SHARED");
+        add_written_apps_preferred(shared.path().to_path_buf(), written);
         let tenant_a = format!("tenant-a-{}", uuid::Uuid::new_v4());
         let tenant_b = format!("tenant-b-{}", uuid::Uuid::new_v4());
         let root_a = tempfile::tempdir().expect("tenant a root");
-        write_catalog_app(root_a.path(), &app_name, "TENANT-A");
+        let written_a = write_catalog_app(root_a.path(), &app_name, "TENANT-A");
         let root_b = tempfile::tempdir().expect("tenant b root");
-        write_catalog_app(root_b.path(), &app_name, "TENANT-B");
+        let written_b = write_catalog_app(root_b.path(), &app_name, "TENANT-B");
 
-        register_install_cache(&tenant_a, root_a.path().to_path_buf(), DirApps::Every);
+        register_written_apps(&tenant_a, root_a.path().to_path_buf(), written_a);
 
         let guide =
             |tenant: &str| crate::os_apps::tenant_app_guide(tenant, &app_name).expect("guide");
@@ -2079,7 +2102,7 @@ mod tests {
                     .is_some_and(|g| g.contains("SHARED")))
         );
 
-        register_install_cache(&tenant_b, root_b.path().to_path_buf(), DirApps::Every);
+        register_written_apps(&tenant_b, root_b.path().to_path_buf(), written_b);
 
         assert!(guide(&tenant_a).contains("TENANT-A"));
         assert!(guide(&tenant_b).contains("TENANT-B"));
@@ -2289,7 +2312,8 @@ mod tests {
         let outside = tempfile::NamedTempFile::new().expect("outside file");
         symlink(outside.path(), root.path().join("leak")).expect("symlink");
 
-        let error = collect_bundle_files(root.path(), &mut GenesisBundleBudget::new())
+        let named = BTreeSet::from(["leak".to_string()]);
+        let error = collect_bundle_files(root.path(), &named, &mut GenesisBundleBudget::new())
             .expect_err("symlink must be rejected");
         assert!(error.contains("symbolic link"));
     }

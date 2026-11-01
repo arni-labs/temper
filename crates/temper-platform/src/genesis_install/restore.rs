@@ -21,7 +21,6 @@ pub(super) use rollback::rollback_to_prior;
 
 use super::registry::recorded_registry;
 use super::*;
-use crate::os_apps::{DirApps, os_app_dir_bundle_digests};
 
 /// Rebuild Genesis app materialization cache roots from durable Genesis rows.
 ///
@@ -97,9 +96,9 @@ pub async fn restore_genesis_app_cache_roots(platform: &PlatformState) -> usize 
                 version_hash,
             };
             match materialize_app_closure(&platform.server, &tenant, &cache_root, root).await {
-                Ok(_) => {
+                Ok(written) => {
                     legacy_specs::convert_legacy_bundle_specs(&cache_root);
-                    register_install_cache(&target_tenant, cache_root, DirApps::Every);
+                    register_written_apps(&target_tenant, cache_root, written);
                     restored += 1;
                 }
                 Err(error) => {
@@ -193,7 +192,7 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
         };
         let candidates =
             install_cache_candidates(platform, &tenant, registry_tenant, &record.app_ref);
-        let cache_root = candidates[0].path.clone();
+        let cache_root = candidates[0].clone();
         // Each tenant's install has its own directory, so records restore it
         // once per directory, from that install's own registry tenant.
         if !seen.insert(cache_root.clone()) {
@@ -203,7 +202,7 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
         if let Some((stored, apps)) =
             first_matching_install(ps.as_ref(), &candidates, &record, recorded).await
         {
-            register_install_cache(&tenant, stored, DirApps::Only(apps));
+            register_written_apps(&tenant, stored, apps);
             restored += 1;
             continue;
         }
@@ -251,7 +250,7 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
                     .await
                 {
                     Some(apps) => {
-                        register_install_cache(&tenant, cache_root, DirApps::Only(apps));
+                        register_written_apps(&tenant, cache_root, apps);
                         restored += 1;
                     }
                     None => tracing::warn!(
@@ -334,10 +333,11 @@ async fn ensure_prior_root_available(
     if let Some((stored, apps)) =
         first_matching_install(ps, &candidates, prior, prior_records).await
     {
-        register_install_cache(&prior.tenant, stored, DirApps::Only(apps.clone()));
-        return Ok(apps);
+        let names = apps.iter().map(|(app, _)| app.clone()).collect();
+        register_written_apps(&prior.tenant, stored, apps);
+        return Ok(names);
     }
-    let cache_root = candidates[0].path.clone();
+    let cache_root = candidates[0].clone();
     if cache_root.is_dir() {
         tracing::warn!(
             app = %prior.app_name,
@@ -376,8 +376,9 @@ async fn ensure_prior_root_available(
                 prior.app_ref
             )
         })?;
-    register_install_cache(&prior.tenant, cache_root, DirApps::Only(apps.clone()));
-    Ok(apps)
+    let names = apps.iter().map(|(app, _)| app.clone()).collect();
+    register_written_apps(&prior.tenant, cache_root, apps);
+    Ok(names)
 }
 
 #[cfg(test)]
