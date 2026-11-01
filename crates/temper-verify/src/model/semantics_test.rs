@@ -303,3 +303,31 @@ fn unconstrained_strings_include_distinct_nonempty_blank_values() {
         "different whitespace-only inputs must remain possible"
     );
 }
+
+#[test]
+fn field_and_list_symbols_share_one_canonical_scope() {
+    let mut s = state("Ready");
+    s.strings.insert("goal".into(), ModelString::Symbol(9));
+    s.lists.insert(
+        "tags".into(),
+        vec![ModelString::Symbol(9), ModelString::Symbol(4), "#1".into()],
+    );
+    canonical_state(&mut s);
+    assert_eq!(s.strings["goal"], ModelString::Symbol(1));
+    assert_eq!(
+        s.lists["tags"],
+        vec![ModelString::Symbol(1), ModelString::Symbol(2), "#1".into()]
+    );
+    assert!(evaluate_guard(
+        &g("goal in tags && '#1' in tags && len(tags) == 3 && !empty(tags)"),
+        &kinds(),
+        &s
+    ));
+    s.lists.get_mut("tags").unwrap().remove(0);
+    canonical_state(&mut s);
+    assert!(!evaluate_guard(&g("goal in tags"), &kinds(), &s));
+    assert_eq!(
+        string_values(std::iter::once(&s)),
+        BTreeSet::from([ModelString::Symbol(1), ModelString::Symbol(2), "#1".into()])
+    );
+}

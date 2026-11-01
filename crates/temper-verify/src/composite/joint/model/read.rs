@@ -9,7 +9,7 @@ use temper_authz::Asker;
 use temper_spec::automaton::{
     ActionConstraint, ActionKind, Automaton, TargetResolver, TriggerKind,
 };
-use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Operand, Set, VarKind};
+use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Name, Operand, Set, VarKind};
 
 use super::super::env::Records;
 use super::super::senders;
@@ -116,6 +116,18 @@ pub(super) fn tracked(
             }
         }
         for reaction in &reactions {
+            // A trigger's guard is decided on its sender's fields.
+            if let Some(guard) = &reaction.guard {
+                let from = &models[&reaction.from];
+                guard.for_each_name(&mut |name| {
+                    if let Name::Var(field) = name
+                        && from.var_kinds.get(field) != Some(&VarKind::Str)
+                        && !from.holds(field)
+                    {
+                        grew |= track(&reaction.from, field);
+                    }
+                });
+            }
             if let Some(TargetResolver::CreateIfMissing { id_field }) = &reaction.resolve {
                 grew |= track(&reaction.from, id_field);
             }
@@ -125,10 +137,17 @@ pub(super) fn tracked(
                 grew |= track(&reaction.from, id_field);
             }
             for (param, arg) in &reaction.args {
-                if let Arg::Var(field) = arg
-                    && models[&reaction.to].models_string(&reaction.target_action, param)
-                    && !models[&reaction.from].tracked_strings.contains(field)
-                {
+                let Arg::Var(field) = arg else { continue };
+                let from = &models[&reaction.from];
+                // A string is passed only where the target models it; any
+                // other field the sender holds only when something reads it.
+                let needed = if from.var_kinds.get(field) == Some(&VarKind::Str) {
+                    models[&reaction.to].models_string(&reaction.target_action, param)
+                        && !from.tracked_strings.contains(field)
+                } else {
+                    !from.holds(field)
+                };
+                if needed {
                     grew |= track(&reaction.from, field);
                 }
             }
@@ -156,7 +175,7 @@ pub(in crate::composite::joint) struct Timeout {
 }
 
 /// What the kernel sends, read once from the specs.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct Kernel {
     /// Each entity's state timers.
     pub(super) timers: BTreeMap<String, Vec<Timeout>>,
@@ -297,7 +316,7 @@ fn reactions_in(by_name: &BTreeMap<&str, &Automaton>, scope: &BTreeSet<String>) 
 
 /// The actions (entity, action) with a constraint the model cannot decide,
 /// and what a module call keeps to decide its answer's.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct Unchecked {
     /// Sent as a dispatch or a request: one on a counter the order does not
     /// keep, or on a string parameter or field the model gives no value.

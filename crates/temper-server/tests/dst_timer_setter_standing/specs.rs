@@ -1,5 +1,6 @@
-//! The specs the simulation runs: a `Job` whose timers a move sets, and a
-//! `Pass` created straight into a timed state.
+//! The specs the simulation runs: a `Job` whose timers a move sets, a `Pass`
+//! created straight into a timed state, and the platform's
+//! `PrincipalGeneration`, whose counters sign users out and revoke grants.
 
 pub(super) const JOB: &str = r#"
 [automaton]
@@ -56,6 +57,25 @@ after_seconds = 600
 on_timeout = "Lapse"
 "#;
 
+/// The platform's sign-out generation, as the platform installs it.
+pub(super) const PRINCIPAL_GENERATION: &str = r#"
+[automaton]
+name = "PrincipalGeneration"
+states = ["Active"]
+initial = "Active"
+
+[[state]]
+name = "generation"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "BumpGeneration"
+kind = "input"
+from = ["Active"]
+effect = ["generation += 1"]
+"#;
+
 pub(super) const CSDL: &str = r#"<?xml version="1.0"?>
 <edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
 <edmx:DataServices><Schema Namespace="Jobs" xmlns="http://docs.oasis-open.org/odata/ns/edm">
@@ -70,5 +90,10 @@ pub(super) const CSDL: &str = r#"<?xml version="1.0"?>
 <Property Name="Id" Type="Edm.String" Nullable="false"/>
 </EntityType>
 <Action Name="Lapse" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Pass"/></Action>
-<EntityContainer Name="Container"><EntitySet Name="Jobs" EntityType="Jobs.Job"/><EntitySet Name="Passes" EntityType="Jobs.Pass"/></EntityContainer>
+<EntityType Name="PrincipalGeneration"><Key><PropertyRef Name="Id"/></Key>
+<Property Name="Id" Type="Edm.String" Nullable="false"/>
+<Property Name="generation" Type="Edm.Int64"/>
+</EntityType>
+<Action Name="BumpGeneration" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.PrincipalGeneration"/></Action>
+<EntityContainer Name="Container"><EntitySet Name="Jobs" EntityType="Jobs.Job"/><EntitySet Name="Passes" EntityType="Jobs.Pass"/><EntitySet Name="PrincipalGenerations" EntityType="Jobs.PrincipalGeneration"/></EntityContainer>
 </Schema></edmx:DataServices></edmx:Edmx>"#;

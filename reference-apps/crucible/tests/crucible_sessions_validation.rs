@@ -202,6 +202,7 @@ fn authenticate(mut request: Request<Body>) -> Request<Body> {
         context_attrs: Default::default(),
         correlation_id: "crucible-session-validation".to_string(),
         cause: None,
+        credential: None,
     };
     request
         .extensions_mut()

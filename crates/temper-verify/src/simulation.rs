@@ -262,7 +262,7 @@ fn run_simulation_impl(model: &TemperModel, config: &SimConfig) -> SimulationRes
                 check_invariants_on_state(
                     model,
                     target_id,
-                    &action.name,
+                    &action,
                     state_before,
                     &new_state,
                     tick,
@@ -331,6 +331,9 @@ fn check_liveness_post_simulation(
                         }
                     }
                 }
+                // Whether a record can still get somewhere needs every state
+                // after it, not one run's last: the model check's walk has them.
+                LivenessKind::CanReach { .. } => {}
                 LivenessKind::ReachesState { from, targets } => {
                     if targets.is_empty() {
                         continue;
@@ -363,7 +366,7 @@ fn check_liveness_post_simulation(
 fn check_invariants_on_state(
     model: &TemperModel,
     actor_id: &str,
-    action_name: &str,
+    action: &TemperModelAction,
     state_before: &TemperModelState,
     state_after: &TemperModelState,
     tick: u64,
@@ -373,7 +376,7 @@ fn check_invariants_on_state(
     if !model.states.contains(&state_after.status) {
         violations.push(InvariantViolation {
             actor_id: actor_id.to_string(),
-            action: action_name.to_string(),
+            action: action.name.clone(),
             state_before: state_before.clone(),
             state_after: state_after.clone(),
             invariant: "TypeInvariant: status not in valid states".to_string(),
@@ -384,7 +387,7 @@ fn check_invariants_on_state(
     let mut violated = |invariant: String| {
         violations.push(InvariantViolation {
             actor_id: actor_id.to_string(),
-            action: action_name.to_string(),
+            action: action.name.clone(),
             state_before: state_before.clone(),
             state_after: state_after.clone(),
             invariant,
@@ -397,6 +400,9 @@ fn check_invariants_on_state(
         if truth(&inv.assert, &model.var_kinds, state_after) == Truth::False {
             violated(inv.name.clone());
         }
+    }
+    if let Some(rule) = crate::model::broken_by_action(model, action, state_before) {
+        violated(rule.name.clone());
     }
 
     if model.terminal.contains(&state_after.status) {

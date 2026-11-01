@@ -132,7 +132,7 @@ async fn validate_ioa_rejects_a_budget_out_of_range() {
 async fn validate_ioa_answers_a_move_with_too_many_parameter_choices() {
     let flags: Vec<String> = (0..13).map(|i| format!("f{i}")).collect();
     let ioa = format!(
-        "[automaton]\nname = \"Flags\"\nstates = [\"On\"]\ninitial = \"On\"\n\n{}\n[[action]]\nname = \"Set\"\nkind = \"input\"\nfrom = [\"On\"]\nparams = [{}]\neffect = [{}]\n",
+        "[automaton]\nname = \"Flags\"\nstates = [\"On\"]\ninitial = \"On\"\n\n{}\n[[action]]\nname = \"Set\"\nkind = \"input\"\nfrom = [\"On\"]\nparams = [{}]\neffect = [{}]\n\n[[invariant]]\nname = \"Held\"\nassert = \"{}\"\n",
         flags
             .iter()
             .map(|f| format!("[[state]]\nname = \"{f}\"\ntype = \"bool\"\ninitial = false\n"))
@@ -148,6 +148,12 @@ async fn validate_ioa_answers_a_move_with_too_many_parameter_choices() {
             .map(|f| format!("\"{f} = params.{f}\""))
             .collect::<Vec<_>>()
             .join(", "),
+        // The model holds only the fields some rule reads.
+        flags
+            .iter()
+            .map(|f| format!("({f} || !{f})"))
+            .collect::<Vec<_>>()
+            .join(" && "),
     );
     let app = build_router(test_state_with_registry());
     let response = app
@@ -220,6 +226,34 @@ async fn validate_ioa_keeps_a_passing_verdict_for_a_change_no_level_reads() {
         rechecked.get("kept").is_none(),
         "a guard is read, so its change is checked: {rechecked}"
     );
+}
+
+/// A move that stays in place, has no guard and writes a field no rule
+/// reads keeps the note's verdict; one from a place the note never reaches
+/// keeps its digest, but its own check refuses it, so it is checked.
+#[tokio::test]
+async fn validate_ioa_keeps_a_verdict_for_a_silent_move_only_where_it_stands() {
+    let state = test_state_with_registry();
+    let note = NOTE.replace(
+        "states = [\"Open\", \"Closed\"]",
+        "states = [\"Open\", \"Closed\", \"Gone\"]",
+    );
+    assert_ne!(note, NOTE);
+    let remark = |from: &str| {
+        format!(
+            "{note}\n[[state]]\nname = \"memo\"\ntype = \"string\"\ninitial = \"\"\n\n[[action]]\nname = \"Remark\"\nkind = \"input\"\nfrom = [\"{from}\"]\nparams = [{{ name = \"memo\", type = \"string\" }}]\n"
+        )
+    };
+    let checked = validate(&state, &note).await;
+    assert_eq!(checked["all_passed"], true, "{checked}");
+
+    let kept = validate(&state, &remark("Open")).await;
+    assert_eq!(kept["all_passed"], true, "{kept}");
+    assert!(kept["kept"].is_string(), "a silent move keeps it: {kept}");
+
+    let dead = validate(&state, &remark("Gone")).await;
+    assert_eq!(dead["all_passed"], false, "{dead}");
+    assert!(dead.get("kept").is_none(), "{dead}");
 }
 
 #[tokio::test]

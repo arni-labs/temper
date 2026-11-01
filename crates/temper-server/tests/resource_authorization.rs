@@ -44,6 +44,7 @@ fn customer_security_context(id: &str) -> SecurityContext {
         context_attrs: Default::default(),
         correlation_id: format!("resource-auth-{id}"),
         cause: None,
+        credential: None,
     }
 }
 

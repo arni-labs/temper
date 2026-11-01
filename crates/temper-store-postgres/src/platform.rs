@@ -822,6 +822,14 @@ impl PostgresEventStore {
             )
             .await?;
         }
+        crate::projection_delta::applied(
+            &self.schema,
+            &mut tx,
+            [tenant, entity_type, entity_id],
+            sequence_nr,
+            fields,
+        )
+        .await?;
 
         let commit_started = Instant::now();
         tx.commit().await.map_err(|e| {
@@ -913,6 +921,12 @@ impl PostgresEventStore {
             .execute(&mut *tx)
             .await
             .map_err(storage_error)?;
+        crate::projection_delta::mark_removed(
+            &self.schema,
+            &mut tx,
+            [tenant, entity_type, entity_id],
+        )
+        .await?;
         let commit_started = Instant::now();
         tx.commit().await.map_err(|e| {
             record_postgres_transaction_commit_duration(

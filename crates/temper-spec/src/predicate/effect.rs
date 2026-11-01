@@ -62,7 +62,7 @@ impl AssignOp {
 pub enum Effect {
     /// `var = v`, `var += v` or `var -= v`.
     Assign {
-        /// The counter or bool written.
+        /// The counter, bool or string written.
         var: String,
         /// The operator.
         op: AssignOp,
@@ -407,9 +407,13 @@ pub fn check_effect(
             VarKind::List => Err(format!(
                 "'{effect}': '{var}' is a list; use append() or remove_at()"
             )),
-            VarKind::Str | VarKind::Num => Err(format!(
-                "'{effect}': only counters and bools can be assigned, '{var}' is neither"
-            )),
+            VarKind::Str => match (op, value) {
+                (AssignOp::Set, Arg::Lit(Literal::Str(_))) => Ok(None),
+                _ => Err(format!(
+                    "'{effect}': a string takes only '=' with a string literal"
+                )),
+            },
+            VarKind::Num => Err(format!("'{effect}': '{var}' is not assignable")),
         },
         Effect::Append { list, value } => {
             if declared(list)? != VarKind::List {

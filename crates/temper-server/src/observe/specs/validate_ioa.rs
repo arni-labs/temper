@@ -156,9 +156,9 @@ pub async fn check_ioa(
             .with_prop_test_cases(prop_test_cases)
             .with_budget(budget)
     };
-    let digest = kept::digest(check.clone()).await;
-    if let Some(digest) = &digest
-        && let Some(kept_result) = kept::kept(state, digest).await
+    let key = kept::key(check.clone()).await;
+    if let Some(key) = &key
+        && let Some(kept_result) = kept::kept(state, key).await
     {
         return Ok(kept_result);
     }
@@ -166,8 +166,8 @@ pub async fn check_ioa(
     let result = tokio::task::spawn_blocking(move || check().run())
         .await
         .map_err(|error| format!("verification worker failed: {error}"))?;
-    if let Some(digest) = &digest {
-        kept::keep(state, digest, &result).await;
+    if let Some(key) = &key {
+        kept::keep(state, &key.digest, &result).await;
     }
     Ok(result)
 }

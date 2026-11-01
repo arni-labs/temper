@@ -7,6 +7,10 @@ mod groups;
 mod triggers;
 mod webhooks;
 
+#[cfg(test)]
+#[path = "entry_rules_test.rs"]
+mod entry_rules_test;
+
 use super::parser::AutomatonParseError;
 use super::types::*;
 
@@ -265,18 +269,70 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
             ));
         }
     }
+    for rule in &automaton.entry_rules {
+        let slot = format!("entry rule '{}'", rule.name);
+        for place in std::iter::once(&rule.place).chain(&rule.from) {
+            if !automaton.automaton.states.contains(place) {
+                return Err(invalid(slot, format!("'{place}' is not a declared state")));
+            }
+        }
+        check(&rule.assert, Scope::State(&vars)).map_err(|e| invalid(slot.clone(), e))?;
+        no_params(&rule.assert, slot.clone())?;
+        no_related_field(&rule.assert, slot.clone())?;
+        // Entry checks share the assertion read contract, with nullable
+        // statuses and local membership modeled by the shared move environment.
+        if let Some(culprit) = crate::predicate::unverifiable_entry(&rule.assert, &vars) {
+            return Err(invalid(
+                slot,
+                format!("`{culprit}` reads a value the verification cascade cannot model"),
+            ));
+        }
+        // A rule no move is checked against proves nothing.
+        let covered = |from: &String| {
+            if rule.from.is_empty() {
+                from != &rule.place
+            } else {
+                rule.from.contains(from)
+            }
+        };
+        if !automaton.actions.iter().any(|a| {
+            let sources = if a.from.is_empty() {
+                &automaton.automaton.states
+            } else {
+                &a.from
+            };
+            a.kind != ActionKind::Output
+                && a.to.as_ref() == Some(&rule.place)
+                && sources.iter().any(covered)
+        }) {
+            return Err(invalid(
+                slot,
+                format!(
+                    "no action moves into '{}' from a place it covers",
+                    rule.place
+                ),
+            ));
+        }
+    }
     for live in &automaton.liveness {
         let slot = format!("liveness '{}'", live.name);
         let Some(eventually) = &live.eventually else {
             if !live.relies_on.is_empty() {
                 return Err(invalid(slot, "`relies_on` needs `eventually`".into()));
             }
+            if !live.can_reach.is_empty() {
+                validate_can_reach(automaton, live).map_err(|e| invalid(slot, e))?;
+            }
             continue;
         };
-        if !live.from.is_empty() || !live.reaches.is_empty() || live.has_actions.is_some() {
+        if !live.from.is_empty()
+            || !live.reaches.is_empty()
+            || !live.can_reach.is_empty()
+            || live.has_actions.is_some()
+        {
             return Err(invalid(
                 slot,
-                "`eventually` takes no `from`, `reaches` or `has_actions`".into(),
+                "`eventually` takes no `from`, `reaches`, `can_reach` or `has_actions`".into(),
             ));
         }
         check(eventually, Scope::State(&vars)).map_err(|e| invalid(slot.clone(), e))?;
@@ -311,6 +367,24 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
             return Err(AutomatonParseError::Validation(format!(
                 "terminal references undeclared state '{state}'"
             )));
+        }
+    }
+    Ok(())
+}
+
+/// A `can_reach` rule is its own kind of liveness, and every place it names
+/// is declared: a misspelt `from` would leave it checking nothing, and a
+/// misspelt target would refuse every record.
+fn validate_can_reach(automaton: &Automaton, live: &Liveness) -> Result<(), String> {
+    if !live.reaches.is_empty() || live.has_actions.is_some() {
+        return Err("`can_reach` takes no `reaches` or `has_actions`".into());
+    }
+    for (key, places) in [("from", &live.from), ("can_reach", &live.can_reach)] {
+        if let Some(place) = places
+            .iter()
+            .find(|place| !automaton.automaton.states.contains(place))
+        {
+            return Err(format!("`{key}` names no place '{place}'"));
         }
     }
     Ok(())

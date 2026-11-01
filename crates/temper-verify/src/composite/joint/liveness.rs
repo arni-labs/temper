@@ -41,7 +41,7 @@
 //! names those answers, since one may be the way out. And a condition written
 //! `premise => conclusion` whose premise no walked state meets proves nothing.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 
 use temper_authz::SendAnalysis;
@@ -49,8 +49,9 @@ use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Truth, eval};
 
 use super::JointStep;
-use super::model::{self, JointModel, Sending};
-use super::room::{Bound, MB};
+use super::model::{self, JointModel};
+use super::proof::liveness_proofs;
+use super::room::Bound;
 
 /// What the joint check found for one `eventually` property.
 #[derive(Debug, Clone)]
@@ -205,101 +206,17 @@ impl fmt::Display for JointLivenessResult {
 }
 
 /// Check every `[[liveness]]` with `eventually` in `automatons` on the joint
-/// model of its entity and the types its condition names. `policies` decide
-/// each move as its sender; without them every sender may send everything.
+/// model of its entity and the types its condition names
+/// ([`liveness_proofs`]).
 pub fn verify_joint_liveness(
     automatons: &[&Automaton],
     policies: Option<&SendAnalysis>,
     bound: Bound<'_>,
 ) -> Vec<JointLivenessResult> {
-    let by_name: BTreeMap<&str, &Automaton> = automatons
+    liveness_proofs(automatons, policies)
         .iter()
-        .map(|a| (a.automaton.name.as_str(), *a))
-        .collect();
-    let mut results = Vec::new();
-    for (name, automaton) in &by_name {
-        for live in &automaton.liveness {
-            let Some(goal) = &live.eventually else {
-                continue;
-            };
-            let mut scope = BTreeSet::from([name.to_string()]);
-            let mut missing = Vec::new();
-            for (entity_type, _) in goal.related_types() {
-                if by_name.contains_key(entity_type.as_str()) {
-                    scope.insert(entity_type);
-                } else {
-                    missing.push(entity_type);
-                }
-            }
-            let mut result = JointLivenessResult {
-                entity: name.to_string(),
-                name: live.name.clone(),
-                eventually: goal.to_string(),
-                relies_on: live.relies_on.clone(),
-                scope: scope.iter().cloned().collect(),
-                states: 0,
-                in_flight_bound: None,
-                outcome: LivenessOutcome::Holds,
-                unwalked: Vec::new(),
-            };
-            if !missing.is_empty() {
-                result.outcome = LivenessOutcome::Incomplete {
-                    reason: format!(
-                        "it reads {}, which this app does not declare",
-                        missing.join(", ")
-                    ),
-                };
-                results.push(result);
-                continue;
-            }
-            let sending = Sending {
-                policies,
-                kernel_moves: true,
-                relies_on: live
-                    .relies_on
-                    .iter()
-                    .map(|action| (name.to_string(), action.clone()))
-                    .collect(),
-            };
-            let model = JointModel::new(&by_name, scope, name, &[goal], sending, true);
-            let mut explored = model.walk_with(bound, true, |_, _| false);
-            result.states = explored.len();
-            result.in_flight_bound = explored.held_back.then_some(model::MAX_IN_FLIGHT);
-            result.unwalked = explored.unwalked();
-            let settling = settle_bytes(&explored);
-            result.outcome = match &explored.stopped {
-                Some(reason) => LivenessOutcome::Incomplete {
-                    reason: reason.clone(),
-                },
-                None => match explored.held.add(settling) {
-                    Ok(()) => match settle(&model, name, goal, &explored) {
-                        (LivenessOutcome::Holds, _) if !result.unwalked.is_empty() => {
-                            LivenessOutcome::Incomplete {
-                                reason: model::unwalked_reason(&result.unwalked),
-                            }
-                        }
-                        (LivenessOutcome::Holds, false) => LivenessOutcome::Vacuous {
-                            premise: super::premise(goal)
-                                .map(ToString::to_string)
-                                .unwrap_or_default(),
-                        },
-                        (outcome, _) => outcome,
-                    },
-                    Err(reason) => LivenessOutcome::Incomplete {
-                        reason: format!(
-                            "deciding the walk does not fit in the memory it may hold: {reason} \
-                             (it held {} MB at {} states and needs {} MB more)",
-                            explored.held.bytes / MB,
-                            explored.len(),
-                            settling / MB
-                        ),
-                    },
-                },
-            };
-            results.push(result);
-        }
-    }
-    results
+        .map(|proof| proof.check(bound))
+        .collect()
 }
 
 /// Whether every walked state reaches `goal` through the system's moves,
@@ -312,7 +229,7 @@ pub fn verify_joint_liveness(
 /// move the system makes there either can lead to a state that reaches it,
 /// or always ends in one of a few states that all do (a guard the model
 /// cannot decide, taken or refused).
-fn settle(
+pub(super) fn settle(
     model: &JointModel,
     owner: &str,
     goal: &temper_spec::predicate::Expr,
@@ -432,7 +349,7 @@ fn settle(
 /// The bytes [`settle`] holds for `explored`: per state, its marks, its
 /// place in the queue and the stuck list, and its two lists of moves in; per
 /// move, its mark and count; per edge, its place in one of those lists.
-fn settle_bytes(explored: &model::Explored<'_>) -> usize {
+pub(super) fn settle_bytes(explored: &model::Explored<'_>) -> usize {
     let per_state = 2 * size_of::<bool>()
         + 2 * size_of::<usize>()
         + 2 * (size_of::<Vec<u32>>() + super::room::block(4 * size_of::<u32>()));

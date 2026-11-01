@@ -15,7 +15,7 @@ use temper_store_sim::SimEventStore;
 
 use super::TENANT;
 use super::process_clock::ProcessClock;
-use super::specs::{CSDL, JOB, PASS};
+use super::specs::{CSDL, JOB, PASS, PRINCIPAL_GENERATION};
 use super::world::SimTimerRows;
 
 /// What outlives a process: the journal, the timer rows, the clock and the
@@ -88,9 +88,13 @@ impl Process {
                 TENANT,
                 parse_csdl(CSDL).unwrap(),
                 CSDL.to_string(),
-                &[("Job", job), ("Pass", PASS)],
+                &[
+                    ("Job", job),
+                    ("Pass", PASS),
+                    ("PrincipalGeneration", PRINCIPAL_GENERATION),
+                ],
             );
-            for entity_type in ["Job", "Pass"] {
+            for entity_type in ["Job", "Pass", "PrincipalGeneration"] {
                 registry.set_verification_status(
                     &TenantId::new(TENANT),
                     entity_type,

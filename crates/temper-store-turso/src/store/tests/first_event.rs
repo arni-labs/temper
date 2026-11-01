@@ -1,4 +1,7 @@
 //! Migration coverage uses the real worker and native SQLite engine.
+use std::time::Duration;
+
+use super::super::first_event::BATCH_HOLD;
 use super::*;
 
 async fn complete(store: &TursoEventStore) -> (i64, i64) {
@@ -44,7 +47,14 @@ async fn first_event_backfill_is_bounded_resumable_and_never_uses_a_retained_tai
         .await
         .unwrap();
     drop(conn);
-    assert_eq!(store.backfill_first_event_batch().await.unwrap(), None);
+    // Rows this small fit many in one hold: the page stops at its row count.
+    assert_eq!(
+        store
+            .backfill_first_event_batch(Duration::MAX)
+            .await
+            .unwrap(),
+        None
+    );
     let conn = store.connection().await.unwrap();
     let mut rows = conn
         .query("SELECT records, complete FROM first_event_backfill", ())
@@ -89,7 +99,7 @@ async fn first_event_backfill_is_bounded_resumable_and_never_uses_a_retained_tai
     assert_eq!(store.first_event_at("a:Ticket:0003").await.unwrap(), None);
     // The watermark covers null records too: completing again is a no-op.
     assert_eq!(
-        store.backfill_first_event_batch().await.unwrap(),
+        store.backfill_first_event_batch(BATCH_HOLD).await.unwrap(),
         Some((259, 87))
     );
     let conn = store.connection().await.unwrap();
@@ -169,5 +179,60 @@ async fn first_event_column_survives_single_and_batched_projection_writes() {
         .unwrap()
     {
         assert_eq!(row.state.unwrap()["first_event_at"], first);
+    }
+}
+
+#[tokio::test]
+async fn a_first_event_batch_commits_once_it_has_held_the_gate_for_its_hold() {
+    let url = sqlite_test_url("first-event-backfill-hold");
+    let store = TursoEventStore::new(&url, None).await.unwrap();
+    let conn = store
+        .write_connection("test", super::super::WritePriority::High)
+        .await
+        .unwrap();
+    for n in 0..3 {
+        let id = format!("{n:04}");
+        conn.execute("INSERT INTO entity_catalog (tenant, entity_type, entity_id, status, fields, state, updated_at, sequence_nr) VALUES ('a', 'Job', ?1, 'Done', '{}', '{}', '2099-01-01', 1)", params![id.clone()]).await.unwrap();
+        conn.execute("INSERT INTO events (tenant, entity_type, entity_id, sequence_nr, event_type, payload) VALUES ('a', 'Job', ?1, 1, 'Created', ?2)",
+            params![id, r#"{"timestamp":"2026-01-01T00:00:00Z"}"#]).await.unwrap();
+    }
+    conn.execute("DELETE FROM first_event_backfill", ())
+        .await
+        .unwrap();
+    drop(conn);
+    // A batch past its hold after its first row commits that row: a move
+    // waiting for the gate waits for one row, never for a page.
+    for written in 1..=3 {
+        assert_eq!(
+            store
+                .backfill_first_event_batch(Duration::ZERO)
+                .await
+                .unwrap(),
+            None
+        );
+        let conn = store.connection().await.unwrap();
+        let mut rows = conn
+            .query("SELECT records FROM first_event_backfill", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), written);
+    }
+    assert_eq!(
+        store
+            .backfill_first_event_batch(Duration::ZERO)
+            .await
+            .unwrap(),
+        Some((3, 0))
+    );
+    let rows = store
+        .load_entity_catalog_rows("a", "Job", &["0000".into(), "0002".into()])
+        .await
+        .unwrap();
+    for row in rows {
+        assert_eq!(
+            row.state.as_ref().unwrap()["first_event_at"],
+            "2026-01-01T00:00:00.000000000Z"
+        );
     }
 }
