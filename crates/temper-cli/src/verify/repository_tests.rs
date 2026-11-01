@@ -46,7 +46,7 @@ fn verify_source_collection(directory: &Path) -> Result<()> {
         }
     }
     anyhow::ensure!(!csdl.schemas.is_empty(), "CSDL must contain a Schema");
-    let sources = read_ioa_sources(directory)?;
+    let sources = input::read_ioa_files(&AppFiles::find(app_dir_of(directory)).ioa)?;
     anyhow::ensure!(!sources.is_empty(), "source contains no IOA specifications");
     input::validate_ioa_entities(&csdl, &sources)?;
     let model = build_spec_model(csdl, read_tla_sources(directory)?);

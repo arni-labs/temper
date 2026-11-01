@@ -13,7 +13,6 @@ use temper_spec::model::build_spec_model;
 
 mod input;
 mod package;
-use input::read_ioa_sources;
 
 /// Run the `temper verify` command.
 ///

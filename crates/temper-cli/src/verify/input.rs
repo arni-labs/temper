@@ -1,11 +1,6 @@
 //! Input checks for `temper verify`.
 use anyhow::{Context, Result};
-use std::{
-    collections::BTreeMap,
-    fs,
-    path::{Path, PathBuf},
-};
-use temper_platform::os_apps::{AppFiles, app_dir_of};
+use std::{collections::BTreeMap, fs, path::PathBuf};
 use temper_spec::csdl::CsdlDocument;
 
 /// Require declared IOA entities to have CSDL types and correctly qualified sets.
@@ -84,12 +79,6 @@ pub(super) fn validate_ioa_entities(
         );
     }
     Ok(())
-}
-
-/// Read the `.ioa.toml` files of the app `specs_dir` holds or belongs to, as
-/// its install reads them (`AppFiles`).
-pub(super) fn read_ioa_sources(specs_dir: &Path) -> Result<BTreeMap<String, String>> {
-    read_ioa_files(&AppFiles::find(app_dir_of(specs_dir)).ioa)
 }
 
 /// Read each IOA spec by its automaton name; two specs of one name fail.

@@ -188,11 +188,9 @@ async fn installed_entity_sets(
             found.this_app = true;
             continue;
         }
-        let app_dir = catalog()
-            .read()
-            .unwrap()
-            .app_dir(Some(tenant), &other)
-            .cloned(); // ci-ok: infallible lock
+        let cat = catalog().read().unwrap(); // ci-ok: infallible lock
+        let app_dir = cat.app_dir(Some(tenant), &other).cloned();
+        drop(cat);
         let Some(app_dir) = app_dir else {
             tracing::warn!(tenant, app = %other, "installed app is not in the catalog; its entity sets are not compared");
             continue;

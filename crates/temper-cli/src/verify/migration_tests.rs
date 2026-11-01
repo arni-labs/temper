@@ -373,7 +373,7 @@ fn verify_reads_the_files_an_install_reads() {
 
     let specs = root.join("specs");
     assert_eq!(
-        input::read_ioa_sources(&specs)
+        input::read_ioa_files(&AppFiles::find(app_dir_of(&specs)).ioa)
             .unwrap()
             .keys()
             .collect::<Vec<_>>(),
