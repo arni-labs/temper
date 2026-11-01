@@ -214,7 +214,7 @@ pub fn reload_os_apps() {
     let cat = catalog().read().unwrap(); // ci-ok: infallible lock
     let dir = cat.apps_dir.clone();
     let added = cat.added.clone();
-    let tenant_written: Vec<(String, Vec<(PathBuf, Vec<(String, AppFiles)>)>)> = cat
+    let tenant_written: Vec<_> = cat
         .tenant_installs
         .iter()
         .map(|(tenant, installs)| (tenant.clone(), installs.written.clone()))
