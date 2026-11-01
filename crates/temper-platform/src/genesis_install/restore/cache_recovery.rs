@@ -1,8 +1,8 @@
 //! Find the cache directory that still holds an install's recorded versions.
 
-use super::super::written;
+use super::super::written::{self, Written};
 use super::*;
-use crate::os_apps::written_apps_bundle_digests;
+use crate::os_apps::{list_install_dir, written_apps_bundle_digests};
 
 /// The cache directories an install of `cache_key` into `tenant` may have, the registry's first.
 ///
@@ -64,8 +64,10 @@ pub(super) async fn first_matching_install(
 /// A directory on disk is not proof on its own: an install could have stopped
 /// partway, and a file in it could have changed since. Its apps are the ones
 /// its install's list names ([`written`]), read by exact path, never by
-/// listing the directory: a directory with no list, or whose list cannot be
-/// read, is not used, and the caller fetches the files again. Each app in it
+/// listing the directory: a directory whose list cannot be read is not used,
+/// and the caller fetches the files again. A directory written before installs
+/// kept a list is listed once and gets its list from that listing (see the
+/// adoption below). Each app in it
 /// is decided on its own: it is taken when it reads back at its recorded
 /// digest, from `recorded` when that names the app, otherwise from the
 /// tenant's stored record. A record without a digest needs the app to read
@@ -83,8 +85,34 @@ pub(super) async fn cached_apps_matching_records(
     if !cache_root.is_dir() {
         return None;
     }
-    let apps = match written::read(cache_root) {
-        Ok(apps) => apps,
+    // `adopted` is the one listing of a cache written before installs kept
+    // their file list, when this root has no list yet.
+    let (apps, adopted) = match written::read(cache_root) {
+        Ok(apps) => (apps, None),
+        Err(_) if !written::exists(cache_root) => {
+            // Caches written before `.written.json` existed have no list.
+            // Fetching each again would hold the first boot after the list
+            // shipped for every install in turn, before the listener binds, so
+            // such a root is listed once instead. Its apps are taken only
+            // where that listing reads back at the recorded digest: a listing
+            // that came back short reads back as another digest and the root
+            // is fetched again, as one that does not match always is. The list
+            // is then written from that listing, and every later boot reads it.
+            // Delete this once every install has a list.
+            let listed: Written = list_install_dir(cache_root).into_iter().collect();
+            match written::app_files(cache_root, listed.clone()) {
+                Ok(apps) => (apps, Some(listed)),
+                Err(error) => {
+                    tracing::warn!(
+                        tenant = %record.tenant,
+                        app = %record.app_name,
+                        error = %error,
+                        "An install's cache directory from before file lists holds no usable apps; it is not used"
+                    );
+                    return None;
+                }
+            }
+        }
         Err(error) => {
             tracing::warn!(
                 tenant = %record.tenant,
@@ -117,6 +145,17 @@ pub(super) async fn cached_apps_matching_records(
             "An install's cache directory does not hold its recorded version; it is not used"
         );
         return None;
+    }
+    if let Some(mut listed) = adopted {
+        listed.retain(|app, _| matching.contains(app));
+        if let Err(error) = written::keep(cache_root, &listed) {
+            tracing::warn!(
+                tenant = %record.tenant,
+                app = %record.app_name,
+                error = %error,
+                "An install's cache directory matched its records but its file list could not be kept; the next boot lists it again"
+            );
+        }
     }
     Some(
         apps.into_iter()

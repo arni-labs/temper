@@ -49,6 +49,11 @@ pub(super) fn read(root: &Path) -> Result<Vec<(String, AppFiles)>, String> {
     app_files(root, load(root)?)
 }
 
+/// Whether `root` has a list at all, readable or not.
+pub(super) fn exists(root: &Path) -> bool {
+    root.join(LIST).exists()
+}
+
 fn load(root: &Path) -> Result<Written, String> {
     let path = root.join(LIST);
     let text = std::fs::read(&path)

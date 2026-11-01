@@ -241,6 +241,74 @@ async fn a_genesis_install_is_restored_as_recorded_after_every_restart() {
     }
 }
 
+/// A cache written before installs kept their file list restores from one
+/// listing, with no fetch: its registry is a port nothing answers on, and the
+/// restore still counts it. The listing becomes its list, so the next boot
+/// reads the list.
+#[tokio::test]
+async fn a_cache_from_before_file_lists_restores_without_a_fetch_and_keeps_a_list() {
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let tenant = format!("{TENANT}-before-lists");
+    let version = "3".repeat(40);
+    let app_ref = format!("acme/notes@{version}");
+    let mut platform = PlatformState::new(None);
+    platform.server.data_dir = data_dir.path().to_path_buf();
+    let cache = genesis_cache_root(
+        &platform.server,
+        CacheOwner::Install {
+            tenant: &tenant,
+            source: InstallSource::Registry("default"),
+        },
+        &app_ref,
+    );
+    write_app(&cache, "notes", "cached before lists");
+    let installed = InstalledAppRecord {
+        tenant: tenant.clone(),
+        app_ref,
+        version_hash: version.clone(),
+        pinned_version_hash: version.clone(),
+        current_version_hash: version,
+        follow_policy: "pinned".to_string(),
+        registry_url: "http://127.0.0.1:9".to_string(),
+        registry_tenant: "default".to_string(),
+        status: "installed".to_string(),
+        ..recorded(&cache, "notes")
+    };
+    let list = cache.join(".written.json");
+    std::fs::remove_file(&list).expect("a cache from before lists has none");
+    let ps = Arc::new(store());
+    ps.record_installed_app_metadata(&installed)
+        .await
+        .expect("record the Genesis install");
+
+    assert_eq!(
+        boot(data_dir.path(), &ps).await,
+        1,
+        "restored with no fetch"
+    );
+    assert!(list.is_file(), "the listing became its list");
+    assert_eq!(
+        written_digest(&cache, "notes"),
+        installed.bundle_digest,
+        "the kept list names the recorded version's files"
+    );
+    assert_eq!(boot(data_dir.path(), &ps).await, 1, "and restores from it");
+}
+
+/// A cache from before file lists whose listing does not read back at the
+/// recorded version is not used, and gets no list: the caller fetches it.
+#[tokio::test]
+async fn a_cache_from_before_file_lists_at_another_version_gets_no_list() {
+    let root = tempfile::tempdir().expect("cache root");
+    write_app(root.path(), "notes", "first version");
+    let record = recorded(root.path(), "notes");
+    write_app(root.path(), "notes", "another version");
+    let list = root.path().join(".written.json");
+    std::fs::remove_file(&list).expect("no list");
+    assert_eq!(matching(&store(), root.path(), &record).await, None);
+    assert!(!list.exists());
+}
+
 #[tokio::test]
 async fn a_replay_installs_nothing_when_only_another_bundle_of_the_name_is_here() {
     let data_dir = tempfile::tempdir().expect("data dir");

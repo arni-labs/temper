@@ -45,9 +45,9 @@ pub use app_catalog::{
     tenant_os_app,
 };
 pub(crate) use app_catalog::{load_tenant_os_app, tenant_os_app_dir};
-pub use app_files::AppFiles;
 #[cfg(test)]
 pub(crate) use app_files::seam as app_files_seam;
+pub use app_files::{AppFiles, list_install_dir};
 pub(crate) use bundle_files::find_ioa_files;
 use bundle_files::{
     find_adrs, find_agents, find_app_skills, find_cedar_policies, find_csdl, find_seed_data,

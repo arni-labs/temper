@@ -150,6 +150,24 @@ fn folder_prefix(path: &str) -> String {
     }
 }
 
+/// Every app folder of install directory `root`, each with every file below
+/// it, found by listing `root` once. Folders whose names start with a dot
+/// (an install's staging folders) are not apps.
+///
+/// Only for adopting an install cache written before installs kept their
+/// file list (see `genesis_install::restore::cache_recovery`); delete it with
+/// that adoption.
+pub fn list_install_dir(root: &Path) -> Vec<(String, BTreeSet<String>)> {
+    list(root)
+        .into_iter()
+        .filter(|(name, is_dir)| *is_dir && !name.starts_with('.'))
+        .map(|(name, _)| {
+            let files = AppFiles::Listed(root.join(&name)).files_under("");
+            (name, files.into_iter().collect())
+        })
+        .collect()
+}
+
 /// `folder/name`, where an empty `folder` is the app's own.
 pub(super) fn join(folder: &str, name: &str) -> String {
     match (folder.is_empty(), name.is_empty()) {
