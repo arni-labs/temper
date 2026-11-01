@@ -267,3 +267,6 @@ async fn validate_ioa_checks_a_failing_spec_again() {
         assert!(answer.get("kept").is_none(), "attempt {attempt}: {answer}");
     }
 }
+
+#[path = "spec_validate_endpoint/queue.rs"]
+mod queue;
