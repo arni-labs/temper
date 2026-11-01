@@ -1,18 +1,19 @@
 //! The one install every source of app files ends in.
 //!
-//! A source only puts an app closure's files in a cache directory: the
-//! registry fetches a pinned Genesis closure, a push writes the files its
-//! caller sent. From there every install is the same: each spec is checked,
-//! the directory becomes what the tenant resolves, the closure reconciles and
-//! is verified runtime-ready, and the install commits with its records or goes
-//! back to the version installed before it.
+//! A source only puts an app closure's files in a cache directory and names
+//! each app's files: the registry fetches a pinned Genesis closure, a push
+//! writes the files its caller sent. From there every install is the same:
+//! each spec is checked, the named files become what the tenant resolves, the
+//! closure reconciles and is verified runtime-ready, and the install commits
+//! with its records or goes back to the version installed before it. Nothing
+//! here lists the directory the source just wrote.
 
 use std::time::Duration;
 
 use temper_verify::CascadeResult;
 
 use super::*;
-use crate::os_apps::{find_ioa_files, installed_line};
+use crate::os_apps::{AppFiles, find_ioa_files, installed_line};
 
 /// Where an installed closure came from, as its install records name it.
 pub(super) struct ClosureSource<'a> {
@@ -30,10 +31,17 @@ pub(super) struct MaterializedClosure<'a> {
     /// The closure's root app.
     pub(super) root: RegistryAppRef,
     /// Every app the directory holds at its version, the root among them.
-    pub(super) refs: Vec<RegistryAppRef>,
+    pub(super) apps: Vec<MaterializedApp>,
     pub(super) source: ClosureSource<'a>,
     /// Time each spec's check may take.
     pub(super) budget: Duration,
+}
+
+/// One app of a closure: its version, and the files its source wrote for it
+/// at `<cache root>/<name>`.
+pub(super) struct MaterializedApp {
+    pub(super) version: RegistryAppRef,
+    pub(super) files: AppFiles,
 }
 
 /// A closure installed and recorded.
@@ -68,18 +76,16 @@ pub(super) async fn install_materialized_closure(
     cache_root: &Path,
     closure: MaterializedClosure<'_>,
 ) -> Result<ClosureInstalled, ClosureRefused> {
-    let materialized: Vec<String> = closure.refs.iter().map(|r| r.name.clone()).collect();
+    let materialized: Vec<String> = closure
+        .apps
+        .iter()
+        .map(|app| app.version.name.clone())
+        .collect();
 
     // Checked before anything changes, so a refusal leaves the tenant as it was.
-    let checks = check_closure_specs(
-        platform,
-        cache_root,
-        &closure.root.name,
-        &materialized,
-        closure.budget,
-    )
-    .await
-    .map_err(ClosureRefused::Failed)?;
+    let checks = check_closure_specs(platform, &closure.root.name, &closure.apps, closure.budget)
+        .await
+        .map_err(ClosureRefused::Failed)?;
     if checks
         .values()
         .any(|check| !check.all_passed || check.stopped.is_some())
@@ -113,7 +119,12 @@ pub(super) async fn install_materialized_closure(
         .find(|record| record.app_name == closure.root.name)
         .cloned();
 
-    register_install_cache(tenant, cache_root.to_path_buf(), DirApps::Every);
+    let written = closure
+        .apps
+        .iter()
+        .map(|app| (app.version.name.clone(), app.files.clone()))
+        .collect();
+    register_written_apps(tenant, cache_root.to_path_buf(), written);
 
     let reconcile_started = Instant::now();
     let reconcile_result =
@@ -217,7 +228,7 @@ pub(super) async fn record_closure(
         closure.app_ref,
         root_hash.trim_start_matches('@')
     );
-    for materialized_ref in &closure.refs {
+    for materialized_ref in closure.apps.iter().map(|app| &app.version) {
         let Some(version_hash) = materialized_ref.version_hash.as_deref() else {
             continue;
         };
@@ -271,27 +282,23 @@ pub(super) async fn record_closure(
 /// read what an earlier passing check read gets that kept verdict back at once.
 async fn check_closure_specs(
     platform: &PlatformState,
-    cache_root: &Path,
     root_app: &str,
-    apps: &[String],
+    apps: &[MaterializedApp],
     budget: Duration,
 ) -> Result<BTreeMap<String, CascadeResult>, String> {
     let mut checks = BTreeMap::new();
     for app in apps {
-        let app_dir = cache_root.join(app);
-        for (_, path) in find_ioa_files(&app_dir) {
-            let relative = path
-                .strip_prefix(&app_dir)
-                .ok()
-                .and_then(Path::to_str)
-                .ok_or_else(|| format!("spec '{}' is outside its app", path.display()))?;
-            let key = if app == root_app {
-                relative.to_string()
+        let name = &app.version.name;
+        for path in find_ioa_files(&app.files) {
+            let key = if name == root_app {
+                path.clone()
             } else {
-                format!("{app}/{relative}")
+                format!("{name}/{path}")
             };
-            let source = std::fs::read_to_string(&path)
-                .map_err(|error| format!("spec '{key}' could not be read: {error}"))?;
+            let source = app
+                .files
+                .read_text(&path)
+                .map_err(|error| format!("spec '{key}': {error}"))?;
             let check = temper_server::observe::check_ioa(
                 &platform.server,
                 source,

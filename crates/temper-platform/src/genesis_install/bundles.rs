@@ -10,11 +10,13 @@ use super::bundle_transport::decode_bundle_response;
 use super::cache_paths::{
     app_cache_dir, replace_directory, validate_git_object_id, validate_identity_component,
 };
+use super::closure_install::MaterializedApp;
 use super::registry::{RegistryUrl, registry_client};
 use super::{
     GenesisRegistryBundleApp, GenesisRegistryBundleFile, GenesisRegistryBundleResponse,
     RegistryAppRef, parse_registry_app_ref,
 };
+use crate::os_apps::AppFiles;
 
 pub(super) const MAX_GENESIS_BUNDLE_FILES: usize = 4096;
 pub(super) const MAX_GENESIS_BUNDLE_APPS: usize = 256;
@@ -32,12 +34,14 @@ const MAX_GENESIS_TREE_ENTRIES: usize = 16_384;
 const MAX_GENESIS_TREE_DEPTH: usize = 128;
 const MAX_GENESIS_TREE_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Fetch the pinned closure's bundle and write it whole to `cache_root`:
+/// each app at `<cache_root>/<name>`, with the files it was written with.
 pub(super) async fn materialize_registry_app_closure_via_bundle(
     registry: &RegistryUrl,
     registry_tenant: &str,
     root_ref: RegistryAppRef,
     cache_root: &Path,
-) -> Result<Vec<RegistryAppRef>, String> {
+) -> Result<Vec<MaterializedApp>, String> {
     let Some(version_hash) = root_ref.version_hash.as_deref() else {
         return Err("bundle fetch requires a pinned root app ref".to_string());
     };
@@ -75,19 +79,21 @@ pub(super) async fn materialize_registry_app_closure_via_bundle(
         .tempdir_in(cache_parent)
         .map_err(|error| format!("create staged Genesis bundle cache: {error}"))?;
 
-    let mut refs = Vec::new();
+    let mut apps = Vec::new();
     for app in bundle.apps {
         validate_identity_component("owner", &app.owner)?;
-        let app_dir = app_cache_dir(staged_cache.path(), &app.name)?;
-        write_bundle_app(&app_dir, &app)?;
-        refs.push(RegistryAppRef {
+        let paths = write_bundle_app(&app_cache_dir(staged_cache.path(), &app.name)?, &app)?;
+        // Where the app is once the staged closure is renamed into place.
+        let files = AppFiles::written(app_cache_dir(cache_root, &app.name)?, paths);
+        let version = RegistryAppRef {
             owner: app.owner,
             name: app.name,
             version_hash: Some(app.version_hash),
-        });
+        };
+        apps.push(MaterializedApp { version, files });
     }
     replace_directory(staged_cache.keep(), cache_root)?;
-    Ok(refs)
+    Ok(apps)
 }
 
 fn validate_registry_bundle(
@@ -190,10 +196,12 @@ fn validate_registry_bundle(
     Ok(())
 }
 
+/// Write `app`'s files into `app_dir`, and return the path of each inside
+/// it, `/`-separated.
 pub(super) fn write_bundle_app(
     app_dir: &Path,
     app: &GenesisRegistryBundleApp,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     if app_dir.exists() {
         std::fs::remove_dir_all(app_dir).map_err(|error| {
             format!("clear Genesis bundle app '{}': {error}", app_dir.display())
@@ -202,9 +210,11 @@ pub(super) fn write_bundle_app(
     std::fs::create_dir_all(app_dir)
         .map_err(|error| format!("create Genesis bundle app '{}': {error}", app_dir.display()))?;
 
+    let mut written = Vec::new();
     for file in &app.files {
         let rel = safe_bundle_relative_path(&file.path)?;
         let path = app_dir.join(&rel);
+        written.push(rel.to_string_lossy().replace('\\', "/"));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
                 format!("create bundle file parent '{}': {error}", parent.display())
@@ -222,7 +232,7 @@ pub(super) fn write_bundle_app(
         std::fs::write(&path, bytes)
             .map_err(|error| format!("write bundle file '{}': {error}", path.display()))?;
     }
-    Ok(())
+    Ok(written)
 }
 
 pub(super) fn safe_bundle_relative_path(path: &str) -> Result<PathBuf, String> {

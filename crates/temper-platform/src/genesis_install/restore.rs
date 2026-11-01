@@ -228,7 +228,7 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
         )
         .await
         {
-            Ok(materialized) => Ok(materialized),
+            Ok(_) => Ok(()),
             Err(error) if genesis_git_fallback_enabled() => {
                 tracing::warn!(
                     tenant = %tenant,
@@ -238,7 +238,9 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
                     error = %error,
                     "Genesis bundle cache recovery failed; falling back to git clone because TEMPER_GENESIS_INSTALL_GIT_FALLBACK is enabled"
                 );
-                materialize_registry_app_closure(&registry, root_ref, &cache_root).await
+                materialize_registry_app_closure(&registry, root_ref, &cache_root)
+                    .await
+                    .map(|_| ())
             }
             Err(error) => Err(error),
         };
