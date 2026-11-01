@@ -11,12 +11,14 @@ use temper_runtime::tenant::TenantId;
 use temper_server::platform_store::{InstalledAppRecord, PlatformStore};
 
 mod cache_recovery;
+mod fetch;
 mod rollback;
 
 use cache_recovery::{
     cached_apps_matching_records, first_matching_install, install_cache_candidates,
 };
 
+pub use fetch::{CacheFetchSummary, CacheFetches};
 pub(super) use rollback::rollback_to_prior;
 
 use super::registry::recorded_registry;
@@ -118,6 +120,26 @@ pub async fn restore_genesis_app_cache_roots(platform: &PlatformState) -> usize 
 }
 
 /// Rebuild local cache roots for apps that were installed from a remote Genesis
+/// registry into this Temper instance, and return how many came from disk.
+///
+/// The installs whose files must be fetched again go on fetching after this
+/// returns; see [`start_genesis_registry_cache_recovery`].
+pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> usize {
+    start_genesis_registry_cache_recovery(platform)
+        .await
+        .restored
+}
+
+/// What a boot's Genesis cache recovery restored from disk, and the fetches it
+/// started for the rest.
+pub struct GenesisCacheRecovery {
+    /// Installs restored from their cache directories.
+    pub restored: usize,
+    /// One fetch for each install whose files were not on disk.
+    pub fetching: CacheFetches,
+}
+
+/// Rebuild local cache roots for apps that were installed from a remote Genesis
 /// registry into this Temper instance.
 ///
 /// These rows live in the target instance's durable installed-app table. They
@@ -128,36 +150,54 @@ pub async fn restore_genesis_app_cache_roots(platform: &PlatformState) -> usize 
 ///
 /// Every stored install comes back, whatever the registry setting is now: from
 /// its cache directory when that holds the recorded version, otherwise fetched
-/// again from the registry it was installed from. An install whose files can
-/// be neither found nor fetched keeps its record, and the reason is logged.
-/// Each app in a directory is taken only while it matches its own record, so a
-/// dependency installed again separately keeps the version it has now.
-pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> usize {
+/// again from the registry it was installed from. The cache directories are
+/// read before this returns. The fetches each run on their own and are not
+/// waited for, so a slow or missing bundle holds neither the boot nor any other
+/// install, and a fetched install brings its apps up itself. An install whose
+/// files can be neither found nor fetched keeps its record, and the reason is
+/// logged at WARN. Each app in a directory is taken only while it matches its
+/// own record, so a dependency installed again separately keeps the version it
+/// has now.
+pub async fn start_genesis_registry_cache_recovery(
+    platform: &PlatformState,
+) -> GenesisCacheRecovery {
+    let nothing = || GenesisCacheRecovery {
+        restored: 0,
+        fetching: CacheFetches::none(),
+    };
     let Some(ps) = platform
         .server
         .storage_stack
         .as_ref()
         .and_then(|stack| stack.platform.clone())
     else {
-        return 0;
+        return nothing();
     };
 
     let installed = match ps.list_all_installed_apps().await {
         Ok(installed) => installed,
         Err(error) => {
-            tracing::warn!(error = %error, "Failed to list installed apps for Genesis cache recovery");
-            return 0;
+            tracing::warn!(
+                recovery = "genesis_cache",
+                result = "error",
+                error = %error,
+                "Failed to list installed apps for Genesis cache recovery"
+            );
+            return nothing();
         }
     };
 
     let mut restored = 0usize;
     let mut seen = BTreeSet::new();
-    for (tenant, app_name) in installed {
+    let mut pending = Vec::new();
+    for (tenant, app_name) in installed.iter().cloned() {
         let record = match ps.get_installed_app(&tenant, &app_name).await {
             Ok(Some(record)) => record,
             Ok(None) => continue,
             Err(error) => {
                 tracing::warn!(
+                    recovery = "genesis_cache",
+                    result = "error",
                     tenant = %tenant,
                     app = %app_name,
                     error = %error,
@@ -176,6 +216,8 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
             Ok(root_ref) => root_ref,
             Err(error) => {
                 tracing::warn!(
+                    recovery = "genesis_cache",
+                    result = "error",
                     tenant = %tenant,
                     app = %app_name,
                     app_ref = %record.app_ref,
@@ -210,6 +252,8 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
             Ok(registry) => registry,
             Err(error) => {
                 tracing::warn!(
+                    recovery = "genesis_cache",
+                    result = "error",
                     tenant = %tenant,
                     app = %app_name,
                     app_ref = %record.app_ref,
@@ -219,61 +263,20 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
                 continue;
             }
         };
-        let materialized = match materialize_registry_app_closure_via_bundle(
-            &registry,
-            registry_tenant,
-            root_ref.clone(),
-            &cache_root,
-        )
-        .await
-        {
-            Ok(_) => Ok(()),
-            Err(error) if genesis_git_fallback_enabled() => {
-                tracing::warn!(
-                    tenant = %tenant,
-                    app = %app_name,
-                    app_ref = %record.app_ref,
-                    registry_url = %registry.as_str(),
-                    error = %error,
-                    "Genesis bundle cache recovery failed; falling back to git clone because TEMPER_GENESIS_INSTALL_GIT_FALLBACK is enabled"
-                );
-                materialize_registry_app_closure(&registry, root_ref, &cache_root)
-                    .await
-                    .map(|_| ())
-            }
-            Err(error) => Err(error),
-        };
-        match materialized {
-            Ok(_) => {
-                legacy_specs::convert_legacy_bundle_specs(&cache_root);
-                match cached_apps_matching_records(ps.as_ref(), &cache_root, &record, recorded)
-                    .await
-                {
-                    Some(apps) => {
-                        register_written_apps(&tenant, cache_root, apps);
-                        restored += 1;
-                    }
-                    None => tracing::warn!(
-                        tenant = %tenant,
-                        app = %app_name,
-                        app_ref = %record.app_ref,
-                        "Fetched Genesis app files do not hold the recorded version; its install record is kept"
-                    ),
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    tenant = %tenant,
-                    app = %app_name,
-                    app_ref = %record.app_ref,
-                    error = %error,
-                    "Failed to fetch installed Genesis app files again; its install record is kept"
-                );
-            }
-        }
+        pending.push(fetch::Pending {
+            registry_tenant: registry_tenant.to_string(),
+            tenant,
+            record,
+            registry,
+            root_ref,
+            cache_root,
+        });
     }
 
-    restored
+    GenesisCacheRecovery {
+        restored,
+        fetching: fetch::spawn(platform, ps, pending, installed),
+    }
 }
 
 /// Recover the root and each dependency independently, even when another bundle is missing.

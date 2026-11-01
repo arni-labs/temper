@@ -400,9 +400,13 @@ async fn partial_rollback_preserves_each_dependency_for_retry_and_boot_recovery(
             &["missing", "cached", "bundled"],
         );
         let rebooted = server_on(data_dir.path(), &ps);
+        let recovery = start_genesis_registry_cache_recovery(&rebooted).await;
         assert_eq!(
-            restore_genesis_registry_cache_roots(&rebooted).await,
-            2,
+            (
+                recovery.restored,
+                recovery.fetching.finished().await.fetched
+            ),
+            (1, 1),
             "seed {seed}: boot restores the cached dependency and fetches the missing one"
         );
         crate::genesis_install::rollback_to_prior(

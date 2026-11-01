@@ -206,6 +206,9 @@ pub async fn adopt_catalog_app(
 ) -> Result<Option<String>, String> {
     validate_identity_component("tenant", tenant)?;
     validate_identity_component("app name", app)?;
+    // Adoption replaces the catalog and its record, just like a new install;
+    // a late recovery must see either side of that replacement, never half.
+    let _turn = temper_server::host_turn::take().await?;
     if recorded_digest(platform, tenant, app).await.is_some() {
         return Ok(None);
     }
