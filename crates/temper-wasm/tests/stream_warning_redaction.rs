@@ -47,6 +47,7 @@ async fn stream_setup_warning_keeps_host_and_path_without_secrets() {
         format!("https://h/build?account=user@{key}"),
         format!("https://user:password@h/build#user@{key}"),
         "https://h/0123456789abcdef~fedcba9876543210/build".to_string(),
+        "https://h/0123456789abcdef.fedcba9876543210/build".to_string(),
     ] {
         let wat = format!(
             r#"(module
@@ -109,13 +110,15 @@ async fn stream_setup_warning_keeps_host_and_path_without_secrets() {
         .collect();
     assert_eq!(
         warnings.len(),
-        3,
+        4,
         "must observe each stream refusal: {output}"
     );
-    for (warning, expected_url) in warnings
-        .iter()
-        .zip(["h/build", "h/build", "h/<redacted>/build"])
-    {
+    for (warning, expected_url) in warnings.iter().zip([
+        "h/build",
+        "h/build",
+        "h/<redacted>/build",
+        "h/<redacted>/build",
+    ]) {
         assert_eq!(warning["level"], "WARN");
         assert_eq!(warning["fields"]["url"], expected_url);
         assert_eq!(warning["fields"]["http_method"], "TRACE");
@@ -126,7 +129,12 @@ async fn stream_setup_warning_keeps_host_and_path_without_secrets() {
                 .contains("unsupported HTTP method")
         );
     }
-    for secret in [key, "password", "0123456789abcdef~fedcba9876543210"] {
+    for secret in [
+        key,
+        "password",
+        "0123456789abcdef~fedcba9876543210",
+        "0123456789abcdef.fedcba9876543210",
+    ] {
         assert!(!output.contains(secret), "logs contain a secret: {output}");
     }
 }

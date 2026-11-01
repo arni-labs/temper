@@ -2395,14 +2395,23 @@ fn key_shaped(run: &str) -> bool {
 }
 
 fn without_keys(path: &str) -> String {
-    let is_run = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '~';
+    let is_run = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~');
     let mut kept = String::with_capacity(path.len());
     let mut rest = path;
     while let Some(start) = rest.find(is_run) {
         let (before, from) = rest.split_at(start);
         kept.push_str(before);
         let (run, after) = from.split_at(from.find(|c| !is_run(c)).unwrap_or(from.len()));
-        kept.push_str(if key_shaped(run) { "<redacted>" } else { run });
+        // Dots in ('...') separate entity-ID components that readers join spans
+        // on. Keep those IDs only when no individual component is key-shaped.
+        let readable_entity_id = before.ends_with("('")
+            && after.starts_with("')")
+            && run.split('.').all(|part| !key_shaped(part));
+        kept.push_str(if key_shaped(run) && !readable_entity_id {
+            "<redacted>"
+        } else {
+            run
+        });
         rest = after;
     }
     kept.push_str(rest);

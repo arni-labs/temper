@@ -167,7 +167,7 @@ fn session_invocation_context() -> WasmInvocationContext {
 }
 
 /// The shapes a secret in a URL takes. None may reach a span, a log line or the module's error.
-const KEYS: [&str; 5] = [
+const KEYS: [&str; 6] = [
     // Katagami's interface builder's address.
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     // A Slack webhook's last segment.
@@ -176,6 +176,8 @@ const KEYS: [&str; 5] = [
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJ",
     // A key whose tilde joins two individually short runs.
     "0123456789abcdef~fedcba9876543210",
+    // A period joins two individually short runs into one path key.
+    "0123456789abcdef.fedcba9876543210",
     // 32 hex, which also parses as a UUID with its hyphens left out.
     "fedcba9876543210fedcba9876543210",
 ];
@@ -295,6 +297,15 @@ fn a_url_in_telemetry_keeps_what_a_reader_needs() {
     assert_eq!(
         seen("http://h/bot123456789:AAE-abcdefghijklmnopqrstuvwxyz012345/sendMessage"),
         "h/bot123456789:<redacted>/sendMessage"
+    );
+    assert_eq!(
+        seen("https://h/0123456789abcdef.fedcba9876543210/build"),
+        "h/<redacted>/build"
+    );
+    // Entity expressions do not exempt an individual key-shaped component.
+    assert_eq!(
+        seen("https://h/tdata/Entities('0123456789abcdef0123456789abcdef.short')/Kept"),
+        "h/tdata/Entities('<redacted>')/Kept"
     );
     assert_eq!(seen("http://h"), "h");
     for suffix in [
