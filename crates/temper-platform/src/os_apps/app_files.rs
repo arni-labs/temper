@@ -72,16 +72,15 @@ impl AppFiles {
             }));
         }
 
-        files.policies = files_ending_in(&app_dir.join("policies"), ".cedar");
+        files.policies = cedar_files_in(&app_dir.join("policies"));
         let manifest = read_app_manifest(app_dir);
         let commons = manifest.as_ref().is_some_and(|manifest| {
             effective_app_deployment_mode(manifest) == AppDeploymentMode::Commons
         });
         if commons {
-            files.policies.extend(files_ending_in(
-                &app_dir.join("policies").join("commons"),
-                ".cedar",
-            ));
+            files
+                .policies
+                .extend(cedar_files_in(&app_dir.join("policies").join("commons")));
         }
 
         let wasm_dir = app_dir.join("wasm");
@@ -171,6 +170,27 @@ pub(super) fn module_binary(wasm_dir: &Path, module: &WasmModuleManifest) -> Opt
         }
     }
     candidates.into_iter().find(|path| path.is_file())
+}
+
+/// Cedar policy files in `dir`, sorted: a `.cedar` extension in any case,
+/// as `temper serve` loads them.
+fn cedar_files_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("cedar"))
+        })
+        .collect();
+    files.sort();
+    files
 }
 
 fn ioa_files_in(dir: &Path) -> Vec<PathBuf> {
