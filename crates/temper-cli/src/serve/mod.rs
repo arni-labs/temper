@@ -9,6 +9,7 @@
 
 mod actor_runtime;
 mod bootstrap;
+mod data_dir;
 mod loader;
 mod local_sandbox;
 mod observe_ui;
@@ -115,8 +116,7 @@ pub async fn run(
             temper_platform::module_review::ModuleReviewer::new(judge),
         ));
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let data_dir = Path::new(&home).join(".local/share/temper");
+    let data_dir = data_dir::data_dir();
     state.server.data_dir = data_dir.clone();
     state.server.files_need_object_store = storage::files_need_object_store();
 
