@@ -286,7 +286,7 @@ impl ServerState {
         agent.idempotency_key = Some(key.clone());
         agent.event_origin = None;
         agent.fires_scheduled_action = Some(timer.row());
-        super::timer_cause::mark_timer_fire(&mut agent);
+        super::timer_cause::mark_timer_fire(&mut agent, None);
         let mut wait = FIRST_RETRY_WAIT;
         let mut retried = false;
         // The last attempt's caller, with the answer the timers its move sets

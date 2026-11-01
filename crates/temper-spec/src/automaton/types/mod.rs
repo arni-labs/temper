@@ -32,16 +32,24 @@ use crate::predicate::{Arg, Expr};
 pub fn is_server_derived_field_name(name: &str) -> bool {
     matches!(
         name,
-        "Id" | "id"
-            | "Status"
-            | "status"
-            | "has_spec"
-            | "HasSpec"
-            | "first_event_at"
-            | "last_event_at"
-            | "last_event_via"
-            | "last_event_by"
-    ) || is_server_derived_context_status_name(name)
+        "Id" | "id" | "Status" | "status" | "has_spec" | "HasSpec"
+    ) || is_event_metadata_field(name)
+        || is_server_derived_context_status_name(name)
+}
+
+/// What the kernel keeps of a record's events, read at the top of the record
+/// and never from an app's fields.
+pub const EVENT_METADATA_FIELDS: [&str; 5] = [
+    "first_event_at",
+    "last_event_at",
+    "last_event_via",
+    "last_event_by",
+    "timer_needs_person",
+];
+
+/// Whether `name` is one of the [`EVENT_METADATA_FIELDS`].
+pub fn is_event_metadata_field(name: &str) -> bool {
+    EVENT_METADATA_FIELDS.contains(&name)
 }
 
 /// Return whether a field is in the server-derived context-status namespace.

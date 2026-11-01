@@ -10,22 +10,19 @@
 //! checks as the service, and a move that binds its caller
 //! (`authenticated_subject`).
 //!
-//! The record's journal keeps who moved it by request (`EventOrigin`). Timer,
-//! reaction and integration moves keep no principal, since each follows the
-//! move before it, so the newest move made by request names the principal the
-//! record's later timers and reactions follow from. A timer that nothing else
-//! names a setter for is set as that principal; only when the journal names
-//! no one does it stay the service's. A reaction from another record also
-//! keeps the principal of its own chain, which no event records, so for a
-//! record moved that way since its last request, the journal names the last
-//! principal that moved the record itself.
+//! The record's journal keeps who each move ran as (`EventOrigin`), however it
+//! came about, and a move the kernel's own identities made names no one. The
+//! newest move that names someone says who the record's later timers follow
+//! from. A timer that nothing else names a setter for is set as that
+//! principal; only when the journal names no one does it stay the service's.
 //!
 //! The journal keeps less than a row. A person comes back as they moved the
 //! record. An agent comes back only when its event keeps whom it acted for,
 //! its type and its role: Cedar's role forbids decide what an agent may do,
 //! so an agent set up without its role could do more than its token let it.
 //! An agent whose event does not keep them (one written before events kept
-//! them) leaves the timer as it was. Neither keeps the credential its token
+//! them) leaves the timer as it was. A move from before moves named who they
+//! ran as is not read: a record only such moves made stays nameless. Neither keeps the credential its token
 //! was issued under, so the fire's revocation check does not apply to it, as
 //! for a timer set before identities kept credentials (`timer_standing`).
 
@@ -33,17 +30,17 @@ use temper_authz::{PrincipalKind, SecurityContext};
 use temper_runtime::persistence::PersistenceError;
 use temper_runtime::tenant::TenantId;
 
-use crate::entity_actor::{EntityEvent, EventOrigin, EventVia};
+use crate::entity_actor::{EntityEvent, EventOrigin};
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
 
 /// The service a timer fires as when nobody armed it: a record found in a
-/// timed state with no timer armed, no row and no move made by request.
+/// timed state with no timer armed, no row and no move that names someone.
 pub(super) const STATE_TIMER_SERVICE: &str = "state-timer";
 
 /// How many journal events one read takes while looking back for the newest
-/// move made by request. The reason is the store: a read costs its rows, and
-/// most records' newest request is among their newest events. A longer
+/// move that names someone. The reason is the store: a read costs its rows,
+/// and most records' newest such move is among their newest events. A longer
 /// journal is read page by page, as far back as it goes.
 const JOURNAL_PAGE: usize = 64;
 
@@ -56,7 +53,7 @@ pub(super) fn is_state_timer_service(agent: &AgentContext) -> bool {
 }
 
 impl ServerState {
-    /// The principal of the record's newest move made by request, set up
+    /// The principal of the record's newest move that names someone, set up
     /// again as its journal keeps it; None when the journal names no one it
     /// can set up (see the module doc), or there is no journal. An error is a
     /// journal that could not be read.
@@ -80,8 +77,8 @@ impl ServerState {
                 else {
                     continue;
                 };
-                if event.origin.via == Some(EventVia::Request) && event.origin.by.is_some() {
-                    return Ok(requested_by(&event.origin));
+                if event.origin.by.is_some() {
+                    return Ok(named_by(&event.origin));
                 }
             }
             match page.first() {
@@ -94,10 +91,10 @@ impl ServerState {
     }
 }
 
-/// The principal a request's origin names, as a context to fire with; None
+/// The principal a move's origin names, as a context to fire with; None
 /// for an agent whose origin does not keep whom it acted for, its type and
 /// its role.
-fn requested_by(origin: &EventOrigin) -> Option<AgentContext> {
+fn named_by(origin: &EventOrigin) -> Option<AgentContext> {
     let by = origin.by.as_deref().filter(|by| !by.is_empty())?;
     let security_ctx = match (&origin.agent_type, &origin.acting_for) {
         (None, None) => SecurityContext::from_verified_jwt(
@@ -129,6 +126,7 @@ fn requested_by(origin: &EventOrigin) -> Option<AgentContext> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entity_actor::EventVia;
 
     fn origin(by: &str) -> EventOrigin {
         EventOrigin {
@@ -144,7 +142,7 @@ mod tests {
             role: Some("owner".into()),
             ..origin("ann")
         };
-        let context = requested_by(&person).and_then(|agent| agent.security_ctx);
+        let context = named_by(&person).and_then(|agent| agent.security_ctx);
         let principal = context.expect("a person comes back").principal;
         assert_eq!(principal.id, "ann");
         assert_eq!(principal.kind, PrincipalKind::Customer);
@@ -159,12 +157,12 @@ mod tests {
             agent_type: Some("claude-code".into()),
             ..origin("hub-client")
         };
-        assert!(requested_by(&agent).is_none(), "no role, no agent");
+        assert!(named_by(&agent).is_none(), "no role, no agent");
         let with_role = EventOrigin {
             role: Some("run".into()),
             ..agent
         };
-        let principal = requested_by(&with_role)
+        let principal = named_by(&with_role)
             .and_then(|agent| agent.security_ctx)
             .expect("an agent with its role comes back")
             .principal;
@@ -181,7 +179,7 @@ mod tests {
         )));
         assert!(!is_state_timer_service(&AgentContext::for_service("other")));
         assert!(!is_state_timer_service(&AgentContext::system()));
-        let person = requested_by(&origin("ann")).expect("a person");
+        let person = named_by(&origin("ann")).expect("a person");
         assert!(!is_state_timer_service(&person));
     }
 }

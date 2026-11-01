@@ -78,6 +78,12 @@ pub enum EntityMsg {
         /// The refused spawn.
         refusal: super::spawn_refusal::SpawnRefusal,
     },
+    /// Record that this entity's state timer stopped because nothing names
+    /// its caller, for the action no one could make.
+    RecordTimerNeedsPerson {
+        /// The refused action.
+        action: String,
+    },
     /// Delete this entity.
     Delete {
         /// Kernel dispatch context; never populated from field values.

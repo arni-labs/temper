@@ -33,11 +33,12 @@
 //! whoever armed the timer it replaces (its row's `armed_by`), else, when
 //! nothing names a setter or only the state-timer service does (a record that
 //! entered its state before rows were kept, or lost its row), the principal of
-//! the record's newest move made by request, as its journal keeps it
+//! the record's newest move that names someone, as its journal keeps it
 //! (`state_timer_setter`), else the kernel's [`STATE_TIMER_SERVICE`]. A
 //! timeout action that binds its caller's identity (`authenticated_subject`)
 //! refuses a service caller by design, so such a record waits for its next
-//! action, whose caller arms it.
+//! move that names someone, whose caller arms it, and says so
+//! (`state_timer_stop`).
 //!
 //! The walks that reconcile every record of a type, after an install and at
 //! boot, are in `state_timer_follow`.
@@ -264,6 +265,10 @@ impl ServerState {
         let identity = match known {
             Some(identity) => identity,
             None if self.action_binds_caller(tenant, entity_type, &st.on_timeout) => {
+                if current.last_event.timer_needs_person.is_none() {
+                    self.say_timer_needs_person(tenant, entity_type, entity_id, &st.on_timeout)
+                        .await;
+                }
                 return TimerFollow::WaitsForCaller;
             }
             None => AgentContext::for_service(STATE_TIMER_SERVICE),

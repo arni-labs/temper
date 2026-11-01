@@ -1025,11 +1025,16 @@ impl EntityActor {
                     }
 
                     // A refused spawn is the kernel's event too: it changes only
-                    // the field that named the child, through the live helper.
-                    if env.event_type == super::spawn_refusal::SPAWN_REFUSED_EVENT {
+                    // the field that named the child, through the live helper. So
+                    // is a stopped timer, which only says so (`LastEvent::record`).
+                    if env.event_type == super::spawn_refusal::SPAWN_REFUSED_EVENT
+                        || env.event_type == super::timer_needs_person::TIMER_NEEDS_PERSON_EVENT
+                    {
                         match parsed_event {
                             Ok(event) => {
-                                super::spawn_refusal::apply(state, &event.params);
+                                if env.event_type == super::spawn_refusal::SPAWN_REFUSED_EVENT {
+                                    super::spawn_refusal::apply(state, &event.params);
+                                }
                                 state.push_event_bounded(event);
                             }
                             Err(e) => {
@@ -1541,6 +1546,7 @@ impl EntityActor {
                 if name == super::effects::FIELDS_UPDATED_EVENT
                     || name == super::effects::FIELDS_REPLACED_EVENT
                     || name == super::spawn_refusal::SPAWN_REFUSED_EVENT
+                    || name == super::timer_needs_person::TIMER_NEEDS_PERSON_EVENT
                 {
                     ctx.reply(EntityResponse::refused(
                         state.clone(),
@@ -2378,6 +2384,23 @@ impl EntityActor {
 
             EntityMsg::RecordSpawnRefusal { refusal } => {
                 let outcome = super::spawn_refusal::commit(self, state, &refusal).await;
+                ctx.reply(EntityResponse {
+                    success: outcome.is_ok(),
+                    refusal: None,
+                    state: state.clone(),
+                    error: outcome.err(),
+                    custom_effects: vec![],
+                    scheduled_actions: vec![],
+                    spawn_requests: vec![],
+                    spec_governed: true,
+                    refused: false,
+                    answered_action: None,
+                    store_unavailable: false,
+                });
+            }
+
+            EntityMsg::RecordTimerNeedsPerson { action } => {
+                let outcome = super::timer_needs_person::commit(self, state, &action).await;
                 ctx.reply(EntityResponse {
                     success: outcome.is_ok(),
                     refusal: None,

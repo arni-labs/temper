@@ -171,6 +171,20 @@ impl ServerState {
                 };
             }
         };
+        // Stopped because nothing names its caller (`state_timer_stop`): no
+        // arming of it fires until a move names someone.
+        if current.last_event.timer_needs_person.is_some() && timer.agent_ctx.caller().is_none() {
+            // Cancelled, not only ended: a timer still held as armed would keep
+            // the move that names someone from arming its own.
+            self.cancel_state_timer(
+                &timer.tenant,
+                &timer.entity_type,
+                &timer.entity_id,
+                current.sequence_nr,
+            )
+            .await;
+            return Fired::Ended;
+        }
         let belongs = current.status == timer.state && self.declares_state_timer(timer);
         if !belongs {
             let follow = super::state_timer_reconcile::Follow {

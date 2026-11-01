@@ -21,6 +21,7 @@ pub mod sim_handler;
 mod snapshot_queue;
 pub(crate) mod spawn_refusal;
 mod timer_fire;
+pub(crate) mod timer_needs_person;
 mod tombstone;
 pub mod types;
 pub(crate) mod undeclared_params;

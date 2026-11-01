@@ -2142,6 +2142,44 @@ impl ServerState {
         Ok(response)
     }
 
+    /// Record on a record that its state timer stopped because nothing names
+    /// its caller. See `entity_actor::timer_needs_person`.
+    pub(crate) async fn record_timer_needs_person(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        action: &str,
+    ) -> Result<(), String> {
+        let actor_ref = self
+            .get_or_spawn_tenant_actor(tenant, entity_type, entity_id)
+            .ok_or_else(|| {
+                format!("No transition table for tenant '{tenant}', entity type '{entity_type}'")
+            })?;
+        let response: EntityResponse = actor_ref
+            .ask(
+                EntityMsg::RecordTimerNeedsPerson {
+                    action: action.to_owned(),
+                },
+                self.action_dispatch_timeout,
+            )
+            .await
+            .map_err(|e| format!("Actor update failed: {e}"))?;
+        if !response.success {
+            return Err(response
+                .error
+                .unwrap_or_else(|| "the stopped timer was not recorded".to_owned()));
+        }
+        self.upsert_kernel_write_projection(
+            tenant,
+            entity_type,
+            entity_id,
+            &response,
+            "timer_needs_person",
+        )
+        .await
+    }
+
     /// Delete an entity.
     #[instrument(skip_all, fields(otel.name = "entity.delete_tenant_entity", tenant = %tenant, entity_type, entity_id))]
     pub async fn delete_tenant_entity(
