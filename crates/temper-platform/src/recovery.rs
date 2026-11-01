@@ -179,8 +179,7 @@ fn push_unique_cedar_text(
 /// Uses the production installer through [`os_apps::restore_os_app`], which
 /// keeps each stored record's origin. It takes no shortcuts.
 ///
-/// This is the **production code path** — identical logic runs at CLI boot
-/// (Phase 8b) and during DST restart simulation.
+/// The DST restart harness runs this; `temper serve` replays each app itself.
 pub async fn restore_installed_apps(state: &PlatformState, ps: &dyn PlatformStore) {
     let installed = match ps.list_all_installed_apps().await {
         Ok(apps) => apps,
@@ -189,9 +188,7 @@ pub async fn restore_installed_apps(state: &PlatformState, ps: &dyn PlatformStor
             return;
         }
     };
-
     os_apps::converge_installed_schemas(state, &installed).await;
-
     for (tenant, app_name) in installed {
         match recover_installed_app_runtime_state(state, ps, &tenant, &app_name).await {
             InstalledAppRuntimeRecoveryOutcome::Ready => {
@@ -316,9 +313,7 @@ pub async fn recover_installed_apps_runtime_state(
             };
         }
     };
-
     os_apps::converge_installed_schemas(state, &installed).await;
-
     let mut summary = InstalledAppsRuntimeRecoverySummary::default();
     for (tenant, app_name) in installed {
         match recover_installed_app_runtime_state(state, ps, &tenant, &app_name).await {
