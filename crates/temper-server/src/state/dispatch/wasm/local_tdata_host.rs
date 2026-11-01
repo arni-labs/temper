@@ -80,8 +80,9 @@ impl LocalTDataWasmHost {
                 HeaderValue::from(body.len()),
             );
         }
-        // A query can carry a module's values, so the span names the path alone.
-        let path_for_span = request.path.split('?').next().unwrap_or_default().to_string();
+        // parse() separates the query before decoding the path. A decoded '?'
+        // belongs to the path and must remain in the span.
+        let path_for_span = request.path.clone();
         let span = tracing::info_span!(
             "wasm.local_tdata_http_call",
             otel.name = "wasm.local_tdata_http_call",

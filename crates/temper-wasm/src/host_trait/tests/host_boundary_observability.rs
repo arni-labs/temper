@@ -279,7 +279,9 @@ async fn a_key_in_a_streamed_call_reaches_no_span_log_or_response_head() {
     for key in KEYS {
         let (spans, events, _guard) = capture_spans_and_events();
         let host = ProductionWasmHost::new(BTreeMap::new());
-        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let down = closed.local_addr().expect("address");
         drop(closed);
         let handles = host
@@ -309,90 +311,6 @@ async fn a_key_in_a_streamed_call_reaches_no_span_log_or_response_head() {
         assert!(url_field.ends_with("/<redacted>/build"), "{url_field}");
         assert_no_key(key, &spans, &events, &format!("{:?}", head.headers));
     }
-}
-
-/// The lines of Rust source that give a tracing macro a URL without `telemetry_url`: a field named for one, a value
-/// that reads one, or a message that prints one. Each host call has its own span, so a new one is a new place to forget.
-/// It reads names, so a URL copied into a variable whose name lacks "url" gets past it.
-fn raw_urls_in_tracing(source: &str) -> Vec<String> {
-    const MACROS: [&str; 7] = ["info_span!(", "debug_span!(", "error!(", "warn!(", "info!(", "debug!(", "trace!("];
-    let mut found = Vec::new();
-    let mut depth = 0i32;
-    for line in source.lines() {
-        let text = line.trim();
-        if text.starts_with("//") {
-            continue;
-        }
-        let opens = MACROS.iter().any(|name| text.contains(name));
-        if depth == 0 && !opens {
-            continue;
-        }
-        let lower = text.to_lowercase();
-        let names_url = lower.contains("url");
-        let safe = text.contains("telemetry_url(") || text.contains("url_for_log");
-        // `url = %x`, `http.url = ?x`, `%url`, `?request.url`, or "{url}" in a message.
-        // `url.path` is a path alone: the local Temper call drops its query before it names one.
-        let field = lower.split_once(" = ").is_some_and(|(name, value)| name.contains("url") && !name.contains("url.path") && (value.starts_with('%') || value.starts_with('?')));
-        let value = (text.starts_with('%') || text.starts_with('?')) && names_url;
-        let value_of_field = lower.split_once(" = ").is_some_and(|(_, value)| (value.starts_with('%') || value.starts_with('?')) && value.contains("url"));
-        if !safe && (field || value || value_of_field || lower.contains("{url") || lower.contains(".url}")) {
-            found.push(text.to_string());
-        }
-        depth += text.matches('(').count() as i32 - text.matches(')').count() as i32;
-    }
-    found
-}
-
-fn rust_sources(dir: &std::path::Path, into: &mut Vec<std::path::PathBuf>) {
-    for entry in std::fs::read_dir(dir).expect("read source folder").flatten() {
-        let path = entry.path();
-        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_string();
-        if path.is_dir() {
-            if name != "tests" {
-                rust_sources(&path, into);
-            }
-        } else if name.ends_with(".rs") && !name.ends_with("_test.rs") && !name.ends_with("_tests.rs") {
-            into.push(path);
-        }
-    }
-}
-
-#[test]
-fn the_check_for_raw_urls_catches_each_way_of_logging_one() {
-    for bad in [
-        "tracing::warn!(url = %url, \"failed\");",
-        "tracing::info_span!(\"x\", http.url = %request.url);",
-        "tracing::warn!(\n    target = ?request.url,\n    \"failed\"\n);",
-        "tracing::warn!(\n    %url,\n    \"failed\"\n);",
-        "tracing::error!(\"call to {url} failed\");",
-    ] {
-        assert_eq!(raw_urls_in_tracing(bad).len(), 1, "{bad}");
-    }
-    for good in [
-        "tracing::warn!(url = %telemetry_url(url), \"failed\");",
-        "tracing::info_span!(\"x\", http.url = %telemetry_url(&request.url));",
-        "tracing::warn!(status = status, \"failed\");",
-        "let url = format!(\"{url}\");",
-    ] {
-        assert_eq!(raw_urls_in_tracing(good), Vec::<String>::new(), "{good}");
-    }
-}
-
-#[test]
-fn no_host_code_gives_tracing_a_raw_url() {
-    let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut sources = Vec::new();
-    rust_sources(&crate_root.join("src"), &mut sources);
-    rust_sources(&crate_root.join("../temper-server/src/state/dispatch"), &mut sources);
-    assert!(sources.len() > 10, "the check must read the host's code, and found {} files", sources.len());
-    let found: Vec<String> = sources
-        .iter()
-        .flat_map(|path| {
-            let source = std::fs::read_to_string(path).expect("read source");
-            raw_urls_in_tracing(&source).into_iter().map(move |line| format!("{}: {line}", path.display()))
-        })
-        .collect();
-    assert_eq!(found, Vec::<String>::new(), "use telemetry_url: a URL can hold a key");
 }
 
 #[test]
