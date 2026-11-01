@@ -22,6 +22,7 @@ use temper_runtime::scheduler::FaultConfig;
 
 mod digest;
 mod models;
+pub use digest::KeptKey;
 
 /// Result of an actor simulation level (Level 2b).
 ///
@@ -490,13 +491,16 @@ impl VerificationCascade {
                     verification.dead_transitions.join(", ")
                 ));
             }
+            parts.extend(verification.unproved_can_reach.iter().cloned());
             format!(
                 "L1 Model Check FAILED: {} states explored, {}",
                 verification.states_explored,
                 parts.join("; "),
             )
         };
-        let summary = if verification.lost_places.is_empty() {
+        // A failed check's failures are the whole answer: a note would often
+        // name the record a failure already names.
+        let summary = if !passed || verification.lost_places.is_empty() {
             summary
         } else {
             let found: Vec<String> = verification

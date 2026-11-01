@@ -28,14 +28,15 @@ pub struct TemperModelState {
     pub counters: BTreeMap<String, usize>,
     /// Named boolean variables (e.g. `has_address`, `payment_captured`).
     pub booleans: BTreeMap<String, bool>,
-    /// Named list variables (e.g. `tags`, `labels`).
-    pub lists: BTreeMap<String, Vec<String>>,
-    /// The string variables an invariant reads, as symbols: `''`, a literal
+    /// Named list variables (e.g. `tags`, `labels`). Elements retain equality
+    /// symbols, so reused inputs alias and independent inputs can differ.
+    pub lists: BTreeMap<String, Vec<ModelString>>,
+    /// The string variables guards or rules read or effects write, as symbols: `''`, a literal
     /// the spec compares the variable with, or `#n`, a value that is equal
     /// only to itself. The verifier tracks which strings are equal, not what
     /// they say, so `#n` are renumbered in order of first use after every
     /// step ([`super::semantics::canonical_strings`]). Empty for a spec whose
-    /// invariants read no string.
+    /// guards, rules and effects use no string.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub strings: BTreeMap<String, ModelString>,
 }
@@ -154,6 +155,8 @@ pub enum ModelEffect {
     SubCounter { var: String, value: Arg },
     /// `var = value` on a bool.
     SetBool { var: String, value: Arg },
+    /// `var = 'literal'` on a string, including the empty string.
+    SetString { var: String, value: String },
     /// `append(var, value)`.
     ListAppend { var: String, value: Arg },
     /// `remove_at(var, index)`; out of range is a no-op.
@@ -174,13 +177,18 @@ pub struct ResolvedTransition {
     pub guard: Expr,
     /// Effects applied when the transition fires.
     pub effects: Vec<ModelEffect>,
-    /// The action parameters the effects read, by kind.
+    /// The action parameters the effects read, by kind. Entry-rule models
+    /// also choose parameters read only by guards or constraints.
     pub params: BTreeMap<String, ParamKind>,
     /// The string parameters the model gives a value: those that write a
     /// tracked string variable of the same name (the runtime writes every
     /// parameter into its field), and those a constraint ties to a tracked
-    /// one.
+    /// one. Entry-rule models also choose guard inputs and list inputs here
+    /// to retain identity and evaluate the guard with the chosen assignment.
     pub string_params: Vec<StringParam>,
+    /// Original input constraints. Route proofs must identify any that
+    /// string parameter exploration does not enforce.
+    pub constraints: Vec<temper_spec::automaton::ActionConstraint>,
 }
 
 /// A string parameter of an action, with what the action's constraints allow
@@ -210,6 +218,21 @@ pub struct ResolvedInvariant {
     pub assert: Expr,
 }
 
+/// A rule on entering a place: every move into `place` from one of `from`
+/// must have `assert` true just before it fires (`model/entry.rs`).
+#[derive(Clone, Debug)]
+pub struct ResolvedEntryRule {
+    /// The rule name.
+    pub name: String,
+    /// The place it guards.
+    pub place: String,
+    /// The places whose moves into `place` it covers, never `place` itself
+    /// unless the spec names it.
+    pub from: Vec<String>,
+    /// The assertion, read in the state before the move.
+    pub assert: Expr,
+}
+
 // ---------------------------------------------------------------------------
 // Liveness properties
 // ---------------------------------------------------------------------------
@@ -226,6 +249,13 @@ pub enum LivenessKind {
     /// From any `from` state, there is always at least one enabled action.
     /// This is actually a safety property (always has actions).
     NoDeadlock { from: Vec<String> },
+    /// From every reachable state in one of `from` (any state when it is
+    /// empty), some moves lead to one of `targets`. Checked on the model
+    /// check's whole walk, after a complete exploration.
+    CanReach {
+        from: Vec<String>,
+        targets: Vec<String>,
+    },
 }
 
 /// A resolved liveness property.
@@ -251,6 +281,8 @@ pub struct TemperModel {
     pub transitions: Vec<ResolvedTransition>,
     /// Pre-resolved safety invariants (accessible to property fn pointers via &self).
     pub invariants: Vec<ResolvedInvariant>,
+    /// Rules every move into a place must meet as it fires.
+    pub entry_rules: Vec<ResolvedEntryRule>,
     /// Pre-resolved liveness properties.
     pub liveness: Vec<ResolvedLiveness>,
     /// States from which no transition may be enabled.
@@ -264,14 +296,15 @@ pub struct TemperModel {
     /// Initial boolean values from [[state]] declarations.
     pub(crate) initial_booleans: BTreeMap<String, bool>,
     /// Initial list values from [[state]] declarations.
-    pub(crate) initial_lists: BTreeMap<String, Vec<String>>,
+    pub(crate) initial_lists: BTreeMap<String, Vec<ModelString>>,
     /// Initial values of the tracked string variables.
     pub(crate) initial_strings: BTreeMap<String, ModelString>,
-    /// The string variables the verifier tracks: those an invariant reads,
-    /// and those whose value reaches one through a constraint or a reaction.
+    /// The string variables the verifier tracks: those guards/invariants read
+    /// or effects write, and those whose value reaches one through a
+    /// constraint or a reaction.
     pub tracked_strings: BTreeSet<String>,
-    /// String literals each tracked variable is compared with in a guard or
-    /// invariant: the values worth choosing for it besides `''` and others'.
+    /// Concrete initial, predicate and effect literals for tracked string inputs,
+    /// including literals tied to them indirectly through related statuses.
     pub(crate) string_literals: BTreeMap<String, BTreeSet<String>>,
     /// Per-counter upper bounds for bounded exploration.
     pub(crate) counter_bounds: BTreeMap<String, usize>,
@@ -334,6 +367,7 @@ impl fmt::Debug for TemperModel {
             states,
             transitions,
             invariants,
+            entry_rules,
             liveness,
             terminal,
             var_kinds,
@@ -354,6 +388,7 @@ impl fmt::Debug for TemperModel {
             .field("states", states)
             .field("transitions", transitions)
             .field("invariants", invariants)
+            .field("entry_rules", entry_rules)
             .field("liveness", liveness)
             .field("terminal", terminal)
             .field("var_kinds", var_kinds)
@@ -373,6 +408,14 @@ impl fmt::Debug for TemperModel {
 }
 
 impl TemperModel {
+    /// Whether the model holds a value for the counter, boolean or list
+    /// `field`: some rule reads it.
+    pub fn holds(&self, field: &str) -> bool {
+        self.initial_counters.contains_key(field)
+            || self.initial_booleans.contains_key(field)
+            || self.initial_lists.contains_key(field)
+    }
+
     /// Whether the model gives `action`'s string parameter `param` a value.
     pub fn models_string(&self, action: &str, param: &str) -> bool {
         self.transitions

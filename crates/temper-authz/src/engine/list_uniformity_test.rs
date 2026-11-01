@@ -17,6 +17,7 @@ fn customer() -> SecurityContext {
         context_attrs: HashMap::new(),
         correlation_id: "list-uniformity".to_string(),
         cause: None,
+        credential: None,
     }
 }
 

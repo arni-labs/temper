@@ -10,10 +10,10 @@ use temper_authz::{Asker, May, SendAnalysis};
 use temper_runtime::tenant::TenantId;
 use temper_spec::automaton::Automaton;
 use temper_spec::cross_invariant;
-use temper_verify::composite::{Bound, JointOutcome, LivenessOutcome};
+use temper_verify::composite::{Bound, JointOutcome, JointProof, LivenessOutcome};
 
 use super::InstallWarning;
-use super::proofs::{self, Attempt, Proof, Verdict, Wait, Walked};
+use super::proofs::{self, Attempt, Keys, Proof, Verdict, Wait, Walked};
 
 use crate::state::PlatformState;
 
@@ -57,7 +57,9 @@ pub(super) fn parse_cross_invariants(source: Option<&str>, app_name: &str) -> Re
 /// send each move decides whether a rule holds and whether a record gets
 /// where it should. A named type the bundle does not carry is taken from what
 /// the tenant already runs. Policy and spec changes check every active tenant
-/// spec, overlaid with the incoming specs.
+/// spec, overlaid with the incoming specs. Policies whose text is the tenant's
+/// Cedar now are no change: a start installs again the specs and Cedar the
+/// tenant runs, proven when they were installed, so it walks nothing.
 ///
 /// Only a rule the check finds broken refuses the install: an invariant with
 /// a path of moves that breaks it, or a liveness rule with a path to a state
@@ -67,9 +69,12 @@ pub(super) fn parse_cross_invariants(source: Option<&str>, app_name: &str) -> Re
 /// install goes ahead; those rules are returned for the install's answer. It
 /// runs before the install writes or swaps anything, so a refused bundle
 /// leaves the tenant as it was and reads keep serving the old specs
-/// meanwhile. The walk runs as its own job (see [`proofs`]): a proof still
-/// walking comes back as the walk to wait for, and the install waits for it
-/// without its lock and starts again, finding the verdict in `attempt`.
+/// meanwhile. Each walk's verdict is kept by the digest of its model and by
+/// the digest of the specs and Cedar (see [`proofs`]), so a rule whose cut
+/// model the install leaves as it was is not walked again, nor one whose
+/// specs a new kernel starts with. A walk still running comes back as the
+/// walk to wait for: the install waits for it without its lock and starts
+/// again, finding the verdict in `attempt`.
 pub(super) async fn prove(
     state: &PlatformState,
     tenant: &str,
@@ -79,6 +84,8 @@ pub(super) async fn prove(
     policies: Option<&str>,
     attempt: &Attempt,
 ) -> Result<ControlFlow<Vec<String>, Wait>, String> {
+    let policies =
+        policies.filter(|text| *text != super::cached_or_active_tenant_policy_text(state, tenant));
     if !new_specs && policies.is_none() {
         return Ok(ControlFlow::Break(Vec::new()));
     }
@@ -108,82 +115,99 @@ pub(super) async fn prove(
     );
     let policies = SendAnalysis::new(&policy_text)
         .map_err(|e| format!("os-app '{app_name}': its Cedar could not be read: {e}"))?;
-    const PROOF: &str = "rules over several records";
-    let digest = proofs::digest(PROOF, &sources(&automatons), Some(&policy_text));
-    let app = app_name.to_string();
-    let walk = move |bound: Bound<'_>| {
+    let sources = sources(&automatons);
+    // Composing a model asks Cedar about each sender and action in its
+    // scope, so it runs off the async threads too.
+    let joint = tokio::task::spawn_blocking(move || {
         let refs: Vec<&Automaton> = automatons.values().map(|(_, a)| a).collect();
-        let invariants =
-            temper_verify::composite::verify_joint_invariants(&refs, Some(&policies), bound);
-        let liveness =
-            temper_verify::composite::verify_joint_liveness(&refs, Some(&policies), bound);
-        let (mut held, mut broken, mut unproved) = (Vec::new(), Vec::new(), Vec::new());
-        // A walk that did not finish says nothing of the specs: it may fit
-        // when the host has more room, so its verdict is not kept. A rule
-        // that checks nothing as written is a verdict on the specs.
-        let mut fit = true;
-        for result in &invariants {
-            match result.outcome {
-                JointOutcome::Holds => held.push(result.to_string()),
-                JointOutcome::Vacuous { .. } => unproved.push(result.to_string()),
-                JointOutcome::Incomplete { .. } => {
-                    fit = false;
-                    unproved.push(result.to_string());
-                }
-                JointOutcome::Broken { .. } => broken.push(result.to_string()),
+        temper_verify::composite::joint_proofs(&refs, Some(&policies))
+    })
+    .await
+    .map_err(|e| {
+        format!("os-app '{app_name}': its rules over several records could not be read: {e}")
+    })?;
+    let (mut held, mut unproved, mut broken) = (Vec::new(), Vec::new(), Vec::new());
+    for joint_proof in joint {
+        let name = joint_proof.name();
+        let keys = Keys {
+            model: joint_proof.digest(),
+            source: proofs::digest(&name, &sources, Some(&policy_text)),
+        };
+        let proof = proofs::proof(state, tenant, app_name, name, keys, attempt, move |bound| {
+            walk(&joint_proof, bound)
+        })
+        .await;
+        match proof {
+            Proof::Done(verdict) => {
+                held.extend(verdict.held);
+                unproved.extend(verdict.unproved);
+                broken.extend(verdict.refused);
             }
+            // Each walk uses the same host room. Wait before starting
+            // another, so this install's proofs do not crowd each other out.
+            Proof::Running(wait) => return Ok(ControlFlow::Continue(wait)),
         }
-        for result in &liveness {
-            match result.outcome {
-                LivenessOutcome::Holds => held.push(result.to_string()),
-                LivenessOutcome::Vacuous { .. } => unproved.push(result.to_string()),
-                LivenessOutcome::Incomplete { .. } => {
-                    fit = false;
-                    unproved.push(result.to_string());
-                }
-                LivenessOutcome::Stuck { .. } => broken.push(result.to_string()),
-            }
-        }
-        let refused = (!broken.is_empty()).then(|| {
-            format!(
-                "os-app '{app}' would break tenant rules over several records:\n{}",
-                broken.join("\n")
-            )
-        });
-        Walked {
-            verdict: Verdict {
-                held,
-                unproved,
-                refused,
-            },
-            fit,
-        }
-    };
-    let proof = proofs::proof(state, tenant, app_name, PROOF, digest, attempt, walk).await;
-    decided(tenant, app_name, proof)
-}
-
-/// The install goes on with the rules left unproved, is refused, or waits
-/// for the walk.
-fn decided(
-    tenant: &str,
-    app_name: &str,
-    proof: Proof,
-) -> Result<ControlFlow<Vec<String>, Wait>, String> {
-    let verdict = match proof {
-        Proof::Running(wait) => return Ok(ControlFlow::Continue(wait)),
-        Proof::Done(verdict) => verdict,
-    };
-    if let Some(refused) = verdict.refused {
-        return Err(refused);
     }
-    for line in &verdict.held {
+    if !broken.is_empty() {
+        return Err(format!(
+            "os-app '{app_name}' would break tenant rules over several records:\n{}",
+            broken.join("\n")
+        ));
+    }
+    for line in &held {
         tracing::info!(tenant, app = %app_name, "{line}");
     }
-    for line in &verdict.unproved {
+    for line in &unproved {
         tracing::warn!(tenant, app = %app_name, "{line}");
     }
-    Ok(ControlFlow::Break(verdict.unproved))
+    Ok(ControlFlow::Break(unproved))
+}
+
+/// Walk one proof: the results that held, those it could not prove, those
+/// broken, and whether the walk fit in its memory. A walk that did not
+/// finish says nothing of the specs: it may fit when the host has more room,
+/// so its verdict is not kept. A rule that checks nothing as written is a
+/// verdict on the specs.
+fn walk(proof: &JointProof, bound: Bound<'_>) -> Walked {
+    let (mut held, mut unproved, mut broken) = (Vec::new(), Vec::new(), Vec::new());
+    let mut fit = true;
+    match proof {
+        JointProof::Invariants(invariants) => {
+            for result in invariants.check(bound) {
+                let text = result.to_string();
+                match result.outcome {
+                    JointOutcome::Holds => held.push(text),
+                    JointOutcome::Vacuous { .. } => unproved.push(text),
+                    JointOutcome::Incomplete { .. } => {
+                        fit = false;
+                        unproved.push(text);
+                    }
+                    JointOutcome::Broken { .. } => broken.push(text),
+                }
+            }
+        }
+        JointProof::Liveness(liveness) => {
+            let result = liveness.check(bound);
+            let text = result.to_string();
+            match result.outcome {
+                LivenessOutcome::Holds => held.push(text),
+                LivenessOutcome::Vacuous { .. } => unproved.push(text),
+                LivenessOutcome::Incomplete { .. } => {
+                    fit = false;
+                    unproved.push(text);
+                }
+                LivenessOutcome::Stuck { .. } => broken.push(text),
+            }
+        }
+    }
+    Walked {
+        verdict: Verdict {
+            held,
+            unproved,
+            refused: (!broken.is_empty()).then(|| broken.join("\n")),
+        },
+        fit,
+    }
 }
 
 /// [`prove`] as an install drives it: wait for the walk while it runs, then
@@ -209,7 +233,7 @@ pub(super) async fn prove_to_the_end(
     }
 }
 
-/// Each type's spec source, which a verdict is kept by.
+/// Each type's spec source, which a verdict is also kept by.
 fn sources(automatons: &Sourced) -> BTreeMap<String, String> {
     automatons
         .iter()

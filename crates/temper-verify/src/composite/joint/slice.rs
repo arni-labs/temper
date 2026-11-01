@@ -57,6 +57,7 @@ pub(super) fn slice(mut model: TemperModel, read: BTreeSet<String>) -> TemperMod
         model.list_literals.remove(name);
     }
     model.invariants.clear();
+    model.entry_rules.clear();
     model.liveness.clear();
     for t in &mut model.transitions {
         t.effects.retain(|e| !dropped.contains(effect_var(e)));
@@ -71,6 +72,7 @@ fn effect_var(effect: &ModelEffect) -> &str {
         | ModelEffect::AddCounter { var, .. }
         | ModelEffect::SubCounter { var, .. }
         | ModelEffect::SetBool { var, .. }
+        | ModelEffect::SetString { var, .. }
         | ModelEffect::ListAppend { var, .. }
         | ModelEffect::ListRemoveAt { var, .. } => var,
     }
@@ -85,6 +87,7 @@ pub(super) fn effect_reads(effect: &ModelEffect) -> Option<&str> {
         | ModelEffect::SetBool { value, .. }
         | ModelEffect::ListAppend { value, .. } => value,
         ModelEffect::ListRemoveAt { index, .. } => index,
+        ModelEffect::SetString { .. } => return None,
     };
     match arg {
         Arg::Var(var) => Some(var),

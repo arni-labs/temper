@@ -26,12 +26,17 @@ from = ["Ready"]
 to = "Ready"
 params = [{ name = "amount", type = "counter" }]
 effect = ["total += params.amount"]
+
+# The model holds only a counter something reads.
+[[invariant]]
+name = "counted"
+assert = "total >= 0"
 "#,
     )
     .unwrap();
     let model = JointModel::new(
         &BTreeMap::from([("Total", &spec)]),
-        ["Total".to_string()].into(),
+        &["Total".to_string()].into(),
         "Total",
         &[],
         Sending::anyone(),

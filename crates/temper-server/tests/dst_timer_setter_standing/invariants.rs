@@ -60,7 +60,7 @@ pub(super) async fn check(
             record.timer,
             row.as_ref().map(|row| (&row.state, &row.armed_by)),
         );
-        if !record.setter.leaves() {
+        if !record.setter.loses_standing() {
             if moves != 1 || place != moves_to {
                 return Err(fail(
                     seed,
@@ -123,7 +123,7 @@ pub(super) fn check_logged(
         let logged = withheld.of(&record.id);
         let principal = record.setter.principal(&record.user);
         let named = !logged.is_empty() && logged.iter().all(|setter| *setter == principal);
-        if record.setter.leaves() != named {
+        if record.setter.loses_standing() != named {
             return Err(fail(
                 seed,
                 trace,

@@ -14,7 +14,7 @@ pub mod statements;
 
 pub use cause::{MoveCause, ReactionHop, TimerArm};
 pub use context::{
-    AuthenticatedRequestContext, Principal, PrincipalKind, SecurityContext,
+    AuthenticatedRequestContext, IssuedCredential, Principal, PrincipalKind, SecurityContext,
     is_cedar_authority_context_key, platform_keys,
 };
 pub use engine::{

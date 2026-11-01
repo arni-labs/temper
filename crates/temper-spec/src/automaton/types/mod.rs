@@ -64,6 +64,9 @@ pub struct Automaton {
     /// Safety invariants (must always hold).
     #[serde(default, rename = "invariant")]
     pub invariants: Vec<Invariant>,
+    /// Rules every move into a place must meet as it fires.
+    #[serde(default, rename = "entry_rule")]
+    pub entry_rules: Vec<EntryRule>,
     /// Liveness properties (something eventually happens).
     #[serde(default, rename = "liveness")]
     pub liveness: Vec<Liveness>,
@@ -191,6 +194,29 @@ pub struct Invariant {
     pub assert: Expr,
 }
 
+/// A rule on entering a place, proven by the verification cascade: every
+/// move into `place` from one of `from` must have `assert` true in the state
+/// just before it fires.
+///
+/// It says how a record may start something, which an invariant cannot: a
+/// cup may start being made only while its topping is in stock, yet the
+/// topping may run out while the cup is being made.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntryRule {
+    /// Rule name.
+    pub name: String,
+    /// The place the rule guards.
+    pub place: String,
+    /// The places whose moves into `place` the rule covers. Empty: every
+    /// other place, so a move that stays in `place` is not covered.
+    #[serde(default)]
+    pub from: Vec<String>,
+    /// Must hold just before each covered move fires. It reads what a guard
+    /// reads, except the move's parameters: the rule covers several moves.
+    pub assert: Expr,
+}
+
 /// A liveness property.
 ///
 /// Liveness properties assert that something "eventually happens" — a state
@@ -206,6 +232,12 @@ pub struct Liveness {
     /// Target states that must eventually be reached.
     #[serde(default)]
     pub reaches: Vec<String>,
+    /// Places a record in `from` (in any place when `from` is empty) can
+    /// always still reach: from each such state, some moves lead to one of
+    /// them. Unlike `reaches`, not every path has to get there; the way must
+    /// never be closed off. Checked on the model check's whole walk.
+    #[serde(default)]
+    pub can_reach: Vec<String>,
     /// If true, asserts that actions are always available (no deadlock).
     #[serde(default)]
     pub has_actions: Option<bool>,

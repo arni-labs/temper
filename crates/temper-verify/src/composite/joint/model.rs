@@ -8,6 +8,7 @@ mod labels;
 mod order;
 mod react;
 mod read;
+mod silent;
 mod step;
 mod walk;
 
@@ -97,6 +98,7 @@ pub(super) struct Walk {
 }
 
 /// The joint model of one entity's properties that read related entities.
+#[derive(Debug)]
 pub(super) struct JointModel {
     expansion: Expansion,
     id_literals: BTreeSet<String>,
@@ -107,9 +109,6 @@ pub(super) struct JointModel {
     /// use: each holds that record's id.
     refs: BTreeMap<String, BTreeSet<String>>,
     delivery: Delivery,
-    /// The types composed: those the properties name, or a trigger-graph
-    /// component for the drop check.
-    pub(super) scope: BTreeSet<String>,
     /// Whether the kernel's own moves are made as the kernel makes them.
     kernel_moves: bool,
     kernel: Kernel,
@@ -163,7 +162,7 @@ impl JointModel {
     /// behaviour.
     pub(super) fn new(
         by_name: &BTreeMap<&str, &Automaton>,
-        scope: BTreeSet<String>,
+        scope: &BTreeSet<String>,
         owner: &str,
         reads: &[&Expr],
         sending: Sending<'_>,
@@ -195,7 +194,7 @@ impl JointModel {
                 Name::Status | Name::Param(_) => {}
             });
         }
-        let (mut models, reactions) = tracked(by_name, &scope, read.clone(), Records::ById);
+        let (mut models, reactions) = tracked(by_name, scope, read.clone(), Records::ById);
         for ((entity, field), literals) in named_literals(owner, reads, &models, &reactions) {
             if let Some(model) = models.get_mut(&entity) {
                 model
@@ -213,14 +212,14 @@ impl JointModel {
     /// read; with `cut`, each entity is cut down to that.
     fn compose(
         by_name: &BTreeMap<&str, &Automaton>,
-        scope: BTreeSet<String>,
+        scope: &BTreeSet<String>,
         (models, reactions): (BTreeMap<String, TemperModel>, Vec<Reaction>),
         read: &BTreeMap<String, BTreeSet<String>>,
         sending: Sending<'_>,
         cut: bool,
     ) -> Self {
         let mut id_literals = BTreeSet::new();
-        for entity in &scope {
+        for entity in scope {
             let a = by_name[entity.as_str()];
             for inv in &a.invariants {
                 read::collect_literals(&inv.assert, &mut id_literals);
@@ -248,11 +247,11 @@ impl JointModel {
             }
         }
         let kernel = if sending.kernel_moves {
-            Kernel::read(by_name, &scope)
+            Kernel::read(by_name, scope)
         } else {
             Kernel::default()
         };
-        let senders = Senders::new(by_name, &scope, sending.policies);
+        let senders = Senders::new(by_name, scope, sending.policies);
         let chosen = |entity: &str, action: &str| {
             sending
                 .relies_on
@@ -284,7 +283,7 @@ impl JointModel {
             .filter(|r| r.principal.is_none())
             .map(|r| r.from.clone())
             .collect();
-        let into = reactions_into(by_name, &scope);
+        let into = reactions_into(by_name, scope);
         let open: BTreeSet<&String> = kernel
             .calls_on
             .iter()
@@ -320,7 +319,6 @@ impl JointModel {
             records: Records::ById,
             refs: BTreeMap::new(),
             delivery: Delivery::Any,
-            scope,
             kernel_moves: sending.kernel_moves,
             kernel,
             relies_on: sending.relies_on,

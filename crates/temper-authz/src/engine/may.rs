@@ -149,4 +149,26 @@ impl SendAnalysis {
             May::Maybe
         }
     }
+
+    /// The policies that may apply when `asker` sends `action` to a
+    /// `resource_type` record whatever it holds, as text in a fixed order.
+    /// [`Self::may`] asked again with some of the record known reads no
+    /// other: knowing more only rules policies out.
+    pub fn applicable(&self, asker: &Asker, action: &str, resource_type: &str) -> Vec<String> {
+        let record = BTreeMap::new();
+        let request = Request {
+            asker,
+            action,
+            resource_type,
+            record: &record,
+        };
+        let mut applicable: Vec<String> = self
+            .policies
+            .iter()
+            .filter(|(_, policy)| request.applies(policy).can(TRUE))
+            .map(|(effect, policy)| format!("{effect:?} {policy}"))
+            .collect();
+        applicable.sort();
+        applicable
+    }
 }

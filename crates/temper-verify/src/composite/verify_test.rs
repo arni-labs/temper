@@ -410,6 +410,11 @@ name = "n"
 type = "counter"
 initial = 0
 
+# The model holds only a counter something reads.
+[[invariant]]
+name = "counted"
+assert = "n >= 0"
+
 [[action]]
 name = "Inc"
 from = ["Counting"]
@@ -447,6 +452,11 @@ allow_indefinite_states = ["Counting"]
 name = "n"
 type = "counter"
 initial = 0
+
+# The model holds only a counter something reads.
+[[invariant]]
+name = "counted"
+assert = "n >= 0"
 
 [[action]]
 name = "Inc"

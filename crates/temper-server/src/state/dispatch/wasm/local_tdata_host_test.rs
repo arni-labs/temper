@@ -198,6 +198,7 @@ fn customer_security_context(id: &str) -> SecurityContext {
         context_attrs: Default::default(),
         correlation_id: "local-tdata-test".to_string(),
         cause: None,
+        credential: None,
     }
 }
 
