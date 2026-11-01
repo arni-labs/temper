@@ -117,6 +117,7 @@ fn entity_response_spec_governed_skipped_when_true() {
         spec_governed: true,
         refused: false,
         answered_action: None,
+        trigger_failures: Vec::new(),
         store_unavailable: false,
     };
     let serialized = serde_json::to_string(&resp).unwrap();

@@ -503,6 +503,9 @@ impl crate::state::ServerState {
             mode: req.mode,
         };
         let mut last_response: Option<EntityResponse> = None;
+        // Triggers on one action are independent: one that fails is kept, and
+        // the triggers after it still run.
+        let mut failures: Vec<String> = Vec::new();
 
         for effect_name in req.custom_effects {
             let integration = integrations
@@ -513,7 +516,7 @@ impl crate::state::ServerState {
                 continue;
             };
 
-            if let Some(resp) = self
+            match self
                 .dispatch_single_integration(
                     &ctx,
                     &integration,
@@ -521,13 +524,19 @@ impl crate::state::ServerState {
                     req.action_params,
                     &base_gate,
                 )
-                .await?
+                .await
             {
-                last_response = Some(resp);
+                Ok(Some(resp)) => last_response = Some(resp),
+                Ok(None) => {}
+                Err(error) => failures.push(error),
             }
         }
 
-        Ok(last_response)
+        if failures.is_empty() {
+            Ok(last_response)
+        } else {
+            Err(failures.join("; "))
+        }
     }
 
     /// Dispatch a single WASM integration: resolve module, invoke, handle result.
