@@ -2363,13 +2363,16 @@ fn datadog_span_id_decimal(span_id: &str) -> Option<String> {
 /// `https://host/<64 hex>/build`, and on 1 Nov 2026 that key was in Datadog on the span of every interface build.
 pub(crate) fn telemetry_url(url: &str) -> String {
     let after_scheme = url.find("://").map(|idx| &url[idx + 3..]).unwrap_or(url);
-    let after_auth = after_scheme
-        .find('@')
-        .map(|idx| &after_scheme[idx + 1..])
-        .unwrap_or(after_scheme);
-    let path_start = after_auth.find(['/', '?', '#']).unwrap_or(after_auth.len());
-    let authority = &after_auth[..path_start];
-    let path_and_query = &after_auth[path_start..];
+    // Credentials only belong to the authority; an @ in the path, query or
+    // fragment must not move that component into the host we keep.
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let (authority, path_and_query) = after_scheme.split_at(authority_end);
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
     let path_end = path_and_query
         .find(['?', '#'])
         .unwrap_or(path_and_query.len());
@@ -2392,7 +2395,7 @@ fn key_shaped(run: &str) -> bool {
 }
 
 fn without_keys(path: &str) -> String {
-    let is_run = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let is_run = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '~';
     let mut kept = String::with_capacity(path.len());
     let mut rest = path;
     while let Some(start) = rest.find(is_run) {

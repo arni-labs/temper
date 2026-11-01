@@ -102,14 +102,22 @@ impl Redirects {
         let request = builder.build().map_err(OutboundError::transport)?;
         let (gate, ctx) = match &self.gate {
             Some((gate, ctx)) if !self.is_internal(request.url()) => (gate, ctx),
-            _ => return client.execute(request).await.map_err(OutboundError::transport),
+            _ => {
+                return client
+                    .execute(request)
+                    .await
+                    .map_err(OutboundError::transport);
+            }
         };
         // The chain shares one timeout, as it did when reqwest followed it. A
         // timeout past the clock's range has no deadline: each hop keeps the
         // client's own, which waits as long.
         let deadline = Instant::now().checked_add(self.timeout);
         let mut hop = Hop::of(&request);
-        let mut response = client.execute(request).await.map_err(OutboundError::transport)?;
+        let mut response = client
+            .execute(request)
+            .await
+            .map_err(OutboundError::transport)?;
         let mut budget = REDIRECT_HOP_BUDGET;
         while let Some(next) = hop.next(&response) {
             if self.is_internal(next.request.url()) {
