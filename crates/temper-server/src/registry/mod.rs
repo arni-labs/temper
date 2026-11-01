@@ -241,6 +241,11 @@ impl SpecRegistry {
                         source: e.to_string(),
                     }
                 })?;
+                // Restoring an old spec must not turn a new install check into
+                // a boot refusal. Use the registered type, not just its TOML name.
+                for finding in automaton::lint_trigger_target_args(&automaton, entity_type) {
+                    tracing::warn!(tenant = %tenant_name, entity_type, "{}", finding.message);
+                }
                 let table = transition_table(&tenant_name, entity_type, &automaton);
                 let integrations = automaton.integrations.clone();
 
@@ -314,6 +319,11 @@ impl SpecRegistry {
                         source: e.to_string(),
                     }
                 })?;
+                // Restoring an old spec must not turn a new install check into
+                // a boot refusal. Use the registered type, not just its TOML name.
+                for finding in automaton::lint_trigger_target_args(&automaton, entity_type) {
+                    tracing::warn!(tenant = %tenant_name, entity_type, "{}", finding.message);
+                }
                 let table = transition_table(&tenant_name, entity_type, &automaton);
                 let integrations = automaton.integrations.clone();
                 entities.insert(

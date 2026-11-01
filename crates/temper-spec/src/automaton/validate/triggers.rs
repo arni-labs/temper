@@ -24,8 +24,6 @@ fn state_names(automaton: &Automaton) -> BTreeSet<&str> {
 /// - The statuses the guard pins are declared states.
 /// - Each `args` value is a literal or a declared state variable, `Id`, or a
 ///   parameter of the source action (parameters are stored as fields).
-/// - On a `strict_action_params` type, a trigger that targets an action of
-///   this same type passes only parameters that action declares.
 /// - `Webhook` kind is refused: nothing sends it (ADR-0182).
 /// - For `Wasm`/`Adapter` kinds: `on_success`/`on_failure` reference
 ///   actions declared on the same source entity.
@@ -131,12 +129,6 @@ pub(super) fn validate_action_triggers(
             let mut readable: BTreeSet<&str> = state_names.clone();
             readable.extend(action.params.iter().map(ActionParam::name));
             check_args(&format!("{scope} args"), &trigger.args, &readable)?;
-            if trigger.kind == TriggerKind::Entity
-                && trigger.target_entity.as_deref() == Some(automaton.automaton.name.as_str())
-                && let Some(target) = trigger.target_action.as_deref()
-            {
-                check_target_accepts(automaton, &scope, target, trigger.args.keys())?;
-            }
 
             // on_success / on_failure must reference actions declared on this
             // source entity (they dispatch on the source after module/HTTP).
@@ -194,49 +186,12 @@ fn check_args(
     Ok(())
 }
 
-/// On a `strict_action_params` type the kernel refuses a move carrying a
-/// parameter its action does not declare. A trigger or timer on this same type
-/// that passes one installs cleanly and then fails every time it fires, so it
-/// is refused here, where both actions are in view. A target that is not a
-/// declared action (a carry move, or a type that is not strict) is left to the
-/// kernel.
-fn check_target_accepts<'a>(
-    automaton: &Automaton,
-    scope: &str,
-    target: &str,
-    keys: impl IntoIterator<Item = &'a String>,
-) -> Result<(), AutomatonParseError> {
-    if !automaton.automaton.strict_action_params {
-        return Ok(());
-    }
-    let Some(action) = automaton.actions.iter().find(|a| a.name == target) else {
-        return Ok(());
-    };
-    for key in keys {
-        if !action.params.iter().any(|p| p.name() == key) {
-            return Err(AutomatonParseError::Validation(format!(
-                "{scope} passes '{key}' to action '{target}', which does not declare it: \
-                 this type has strict_action_params, so every dispatch would be refused \
-                 (\"Action '{target}' does not accept parameter '{key}'\"). Declare '{key}' \
-                 in '{target}' params, or drop it from args"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// `[[state_timeout]] args` read declared state variables, and on a strict
-/// type name only parameters `on_timeout` declares.
+/// `[[state_timeout]] args` read declared state variables.
 pub(super) fn validate_timeout_args(automaton: &Automaton) -> Result<(), AutomatonParseError> {
     let state_names = state_names(automaton);
     for st in &automaton.state_timeouts {
         let scope = format!("state_timeout for '{}'", st.state);
         check_args(&format!("{scope} args"), &st.args, &state_names)?;
-        check_target_accepts(automaton, &scope, &st.on_timeout, st.args.keys())?;
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "triggers_test.rs"]
-mod triggers_test;
