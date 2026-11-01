@@ -789,6 +789,30 @@ async fn e2e_http_agent_credential_auth() {
 }
 
 /// Bearer auth: no token → 401, wrong token → 401.
+/// A credential starts Active, so one created with no key hash, agent type or
+/// instance is refused: an Active credential must carry all three.
+#[tokio::test]
+async fn e2e_http_bare_active_credential_is_refused() {
+    let app = identity_test_router().await;
+    let key_hash = hash_token("tmpr_http-bare-credential");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/tdata/AgentCredentials")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {TEST_OPERATOR_KEY}"))
+                .header("X-Tenant-Id", TEST_TENANT)
+                .body(Body::from(format!(r#"{{"id": "{key_hash}"}}"#)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let json = body_json(response).await;
+    assert_eq!(json["error"]["code"], "ConstraintViolation", "{json}");
+}
+
 #[tokio::test]
 async fn e2e_http_missing_and_wrong_token_rejected() {
     let app = identity_test_router().await;
