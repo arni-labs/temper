@@ -13,10 +13,7 @@ use std::time::Duration;
 use temper_verify::CascadeResult;
 
 use super::*;
-use crate::os_apps::{
-    AppFiles, find_ioa_files, installed_line, local_os_app_dependency_name, read_app_manifest,
-    tenant_dependency_files,
-};
+use crate::os_apps::{AppFiles, find_ioa_files, installed_line, resolve_materialized_app_closure};
 
 /// Where an installed closure came from, as its install records name it.
 pub(super) struct ClosureSource<'a> {
@@ -27,19 +24,16 @@ pub(super) struct ClosureSource<'a> {
     pub(super) follow_policy: &'a str,
 }
 
-/// An app closure whose files are in its cache directory, ready to install.
+/// A source's app files in its cache directory, ready to resolve and install.
 pub(super) struct MaterializedClosure<'a> {
     /// The ref the install was asked for, as messages name it.
     pub(super) app_ref: &'a str,
     /// The closure's root app.
     pub(super) root: RegistryAppRef,
-    /// Every app the directory holds at its version, the root among them.
+    /// Every app this source materialized at its version, the root among
+    /// them. The core resolves dependencies already in the tenant catalog
+    /// before checking or mutating anything; they retain their own source.
     pub(super) apps: Vec<MaterializedApp>,
-    /// The dependencies of `apps` the source did not write, as the tenant
-    /// resolves them now, each with its files. They are part of the closure
-    /// for every phase but registering and recording: checked, snapshotted
-    /// for rollback, reconciled and verified with the rest.
-    pub(super) resolved: Vec<(String, AppFiles)>,
     pub(super) source: ClosureSource<'a>,
     /// Time each spec's check may take.
     pub(super) budget: Duration,
@@ -84,21 +78,19 @@ pub(super) async fn install_materialized_closure(
     cache_root: &Path,
     closure: MaterializedClosure<'_>,
 ) -> Result<ClosureInstalled, ClosureRefused> {
-    let materialized: Vec<String> = closure
-        .apps
-        .iter()
-        .map(|app| app.version.name.clone())
-        .collect();
-    let whole: Vec<(String, AppFiles)> = closure
+    // Keep the source's explicit paths, including through dependency
+    // resolution: a fresh install never relies on listing its new directory.
+    let written: Vec<(String, AppFiles)> = closure
         .apps
         .iter()
         .map(|app| (app.version.name.clone(), app.files.clone()))
-        .chain(closure.resolved.iter().cloned())
         .collect();
-    let every: Vec<String> = whole.iter().map(|(name, _)| name.clone()).collect();
+    let apps = resolve_materialized_app_closure(tenant, cache_root, &written)
+        .map_err(ClosureRefused::Failed)?;
+    let materialized: Vec<String> = apps.iter().map(|(name, _)| name.clone()).collect();
 
-    // Checked before anything changes, so a refusal leaves the tenant as it was.
-    let checks = check_closure_specs(platform, &closure.root.name, &whole, closure.budget)
+    // One complete order drives checks, snapshots, reconcile and verification.
+    let checks = check_closure_specs(platform, &closure.root.name, &apps, closure.budget)
         .await
         .map_err(ClosureRefused::Failed)?;
     if checks
@@ -116,7 +108,7 @@ pub(super) async fn install_materialized_closure(
     let ps = platform_store(platform);
     let mut prior_records: Vec<InstalledAppRecord> = Vec::new();
     if let Some(ps) = &ps {
-        for app_name in &every {
+        for app_name in &materialized {
             match ps.get_installed_app(tenant, app_name).await {
                 Ok(Some(record)) => prior_records.push(record),
                 Ok(None) => {}
@@ -134,16 +126,11 @@ pub(super) async fn install_materialized_closure(
         .find(|record| record.app_name == closure.root.name)
         .cloned();
 
-    let written = closure
-        .apps
-        .iter()
-        .map(|app| (app.version.name.clone(), app.files.clone()))
-        .collect();
     register_written_apps(tenant, cache_root.to_path_buf(), written);
 
     let reconcile_started = Instant::now();
     let reconcile_result =
-        reconcile_materialized_app_closure(platform, tenant, &closure.root.name).await;
+        reconcile_app_install_order(platform, tenant, &closure.root.name, &materialized).await;
 
     // Verify EVERY app in the reconciled closure reached runtime-ready — specs/policies/wasm
     // registered AND every app-required wasm module compiles. A reconcile error counts as
@@ -152,7 +139,7 @@ pub(super) async fn install_materialized_closure(
     // store-less behavior).
     let new_version_ready = match (&reconcile_result, &ps) {
         (Ok(_), Some(ps)) => {
-            verify_install_closure_runtime_ready(platform, ps.as_ref(), tenant, &every).await
+            verify_install_closure_runtime_ready(platform, ps.as_ref(), tenant, &materialized).await
         }
         (Ok(_), None) => true,
         _ => false,
@@ -290,28 +277,6 @@ pub(super) async fn record_closure(
         }
     }
     Ok(root_closure_id)
-}
-
-/// The dependencies `written` apps name that none of them is, with theirs,
-/// as `tenant` resolves them now: the rest of the closure the install
-/// reconciles. An error names a dependency the tenant does not resolve.
-pub(super) fn resolved_dependencies(
-    tenant: &str,
-    written: &[(String, AppFiles)],
-) -> Result<Vec<(String, AppFiles)>, String> {
-    let is_written = |name: &str| written.iter().any(|(app, _)| app == name);
-    let needed: Vec<String> = written
-        .iter()
-        .filter_map(|(_, files)| read_app_manifest(files.dir()))
-        .flat_map(|manifest| manifest.dependencies)
-        .filter_map(|dependency| local_os_app_dependency_name(&dependency))
-        .filter(|name| !is_written(name))
-        .collect();
-    let resolved = tenant_dependency_files(tenant, &needed)?;
-    Ok(resolved
-        .into_iter()
-        .filter(|(name, _)| !is_written(name))
-        .collect())
 }
 
 /// Check every spec the installer will read from the closure, through the

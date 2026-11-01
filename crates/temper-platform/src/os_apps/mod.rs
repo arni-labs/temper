@@ -29,6 +29,7 @@ mod entity_aliases;
 mod install_checks;
 mod install_guard;
 mod install_lines;
+mod materialized_closure;
 mod module_review_step;
 mod policy_rows;
 mod proofs;
@@ -62,6 +63,7 @@ use entity_aliases::{
     file_already_contains, slug_fragment,
 };
 pub use install_lines::{installed_line, stored_line, waiting_line};
+pub(crate) use materialized_closure::resolve_materialized_app_closure;
 #[cfg(test)]
 pub(super) use policy_rows::os_app_policy_row_id;
 pub(crate) use reconcile::{
@@ -69,8 +71,7 @@ pub(crate) use reconcile::{
 };
 pub use reconcile::{
     os_app_bundle_digest, reconcile_os_app, resolve_os_app_install_order,
-    resolve_tenant_os_app_install_order, tenant_dependency_files, tenant_os_app_bundle_digest,
-    written_apps_bundle_digests,
+    resolve_tenant_os_app_install_order, tenant_os_app_bundle_digest, written_apps_bundle_digests,
 };
 pub(crate) use runtime_heal::{
     restore_app_specs_from_matching_digest, tenant_has_ready_app_specs_for_bundle,
@@ -484,7 +485,11 @@ fn load_app_bundle(files: &AppFiles) -> Result<AppBundle, String> {
 fn os_app_dependencies(tenant: Option<&str>, name: &str) -> Vec<String> {
     // Check manifest first.
     let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-    if let Some(entry) = cat.app_entry(tenant, name)
+    dependencies_for_entry(name, cat.app_entry(tenant, name))
+}
+
+fn dependencies_for_entry(name: &str, entry: Option<&AppEntry>) -> Vec<String> {
+    if let Some(entry) = entry
         && !entry.dependencies.is_empty()
     {
         return entry
@@ -501,7 +506,7 @@ fn os_app_dependencies(tenant: Option<&str>, name: &str) -> Vec<String> {
     }
 }
 
-pub(crate) fn local_os_app_dependency_name(dependency: &str) -> Option<String> {
+fn local_os_app_dependency_name(dependency: &str) -> Option<String> {
     let unpinned = dependency
         .trim()
         .split_once('@')

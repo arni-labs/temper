@@ -115,20 +115,18 @@ impl InstalledAppView {
     }
 }
 
-/// The absolute path of the folder `tenant` serves `app` from, or `""` when
-/// no folder holds it.
+/// The folder `tenant` serves `app` from, as an absolute path, or `""`
+/// when no folder holds it. The response serializer escapes JSON characters.
 fn served_dir(tenant: &str, app: &str) -> Result<String, String> {
     let Some(dir) = crate::os_apps::tenant_os_app_dir(tenant, app) else {
         return Ok(String::new());
     };
     let dir = std::path::absolute(&dir)
         .map_err(|error| format!("the folder of '{app}' has no absolute path: {error}"))?;
-    dir.into_os_string().into_string().map_err(|dir| {
-        format!(
-            "the folder of '{app}' ({}) is not UTF-8",
-            dir.to_string_lossy()
-        )
-    })
+    let text = dir
+        .to_str()
+        .ok_or_else(|| format!("the folder of '{app}' ({}) is not UTF-8", dir.display()))?;
+    Ok(text.to_string())
 }
 
 /// Authorize a read of the credential tenant's app installs and return that

@@ -9,7 +9,7 @@ use super::app_catalog::AppCatalog;
 use super::{
     AppBundle, AppEntry, AppFiles, OsAppBundleDigest, OsAppInstallPlan, OsAppReconcileResult,
     catalog, get_os_app, install_os_app_with_plan, load_app_bundle, load_tenant_os_app,
-    local_os_app_dependency_name, os_app_dependencies, restore_app_specs_from_matching_digest,
+    os_app_dependencies, restore_app_specs_from_matching_digest,
     tenant_has_ready_app_specs_for_bundle, tenant_os_app,
 };
 use crate::state::PlatformState;
@@ -59,28 +59,6 @@ pub fn resolve_tenant_os_app_install_order(
     resolve_os_app_install_order_with_dependencies(app_names, |app_name| {
         os_app_dependencies(Some(tenant), app_name)
     })
-}
-
-/// The apps `tenant` resolves now that an app whose app.toml names
-/// `dependencies` installs with, dependency-first, each with its files. An
-/// error names a dependency the tenant does not resolve.
-pub fn tenant_dependency_files(
-    tenant: &str,
-    dependencies: &[String],
-) -> Result<Vec<(String, AppFiles)>, String> {
-    let names: Vec<String> = dependencies
-        .iter()
-        .filter_map(|dependency| local_os_app_dependency_name(dependency))
-        .collect();
-    let order = resolve_tenant_os_app_install_order(tenant, &names)?;
-    let cat = catalog().read().expect("OS app catalog lock poisoned");
-    order
-        .into_iter()
-        .map(|name| match cat.app_files(Some(tenant), &name) {
-            Some(files) => Ok((name, files.clone())),
-            None => Err(format!("its dependency '{name}' is not installed")),
-        })
-        .collect()
 }
 
 pub(super) fn resolve_os_app_install_order_with_dependencies(

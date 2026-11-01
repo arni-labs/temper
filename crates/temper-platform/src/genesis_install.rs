@@ -358,11 +358,6 @@ pub async fn install_genesis_app_from_registry(
     };
     // Every source ends in the same install: checks, register, reconcile,
     // verify, then commit or go back to the version before.
-    let written: Vec<_> = materialized_apps
-        .iter()
-        .map(|app| (app.version.name.clone(), app.files.clone()))
-        .collect();
-    let resolved = closure_install::resolved_dependencies(&request.tenant, &written)?;
     let turn = temper_server::host_turn::take().await?;
     let installed = closure_install::install_materialized_closure(
         platform,
@@ -372,7 +367,6 @@ pub async fn install_genesis_app_from_registry(
             app_ref: &request.app_ref,
             root: root_ref.clone(),
             apps: materialized_apps,
-            resolved,
             source: closure_install::ClosureSource {
                 source_kind: "genesis",
                 registry_url: &registry_url,
@@ -447,12 +441,22 @@ pub(crate) async fn reconcile_materialized_app_closure(
     root_app_name: &str,
 ) -> Result<InstallResult, String> {
     let order = resolve_tenant_os_app_install_order(tenant, &[root_app_name.to_string()])?;
+    reconcile_app_install_order(platform, tenant, root_app_name, &order).await
+}
+
+/// Reconcile exactly the closure resolved before its checks and snapshots.
+async fn reconcile_app_install_order(
+    platform: &PlatformState,
+    tenant: &str,
+    root_app_name: &str,
+    order: &[String],
+) -> Result<InstallResult, String> {
     let mut root_result = InstallResult::default();
     let (mut warnings, mut reviewed) = (Vec::new(), Vec::new());
 
     for app_name in order {
         let started = Instant::now();
-        match reconcile_os_app(platform, tenant, &app_name).await? {
+        match reconcile_os_app(platform, tenant, app_name).await? {
             OsAppReconcileResult::Skipped { bundle_digest, .. } => {
                 tracing::info!(
                     tenant = %tenant,

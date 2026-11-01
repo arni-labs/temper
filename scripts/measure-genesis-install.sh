@@ -27,10 +27,9 @@
 #                  (Cedar install_app) and read their installs
 #   REGISTRY_URL   the Genesis registry that Temper is configured with
 #                  (TEMPER_GENESIS_REGISTRY_URL; it installs from no other)
-#   APP_REF        default temperpaw/paw-patrol@e3cca7fccf9f6e2dee982f6d97ebc94101535257,
-#                  the public TemperPaw app with the most specs on production
-#                  Genesis (29, 57 with its closure); pass the same app's ref in
-#                  the registry the Temper uses if that registry names it otherwise
+#   APP_REF        default temperpaw/paw-media@fd62a5dc415a752625b7564abc237a1843838668,
+#                  the pinned gate app: 20 specs across paw-media, paw-agent
+#                  and paw-fs, all in the current spec syntax
 #   TENANT_PREFIX  default kgtiming; never a person's tenant
 #   TENANT         unset by default; one tenant for every run (see above)
 #   RUNS           default 3
@@ -69,7 +68,7 @@ esac
 : "${TEMPER_URL:?set TEMPER_URL}"
 : "${TEMPER_API_KEY:?set TEMPER_API_KEY}"
 : "${REGISTRY_URL:?set REGISTRY_URL}"
-APP_REF="${APP_REF:-temperpaw/paw-patrol@e3cca7fccf9f6e2dee982f6d97ebc94101535257}"
+APP_REF="${APP_REF:-temperpaw/paw-media@fd62a5dc415a752625b7564abc237a1843838668}"
 TENANT_PREFIX="${TENANT_PREFIX:-kgtiming}"
 TENANT="${TENANT:-}"
 RUNS="${RUNS:-3}"
@@ -157,6 +156,7 @@ if [ -n "$TENANT" ]; then listed_runs=1; else listed_runs="$RUNS"; fi
 for run in $(seq 1 "$listed_runs"); do
     tenant="$(tenant_for "$run")"
     curl -sS -H @"$out/auth" -H "X-Tenant-Id: $tenant" "$base/api/genesis/apps/installs" \
-        | tr '}' '\n' | grep -o '"app_name":"[^"]*"\|"app_ref":"[^"]*"' | paste -sd' ' - \
-        | sed "s/^/#   $tenant: /" || echo "#   $tenant: could not be listed"
+        | jq -r --arg tenant "$tenant" '
+            .value | map("\(.app_name) \(.app_ref)") | join(" ") | "#   \($tenant): \(.)"
+          ' || echo "#   $tenant: could not be listed"
 done

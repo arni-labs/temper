@@ -5,7 +5,7 @@
 //! boot restore and adoption.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -18,9 +18,12 @@ use temper_server::platform_store::{
 use tower::ServiceExt;
 
 use crate::genesis_install::{adopt_catalog_app, restore_genesis_registry_cache_roots};
-use crate::os_apps::{AppFiles, app_files_seam, tenant_os_app};
+use crate::os_apps::{app_files_seam, tenant_os_app};
 use crate::state::PlatformState;
 use crate::tenant_api::tenant_api_router;
+
+#[path = "pushed_test/review_regressions.rs"]
+mod review_regressions;
 
 const APP: &str = "evolution";
 const SPEC: &str = "sentinel_monitor.ioa.toml";
@@ -52,23 +55,17 @@ permit(principal, action == Action::"read_app_installs", resource is AppInstall)
 struct Server {
     state: PlatformState,
     ps: Arc<SimPlatformStore>,
-    /// A folder whose name JSON must escape, so every listing here carries a
-    /// `dir` with a quote and a backslash in it.
-    data_dir: PathBuf,
-    _home: tempfile::TempDir,
+    data_dir: tempfile::TempDir,
 }
 
 fn server(tenant: &str) -> Server {
-    let home = tempfile::tempdir().expect("data dir");
-    let data_dir = home.path().join("we\"ird\\one");
-    std::fs::create_dir(&data_dir).expect("data dir");
+    let data_dir = tempfile::tempdir().expect("data dir");
     let ps = Arc::new(SimPlatformStore::new(0, SimPlatformFaultConfig::none()));
-    let state = server_on(tenant, &data_dir, &ps);
+    let state = server_on(tenant, data_dir.path(), &ps);
     Server {
         state,
         ps,
         data_dir,
-        _home: home,
     }
 }
 
@@ -159,8 +156,8 @@ struct Listed {
     dir: String,
 }
 
-/// The app's install as the listing's JSON gives it, or `None` when the
-/// listing holds no install of the app.
+/// The app's install as the listing gives it. Read JSON as JSON so every
+/// valid filesystem path survives escaping. None when the app is absent.
 fn listed(body: &str) -> Option<Listed> {
     let value: serde_json::Value = serde_json::from_str(body).expect("json");
     let entry = value["value"]
@@ -168,6 +165,14 @@ fn listed(body: &str) -> Option<Listed> {
         .expect("a list")
         .iter()
         .find(|entry| entry["app_name"] == APP)?;
+    assert!(
+        entry
+            .as_object()
+            .expect("an object")
+            .values()
+            .all(|field| field.is_string() || field.is_null()),
+        "flat: {entry}"
+    );
     let field = |name: &str| entry[name].as_str().unwrap_or_default().to_string();
     Some(Listed {
         source_kind: field("source_kind"),
@@ -247,7 +252,7 @@ async fn a_push_needs_a_credential_and_a_permit_in_its_own_tenant() {
         send(&server.state, push(&other, body)).await.0,
         StatusCode::FORBIDDEN
     );
-    assert!(pushed_versions(server.data_dir.as_path()).is_empty());
+    assert!(pushed_versions(server.data_dir.path()).is_empty());
 
     // Reading the installs takes `read_app_installs`; with it, nothing is
     // installed yet.
@@ -276,7 +281,7 @@ async fn a_push_naming_a_path_outside_the_app_is_refused() {
             "{body}"
         );
     }
-    assert!(pushed_versions(server.data_dir.as_path()).is_empty());
+    assert!(pushed_versions(server.data_dir.path()).is_empty());
     assert!(record(&server.ps, &tenant).await.is_none());
 }
 
@@ -292,7 +297,7 @@ async fn a_push_whose_spec_fails_its_check_changes_nothing() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let installed = record(&server.ps, &tenant).await.expect("recorded");
     let spec_before = resolved_spec(&tenant);
-    let versions_before = pushed_versions(server.data_dir.as_path());
+    let versions_before = pushed_versions(server.data_dir.path());
 
     // Entering Triggering without setting has_alerts breaks the spec's own
     // invariant `Triggering => has_alerts`.
@@ -315,84 +320,10 @@ async fn a_push_whose_spec_fails_its_check_changes_nothing() {
     assert_eq!(after.bundle_digest, installed.bundle_digest);
     assert_eq!(resolved_spec(&tenant), spec_before);
     assert_eq!(
-        pushed_versions(server.data_dir.as_path()),
+        pushed_versions(server.data_dir.path()),
         versions_before,
         "the refused version is not kept"
     );
-}
-
-/// A push installs with the dependencies its app.toml names, as the tenant
-/// resolves them, and every phase covers them: here the dependency's spec
-/// breaks its own invariant, and the push is refused naming it, with nothing
-/// installed.
-#[tokio::test]
-async fn a_push_checks_the_dependencies_it_installs_with() {
-    let tenant = unique_tenant("dependency");
-    let server = server(&tenant);
-    let home = tempfile::tempdir().expect("dependency home");
-    let helper = home.path().join("helper");
-    std::fs::create_dir_all(&helper).expect("helper dir");
-    let broken = app_files()[SPEC].replace(
-        r#"effect = ["has_alerts = true", "alert_count += 1"]"#,
-        r#"effect = ["alert_count += 1"]"#,
-    );
-    for (path, text) in [
-        ("app.toml", "name = \"helper\"\n".to_string()),
-        ("APP.md", "# helper\n\nA dependency.\n".to_string()),
-        (SPEC, broken),
-    ] {
-        std::fs::write(helper.join(path), text).expect("helper file");
-    }
-    let paths = ["app.toml", "APP.md", SPEC].map(str::to_string);
-    crate::os_apps::add_tenant_written_apps(
-        &tenant,
-        home.path().to_path_buf(),
-        vec![("helper".to_string(), AppFiles::written(helper, paths))],
-    );
-
-    let mut files = with_comment("needs a helper");
-    files
-        .get_mut("app.toml")
-        .expect("app.toml")
-        .push_str("\ndependencies = [\"helper\"]\n");
-    let (status, body) = send(
-        &server.state,
-        push(&tenant, serde_json::json!({ "files": files })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    let helper_spec = format!("helper/{SPEC}");
-    assert_eq!(
-        body["checks"][helper_spec.as_str()]["all_passed"],
-        false,
-        "{body}"
-    );
-    assert_eq!(body["checks"][SPEC]["all_passed"], true, "{body}");
-    assert!(
-        record(&server.ps, &tenant).await.is_none(),
-        "nothing installed"
-    );
-    assert!(pushed_versions(server.data_dir.as_path()).is_empty());
-
-    // A dependency the tenant does not have refuses the push, naming it.
-    let mut files = with_comment("needs a stranger");
-    files
-        .get_mut("app.toml")
-        .expect("app.toml")
-        .push_str("\ndependencies = [\"stranger\"]\n");
-    let (status, body) = send(
-        &server.state,
-        push(&tenant, serde_json::json!({ "files": files })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(
-        body["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("'stranger'")),
-        "{body}"
-    );
-    assert!(pushed_versions(server.data_dir.as_path()).is_empty());
 }
 
 /// A version whose checks pass but which the installer refuses goes back to
@@ -474,14 +405,8 @@ async fn a_good_push_is_installed_recorded_and_restored_at_boot() {
     assert_eq!(recorded.app_ref, format!("pushed/{APP}@{digest}"));
 
     // The listing names the pushed version and the folder it is served from,
-    // whose path JSON escapes.
+    // its `dir` read from JSON.
     let served = listed_for(&server.state, &tenant).await.expect("listed");
-    assert!(
-        served
-            .dir
-            .starts_with(server.data_dir.to_str().expect("utf-8")),
-        "{served:?}"
-    );
     assert_eq!(
         served,
         Listed {
@@ -501,7 +426,7 @@ async fn a_good_push_is_installed_recorded_and_restored_at_boot() {
 
     // A fresh server over the same files and records finds the version again,
     // and lists it served from the same folder.
-    let restarted = server_on(&tenant, server.data_dir.as_path(), &server.ps);
+    let restarted = server_on(&tenant, server.data_dir.path(), &server.ps);
     assert!(restore_genesis_registry_cache_roots(&restarted).await >= 1);
     assert!(resolved_spec(&tenant).contains("# pushed to its own server"));
     assert_eq!(listed_for(&restarted, &tenant).await, Some(served));
@@ -539,7 +464,7 @@ async fn a_push_keeps_only_its_version_and_the_one_before() {
         .await;
         assert_eq!(status, StatusCode::OK, "{comment}: {body}");
     }
-    assert_eq!(pushed_versions(server.data_dir.as_path()).len(), 2);
+    assert_eq!(pushed_versions(server.data_dir.path()).len(), 2);
     assert!(resolved_spec(&tenant).contains("# third"));
 }
 
@@ -647,6 +572,8 @@ async fn an_adopted_catalog_version_is_the_version_a_push_builds_on() {
     assert!(resolved_spec(&tenant).contains("# pushed after adoption"));
 }
 
+/// The app's files with one spec in the old syntax this kernel refuses: a
+/// bool written as a string, as TemperPaw's paw-patrol has it.
 /// The sentinel spec `tenant` has registered with the server.
 fn registered_spec(state: &PlatformState, tenant: &str) -> String {
     state
@@ -666,7 +593,7 @@ fn registered_spec(state: &PlatformState, tenant: &str) -> String {
 async fn a_push_installs_the_files_it_named_when_its_folder_lists_empty() {
     let tenant = unique_tenant("lists-empty");
     let server = server(&tenant);
-    app_files_seam::list_empty_under(server.data_dir.as_path());
+    app_files_seam::list_empty_under(server.data_dir.path());
     let files = with_comment("named, not listed");
     let specs = files
         .keys()
@@ -693,7 +620,9 @@ async fn a_push_installs_the_files_it_named_when_its_folder_lists_empty() {
 
 /// Boot restores a pushed version from the list of files its install kept,
 /// never from a listing: here every folder under the data folder lists empty
-/// at boot, and the restored app still serves its pushed specs.
+/// at boot, and the restored app still serves its pushed specs. The catalog
+/// outlives the restart in one test process, so the restore count is what
+/// tells a list-driven restore from no restore at all.
 #[tokio::test]
 async fn a_boot_whose_folders_list_empty_restores_the_pushed_specs() {
     let tenant = unique_tenant("boot-lists-empty");
@@ -707,16 +636,14 @@ async fn a_boot_whose_folders_list_empty_restores_the_pushed_specs() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let served = listed_for(&server.state, &tenant).await.expect("listed");
 
-    app_files_seam::list_empty_under(server.data_dir.as_path());
-    let restarted = server_on(&tenant, server.data_dir.as_path(), &server.ps);
+    app_files_seam::list_empty_under(server.data_dir.path());
+    let restarted = server_on(&tenant, server.data_dir.path(), &server.ps);
     assert_eq!(restore_genesis_registry_cache_roots(&restarted).await, 1);
     let restored = tenant_os_app(&tenant, APP).expect("the tenant resolves the app");
+    let pushed_specs = files.keys().filter(|path| path.ends_with(".ioa.toml"));
     assert_eq!(
         restored.specs.len(),
-        files
-            .keys()
-            .filter(|path| path.ends_with(".ioa.toml"))
-            .count(),
+        pushed_specs.count(),
         "every pushed spec is restored"
     );
     assert!(resolved_spec(&tenant).contains("# restored from its list"));
@@ -741,7 +668,7 @@ async fn a_re_push_whose_folder_lists_empty_serves_its_own_version() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    app_files_seam::list_empty_under(server.data_dir.as_path());
+    app_files_seam::list_empty_under(server.data_dir.path());
     let (status, body) = send(
         &server.state,
         push(
@@ -785,7 +712,7 @@ async fn a_named_file_that_cannot_be_read_refuses_the_push_naming_it() {
     let listed_before = listed_for(&server.state, &tenant).await.expect("listed");
 
     // Only the new version has this policy, so the version before still reads.
-    app_files_seam::unreadable_under(server.data_dir.as_path(), "policies/unreadable.cedar");
+    app_files_seam::unreadable_under(server.data_dir.path(), "policies/unreadable.cedar");
     let mut files = with_comment("has a file that cannot be read");
     files.insert(
         "policies/unreadable.cedar".to_string(),
@@ -813,8 +740,6 @@ async fn a_named_file_that_cannot_be_read_refuses_the_push_naming_it() {
     );
 }
 
-/// The app's files with one spec in the old syntax this kernel refuses: a
-/// bool written as a string, as TemperPaw's paw-patrol has it.
 fn old_syntax_files() -> BTreeMap<String, String> {
     let mut files = app_files();
     let spec = files.get_mut(SPEC).expect("sentinel spec");
@@ -845,7 +770,7 @@ async fn a_push_with_an_old_syntax_spec_is_refused_with_its_problem() {
         "{body}"
     );
     assert!(record(&server.ps, &tenant).await.is_none());
-    assert!(pushed_versions(server.data_dir.as_path()).is_empty());
+    assert!(pushed_versions(server.data_dir.path()).is_empty());
     assert!(listed_for(&server.state, &tenant).await.is_none());
 }
 
@@ -929,7 +854,7 @@ async fn a_registry_install_reads_the_files_its_bundle_named() {
     assert!(record(&server.ps, &tenant).await.is_none());
     assert!(listed_for(&server.state, &tenant).await.is_none());
 
-    app_files_seam::list_empty_under(server.data_dir.as_path());
+    app_files_seam::list_empty_under(server.data_dir.path());
     let (status, body) = send(&server.state, install(GOOD)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(resolved_spec(&tenant).contains("# from the registry"));

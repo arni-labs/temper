@@ -145,25 +145,13 @@ async fn install_in_turn(
             "these files are not the app '{app}': it needs an app.toml naming '{app}' and an APP.md"
         )));
     }
-    // Its dependencies install with it as the tenant resolves them now, so
-    // every phase, from the checks to the verify, covers the whole closure.
-    let pushed = [(app.to_string(), written.clone())];
-    let resolved = match closure_install::resolved_dependencies(tenant, &pushed) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            discard();
-            return Err(PushRefused::Request(format!(
-                "the app '{app}' cannot install here: {error}"
-            )));
-        }
-    };
 
     let app_ref = pushed_ref(app, &digest);
     let installed = closure_install::install_materialized_closure(
         platform,
         tenant,
         &root,
-        closure(&app_ref, app, &digest, budget, written, resolved),
+        closure(&app_ref, app, &digest, budget, written),
     )
     .await;
     match installed {
@@ -241,7 +229,7 @@ pub async fn adopt_catalog_app(
     let written = AppFiles::written(root.join(app), tree.keys().cloned());
     register_written_apps(tenant, root, vec![(app.to_string(), written.clone())]);
     let app_ref = pushed_ref(app, &digest);
-    let adopted = closure(&app_ref, app, &digest, Duration::ZERO, written, Vec::new());
+    let adopted = closure(&app_ref, app, &digest, Duration::ZERO, written);
     closure_install::record_closure(platform, tenant, &adopted).await?;
     Ok(Some(digest))
 }
@@ -272,15 +260,15 @@ fn pushed_ref(app: &str, digest: &str) -> String {
     format!("{SOURCE_KIND}/{app}@{digest}")
 }
 
-/// Pushed version `digest` of `app`, written as `files`, with the
-/// dependencies the tenant resolves for it: recorded as pushed and pinned.
+/// The files this push supplies: version `digest` of `app`, recorded as
+/// pushed and pinned. The shared core resolves its complete dependency
+/// closure over the tenant catalog before checking or mutating anything.
 fn closure<'a>(
     app_ref: &'a str,
     app: &str,
     digest: &str,
     budget: Duration,
     files: AppFiles,
-    resolved: Vec<(String, AppFiles)>,
 ) -> MaterializedClosure<'a> {
     let version = RegistryAppRef {
         owner: SOURCE_KIND.to_string(),
@@ -291,7 +279,6 @@ fn closure<'a>(
         app_ref,
         root: version.clone(),
         apps: vec![MaterializedApp { version, files }],
-        resolved,
         source: ClosureSource {
             source_kind: SOURCE_KIND,
             registry_url: "",
