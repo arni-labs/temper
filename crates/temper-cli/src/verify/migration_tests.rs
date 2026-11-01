@@ -437,3 +437,66 @@ fn verify_finds_a_module_where_its_install_does() {
     fs::write(root.join("specs/counter.ioa.toml"), source).unwrap();
     verify_specs(&app).unwrap();
 }
+
+/// A spec may call a module of an app its own app depends on: the install
+/// installs that app first, so verify finds the module there, as the
+/// install's closure does, and still refuses one no app in it declares.
+#[test]
+fn verify_finds_a_module_of_an_app_it_depends_on() {
+    let apps = tempfile::tempdir().unwrap();
+    let suffix: String = apps
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_lowercase();
+    let dependency = format!("gate-{suffix}");
+    let gate = apps.path().join(&dependency);
+    fs::create_dir_all(gate.join("wasm/probe_gate")).unwrap();
+    fs::write(
+        gate.join("app.toml"),
+        format!(
+            "name = \"{dependency}\"\ndescription = \"Holds the module\"\nversion = \"0.1.0\"\n\n[[wasm_modules]]\nname = \"probe_gate\"\n"
+        ),
+    )
+    .unwrap();
+    fs::write(gate.join("APP.md"), "# Gate\n\nHolds the module.\n").unwrap();
+    fs::write(gate.join("wasm/probe_gate/probe_gate.wasm"), b"\0asm").unwrap();
+
+    let app = apps.path().join(format!("counter-{suffix}"));
+    let specs = app.join("specs");
+    fs::create_dir_all(specs.join("policies")).unwrap();
+    fs::write(specs.join("model.csdl.xml"), CSDL).unwrap();
+    fs::write(
+        specs.join("policies/counter.cedar"),
+        "permit(principal is Agent, action == Action::\"Increment\", resource is Counter);",
+    )
+    .unwrap();
+    let calls = |module: &str| {
+        IOA.replace(
+            "[[invariant]]",
+            &format!(
+                "[[action.triggers]]\nname=\"gate\"\nkind=\"wasm\"\nmodule=\"{module}\"\n\n[[invariant]]"
+            ),
+        )
+    };
+    fs::write(
+        app.join("app.toml"),
+        format!(
+            "name = \"counter-{suffix}\"\ndescription = \"Calls a module of its dependency\"\nversion = \"0.1.0\"\ndependencies = [\"{dependency}\"]\n"
+        ),
+    )
+    .unwrap();
+    fs::write(specs.join("counter.ioa.toml"), calls("probe_gate")).unwrap();
+    run(specs.to_str().unwrap()).unwrap();
+
+    fs::write(specs.join("counter.ioa.toml"), calls("absent_gate")).unwrap();
+    let error = run(specs.to_str().unwrap()).unwrap_err().to_string();
+    assert!(
+        error.contains("missing compiled WASM module absent_gate"),
+        "a module no app in the closure declares is still refused: {error}"
+    );
+}
