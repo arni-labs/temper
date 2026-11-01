@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use super::file_source::{AppFileSource, join};
+use super::file_source::AppFileSource;
 use super::{
     AdrEntry, AgentDefinition, AppFiles, AppSkillDefinition, CompanionFile, SeedFile, SeedInstance,
     WasmModuleManifest, extract_description,
