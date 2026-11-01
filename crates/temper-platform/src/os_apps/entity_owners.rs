@@ -152,17 +152,28 @@ fn entity_sets(csdl: Option<&CsdlDocument>) -> BTreeMap<String, String> {
 
 /// The apps installed in a tenant, as the install of one of them sees them.
 #[derive(Default)]
-struct Installed {
+pub(super) struct Installed {
+    /// Whether the installed apps could be listed: a tenant with no platform
+    /// store cannot say which apps contribute to its schema.
+    pub(super) listed: bool,
     /// Whether the app being installed is installed already.
-    this_app: bool,
-    /// The entity sets each other installed app declares.
-    others: Vec<(String, BTreeSet<String>)>,
+    pub(super) this_app: bool,
+    /// Each other installed app with its own CSDL.
+    pub(super) others: Vec<InstalledApp>,
 }
 
-/// The apps installed in `tenant` besides `app_name`, with the entity sets
-/// each declares, read from its files in the catalog. An app whose files the
-/// catalog no longer holds cannot be compared, so it is logged and left out.
-async fn installed_entity_sets(
+/// One installed app and what its files say it declares.
+pub(super) struct InstalledApp {
+    pub(super) name: String,
+    /// The app's CSDL, `None` when the app has none, or why it cannot be read.
+    pub(super) csdl: Result<Option<CsdlDocument>, String>,
+}
+
+/// The apps installed in `tenant` besides `app_name`, each with the CSDL its
+/// files hold in the catalog. An app whose files the catalog no longer holds,
+/// or whose CSDL does not read, is kept with the reason: callers decide what
+/// that means for them.
+pub(super) async fn installed_apps(
     state: &PlatformState,
     tenant: &str,
     app_name: &str,
@@ -179,7 +190,10 @@ async fn installed_entity_sets(
         .list_all_installed_apps()
         .await
         .map_err(|e| format!("Failed to list the apps installed in tenant '{tenant}': {e}"))?;
-    let mut found = Installed::default();
+    let mut found = Installed {
+        listed: true,
+        ..Installed::default()
+    };
     for (_, other) in installed
         .into_iter()
         .filter(|(row_tenant, _)| row_tenant == tenant)
@@ -188,26 +202,56 @@ async fn installed_entity_sets(
             found.this_app = true;
             continue;
         }
-        let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-        let app_dir = cat.app_dir(Some(tenant), &other).cloned();
-        drop(cat);
-        let Some(app_dir) = app_dir else {
-            tracing::warn!(tenant, app = %other, "installed app is not in the catalog; its entity sets are not compared");
-            continue;
-        };
-        let Some(text) = AppFiles::find(&app_dir)
-            .csdl
-            .and_then(|path| std::fs::read_to_string(path).ok())
-        else {
-            continue;
-        };
-        let Ok(csdl) = parse_csdl(&text) else {
-            tracing::warn!(tenant, app = %other, "installed app's CSDL does not parse; its entity sets are not compared");
-            continue;
-        };
-        found
-            .others
-            .push((other, entity_sets(Some(&csdl)).into_keys().collect()));
+        let csdl = read_app_csdl(tenant, &other);
+        found.others.push(InstalledApp { name: other, csdl });
     }
     Ok(found)
+}
+
+fn read_app_csdl(tenant: &str, app: &str) -> Result<Option<CsdlDocument>, String> {
+    let cat = catalog().read().unwrap(); // ci-ok: infallible lock
+    let app_dir = cat.app_dir(Some(tenant), app).cloned();
+    drop(cat);
+    let Some(app_dir) = app_dir else {
+        return Err("the app is not in the catalog".to_string());
+    };
+    let Some(path) = AppFiles::find(&app_dir).csdl else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("{} does not read: {e}", path.display()))?;
+    parse_csdl(&text)
+        .map(Some)
+        .map_err(|e| format!("its CSDL does not parse: {e}"))
+}
+
+/// The entity sets each other installed app declares. An app that cannot be
+/// read cannot be compared, so it is logged and left out.
+async fn installed_entity_sets(
+    state: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+) -> Result<EntitySets, String> {
+    let installed = installed_apps(state, tenant, app_name).await?;
+    let mut found = EntitySets {
+        this_app: installed.this_app,
+        others: Vec::new(),
+    };
+    for other in installed.others {
+        match other.csdl {
+            Ok(csdl) => found
+                .others
+                .push((other.name, entity_sets(csdl.as_ref()).into_keys().collect())),
+            Err(why) => {
+                tracing::warn!(tenant, app = %other.name, "installed app's entity sets are not compared: {why}");
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The entity sets each other installed app declares.
+struct EntitySets {
+    this_app: bool,
+    others: Vec<(String, BTreeSet<String>)>,
 }

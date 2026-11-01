@@ -190,6 +190,8 @@ pub async fn restore_installed_apps(state: &PlatformState, ps: &dyn PlatformStor
         }
     };
 
+    os_apps::converge_installed_schemas(state, &installed).await;
+
     for (tenant, app_name) in installed {
         match recover_installed_app_runtime_state(state, ps, &tenant, &app_name).await {
             InstalledAppRuntimeRecoveryOutcome::Ready => {
@@ -314,6 +316,8 @@ pub async fn recover_installed_apps_runtime_state(
             };
         }
     };
+
+    os_apps::converge_installed_schemas(state, &installed).await;
 
     let mut summary = InstalledAppsRuntimeRecoverySummary::default();
     for (tenant, app_name) in installed {

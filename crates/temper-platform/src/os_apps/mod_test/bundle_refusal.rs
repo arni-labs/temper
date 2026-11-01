@@ -181,6 +181,7 @@ fn registering_unparseable_cross_invariants_returns_an_error_and_keeps_the_regis
         &[("Order", ORDER_IOA)],
         bootstrap::BootstrapTenantSpecsOptions {
             merge: true,
+            csdl_mode: bootstrap::CsdlMode::MergedIntoExisting,
             label: "OsApp(test)",
             verified_cache: &verified_cache,
             cross_invariants_source: Some(UNSUPPORTED_CROSS_INVARIANTS),
