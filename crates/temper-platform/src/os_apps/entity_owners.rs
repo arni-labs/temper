@@ -16,36 +16,59 @@ use super::app_files::AppFiles;
 use super::types::{AppBundle, InstallWarning};
 use crate::state::PlatformState;
 
-/// What `app_name`'s bundle would leave without an owner, or with two: each
-/// spec whose entity type its CSDL does not declare, and each entity set
-/// another app installed in `tenant` already declares, named with that app.
-pub(super) async fn ownership_problems(
+/// What an install of `app_name`'s bundle would do to who owns what.
+#[derive(Debug, Default)]
+pub(super) struct Ownership {
+    /// What the install would newly break, which a request refuses: each
+    /// spec whose entity type its CSDL does not declare, and each entity set
+    /// another app installed in `tenant` declares while `app_name` is not
+    /// installed there yet, named with that app.
+    pub(super) refused: Vec<String>,
+    /// Entity sets `app_name`, already installed, and another installed app
+    /// both declare from before. The install goes ahead and says so, as a
+    /// boot replay does: refusing it would take a running app away.
+    pub(super) standing: Vec<String>,
+}
+
+/// Who owns what once `app_name`'s bundle is installed in `tenant`.
+pub(super) async fn ownership(
     state: &PlatformState,
     tenant: &str,
     app_name: &str,
     bundle: &AppBundle,
-) -> Result<Vec<String>, String> {
+) -> Result<Ownership, String> {
     let csdl = bundle_csdl(bundle, app_name)?;
     let declared = declared_types(csdl.as_ref());
-    let mut problems: Vec<String> = bundle
-        .specs
-        .iter()
-        .filter(|(entity_type, _)| !declared.contains(entity_type))
-        .map(|(entity_type, _)| {
-            format!("spec {entity_type} has no entity type {entity_type} in the app's CSDL")
-        })
-        .collect();
+    let mut ownership = Ownership {
+        refused: bundle
+            .specs
+            .iter()
+            .filter(|(entity_type, _)| !declared.contains(entity_type))
+            .map(|(entity_type, _)| {
+                format!("spec {entity_type} has no entity type {entity_type} in the app's CSDL")
+            })
+            .collect(),
+        standing: Vec::new(),
+    };
     let sets = entity_sets(csdl.as_ref());
-    if !sets.is_empty() {
-        for (other, other_sets) in installed_entity_sets(state, tenant, app_name).await? {
-            for set in sets.keys().filter(|set| other_sets.contains(*set)) {
-                problems.push(format!(
+    if sets.is_empty() {
+        return Ok(ownership);
+    }
+    let installed = installed_entity_sets(state, tenant, app_name).await?;
+    for (other, other_sets) in installed.others {
+        for set in sets.keys().filter(|set| other_sets.contains(*set)) {
+            if installed.this_app {
+                ownership.standing.push(format!(
+                    "entity set {set} is declared by both '{app_name}' and '{other}'"
+                ));
+            } else {
+                ownership.refused.push(format!(
                     "entity set {set} is already owned by app '{other}'"
                 ));
             }
         }
     }
-    Ok(problems)
+    Ok(ownership)
 }
 
 /// Warnings for what the bundle declares but will not run: each CSDL entity
@@ -127,31 +150,44 @@ fn entity_sets(csdl: Option<&CsdlDocument>) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The entity sets each other app installed in `tenant` declares, read from
-/// its files in the catalog. An app whose files the catalog no longer holds
-/// cannot be compared, so it is logged and left out.
+/// The apps installed in a tenant, as the install of one of them sees them.
+#[derive(Default)]
+struct Installed {
+    /// Whether the app being installed is installed already.
+    this_app: bool,
+    /// The entity sets each other installed app declares.
+    others: Vec<(String, BTreeSet<String>)>,
+}
+
+/// The apps installed in `tenant` besides `app_name`, with the entity sets
+/// each declares, read from its files in the catalog. An app whose files the
+/// catalog no longer holds cannot be compared, so it is logged and left out.
 async fn installed_entity_sets(
     state: &PlatformState,
     tenant: &str,
     app_name: &str,
-) -> Result<Vec<(String, BTreeSet<String>)>, String> {
+) -> Result<Installed, String> {
     let Some(store) = state
         .server
         .storage_stack
         .as_ref()
         .and_then(|stack| stack.platform.clone())
     else {
-        return Ok(Vec::new());
+        return Ok(Installed::default());
     };
     let installed = store
         .list_all_installed_apps()
         .await
         .map_err(|e| format!("Failed to list the apps installed in tenant '{tenant}': {e}"))?;
-    let mut owners = Vec::new();
+    let mut found = Installed::default();
     for (_, other) in installed
         .into_iter()
-        .filter(|(row_tenant, other)| row_tenant == tenant && other != app_name)
+        .filter(|(row_tenant, _)| row_tenant == tenant)
     {
+        if other == app_name {
+            found.this_app = true;
+            continue;
+        }
         let app_dir = catalog()
             .read()
             .unwrap()
@@ -171,7 +207,9 @@ async fn installed_entity_sets(
             tracing::warn!(tenant, app = %other, "installed app's CSDL does not parse; its entity sets are not compared");
             continue;
         };
-        owners.push((other, entity_sets(Some(&csdl)).into_keys().collect()));
+        found
+            .others
+            .push((other, entity_sets(Some(&csdl)).into_keys().collect()));
     }
-    Ok(owners)
+    Ok(found)
 }

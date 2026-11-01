@@ -68,7 +68,7 @@ fn verify_specs(app: &TempDir) -> Result<()> {
 fn policy_warnings(specs: &Path) -> Vec<String> {
     let files = AppFiles::find(app_dir_of(specs));
     let sources = input::read_ioa_files(&files.ioa).unwrap();
-    package::validate(&sources, &specs.join("modules"), &files.policies)
+    package::validate(&sources, &files.modules, &files.policies)
         .unwrap()
         .1
 }
@@ -415,4 +415,25 @@ fn a_shadowed_spec_file_is_named_with_the_file_read_instead() {
             "specs/model.csdl.xml is not read: model.csdl.xml is read in its place",
         ]
     );
+}
+
+/// A module the app declares in app.toml, with its binary under wasm/, is
+/// found by verify where its install finds it.
+#[test]
+fn verify_finds_a_module_where_its_install_does() {
+    let app = application();
+    let root = app.path();
+    fs::write(
+        root.join("app.toml"),
+        "name = \"counter-app\"\ndescription = \"Verify layout test\"\nversion = \"0.1.0\"\n\n[[wasm_modules]]\nname = \"probe\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("wasm/probe")).unwrap();
+    fs::write(root.join("wasm/probe/probe.wasm"), b"\0asm").unwrap();
+    let source = IOA.replace(
+        "[[invariant]]",
+        "[[action.triggers]]\nname=\"probe\"\nkind=\"wasm\"\nmodule=\"probe\"\n\n[[invariant]]",
+    );
+    fs::write(root.join("specs/counter.ioa.toml"), source).unwrap();
+    verify_specs(&app).unwrap();
 }

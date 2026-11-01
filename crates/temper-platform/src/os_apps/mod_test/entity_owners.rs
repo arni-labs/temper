@@ -188,6 +188,42 @@ async fn a_replay_restores_a_second_owner_that_a_request_refuses() {
         .expect("a replay restores it");
 }
 
+/// Two apps a tenant holds from before both declaring one set is a standing
+/// pair: upgrading either goes ahead and names both, so no running tenant
+/// is broken and the pair shows in the warnings.
+#[tokio::test]
+async fn an_existing_pair_upgrades_with_a_warning_naming_both() {
+    let fx = Fixture::new("standing").await;
+    let tenant = unique("owners-tenant");
+    let held = unique("owners-held");
+    let upgraded = unique("owners-upgraded");
+    fx.write_app(&held, true, &["Counter"]);
+    fx.write_app(&upgraded, true, &["Counter"]);
+    for app in [&held, &upgraded] {
+        fx.store
+            .record_installed_app(&tenant, app)
+            .await
+            .expect("record the pair the tenant holds from before");
+    }
+
+    let result = fx
+        .install(&tenant, &upgraded)
+        .await
+        .expect("an existing pair is not refused");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.check == "entity_ownership"
+                && warning.message
+                    == format!(
+                        "entity set Counters is declared by both '{upgraded}' and '{held}'"
+                    )),
+        "{:?}",
+        result.warnings
+    );
+}
+
 #[tokio::test]
 async fn a_type_with_no_spec_and_a_shadowed_file_are_warnings() {
     let fx = Fixture::new("warnings").await;

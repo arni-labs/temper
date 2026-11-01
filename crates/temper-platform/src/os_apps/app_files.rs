@@ -1,8 +1,11 @@
-//! The spec, CSDL and policy files of an app, found one way for its install
-//! and for `temper verify`, so what verify checks is what an install runs.
+//! The spec, CSDL, policy and compiled module files of an app, found one way
+//! for its install and for `temper verify`, so what verify checks is what an
+//! install runs.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use super::types::WasmModuleManifest;
 use super::{AppDeploymentMode, effective_app_deployment_mode, read_app_manifest};
 
 /// The files of an app an install reads, and those it holds but does not read.
@@ -16,6 +19,9 @@ pub struct AppFiles {
     /// Cedar policies in `policies/`, and `policies/commons/` for an app that
     /// deploys as commons, in the order the install loads them.
     pub policies: Vec<PathBuf>,
+    /// The compiled binary of each module `app.toml` declares, by module
+    /// name, for each declared module whose binary is under `wasm/`.
+    pub modules: BTreeMap<String, PathBuf>,
     /// Spec and CSDL files another file of the same kind shadows, so the
     /// install does not read them.
     pub shadowed: Vec<Shadowed>,
@@ -67,8 +73,9 @@ impl AppFiles {
         }
 
         files.policies = files_ending_in(&app_dir.join("policies"), ".cedar");
-        let commons = read_app_manifest(app_dir).is_some_and(|manifest| {
-            effective_app_deployment_mode(&manifest) == AppDeploymentMode::Commons
+        let manifest = read_app_manifest(app_dir);
+        let commons = manifest.as_ref().is_some_and(|manifest| {
+            effective_app_deployment_mode(manifest) == AppDeploymentMode::Commons
         });
         if commons {
             files.policies.extend(files_ending_in(
@@ -76,6 +83,16 @@ impl AppFiles {
                 ".cedar",
             ));
         }
+
+        let wasm_dir = app_dir.join("wasm");
+        files.modules = manifest
+            .iter()
+            .flat_map(|manifest| &manifest.wasm_modules)
+            .filter_map(|module| {
+                let binary = module_binary(&wasm_dir, module)?;
+                Some((module.name.clone(), binary))
+            })
+            .collect();
         files
     }
 
@@ -119,6 +136,41 @@ pub fn app_dir_of(dir: &Path) -> &Path {
         }
         _ => dir,
     }
+}
+
+/// The first binary of `module` that exists, looking where the app is
+/// packaged before the build output a local checkout leaves: `wasm/<name>/`,
+/// then `wasm/`, then the module's own `target/`, by its underscored and
+/// dashed names.
+pub(super) fn module_binary(wasm_dir: &Path, module: &WasmModuleManifest) -> Option<PathBuf> {
+    let name = &module.name;
+    let module_dir = wasm_dir.join(name);
+    if !module_dir.is_dir() {
+        return None;
+    }
+    let dashed = name.replace('_', "-");
+    let targets: Vec<&str> = match module.target.as_deref() {
+        Some(target) => vec![target],
+        None => vec!["wasm32-unknown-unknown", "wasm32-wasip1"],
+    };
+    let mut candidates = Vec::new();
+    for dir in [&module_dir, wasm_dir] {
+        for file in [name, &dashed] {
+            candidates.push(dir.join(format!("{file}.wasm")));
+        }
+    }
+    for file in [name, &dashed] {
+        for target in &targets {
+            candidates.push(
+                module_dir
+                    .join("target")
+                    .join(target)
+                    .join("release")
+                    .join(format!("{file}.wasm")),
+            );
+        }
+    }
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 fn ioa_files_in(dir: &Path) -> Vec<PathBuf> {

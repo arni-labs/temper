@@ -1,14 +1,15 @@
 //! Policy and compiled module checks for `temper verify`.
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-/// Require each module the specs reference in `modules`, then parse all
-/// `policies` and return their text, with a warning for each entity no
+/// Require each module the specs reference among the app's compiled
+/// `modules` (`AppFiles::modules`, where its install finds them), then parse
+/// all `policies` and return their text, with a warning for each entity no
 /// permit reaches. A permit in any policy file counts for any entity.
 pub(super) fn validate(
     ioa_sources: &BTreeMap<String, String>,
-    modules: &Path,
+    modules: &BTreeMap<String, PathBuf>,
     policies: &[PathBuf],
 ) -> Result<(String, Vec<String>)> {
     anyhow::ensure!(
@@ -37,8 +38,9 @@ pub(super) fn validate(
                 "invalid module name"
             );
             anyhow::ensure!(
-                modules.join(format!("{module}.wasm")).is_file(),
-                "missing compiled WASM module {module}"
+                modules.contains_key(module),
+                "missing compiled WASM module {module}: app.toml must declare it in \
+                 [[wasm_modules]], with its binary under wasm/{module}/"
             );
         }
     }

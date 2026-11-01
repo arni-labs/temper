@@ -53,7 +53,7 @@ pub fn run(specs_dir: &str) -> Result<()> {
     let tla_sources = read_tla_sources(specs_path)?;
     input::validate_ioa_entities(&csdl, &ioa_sources)?;
     let (policy_text, mut policy_warnings) =
-        package::validate(&ioa_sources, &specs_path.join("modules"), &files.policies)?;
+        package::validate(&ioa_sources, &files.modules, &files.policies)?;
     policy_warnings.extend(files.unread_warnings(app_dir));
     let specs = ioa_sources.keys().map(String::as_str).collect();
     policy_warnings.extend(unspecified_entity_types(&csdl, &specs));

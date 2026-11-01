@@ -249,106 +249,39 @@ fn effective_app_deployment_mode(manifest: &AppManifest) -> AppDeploymentMode {
 ///
 /// Scans packaged artifacts copied next to the module first, then falls back
 /// to manifest-selected target outputs and common WASM release outputs.
+/// Read the binary of each module in `module_configs` found where
+/// [`AppFiles`] finds it, and warn about binaries under `wasm/` that
+/// `app.toml` does not declare.
 fn find_wasm_modules(
     app_dir: &Path,
     module_configs: &BTreeMap<String, WasmModuleManifest>,
 ) -> BTreeMap<String, Vec<u8>> {
-    let mut modules = BTreeMap::new();
     let wasm_dir = app_dir.join("wasm");
-    if !wasm_dir.is_dir() {
-        return modules;
-    }
-
-    let declared: Vec<_> = module_configs.keys().cloned().collect();
-    if declared.is_empty() {
-        warn_undeclared_wasm_artifacts(&wasm_dir, module_configs);
-        return modules;
-    }
-
-    for module_name in declared {
-        let module_dir = wasm_dir.join(&module_name);
-        if !module_dir.is_dir() {
+    let mut modules = BTreeMap::new();
+    for (module_name, config) in module_configs {
+        let Some(wasm_path) = app_files::module_binary(&wasm_dir, config) else {
             continue;
-        }
-        // Prefer packaged sibling artifacts because they are the deployable
-        // copy left after Docker target pruning. Target output remains a local
-        // development fallback.
-        let dashed_name = module_name.replace('_', "-");
-        let candidates: Vec<PathBuf> = if let Some(config) = module_configs.get(&module_name)
-            && let Some(ref target) = config.target
-        {
-            vec![
-                module_dir.join(format!("{module_name}.wasm")),
-                module_dir.join(format!("{dashed_name}.wasm")),
-                wasm_dir.join(format!("{module_name}.wasm")),
-                wasm_dir.join(format!("{dashed_name}.wasm")),
-                module_dir
-                    .join("target")
-                    .join(target)
-                    .join("release")
-                    .join(format!("{module_name}.wasm")),
-                module_dir
-                    .join("target")
-                    .join(target)
-                    .join("release")
-                    .join(format!("{dashed_name}.wasm")),
-            ]
-        } else {
-            vec![
-                module_dir.join(format!("{module_name}.wasm")),
-                module_dir.join(format!("{dashed_name}.wasm")),
-                wasm_dir.join(format!("{module_name}.wasm")),
-                wasm_dir.join(format!("{dashed_name}.wasm")),
-                module_dir
-                    .join("target")
-                    .join("wasm32-unknown-unknown")
-                    .join("release")
-                    .join(format!("{module_name}.wasm")),
-                module_dir
-                    .join("target")
-                    .join("wasm32-wasip1")
-                    .join("release")
-                    .join(format!("{module_name}.wasm")),
-                module_dir
-                    .join("target")
-                    .join("wasm32-unknown-unknown")
-                    .join("release")
-                    .join(format!("{dashed_name}.wasm")),
-                module_dir
-                    .join("target")
-                    .join("wasm32-wasip1")
-                    .join("release")
-                    .join(format!("{dashed_name}.wasm")),
-            ]
         };
-
-        for wasm_path in candidates {
-            if !wasm_path.exists() {
-                continue;
+        match std::fs::read(&wasm_path) {
+            Ok(bytes) => {
+                tracing::debug!(
+                    module = %module_name,
+                    path = %wasm_path.display(),
+                    size = bytes.len(),
+                    "Found WASM module in OS app"
+                );
+                modules.insert(module_name.clone(), bytes);
             }
-            match std::fs::read(&wasm_path) {
-                Ok(bytes) => {
-                    tracing::debug!(
-                        module = %module_name,
-                        path = %wasm_path.display(),
-                        size = bytes.len(),
-                        "Found WASM module in OS app"
-                    );
-                    modules.insert(module_name.clone(), bytes);
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        module = %module_name,
-                        path = %wasm_path.display(),
-                        error = %e,
-                        "Failed to read WASM module binary"
-                    );
-                }
+            Err(e) => {
+                tracing::warn!(
+                    module = %module_name,
+                    path = %wasm_path.display(),
+                    error = %e,
+                    "Failed to read WASM module binary"
+                );
             }
         }
     }
-
     warn_undeclared_wasm_artifacts(&wasm_dir, module_configs);
     modules
 }
@@ -1050,22 +983,25 @@ async fn install_once(
     }
     // A spec its own app does not declare, or an entity set another app
     // already declares, serves one app's records under the other's schema.
-    // A request is refused before any write; a boot replay restores what the
-    // tenant already runs, so it only logs, since refusing it would drop an
-    // installed app at start.
+    // A request that would newly do so is refused before any write. A pair
+    // the tenant holds from before goes ahead with a warning, and a boot
+    // replay only logs, since refusing either would take a running app away.
     let ownership = if plan.specs {
-        entity_owners::ownership_problems(state, tenant, app_name, &bundle).await?
+        entity_owners::ownership(state, tenant, app_name, &bundle).await?
     } else {
-        Vec::new()
+        entity_owners::Ownership::default()
     };
-    if !ownership.is_empty() {
-        let problems = ownership.join("; ");
+    if !ownership.refused.is_empty() {
+        let problems = ownership.refused.join("; ");
         if origin == InstallOrigin::Request {
             return Err(format!(
                 "Refusing to install os-app '{app_name}' for tenant '{tenant}': {problems}"
             ));
         }
         tracing::warn!(tenant, app = %app_name, problems, "replayed app has entity ownership problems");
+    }
+    for standing in &ownership.standing {
+        tracing::warn!(tenant, app = %app_name, "{standing}");
     }
     if bundle.deployment_mode == AppDeploymentMode::Commons {
         state.server.enable_commons_guardrails(tenant);
@@ -1175,6 +1111,12 @@ async fn install_once(
             &app_dir, app_name, &bundle,
         )?);
     }
+    warnings.extend(
+        ownership
+            .standing
+            .into_iter()
+            .map(InstallWarning::entity_ownership),
+    );
     let specs = &bundle.specs;
     let checked = install_checks::model_warnings(
         state, tenant, app_name, specs, new_specs, policies, attempt,
