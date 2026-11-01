@@ -209,3 +209,59 @@ async fn matching_cached_apps(
             .collect(),
     )
 }
+
+/// The files of installed app `app_name` in `tenant` at the version its record
+/// holds, from the cache directory its install wrote. Only Genesis and pushed
+/// installs keep their version's files apart from the next version's; a local
+/// install replaces its files in place, so its installed version cannot be
+/// read once its folder holds another. A pre-tenant shared cache is not read
+/// here, since using one means copying it into the tenant first.
+pub(crate) async fn installed_version_files(
+    platform: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+) -> Result<AppFileSource, String> {
+    let ps = platform
+        .server
+        .storage_stack
+        .as_ref()
+        .and_then(|stack| stack.platform.clone())
+        .ok_or_else(|| "the server has no platform store".to_string())?;
+    let record = ps
+        .get_installed_app(tenant, app_name)
+        .await
+        .map_err(|error| format!("its install record does not read: {error}"))?
+        .ok_or_else(|| "it has no install record".to_string())?;
+    if record.source_kind != "genesis" && record.source_kind != pushed::SOURCE_KIND {
+        return Err(format!(
+            "it was installed from {} files, which are replaced in place",
+            if record.source_kind.is_empty() {
+                "local"
+            } else {
+                record.source_kind.as_str()
+            }
+        ));
+    }
+    let registry_tenant = match record.registry_tenant.trim() {
+        "" => "default",
+        named => named,
+    };
+    let recorded = std::slice::from_ref(&record);
+    for candidate in install_cache_candidates(platform, tenant, registry_tenant, &record.app_ref)
+        .into_iter()
+        .filter(|candidate| !candidate.legacy)
+    {
+        let Some(apps) =
+            matching_cached_apps(ps.as_ref(), &candidate.path, &record, recorded, false).await
+        else {
+            continue;
+        };
+        if let Some((_, files)) = apps.into_iter().find(|(app, _)| app == app_name) {
+            return Ok(files);
+        }
+    }
+    Err(format!(
+        "no cache directory holds its installed version {}",
+        record.app_ref
+    ))
+}

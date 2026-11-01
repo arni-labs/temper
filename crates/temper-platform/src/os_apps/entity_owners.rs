@@ -20,12 +20,15 @@ use crate::state::PlatformState;
 pub(super) struct Ownership {
     /// What the install would newly break, which a request refuses: each
     /// spec whose entity type its CSDL does not declare, and each entity set
-    /// another app installed in `tenant` declares while `app_name` is not
-    /// installed there yet, named with that app.
+    /// another app installed in `tenant` declares that is new to `app_name`
+    /// (it is not installed there yet, or its installed version does not
+    /// declare the set), named with that app.
     pub(super) refused: Vec<String>,
-    /// Entity sets `app_name`, already installed, and another installed app
+    /// Entity sets `app_name`'s installed version and another installed app
     /// both declare from before. The install goes ahead and says so, as a
-    /// boot replay does: refusing it would take a running app away.
+    /// boot replay does: refusing it would take a running app away. When the
+    /// installed version cannot be read, a shared set is kept here too, with
+    /// a line saying why it could not be told apart.
     pub(super) standing: Vec<String>,
 }
 
@@ -54,20 +57,54 @@ pub(super) async fn ownership(
         return Ok(ownership);
     }
     let installed = installed_entity_sets(state, tenant, app_name).await?;
+    // The sets `app_name`'s installed version declares, read only when
+    // another app shares one.
+    let mut before: Option<Result<BTreeSet<String>, String>> = None;
     for (other, other_sets) in installed.others {
         for set in sets.keys().filter(|set| other_sets.contains(*set)) {
-            if installed.this_app {
-                ownership.standing.push(format!(
-                    "entity set {set} is declared by both '{app_name}' and '{other}'"
-                ));
-            } else {
+            if !installed.this_app {
                 ownership.refused.push(format!(
                     "entity set {set} is already owned by app '{other}'"
                 ));
+                continue;
+            }
+            if before.is_none() {
+                before = Some(installed_version_sets(state, tenant, app_name).await);
+            }
+            match before.as_ref() {
+                Some(Ok(declared)) if !declared.contains(set) => ownership.refused.push(format!(
+                    "entity set {set} is already owned by app '{other}', and the installed \
+                     version of '{app_name}' does not declare it"
+                )),
+                Some(Err(why)) => {
+                    ownership.standing.push(format!(
+                        "entity set {set} is declared by both '{app_name}' and '{other}'"
+                    ));
+                    ownership.standing.push(format!(
+                        "whether entity set {set} is new to '{app_name}' is not known, because \
+                         its installed version cannot be read: {why}"
+                    ));
+                }
+                _ => ownership.standing.push(format!(
+                    "entity set {set} is declared by both '{app_name}' and '{other}'"
+                )),
             }
         }
     }
     Ok(ownership)
+}
+
+/// The entity sets installed app `app_name`'s installed version declares, read
+/// from that version's own files. Unreadable files are an error, never an
+/// empty set: an empty set would refuse a pair that stands.
+async fn installed_version_sets(
+    state: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+) -> Result<BTreeSet<String>, String> {
+    let source = crate::genesis_install::installed_version_files(state, tenant, app_name).await?;
+    let csdl = read_source_csdl(&source)?;
+    Ok(entity_sets(csdl.as_ref()).into_keys().collect())
 }
 
 /// Warnings for what the bundle declares but will not run: each CSDL entity
@@ -214,12 +251,18 @@ fn read_app_csdl(tenant: &str, app: &str) -> Result<Option<CsdlDocument>, String
     let Some(source) = source else {
         return Err("the app is not in the catalog".to_string());
     };
+    read_source_csdl(&source)
+}
+
+/// The CSDL the app files in `source` hold: `None` only for an app with no
+/// specs, and an error for one whose files do not read.
+fn read_source_csdl(source: &super::AppFileSource) -> Result<Option<CsdlDocument>, String> {
     // A boot or install that reads an app as declaring nothing rebuilds the
     // schema without it, so only an app whose files are on disk and hold no
     // specs may read as having no CSDL. A missing or half-written app is
     // unreadable, and callers keep the schema the tenant already has.
     source.read_text("app.toml")?;
-    let files = AppFiles::from_source(&source);
+    let files = AppFiles::from_source(source);
     let Some(path) = files.csdl else {
         if files.ioa.is_empty() {
             return Ok(None);

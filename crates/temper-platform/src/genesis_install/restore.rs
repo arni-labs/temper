@@ -13,6 +13,7 @@ use temper_server::platform_store::{InstalledAppRecord, PlatformStore};
 mod cache_recovery;
 mod rollback;
 
+pub(crate) use cache_recovery::installed_version_files;
 use cache_recovery::{
     cached_apps_matching_records, first_matching_install, install_cache_candidates,
 };
