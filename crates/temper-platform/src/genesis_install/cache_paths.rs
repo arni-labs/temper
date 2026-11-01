@@ -161,6 +161,13 @@ pub(super) fn genesis_cache_root(
     root.join(format!("{}-{}", sanitize_fragment(app_ref), &digest[..32]))
 }
 
+/// The pre-tenant shared layout, used only for digest-verified recovery.
+/// Delete with the pre-tenant cache migration after existing installs move.
+pub(super) fn legacy_genesis_cache_root(state: &ServerState, app_ref: &str) -> PathBuf {
+    let digest = format!("{:x}", sha2::Sha256::digest(app_ref.as_bytes()));
+    genesis_cache_base(state).join(format!("{}-{}", sanitize_fragment(app_ref), &digest[..16]))
+}
+
 fn genesis_cache_base(state: &ServerState) -> PathBuf {
     if state.data_dir.as_os_str().is_empty() {
         std::env::temp_dir().join("temper-genesis-app-cache")

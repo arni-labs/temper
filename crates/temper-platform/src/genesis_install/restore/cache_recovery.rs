@@ -1,8 +1,19 @@
 //! Find the cache directory that still holds an install's recorded versions.
 
+use super::super::cache_paths::legacy_genesis_cache_root;
 use super::super::written::{self, Written};
 use super::*;
 use crate::os_apps::{list_install_dir, written_apps_bundle_digests};
+
+#[path = "legacy_cache.rs"]
+mod legacy_cache;
+
+/// A tenant-owned cache, or a shared pre-tenant cache requiring migration.
+pub(super) struct InstallCacheCandidate {
+    /// Filesystem location of this recovery candidate.
+    pub(super) path: PathBuf,
+    legacy: bool,
+}
 
 /// The cache directories an install of `cache_key` into `tenant` may have, the registry's first.
 ///
@@ -10,13 +21,14 @@ use crate::os_apps::{list_install_dir, written_apps_bundle_digests};
 /// on this server caches under the service's tenant, which its record names as the registry
 /// tenant unless the request named another one, so every Genesis source tenant is a candidate too.
 /// A pushed install caches under its tenant alone, after every Genesis source.
-/// A candidate is used only when it holds the recorded versions.
+/// A candidate is used only when it holds the recorded versions. Pre-tenant
+/// shared caches require recorded digests and migrate into the first private root.
 pub(super) fn install_cache_candidates(
     platform: &PlatformState,
     tenant: &str,
     registry_tenant: &str,
     cache_key: &str,
-) -> Vec<PathBuf> {
+) -> Vec<InstallCacheCandidate> {
     let mut sources = vec![
         InstallSource::Registry(registry_tenant),
         InstallSource::Local(registry_tenant),
@@ -29,29 +41,52 @@ pub(super) fn install_cache_candidates(
             .map(|source| InstallSource::Local(source.as_str())),
     );
     sources.push(InstallSource::Pushed);
-    sources
+    let mut candidates: Vec<_> = sources
         .into_iter()
-        .map(|source| {
-            genesis_cache_root(
+        .map(|source| InstallCacheCandidate {
+            path: genesis_cache_root(
                 &platform.server,
                 CacheOwner::Install { tenant, source },
                 cache_key,
-            )
+            ),
+            legacy: false,
         })
-        .collect()
+        .collect();
+    candidates.push(InstallCacheCandidate {
+        path: legacy_genesis_cache_root(&platform.server, cache_key),
+        legacy: true,
+    });
+    candidates
 }
 
 /// The first of `candidates` that holds `record`'s app at its recorded version,
 /// with the apps to take from it.
 pub(super) async fn first_matching_install(
     ps: &dyn PlatformStore,
-    candidates: &[PathBuf],
+    candidates: &[InstallCacheCandidate],
     record: &InstalledAppRecord,
     recorded: &[InstalledAppRecord],
 ) -> Option<(PathBuf, Vec<(String, AppFiles)>)> {
     for candidate in candidates {
-        if let Some(apps) = cached_apps_matching_records(ps, candidate, record, recorded).await {
-            return Some((candidate.clone(), apps));
+        let Some(apps) =
+            matching_cached_apps(ps, &candidate.path, record, recorded, candidate.legacy).await
+        else {
+            continue;
+        };
+        if !candidate.legacy {
+            return Some((candidate.path.clone(), apps));
+        }
+        // Shared files must never become the tenant's live catalog. Verify a
+        // private copy and its saved file list before publishing it instead.
+        let destination = &candidates[0].path;
+        match legacy_cache::migrate(ps, destination, apps, record, recorded).await {
+            Ok(apps) => return Some((destination.clone(), apps)),
+            Err(error) => tracing::warn!(
+                tenant = %record.tenant,
+                app = %record.app_name,
+                error = %error,
+                "Failed to migrate verified pre-tenant Genesis cache"
+            ),
         }
     }
     None
@@ -81,6 +116,16 @@ pub(super) async fn cached_apps_matching_records(
     cache_root: &Path,
     record: &InstalledAppRecord,
     recorded: &[InstalledAppRecord],
+) -> Option<Vec<(String, AppFiles)>> {
+    matching_cached_apps(ps, cache_root, record, recorded, false).await
+}
+
+async fn matching_cached_apps(
+    ps: &dyn PlatformStore,
+    cache_root: &Path,
+    record: &InstalledAppRecord,
+    recorded: &[InstalledAppRecord],
+    require_digest: bool,
 ) -> Option<Vec<(String, AppFiles)>> {
     if !cache_root.is_dir() {
         return None;
@@ -133,7 +178,7 @@ pub(super) async fn cached_apps_matching_records(
                 _ => continue,
             },
         };
-        if expected.is_empty() || expected == digest.bundle_digest {
+        if (!require_digest && expected.is_empty()) || expected == digest.bundle_digest {
             matching.insert(digest.app_name.clone());
         }
     }
@@ -146,7 +191,8 @@ pub(super) async fn cached_apps_matching_records(
         );
         return None;
     }
-    if let Some(mut listed) = adopted {
+    // A shared pre-tenant root is read-only; its list is saved in the tenant copy.
+    if let Some(mut listed) = adopted.filter(|_| !require_digest) {
         listed.retain(|app, _| matching.contains(app));
         if let Err(error) = written::keep(cache_root, &listed) {
             tracing::warn!(

@@ -192,7 +192,7 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
         };
         let candidates =
             install_cache_candidates(platform, &tenant, registry_tenant, &record.app_ref);
-        let cache_root = candidates[0].clone();
+        let cache_root = candidates[0].path.clone();
         // Each tenant's install has its own directory, so records restore it
         // once per directory, from that install's own registry tenant.
         if !seen.insert(cache_root.clone()) {
@@ -337,7 +337,7 @@ async fn ensure_prior_root_available(
         register_written_apps(&prior.tenant, stored, apps);
         return Ok(names);
     }
-    let cache_root = candidates[0].clone();
+    let cache_root = candidates[0].path.clone();
     if cache_root.is_dir() {
         tracing::warn!(
             app = %prior.app_name,

@@ -177,7 +177,7 @@ async fn restore_dependency(
     };
     let mut candidates =
         install_cache_candidates(platform, &record.tenant, registry_tenant, &record.app_ref);
-    let destination = candidates[0].clone();
+    let destination = candidates[0].path.clone();
     let own = first_matching_install(ps, &candidates, record, prior_records).await;
     let (stored, apps) = match own {
         Some(found) => found,
