@@ -285,41 +285,45 @@ async fn a_push_naming_a_path_outside_the_app_is_refused() {
     assert!(record(&server.ps, &tenant).await.is_none());
 }
 
-/// An install checks at main's level: each spec parses, and the installer's
-/// joint proofs warn. A spec whose own invariant an unguarded move breaks
-/// (an L1 counterexample, the shape of paw-fs's `UsageBelowQuota`) installs
-/// with 200, as it does on main; the per-spec L0-L3 check is the caller's,
-/// before it sends.
 #[tokio::test]
-async fn a_spec_with_a_model_check_counterexample_installs_at_mains_level() {
-    let tenant = unique_tenant("counterexample");
+async fn a_push_whose_spec_fails_its_check_changes_nothing() {
+    let tenant = unique_tenant("refused");
     let server = server(&tenant);
+    let (status, body) = send(
+        &server.state,
+        push(&tenant, serde_json::json!({ "files": app_files() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let installed = record(&server.ps, &tenant).await.expect("recorded");
+    let spec_before = resolved_spec(&tenant);
+    let versions_before = pushed_versions(server.data_dir.path());
+
     // Entering Triggering without setting has_alerts breaks the spec's own
     // invariant `Triggering => has_alerts`.
-    let mut files = with_comment("breaks its own invariant");
+    let mut files = app_files();
     let spec = files.get_mut(SPEC).expect("sentinel spec");
     *spec = spec.replace(
         r#"effect = ["has_alerts = true", "alert_count += 1"]"#,
         r#"effect = ["alert_count += 1"]"#,
-    );
-    assert!(
-        !spec.contains("has_alerts = true"),
-        "the move no longer sets it"
     );
     let (status, body) = send(
         &server.state,
         push(&tenant, serde_json::json!({ "files": files })),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(
-        body.get("checks").is_none(),
-        "no per-spec check runs: {body}"
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["checks"][SPEC]["all_passed"], false, "{body}");
+
+    let after = record(&server.ps, &tenant).await.expect("still recorded");
+    assert_eq!(after.app_ref, installed.app_ref);
+    assert_eq!(after.bundle_digest, installed.bundle_digest);
+    assert_eq!(resolved_spec(&tenant), spec_before);
+    assert_eq!(
+        pushed_versions(server.data_dir.path()),
+        versions_before,
+        "the refused version is not kept"
     );
-    let digest = body["digest"].as_str().expect("digest");
-    let installed = record(&server.ps, &tenant).await.expect("recorded");
-    assert_eq!(installed.app_ref, format!("pushed/{APP}@{digest}"));
-    assert!(resolved_spec(&tenant).contains("# breaks its own invariant"));
 }
 
 /// A version whose checks pass but which the installer refuses goes back to
@@ -339,7 +343,7 @@ async fn a_push_the_installer_refuses_rolls_back_to_the_version_before() {
     let spec_before = resolved_spec(&tenant);
     let listed_before = listed_for(&server.state, &tenant).await.expect("listed");
 
-    // The specs parse; the installer cannot parse the policy.
+    // The specs pass their checks; the installer cannot parse the policy.
     let mut files = with_comment("refused by the installer");
     files.insert(
         "policies/evolution.cedar".to_string(),
@@ -385,6 +389,7 @@ async fn a_good_push_is_installed_recorded_and_restored_at_boot() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let digest = body["digest"].as_str().expect("digest").to_string();
     assert_eq!(body["installed"], APP);
+    assert_eq!(body["checks"][SPEC]["all_passed"], true, "{body}");
     assert!(resolved_spec(&tenant).contains("# pushed to its own server"));
     let registered = server
         .state
@@ -583,7 +588,7 @@ fn registered_spec(state: &PlatformState, tenant: &str) -> String {
 /// The installer reads the files a push names, never a listing of the folder
 /// the push just wrote. Here every folder under the server's data folder
 /// lists empty, as a folder just renamed into place can on some drives, and
-/// the push still parses every spec, installs, and serves them.
+/// the push still checks every spec, installs, and serves them.
 #[tokio::test]
 async fn a_push_installs_the_files_it_named_when_its_folder_lists_empty() {
     let tenant = unique_tenant("lists-empty");
@@ -600,12 +605,12 @@ async fn a_push_installs_the_files_it_named_when_its_folder_lists_empty() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let installed = tenant_os_app(&tenant, APP).expect("the tenant resolves the app");
     assert_eq!(
-        installed.specs.len(),
-        specs,
-        "every pushed spec is installed"
+        body["checks"].as_object().map(serde_json::Map::len),
+        Some(specs),
+        "every pushed spec is checked: {body}"
     );
+    assert_eq!(body["checks"][SPEC]["all_passed"], true, "{body}");
     assert!(resolved_spec(&tenant).contains("# named, not listed"));
     assert!(registered_spec(&server.state, &tenant).contains("# named, not listed"));
     let digest = body["digest"].as_str().expect("digest");
@@ -815,11 +820,10 @@ async fn a_push_with_an_old_syntax_spec_is_refused_with_its_problem() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    let error = body["error"].as_str().unwrap_or_default();
+    assert_eq!(body["checks"][SPEC]["all_passed"], false, "{body}");
+    let summary = body["checks"][SPEC]["levels"][0]["summary"].as_str();
     assert!(
-        error.contains(SPEC)
-            && error.contains("does not parse")
-            && error.contains("migrate-predicates"),
+        summary.is_some_and(|s| s.contains("does not parse") && s.contains("migrate-predicates")),
         "{body}"
     );
     assert!(record(&server.ps, &tenant).await.is_none());

@@ -6,13 +6,11 @@
 //! {"keep": "<sha256 hex>"}}, "budget_ms": <time each spec's check may
 //! take>}`. The app goes into the credential's own tenant; a request cannot
 //! name another. Answers 200 with the install, 400 for a wrong request, 422
-//! when a spec does not parse or the installer refused it, with why. The
-//! install checks at main's level (each spec parses; joint proofs warn), so
-//! `budget_ms` bounds no check yet; it is still validated, because the
-//! caller (Katagami's apps_build) sends it for the per-spec check. Every answer
+//! when a spec's check or the installer refused it, with why. Every answer
 //! says how long the push waited for this host's install turn (`waited_ms`).
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use axum::Json;
 use axum::body::Bytes;
@@ -94,7 +92,8 @@ async fn install(
         );
     }
 
-    let (waited, pushed) = install_pushed_app(&state, tenant, &name, request.files).await;
+    let budget = Duration::from_millis(budget_ms);
+    let (waited, pushed) = install_pushed_app(&state, tenant, &name, request.files, budget).await;
     let (status, mut answer) = match pushed {
         Ok(pushed) => (
             StatusCode::OK,
@@ -102,10 +101,17 @@ async fn install(
                 "installed": name,
                 "digest": pushed.digest,
                 "result": pushed.result,
+                "checks": pushed.checks,
             }),
         ),
         Err(PushRefused::Request(error)) => (StatusCode::BAD_REQUEST, error_body(error)),
-        Err(PushRefused::Unparsed(error)) => (StatusCode::UNPROCESSABLE_ENTITY, error_body(error)),
+        Err(PushRefused::Checks(checks)) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({
+                "error": format!("a spec of '{name}' did not pass its check; nothing was installed"),
+                "checks": checks,
+            }),
+        ),
         Err(PushRefused::Install(error)) => (StatusCode::UNPROCESSABLE_ENTITY, error_body(error)),
         Err(PushRefused::Server(error)) => (StatusCode::INTERNAL_SERVER_ERROR, error_body(error)),
     };

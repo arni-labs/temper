@@ -50,18 +50,19 @@ fn with_dependency(name: &str) -> BTreeMap<String, String> {
     files
 }
 
-/// Every phase covers the whole closure, the parse among them: a transitive
-/// dependency whose spec does not parse refuses the push, naming it, before
-/// anything changes.
 #[tokio::test]
-async fn a_transitive_dependency_that_does_not_parse_refuses_before_any_install_changes() {
-    let tenant = unique_tenant("closure-parse");
+async fn a_transitive_dependency_fails_checks_before_any_install_changes() {
+    let tenant = unique_tenant("closure-checks");
     let server = server(&tenant);
     let catalog = tempfile::tempdir().unwrap();
     dependency(catalog.path(), "push-parent", &["push-leaf"]);
     dependency(catalog.path(), "push-leaf", &[]);
-    let old = old_syntax_files()[SPEC].replace("SentinelMonitor", "PushDependency");
-    std::fs::write(catalog.path().join("push-leaf").join(SPEC), old).unwrap();
+    let path = catalog.path().join("push-leaf").join(SPEC);
+    let spec = std::fs::read_to_string(&path).unwrap().replace(
+        r#"effect = ["has_alerts = true", "alert_count += 1"]"#,
+        r#"effect = ["alert_count += 1"]"#,
+    );
+    std::fs::write(path, spec).unwrap();
     register(
         &tenant,
         catalog.path(),
@@ -81,9 +82,9 @@ async fn a_transitive_dependency_that_does_not_parse_refuses_before_any_install_
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    let error = body["error"].as_str().unwrap_or_default();
-    assert!(
-        error.contains(&format!("push-leaf/{SPEC}")) && error.contains("does not parse"),
+    assert_eq!(
+        body["checks"][format!("push-leaf/{SPEC}")]["all_passed"],
+        false,
         "{body}"
     );
     assert!(record(&server.ps, &tenant).await.is_none());
