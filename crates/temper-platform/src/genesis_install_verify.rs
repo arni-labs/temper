@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use temper_server::platform_store::InstalledAppRecord;
 
 use crate::genesis_install::reconcile_materialized_app_closure;
-use crate::os_apps::{WasmModuleManifest, tenant_os_app, tenant_os_app_bundle_digest};
+use crate::os_apps::{Swap, WasmModuleManifest, tenant_os_app, tenant_os_app_bundle_digest};
 use crate::recovery::{InstalledAppRuntimeRecoveryOutcome, recover_installed_app_runtime_state};
 use crate::state::PlatformState;
 
@@ -174,7 +174,7 @@ pub async fn restore_prior_install(
     tenant: &str,
     prior: &InstalledAppRecord,
 ) -> Result<(), String> {
-    reconcile_materialized_app_closure(platform, tenant, &prior.app_name)
+    reconcile_materialized_app_closure(platform, tenant, &prior.app_name, Swap::SpecsFirst)
         .await
         .map_err(|error| {
             format!(

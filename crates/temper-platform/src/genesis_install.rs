@@ -60,8 +60,8 @@ use crate::genesis_install_verify::{
     restore_prior_install, verify_install_closure_runtime_ready, verify_install_runtime_ready,
 };
 use crate::os_apps::{
-    AppFileSource, AppManifest, InstallResult, InstallWarning, OsAppReconcileResult,
-    add_tenant_written_apps, add_written_apps_preferred, reconcile_os_app,
+    AppFileSource, AppManifest, InstallResult, InstallWarning, OsAppReconcileResult, Swap,
+    add_tenant_written_apps, add_written_apps_preferred, reconcile_os_app_swapping,
     resolve_tenant_os_app_install_order, tenant_os_app_bundle_digest,
 };
 use crate::state::PlatformState;
@@ -428,9 +428,10 @@ pub(crate) async fn reconcile_materialized_app_closure(
     platform: &PlatformState,
     tenant: &str,
     root_app_name: &str,
+    swap: Swap,
 ) -> Result<InstallResult, String> {
     let order = resolve_tenant_os_app_install_order(tenant, &[root_app_name.to_string()])?;
-    reconcile_app_install_order(platform, tenant, root_app_name, &order).await
+    reconcile_app_install_order(platform, tenant, root_app_name, &order, swap).await
 }
 
 /// Reconcile exactly the closure resolved before its checks and snapshots.
@@ -439,13 +440,14 @@ async fn reconcile_app_install_order(
     tenant: &str,
     root_app_name: &str,
     order: &[String],
+    swap: Swap,
 ) -> Result<InstallResult, String> {
     let mut root_result = InstallResult::default();
     let (mut warnings, mut reviewed) = (Vec::new(), Vec::new());
 
     for app_name in order {
         let started = Instant::now();
-        match reconcile_os_app(platform, tenant, app_name).await? {
+        match reconcile_os_app_swapping(platform, tenant, app_name, swap).await? {
             OsAppReconcileResult::Skipped { bundle_digest, .. } => {
                 tracing::info!(
                     tenant = %tenant,
@@ -860,7 +862,14 @@ impl BoundActionHook for GenesisInstallHook {
 
         let mut platform = self.platform.clone();
         platform.server = state.clone();
-        match reconcile_materialized_app_closure(&platform, &target_tenant, &name).await {
+        match reconcile_materialized_app_closure(
+            &platform,
+            &target_tenant,
+            &name,
+            Swap::ModulesFirst,
+        )
+        .await
+        {
             Ok(result) => {
                 let closure_id = format!(
                     "genesis:{}:{}",

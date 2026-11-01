@@ -121,8 +121,14 @@ pub(super) async fn install_materialized_closure(
     register_written_apps(tenant, cache_root.to_path_buf(), written);
 
     let reconcile_started = Instant::now();
-    let reconcile_result =
-        reconcile_app_install_order(platform, tenant, &closure.root.name, &materialized).await;
+    let reconcile_result = reconcile_app_install_order(
+        platform,
+        tenant,
+        &closure.root.name,
+        &materialized,
+        Swap::ModulesFirst,
+    )
+    .await;
 
     // Verify EVERY app in the reconciled closure reached runtime-ready — specs/policies/wasm
     // registered AND every app-required wasm module compiles. A reconcile error counts as

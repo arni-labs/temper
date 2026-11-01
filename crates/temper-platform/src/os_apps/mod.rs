@@ -9,7 +9,6 @@
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 use std::path::Path;
-use std::time::Instant;
 
 use serde::Serialize;
 use temper_runtime::tenant::TenantId;
@@ -24,6 +23,7 @@ mod app_catalog;
 mod app_files;
 mod apps_dir;
 mod bundle_files;
+mod bundle_modules;
 mod closure_bootstrap;
 mod entity_aliases;
 mod entity_owners;
@@ -51,6 +51,7 @@ pub(crate) use app_catalog::{load_tenant_os_app, tenant_os_app_dir};
 pub use app_files::{AppFiles, Shadowed, app_dir_of};
 pub(crate) use bundle_files::find_ioa_files;
 use bundle_files::{find_adrs, find_agents, find_app_skills, find_seed_data, find_wasm_modules};
+use bundle_modules::{BundleModules, register_bundle_modules};
 pub use closure_bootstrap::{
     ClosureBootstrapResult, OS_APP_CLOSURE_RESOLVER_VERSION, OsAppClosure,
     bootstrap_closure_manifest, os_app_closure_for_roots, parse_bootstrap_manifest_str,
@@ -70,7 +71,8 @@ pub(crate) use own_schema::converge_installed_schemas;
 #[cfg(test)]
 pub(super) use policy_rows::os_app_policy_row_id;
 pub(crate) use reconcile::{
-    InstallOrigin, tenant_has_active_policies_for_bundle, tenant_has_registered_wasm_for_bundle,
+    InstallOrigin, reconcile_os_app_swapping, tenant_has_active_policies_for_bundle,
+    tenant_has_registered_wasm_for_bundle,
 };
 pub use reconcile::{
     os_app_bundle_digest, reconcile_os_app, resolve_os_app_install_order,
@@ -590,12 +592,58 @@ pub(super) async fn install_os_app_with_plan(
     plan: OsAppInstallPlan,
     origin: InstallOrigin,
 ) -> Result<InstallResult, String> {
+    install_os_app_swapping(
+        state,
+        tenant,
+        app_name,
+        plan,
+        origin,
+        Swap::for_origin(origin),
+    )
+    .await
+}
+
+/// Which half of a new app version goes in first: its WASM modules or its
+/// specs. An integration's call is fixed by the spec its action ran under,
+/// and its module is looked up by name only when the call runs, so the newer
+/// module must be in place whenever the newer spec can run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Swap {
+    /// A new version: its modules go in, then its specs. Until the specs go
+    /// live, the old spec's calls reach the new module.
+    ModulesFirst,
+    /// An older version put back, after a failed install or at boot: its
+    /// specs go back, then its modules, so the newer module answers both
+    /// specs meanwhile. A call the newer spec had already started when the
+    /// modules go back still reaches the older module.
+    SpecsFirst,
+}
+
+impl Swap {
+    /// A request installs a new version; a replay puts a recorded one back.
+    pub(crate) fn for_origin(origin: InstallOrigin) -> Self {
+        match origin {
+            InstallOrigin::Request => Self::ModulesFirst,
+            InstallOrigin::Replay => Self::SpecsFirst,
+        }
+    }
+}
+
+/// [`install_os_app_with_plan`] with the order its modules and specs go in.
+pub(super) async fn install_os_app_swapping(
+    state: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+    plan: OsAppInstallPlan,
+    origin: InstallOrigin,
+    swap: Swap,
+) -> Result<InstallResult, String> {
     // A proof that is still walking is waited for without the tenant's
     // install lock; the install then starts again under it and finds the
     // verdict in `attempt`, or a new walk when the tenant changed meanwhile.
     let mut attempt = proofs::Attempt::default();
     loop {
-        match install_once(state, tenant, app_name, plan, origin, &attempt).await? {
+        match install_once(state, tenant, app_name, plan, origin, swap, &attempt).await? {
             ControlFlow::Break(result) => return Ok(result),
             ControlFlow::Continue(proof) => proof.ended(&mut attempt).await?,
         }
@@ -610,6 +658,7 @@ async fn install_once(
     app_name: &str,
     plan: OsAppInstallPlan,
     origin: InstallOrigin,
+    swap: Swap,
     attempt: &proofs::Attempt,
 ) -> Result<ControlFlow<InstallResult, proofs::Wait>, String> {
     install_checks::refuse_unavailable_tenant(state, tenant, app_name)?;
@@ -911,6 +960,17 @@ async fn install_once(
         policy_rows::delete_dropped_rows(state, tenant, &superseded).await?;
     }
 
+    // ── Modules first, unless the specs go first (see Swap). ───────
+    // An integration's call is fixed by the spec its action ran under, and its
+    // module is looked up by name only when the call runs: a new version's
+    // spec live before its module calls the old binary with what only the new
+    // one understands, and the record it moved breaks.
+    let modules = if plan.wasm && swap == Swap::ModulesFirst {
+        Some(register_bundle_modules(state, tenant, &tenant_id, &bundle, &upload_replacement).await)
+    } else {
+        None
+    };
+
     // ── Step 2: Bootstrap into memory (verification + registry). ────
     // Only process specs whose content has changed (added or updated);
     // skipped specs are already loaded with identical content.
@@ -982,144 +1042,19 @@ async fn install_once(
         }
     }
 
-    // ── Step 4: Persist/register WASM modules, warming only eager modules. ──
-    //
-    // Source-aware preservation: if a (tenant, module) row in the durable store
-    // has source='upload' (i.e., a hot upload from `POST /api/wasm/modules/{name}`),
-    // preserve uploads newer than the installed app record. Replace uploads when
-    // the bundle digest changed or durable metadata predates the app record.
-    let mut wasm_registered = Vec::new();
-    let mut wasm_skipped = Vec::new();
-    let mut wasm_failures = Vec::new();
-    if plan.wasm {
-        let existing_sources = match state.server.load_wasm_module_sources(tenant).await {
-            Ok(map) => map,
-            Err(e) => {
-                tracing::warn!(
-                    tenant,
-                    error = %e,
-                    "Failed to load existing WASM modules; install pipeline will not honor hot-upload preservation this cycle"
-                );
-                std::collections::BTreeMap::new()
-            }
-        };
-
-        for (module_name, wasm_bytes) in &bundle.wasm_modules {
-            let module_started = Instant::now();
-            let module_config = bundle.wasm_module_configs.get(module_name);
-            let hash = temper_wasm::WasmEngine::hash_module(wasm_bytes);
-            let required = module_config.is_some_and(WasmModuleManifest::is_required);
-            let replace_uploaded_module =
-                existing_sources.get(module_name).is_some_and(|existing| {
-                    upload_replacement.should_replace(existing)
-                        || (required && existing.source == "upload" && existing.sha256_hash != hash)
-                });
-            if let Some(existing) = existing_sources.get(module_name)
-                && existing.source == "upload"
-                && existing.sha256_hash != hash
-            {
-                if replace_uploaded_module {
-                    tracing::info!(
-                        tenant,
-                        module = %module_name,
-                        bundled_hash = %hash,
-                        upload_hash = %existing.sha256_hash,
-                        "Replacing stale hot-uploaded WASM module during os-app reconcile"
-                    );
-                } else {
-                    tracing::info!(
-                        tenant,
-                        module = %module_name,
-                        bundled_hash = %hash,
-                        upload_hash = %existing.sha256_hash,
-                        "Skipping bundled install: hot-uploaded module preserved"
-                    );
-                    wasm_skipped.push(module_name.clone());
-                    continue;
-                }
-            }
-
-            let upsert_result = if replace_uploaded_module {
-                state
-                    .server
-                    .upsert_bundled_wasm_module_replacing_upload(
-                        tenant,
-                        module_name,
-                        wasm_bytes,
-                        &hash,
-                    )
-                    .await
-            } else {
-                state
-                    .server
-                    .upsert_wasm_module(tenant, module_name, wasm_bytes, &hash, "bundled")
-                    .await
-            };
-            if let Err(e) = upsert_result {
-                tracing::warn!(
-                    tenant,
-                    module = %module_name,
-                    error = %e,
-                    "Failed to persist WASM module to durable store (continuing in-memory only)"
-                );
-            }
-            state
-                .server
-                .register_wasm_module(&tenant_id, module_name, &hash);
-
-            if matches!(
-                module_config.map(|config| config.startup_loading),
-                Some(WasmStartupLoading::Eager)
-            ) && let Err(e) = state.server.wasm_engine.compile_and_cache(wasm_bytes)
-            {
-                wasm_failures.push(module_name.clone());
-                tracing::warn!(
-                    tenant,
-                    module = %module_name,
-                    error = %e,
-                    "Failed to eagerly compile WASM module from OS app"
-                );
-            }
-
-            tracing::info!(
-                tenant,
-                module = %module_name,
-                hash = %hash,
-                size = wasm_bytes.len(),
-                duration_ms = module_started.elapsed().as_millis() as u64,
-                startup_loading = ?module_config
-                    .map(|config| config.startup_loading)
-                    .unwrap_or_default(),
-                "WASM module registered from OS app"
-            );
-            wasm_registered.push(module_name.clone());
+    // ── Step 4: modules, when the specs went first (Swap::SpecsFirst). ──
+    let modules = match modules {
+        Some(modules) => modules,
+        None if plan.wasm => {
+            register_bundle_modules(state, tenant, &tenant_id, &bundle, &upload_replacement).await
         }
-
-        for (module_name, module_config) in &bundle.wasm_module_configs {
-            if bundle.wasm_modules.contains_key(module_name) {
-                continue;
-            }
-            match module_config.criticality {
-                WasmModuleCriticality::Optional => {
-                    wasm_skipped.push(module_name.clone());
-                    tracing::warn!(
-                        tenant,
-                        module = %module_name,
-                        "Configured optional WASM module artifact is missing from the app bundle"
-                    );
-                }
-                WasmModuleCriticality::PlatformRequired | WasmModuleCriticality::AppRequired => {
-                    wasm_failures.push(module_name.clone());
-                    tracing::error!(
-                        tenant,
-                        module = %module_name,
-                        criticality = ?module_config.criticality,
-                        "Configured required WASM module artifact is missing from the app bundle"
-                    );
-                }
-            }
-        }
-    }
+        None => BundleModules::default(),
+    };
+    let BundleModules {
+        registered: wasm_registered,
+        skipped: wasm_skipped,
+        failures: wasm_failures,
+    } = modules;
 
     // Overdue timers may fire at once: reconcile only now that policies and modules are in.
     install.installed(&state.server, plan.specs);

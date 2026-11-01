@@ -3697,3 +3697,6 @@ async fn test_concurrent_installs_into_one_tenant_keep_both_apps_cedar() {
 
 #[path = "mod_test/timer_install.rs"]
 mod timer_install;
+
+#[path = "mod_test/install_order.rs"]
+mod install_order;
