@@ -22,7 +22,7 @@ use crate::os_apps::{app_files_seam, tenant_os_app};
 use crate::state::PlatformState;
 use crate::tenant_api::tenant_api_router;
 
-#[path = "pushed_test/review_regressions.rs"]
+#[path = "pushed_test/review_regressions_test.rs"]
 mod review_regressions;
 
 const APP: &str = "evolution";
