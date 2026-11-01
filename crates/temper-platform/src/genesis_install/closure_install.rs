@@ -3,14 +3,15 @@
 //! A source only puts an app closure's files in a cache directory and names
 //! each app's files: the registry fetches a pinned Genesis closure, a push
 //! writes the files its caller sent. From there every install is the same:
-//! each spec is checked, the named files become what the tenant resolves, the
+//! each spec is parsed, the named files become what the tenant resolves, the
 //! closure reconciles and is verified runtime-ready, and the install commits
 //! with its records or goes back to the version installed before it. Nothing
 //! here lists the directory the source just wrote.
-
-use std::time::Duration;
-
-use temper_verify::CascadeResult;
+//!
+//! An install checks at main's level, as a TrustBundle install does: each
+//! spec must parse, and the installer's joint proofs become warnings. The
+//! per-spec L0-L3 cascade is not run here; a caller runs it before it
+//! sends (Katagami's apps_build, through `POST /api/specs/validate-ioa`).
 
 use super::*;
 use crate::os_apps::{AppFiles, find_ioa_files, installed_line, resolve_materialized_app_closure};
@@ -35,8 +36,6 @@ pub(super) struct MaterializedClosure<'a> {
     /// before checking or mutating anything; they retain their own source.
     pub(super) apps: Vec<MaterializedApp>,
     pub(super) source: ClosureSource<'a>,
-    /// Time each spec's check may take.
-    pub(super) budget: Duration,
 }
 
 /// One app of a closure: its version, and the files its source wrote for it
@@ -53,16 +52,13 @@ pub(super) struct ClosureInstalled {
     pub(super) closure_id: String,
     /// The names of every app in the closure.
     pub(super) materialized: Vec<String>,
-    /// Each spec's check, by its path: the root app's relative to it, every
-    /// other app's under its name.
-    pub(super) checks: BTreeMap<String, CascadeResult>,
 }
 
 /// Why a closure was not installed.
 pub(super) enum ClosureRefused {
-    /// A spec failed its check or ran out of its budget. Nothing changed: the
-    /// checks run before the directory is registered.
-    Checks(BTreeMap<String, CascadeResult>),
+    /// A spec does not parse; says which and why. Nothing changed: specs
+    /// are parsed before the directory is registered.
+    Unparsed(String),
     /// The installer or its verification refused the closure; the version
     /// installed before it, if any, is installed again. Says why.
     Failed(String),
@@ -70,8 +66,7 @@ pub(super) enum ClosureRefused {
 
 /// Install the closure in `cache_root` for `tenant`.
 ///
-/// The caller holds this host's install turn ([`temper_server::host_turn`]):
-/// the checks walk state spaces sized from this host's free memory.
+/// The caller holds this host's install turn ([`temper_server::host_turn`]).
 pub(super) async fn install_materialized_closure(
     platform: &PlatformState,
     tenant: &str,
@@ -89,16 +84,8 @@ pub(super) async fn install_materialized_closure(
         .map_err(ClosureRefused::Failed)?;
     let materialized: Vec<String> = apps.iter().map(|(name, _)| name.clone()).collect();
 
-    // One complete order drives checks, snapshots, reconcile and verification.
-    let checks = check_closure_specs(platform, &closure.root.name, &apps, closure.budget)
-        .await
-        .map_err(ClosureRefused::Failed)?;
-    if checks
-        .values()
-        .any(|check| !check.all_passed || check.stopped.is_some())
-    {
-        return Err(ClosureRefused::Checks(checks));
-    }
+    // One complete order drives the parse, snapshots, reconcile and verification.
+    parse_closure_specs(&closure.root.name, &apps)?;
 
     // Capture the previously-installed records for EVERY app in the closure BEFORE mutating the
     // catalog or store, so a failed install can be rolled back to them. reconcile overwrites the
@@ -164,7 +151,6 @@ pub(super) async fn install_materialized_closure(
                 install,
                 closure_id: root_closure_id,
                 materialized,
-                checks,
             })
         }
         InstallVerifyDecision::RollBackToPrevious => {
@@ -279,16 +265,10 @@ pub(super) async fn record_closure(
     Ok(root_closure_id)
 }
 
-/// Check every spec the installer will read from the closure, through the
-/// budgeted cascade `POST /api/specs/validate-ioa` runs. A spec whose levels
-/// read what an earlier passing check read gets that kept verdict back at once.
-async fn check_closure_specs(
-    platform: &PlatformState,
-    root_app: &str,
-    apps: &[(String, AppFiles)],
-    budget: Duration,
-) -> Result<BTreeMap<String, CascadeResult>, String> {
-    let mut checks = BTreeMap::new();
+/// Parse every spec the installer will read from the closure, before anything
+/// changes: a spec that does not parse refuses the install, naming it, as the
+/// installer itself would after registering it.
+fn parse_closure_specs(root_app: &str, apps: &[(String, AppFiles)]) -> Result<(), ClosureRefused> {
     for (name, files) in apps {
         for path in find_ioa_files(files) {
             let key = if name == root_app {
@@ -298,17 +278,13 @@ async fn check_closure_specs(
             };
             let source = files
                 .read_text(&path)
-                .map_err(|error| format!("spec '{key}': {error}"))?;
-            let check = temper_server::observe::check_ioa(
-                &platform.server,
-                source,
-                temper_server::observe::DEFAULT_SIM_SEEDS,
-                temper_server::observe::DEFAULT_PROP_TEST_CASES,
-                budget,
-            )
-            .await?;
-            checks.insert(key, check);
+                .map_err(|error| ClosureRefused::Failed(format!("spec '{key}': {error}")))?;
+            if let Err(error) = temper_spec::automaton::parse_automaton(&source) {
+                return Err(ClosureRefused::Unparsed(format!(
+                    "spec '{key}' does not parse: {error}"
+                )));
+            }
         }
     }
-    Ok(checks)
+    Ok(())
 }
