@@ -4,86 +4,13 @@
 //! back before its module (`Swap`).
 use super::*;
 use std::sync::Arc;
-use temper_runtime::persistence::PersistenceError;
-use temper_server::storage::TursoStoreProvider;
-use temper_store_turso::{TenantUserRow, TursoEventStore};
+use temper_store_turso::TursoEventStore;
+
+#[path = "install_order/storage.rs"]
+mod storage;
+use storage::PauseInstallStorage;
 
 tokio::task_local! { static INSTALLER: bool; }
-
-/// Holds the install at each storage call it makes for `tenant`, one release
-/// at a time, so the test can move a record at every point it waits.
-struct PauseInstallStorage {
-    inner: Arc<dyn TursoStoreProvider>,
-    tenant: TenantId,
-    entered: Arc<tokio::sync::Notify>,
-    release: Arc<tokio::sync::Semaphore>,
-}
-
-#[async_trait::async_trait]
-impl TursoStoreProvider for PauseInstallStorage {
-    fn supports_tenant_admin(&self) -> bool {
-        self.inner.supports_tenant_admin()
-    }
-    fn platform_store(&self) -> Option<TursoEventStore> {
-        self.inner.platform_store()
-    }
-    async fn store_for_tenant(&self, tenant: &str) -> Option<TursoEventStore> {
-        if tenant == self.tenant.as_str()
-            && INSTALLER.try_with(|installer| *installer).unwrap_or(false)
-        {
-            self.entered.notify_one();
-            self.release.acquire().await.expect("release").forget();
-        }
-        self.inner.store_for_tenant(tenant).await
-    }
-    async fn all_stores(&self) -> Vec<TursoEventStore> {
-        self.inner.all_stores().await
-    }
-    async fn connected_tenants(&self) -> Vec<String> {
-        self.inner.connected_tenants().await
-    }
-    async fn tenants_for_user(
-        &self,
-        user_id: &str,
-    ) -> Result<Vec<TenantUserRow>, PersistenceError> {
-        self.inner.tenants_for_user(user_id).await
-    }
-    async fn register_tenant(&self, tenant_id: &str) -> Result<TursoEventStore, PersistenceError> {
-        self.inner.register_tenant(tenant_id).await
-    }
-    async fn list_tenants(&self) -> Result<Vec<String>, PersistenceError> {
-        self.inner.list_tenants().await
-    }
-    async fn remove_tenant(&self, tenant_id: &str) -> Result<bool, PersistenceError> {
-        self.inner.remove_tenant(tenant_id).await
-    }
-    async fn add_tenant_user(
-        &self,
-        tenant_id: &str,
-        user_id: &str,
-        role: &str,
-    ) -> Result<(), PersistenceError> {
-        self.inner.add_tenant_user(tenant_id, user_id, role).await
-    }
-    async fn list_tenant_users(
-        &self,
-        tenant_id: &str,
-    ) -> Result<Vec<TenantUserRow>, PersistenceError> {
-        self.inner.list_tenant_users(tenant_id).await
-    }
-    async fn remove_tenant_user(
-        &self,
-        tenant_id: &str,
-        user_id: &str,
-    ) -> Result<(), PersistenceError> {
-        self.inner.remove_tenant_user(tenant_id, user_id).await
-    }
-    async fn ensure_tenant(&self, tenant_id: &str) -> Result<bool, PersistenceError> {
-        self.inner.ensure_tenant(tenant_id).await
-    }
-}
-
-const APP: &str = "install-order";
 
 const CSDL: &str = r#"<?xml version="1.0"?><edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx"><edmx:DataServices><Schema Namespace="Order" xmlns="http://docs.oasis-open.org/odata/ns/edm"><EntityType Name="Job"><Key><PropertyRef Name="Id"/></Key><Property Name="Id" Type="Edm.String" Nullable="false"/></EntityType><EntityContainer Name="Container"><EntitySet Name="Jobs" EntityType="Order.Job"/></EntityContainer></Schema></edmx:DataServices></edmx:Edmx>"#;
 
@@ -114,11 +41,9 @@ to = "Broken"
 name = "Poke"
 from = ["Waiting"]
 to = "Poked"
-effect = "trigger ask"
-[[integration]]
+[[action.triggers]]
 name = "ask"
-trigger = "ask"
-type = "wasm"
+kind = "wasm"
 module = "answer"
 on_success = "Answered"
 on_failure = "Refused"
@@ -143,10 +68,14 @@ fn answering_module() -> Vec<u8> {
     )
     .expect("read the context reader fixture")
 }
-const REFUSING_MODULE: &[u8] = b"not a module: every call to it fails";
+// A valid module whose invocation traps, so the declared on_failure runs.
+const REFUSING_MODULE: &[u8] = br#"(module
+    (memory (export "memory") 1)
+    (func (export "run") (param i32 i32) (result i32) unreachable)
+)"#;
 
 /// Write one version of the app: its Job spec and its `answer` module.
-fn write_version(dir: &std::path::Path, calls: bool, module: &[u8]) {
+fn write_version(dir: &std::path::Path, app: &str, calls: bool, module: &[u8]) {
     fs::create_dir_all(dir.join("specs")).expect("create specs dir");
     fs::create_dir_all(dir.join("wasm/answer")).expect("create the module dir");
     fs::create_dir_all(dir.join("policies")).expect("create policies dir");
@@ -158,7 +87,7 @@ fn write_version(dir: &std::path::Path, calls: bool, module: &[u8]) {
     fs::write(
         dir.join("app.toml"),
         format!(
-            r#"name = "{APP}"
+            r#"name = "{app}"
 version = "0.1.0"
 [[wasm_modules]]
 name = "answer"
@@ -195,10 +124,12 @@ async fn poke(state: &PlatformState, tenant: &TenantId, id: &str) -> String {
         .await
         .expect("dispatch Poke");
     assert!(response.success, "Poke failed: {:?}", response.error);
+    // Action-local WASM triggers are emitted in the dispatch response under
+    // their synthesized name; wait for the callback only when Poke ran one.
     if !response
         .custom_effects
         .iter()
-        .any(|effect| effect.starts_with("__trigger__:Poke:"))
+        .any(|effect| effect == "__trigger__:Poke:ask")
     {
         return response.state.status;
     }
@@ -231,8 +162,10 @@ async fn install_poking(name: &str, from: (bool, &[u8]), to: (bool, &[u8]), swap
         seed: false,
     };
     let root = std::env::temp_dir().join(format!("{name}-{}", uuid::Uuid::new_v4()));
-    let dir = root.join(APP);
-    write_version(&dir, from.0, from.1);
+    // The global catalog retains the first directory registered for each app.
+    // Use this test's distinct name so the tests never share a catalog entry.
+    let dir = root.join(name);
+    write_version(&dir, name, from.0, from.1);
     let store = TursoEventStore::new(&format!("file:{}", root.join("events.db").display()), None)
         .await
         .expect("open turso store");
@@ -250,7 +183,7 @@ async fn install_poking(name: &str, from: (bool, &[u8]), to: (bool, &[u8]), swap
         .await
         .expect("boot walk");
     add_os_apps_dir(root.clone());
-    install_os_app_with_plan(&state, tenant.as_str(), APP, plan, InstallOrigin::Request)
+    install_os_app_with_plan(&state, tenant.as_str(), name, plan, InstallOrigin::Request)
         .await
         .expect("install the version before");
     assert_ne!(poke(&state, &tenant, "before").await, "Broken");
@@ -264,20 +197,23 @@ async fn install_poking(name: &str, from: (bool, &[u8]), to: (bool, &[u8]), swap
         .expect("storage stack")
         .as_ref()
         .clone();
-    stack.turso = Some(Arc::new(PauseInstallStorage {
+    let paused = Arc::new(PauseInstallStorage {
         inner: stack.turso.take().expect("turso provider"),
+        platform: stack.platform.take().expect("platform store"),
         tenant: tenant.clone(),
         entered: entered.clone(),
         release: release.clone(),
-    }));
+    });
+    stack.turso = Some(paused.clone());
+    stack.platform = Some(paused);
     state.server.set_storage_stack(stack);
-    write_version(&dir, to.0, to.1);
+    write_version(&dir, name, to.0, to.1);
     let install = INSTALLER.scope(
         true,
         install_os_app_swapping(
             &state,
             tenant.as_str(),
-            APP,
+            name,
             plan,
             InstallOrigin::Request,
             swap,
@@ -302,6 +238,7 @@ async fn install_poking(name: &str, from: (bool, &[u8]), to: (bool, &[u8]), swap
         release.add_permits(1);
     }
     assert_ne!(poke(&state, &tenant, "after").await, "Broken");
+    eprintln!("{name}: exercised {waits} storage waits");
     fs::remove_dir_all(root).expect("remove temp dir");
     waits
 }
