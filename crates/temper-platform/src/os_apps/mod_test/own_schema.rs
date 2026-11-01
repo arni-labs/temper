@@ -309,3 +309,52 @@ async fn a_restart_does_not_bring_a_dropped_type_back() {
         config.entity_set_map
     );
 }
+
+/// A restart while an installed app's files cannot be read keeps that app's
+/// declarations: the boot neither rebuilds the schema without it nor drops
+/// its types, even one that has no spec to keep it.
+#[tokio::test]
+async fn a_restart_keeps_the_schema_of_an_app_it_cannot_read() {
+    let fx = Fixture::new("unreadable").await;
+    let (tenant, first, second) = (unique("own-tenant"), unique("own-a"), unique("own-b"));
+    fx.write_app(&first, "Test.Shared", &["Counter"], &["Counter"]);
+    fx.write_app(&second, "Test.Shared", &["Other", "Note"], &["Other"]);
+    fx.install(&tenant, &first).await;
+    fx.install(&tenant, &second).await;
+
+    let restarted = TursoEventStore::new(&fx.db_url, None)
+        .await
+        .expect("reopen the database");
+    let mut state = PlatformState::new(None);
+    state
+        .server
+        .set_storage_stack(temper_server::StorageStack::from_turso(restarted.clone()));
+    {
+        let mut restored = temper_server::registry::SpecRegistry::new();
+        restore_registry_from_turso(&mut restored, &restarted)
+            .await
+            .expect("restore the registry");
+        *state.registry.write().unwrap() = restored;
+    }
+    // The catalog lists the second app, but its files are gone.
+    add_os_apps_dir(fx.apps_root.clone());
+    fs::remove_dir_all(fx.apps_root.join(&second)).expect("remove the second app's files");
+
+    // Recovery, then the replay of the first app as a server boot runs it.
+    crate::recovery::restore_installed_apps(&state, &restarted).await;
+    restore_os_app(&state, &tenant, &first)
+        .await
+        .expect("the first app replays");
+
+    let registry = state.registry.read().unwrap();
+    let config = registry
+        .get_tenant(&TenantId::new(&tenant))
+        .expect("the tenant is restored");
+    for set in ["Counters", "Others", "Notes"] {
+        assert!(
+            config.entity_set_map.contains_key(set),
+            "a boot with an unreadable app should keep serving {set}: {:?}",
+            config.entity_set_map
+        );
+    }
+}

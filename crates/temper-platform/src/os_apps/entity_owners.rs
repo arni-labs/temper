@@ -215,8 +215,19 @@ fn read_app_csdl(tenant: &str, app: &str) -> Result<Option<CsdlDocument>, String
     let Some(app_dir) = app_dir else {
         return Err("the app is not in the catalog".to_string());
     };
-    let Some(path) = AppFiles::find(&app_dir).csdl else {
-        return Ok(None);
+    // A boot or install that reads an app as declaring nothing rebuilds the
+    // schema without it, so only an app whose files are on disk and hold no
+    // specs may read as having no CSDL. A missing or half-written app is
+    // unreadable, and callers keep the schema the tenant already has.
+    if !app_dir.join("app.toml").is_file() {
+        return Err(format!("{} holds no app.toml", app_dir.display()));
+    }
+    let files = AppFiles::find(&app_dir);
+    let Some(path) = files.csdl else {
+        if files.ioa.is_empty() {
+            return Ok(None);
+        }
+        return Err("it has specs but no CSDL".to_string());
     };
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("{} does not read: {e}", path.display()))?;
