@@ -66,7 +66,7 @@ pub(super) async fn first_matching_install(
     candidates: &[InstallCacheCandidate],
     record: &InstalledAppRecord,
     recorded: &[InstalledAppRecord],
-) -> Option<(PathBuf, Vec<(String, AppFiles)>)> {
+) -> Option<(PathBuf, Vec<(String, AppFileSource)>)> {
     for candidate in candidates {
         let Some(apps) =
             matching_cached_apps(ps, &candidate.path, record, recorded, candidate.legacy).await
@@ -116,7 +116,7 @@ pub(super) async fn cached_apps_matching_records(
     cache_root: &Path,
     record: &InstalledAppRecord,
     recorded: &[InstalledAppRecord],
-) -> Option<Vec<(String, AppFiles)>> {
+) -> Option<Vec<(String, AppFileSource)>> {
     matching_cached_apps(ps, cache_root, record, recorded, false).await
 }
 
@@ -126,7 +126,7 @@ async fn matching_cached_apps(
     record: &InstalledAppRecord,
     recorded: &[InstalledAppRecord],
     require_digest: bool,
-) -> Option<Vec<(String, AppFiles)>> {
+) -> Option<Vec<(String, AppFileSource)>> {
     if !cache_root.is_dir() {
         return None;
     }

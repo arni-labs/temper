@@ -4,10 +4,10 @@ use std::sync::{OnceLock, RwLock, RwLockReadGuard};
 
 use temper_spec::automaton;
 
-use super::app_files::list;
 use super::apps_dir::static_apps_dir;
+use super::file_source::list;
 use super::{
-    AppBundle, AppEntry, AppFiles, StartupInstallMode, extract_description, find_ioa_files,
+    AppBundle, AppEntry, AppFileSource, StartupInstallMode, extract_description, find_ioa_files,
     load_app_bundle, read_app_guide, read_app_manifest,
 };
 
@@ -20,7 +20,7 @@ pub(crate) struct AppCatalog {
     /// Catalog entries (lightweight metadata).
     entries: Vec<AppEntry>,
     /// Mapping from app name to its folder and files.
-    paths: BTreeMap<String, AppFiles>,
+    paths: BTreeMap<String, AppFileSource>,
     /// Apps installed from Genesis into one tenant other than the platform
     /// tenant, by tenant id.
     ///
@@ -37,15 +37,15 @@ enum Added {
     Folder(PathBuf),
     /// Apps of an install's directory, each with the files the install
     /// wrote; they win over apps of the same name merged before them.
-    Written(PathBuf, Vec<(String, AppFiles)>),
+    Written(PathBuf, Vec<(String, AppFileSource)>),
 }
 
 /// `earlier` apps of a directory added again with `apps`: the earlier ones
 /// this adds no files for, then these.
 fn merged(
-    mut earlier: Vec<(String, AppFiles)>,
-    apps: &[(String, AppFiles)],
-) -> Vec<(String, AppFiles)> {
+    mut earlier: Vec<(String, AppFileSource)>,
+    apps: &[(String, AppFileSource)],
+) -> Vec<(String, AppFileSource)> {
     earlier.retain(|(name, _)| !apps.iter().any(|(added, _)| added == name));
     earlier.extend(apps.iter().cloned());
     earlier
@@ -55,15 +55,15 @@ fn merged(
 #[derive(Default)]
 struct TenantInstalls {
     /// Install directories in the order they were added, with the apps of each.
-    written: Vec<(PathBuf, Vec<(String, AppFiles)>)>,
+    written: Vec<(PathBuf, Vec<(String, AppFileSource)>)>,
     entries: BTreeMap<String, AppEntry>,
-    paths: BTreeMap<String, AppFiles>,
+    paths: BTreeMap<String, AppFileSource>,
 }
 
 impl TenantInstalls {
     /// Add `installed`, whose apps are `apps`, over what this tenant has. A
     /// directory added again moves last.
-    fn add(&mut self, installed: AppCatalog, apps: &[(String, AppFiles)]) {
+    fn add(&mut self, installed: AppCatalog, apps: &[(String, AppFileSource)]) {
         let dir = installed.apps_dir;
         let earlier = match self.written.iter().position(|(known, _)| known == &dir) {
             Some(index) => self.written.remove(index).1,
@@ -176,7 +176,7 @@ pub fn add_os_apps_dir(dir: PathBuf) {
 /// tenant use this path because a pinned registry closure is the source of
 /// truth for the requested install: development/local app catalogs must not
 /// shadow the pinned Genesis bundle when both expose the same app name.
-pub fn add_written_apps_preferred(dir: PathBuf, apps: Vec<(String, AppFiles)>) {
+pub fn add_written_apps_preferred(dir: PathBuf, apps: Vec<(String, AppFileSource)>) {
     let mut lock = catalog().write().unwrap(); // ci-ok: infallible lock
     lock.merge_catalog_preferred(AppCatalog::from_apps(dir.clone(), apps.clone()));
     let mut earlier = Vec::new();
@@ -196,7 +196,7 @@ pub fn add_written_apps_preferred(dir: PathBuf, apps: Vec<(String, AppFiles)>) {
 /// Genesis installs into a tenant other than the platform tenant use this: a
 /// pinned closure is what that tenant asked to run, so for that tenant it wins
 /// over a shared app of the same name, and no other tenant sees it.
-pub fn add_tenant_written_apps(tenant: &str, dir: PathBuf, apps: Vec<(String, AppFiles)>) {
+pub fn add_tenant_written_apps(tenant: &str, dir: PathBuf, apps: Vec<(String, AppFileSource)>) {
     let installed = AppCatalog::from_apps(dir, apps.clone());
     let mut lock = catalog().write().unwrap(); // ci-ok: infallible lock
     lock.tenant_installs
@@ -259,7 +259,7 @@ impl AppCatalog {
     /// The files `name` resolves to for `tenant`: that tenant's own install
     /// when it has one, otherwise the shared catalog's. `None` looks at the
     /// shared catalog only.
-    pub(super) fn app_files(&self, tenant: Option<&str>, name: &str) -> Option<&AppFiles> {
+    pub(super) fn app_files(&self, tenant: Option<&str>, name: &str) -> Option<&AppFileSource> {
         self.installs(tenant)
             .and_then(|installs| installs.paths.get(name))
             .or_else(|| self.paths.get(name))
@@ -315,7 +315,7 @@ impl AppCatalog {
         let apps = folders
             .into_iter()
             .map(|name| {
-                let files = AppFiles::Listed(dir.join(&name));
+                let files = AppFileSource::Listed(dir.join(&name));
                 (name, files)
             })
             .collect();
@@ -323,7 +323,7 @@ impl AppCatalog {
     }
 
     /// The apps of `dir`, each its folder name and its files.
-    pub(super) fn from_apps(dir: PathBuf, apps: Vec<(String, AppFiles)>) -> Self {
+    pub(super) fn from_apps(dir: PathBuf, apps: Vec<(String, AppFileSource)>) -> Self {
         let mut entries = Vec::new();
         let mut paths = BTreeMap::new();
 

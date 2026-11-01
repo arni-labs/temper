@@ -14,7 +14,9 @@
 //! sends (Katagami's apps_build, through `POST /api/specs/validate-ioa`).
 
 use super::*;
-use crate::os_apps::{AppFiles, find_ioa_files, installed_line, resolve_materialized_app_closure};
+use crate::os_apps::{
+    AppFileSource, find_ioa_files, installed_line, resolve_materialized_app_closure,
+};
 
 /// Where an installed closure came from, as its install records name it.
 pub(super) struct ClosureSource<'a> {
@@ -42,7 +44,7 @@ pub(super) struct MaterializedClosure<'a> {
 /// at `<cache root>/<name>`.
 pub(super) struct MaterializedApp {
     pub(super) version: RegistryAppRef,
-    pub(super) files: AppFiles,
+    pub(super) files: AppFileSource,
 }
 
 /// A closure installed and recorded.
@@ -75,7 +77,7 @@ pub(super) async fn install_materialized_closure(
 ) -> Result<ClosureInstalled, ClosureRefused> {
     // Keep the source's explicit paths, including through dependency
     // resolution: a fresh install never relies on listing its new directory.
-    let written: Vec<(String, AppFiles)> = closure
+    let written: Vec<(String, AppFileSource)> = closure
         .apps
         .iter()
         .map(|app| (app.version.name.clone(), app.files.clone()))
@@ -268,7 +270,10 @@ pub(super) async fn record_closure(
 /// Parse every spec the installer will read from the closure, before anything
 /// changes: a spec that does not parse refuses the install, naming it, as the
 /// installer itself would after registering it.
-fn parse_closure_specs(root_app: &str, apps: &[(String, AppFiles)]) -> Result<(), ClosureRefused> {
+fn parse_closure_specs(
+    root_app: &str,
+    apps: &[(String, AppFileSource)],
+) -> Result<(), ClosureRefused> {
     for (name, files) in apps {
         for path in find_ioa_files(files) {
             let key = if name == root_app {

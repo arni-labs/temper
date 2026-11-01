@@ -7,7 +7,7 @@ use temper_server::platform_store::InstalledAppRecord;
 
 use super::app_catalog::AppCatalog;
 use super::{
-    AppBundle, AppEntry, AppFiles, OsAppBundleDigest, OsAppInstallPlan, OsAppReconcileResult,
+    AppBundle, AppEntry, AppFileSource, OsAppBundleDigest, OsAppInstallPlan, OsAppReconcileResult,
     catalog, get_os_app, install_os_app_with_plan, load_app_bundle, load_tenant_os_app,
     os_app_dependencies, restore_app_specs_from_matching_digest,
     tenant_has_ready_app_specs_for_bundle, tenant_os_app,
@@ -118,7 +118,7 @@ pub(super) fn digest_app_bundle(
 /// cannot be read, is left out.
 pub fn written_apps_bundle_digests(
     dir: &Path,
-    apps: Vec<(String, AppFiles)>,
+    apps: Vec<(String, AppFileSource)>,
 ) -> Vec<OsAppBundleDigest> {
     let installed = AppCatalog::from_apps(dir.to_path_buf(), apps);
     installed

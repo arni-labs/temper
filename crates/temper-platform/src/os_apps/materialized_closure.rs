@@ -4,7 +4,7 @@ use std::path::Path;
 
 use super::app_catalog::AppCatalog;
 use super::reconcile::resolve_os_app_install_order_with_dependencies;
-use super::{AppFiles, catalog, dependencies_for_entry, os_app_dependencies};
+use super::{AppFileSource, catalog, dependencies_for_entry, os_app_dependencies};
 
 /// Every app reconciliation will read, in dependency-first order, with the
 /// same files its checks must read. Incoming apps win over the tenant's
@@ -13,8 +13,8 @@ use super::{AppFiles, catalog, dependencies_for_entry, os_app_dependencies};
 pub(crate) fn resolve_materialized_app_closure(
     tenant: &str,
     cache_root: &Path,
-    apps: &[(String, AppFiles)],
-) -> Result<Vec<(String, AppFiles)>, String> {
+    apps: &[(String, AppFileSource)],
+) -> Result<Vec<(String, AppFileSource)>, String> {
     let incoming = AppCatalog::from_apps(cache_root.to_path_buf(), apps.to_vec());
     let roots: Vec<String> = apps.iter().map(|(name, _)| name.clone()).collect();
     for name in &roots {

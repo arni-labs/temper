@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use super::cache_paths::app_cache_dir;
-use crate::os_apps::AppFiles;
+use crate::os_apps::AppFileSource;
 
 /// Where in a cache directory its list is kept. App folders are named by app
 /// names, which never start with a dot.
@@ -45,7 +45,7 @@ pub(super) fn keep(root: &Path, written: &Written) -> Result<(), String> {
 /// the files it was written with. An error when there is no list, or it cannot
 /// be read: such a directory is never served, and a caller fetches the files
 /// again instead.
-pub(super) fn read(root: &Path) -> Result<Vec<(String, AppFiles)>, String> {
+pub(super) fn read(root: &Path) -> Result<Vec<(String, AppFileSource)>, String> {
     app_files(root, load(root)?)
 }
 
@@ -73,12 +73,15 @@ pub(super) fn keep_app(root: &Path, app: &str, paths: &[&str]) {
 }
 
 /// `written`'s apps, each at its folder in `root`.
-pub(super) fn app_files(root: &Path, written: Written) -> Result<Vec<(String, AppFiles)>, String> {
+pub(super) fn app_files(
+    root: &Path,
+    written: Written,
+) -> Result<Vec<(String, AppFileSource)>, String> {
     written
         .into_iter()
         .map(|(app, paths)| {
             let dir = app_cache_dir(root, &app)?;
-            Ok((app, AppFiles::written(dir, paths)))
+            Ok((app, AppFileSource::written(dir, paths)))
         })
         .collect()
 }

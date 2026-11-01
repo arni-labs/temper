@@ -63,6 +63,7 @@ pub(super) fn replay_copy(response: &EntityResponse) -> EntityResponse {
         spec_governed: response.spec_governed,
         refused: response.refused,
         answered_action: None,
+        trigger_failures: response.trigger_failures.clone(),
         store_unavailable: response.store_unavailable,
     }
 }

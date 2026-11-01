@@ -1,269 +1,263 @@
-//! The files of one app folder, and how the loader and the catalog find
-//! them.
-//!
-//! An install knows every file it wrote, so it names them and keeps their
-//! list beside them, and nothing it installs, restores at boot or rolls back
-//! to depends on listing a folder. A listing that comes back short is not an
-//! error, so a folder that lists short (on some drives a folder can list empty
-//! for a while after it is renamed into place) would otherwise install as an
-//! app with fewer specs, or none, and pass zero checks. Only the static apps
-//! folders (`TEMPER_OS_APPS_DIR`, and folders added whole), which no install
-//! wrote and which have no list, are found by listing.
+//! The spec, CSDL, policy and compiled module files of an app, found one way
+//! for its install and for `temper verify`, so what verify checks is what an
+//! install runs.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-/// The files of one app folder.
-#[derive(Clone, Debug)]
-pub enum AppFiles {
-    /// Found by listing the folder when they are read.
-    Listed(PathBuf),
-    /// Named by whoever wrote them: `/`-separated paths relative to `dir`.
-    Written {
-        dir: PathBuf,
-        paths: Arc<BTreeSet<String>>,
-    },
+use super::file_source::{AppFileSource, join};
+use super::types::WasmModuleManifest;
+use super::{AppDeploymentMode, effective_app_deployment_mode, read_app_manifest};
+
+/// The files of an app an install reads, and those it holds but does not read.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AppFiles {
+    /// IOA specs: the app root first, then `specs/`.
+    pub ioa: Vec<PathBuf>,
+    /// The CSDL model: `model.csdl.xml` at the root, else in `specs/`, else
+    /// the first `csdl/*.csdl.xml`.
+    pub csdl: Option<PathBuf>,
+    /// Cedar policies in `policies/`, and `policies/commons/` for an app that
+    /// deploys as commons, in the order the install loads them.
+    pub policies: Vec<PathBuf>,
+    /// The compiled binary of each module `app.toml` declares, by module
+    /// name, for each declared module whose binary is under `wasm/`.
+    pub modules: BTreeMap<String, PathBuf>,
+    /// Spec and CSDL files another file of the same kind shadows, so the
+    /// install does not read them.
+    pub shadowed: Vec<Shadowed>,
+}
+
+/// A spec or CSDL file the install does not read, and the one it reads in
+/// its place.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shadowed {
+    pub path: PathBuf,
+    pub read_instead: PathBuf,
 }
 
 impl AppFiles {
-    /// The files at `paths`, relative to `dir`, as the install that wrote
-    /// them names them.
-    pub fn written(dir: PathBuf, paths: impl IntoIterator<Item = String>) -> Self {
-        Self::Written {
-            dir,
-            paths: Arc::new(paths.into_iter().collect()),
-        }
+    /// Find the files of the app at `app_dir`.
+    pub fn find(app_dir: &Path) -> Self {
+        Self::from_source(&AppFileSource::Listed(app_dir.to_path_buf()))
     }
 
-    /// The app's folder.
-    pub fn dir(&self) -> &Path {
-        match self {
-            Self::Listed(dir) | Self::Written { dir, .. } => dir,
-        }
-    }
+    /// Select the files from an install's exact list, or a static app folder.
+    pub(crate) fn from_source(source: &AppFileSource) -> Self {
+        let app_dir = source.dir();
+        let mut files = Self::default();
 
-    /// Whether the app has a file at `path`.
-    pub(super) fn has(&self, path: &str) -> bool {
-        match self {
-            Self::Listed(dir) => dir.join(path).is_file(),
-            Self::Written { paths, .. } => paths.contains(path),
-        }
-    }
-
-    /// Whether the app has a folder at `path` holding any file.
-    pub(super) fn has_dir(&self, path: &str) -> bool {
-        match self {
-            Self::Listed(dir) => dir.join(path).is_dir(),
-            Self::Written { paths, .. } => {
-                let prefix = format!("{path}/");
-                paths.iter().any(|file| file.starts_with(&prefix))
+        // A root spec shadows a `specs/` spec of the same file name.
+        let root_ioa = files_ending_in(source, "", ".ioa.toml");
+        for path in files_ending_in(source, "specs", ".ioa.toml") {
+            match root_ioa
+                .iter()
+                .find(|root| root.file_name() == path.file_name())
+            {
+                Some(root) => files.shadowed.push(Shadowed {
+                    path,
+                    read_instead: root.clone(),
+                }),
+                None => files.ioa.push(path),
             }
         }
+        files.ioa.splice(0..0, root_ioa);
+
+        let mut models = [
+            app_dir.join("model.csdl.xml"),
+            app_dir.join("specs/model.csdl.xml"),
+        ]
+        .into_iter()
+        .filter(|path| source.has(&super::app_relative_path(app_dir, path)))
+        .chain(files_ending_in(source, "csdl", ".csdl.xml"));
+        files.csdl = models.next();
+        if let Some(read) = &files.csdl {
+            files.shadowed.extend(models.map(|path| Shadowed {
+                path,
+                read_instead: read.clone(),
+            }));
+        }
+
+        files.policies = cedar_files_in(source, "policies");
+        let manifest = read_app_manifest(app_dir);
+        let commons = manifest.as_ref().is_some_and(|manifest| {
+            effective_app_deployment_mode(manifest) == AppDeploymentMode::Commons
+        });
+        if commons {
+            files
+                .policies
+                .extend(cedar_files_in(source, "policies/commons"));
+        }
+
+        files.modules = manifest
+            .iter()
+            .flat_map(|manifest| &manifest.wasm_modules)
+            .filter_map(|module| {
+                let binary = module_binary(source, module)?;
+                Some((module.name.clone(), binary))
+            })
+            .collect();
+        files
     }
 
-    /// The names of the files directly in folder `path` (`""` is the app's
-    /// own folder), sorted.
-    pub(super) fn files_in(&self, path: &str) -> Vec<String> {
-        self.children(path, false)
+    /// One line for each spec or CSDL file under `app_dir` the install does
+    /// not read: each shadowed one, named with the file read in its place,
+    /// and each `.ioa.toml` outside the root and `specs/`.
+    pub fn unread_warnings(&self, app_dir: &Path) -> Vec<String> {
+        self.unread_warnings_from_source(&AppFileSource::Listed(app_dir.to_path_buf()))
     }
 
-    /// The names of the folders directly in folder `path`, sorted.
-    pub(super) fn dirs_in(&self, path: &str) -> Vec<String> {
-        self.children(path, true)
-    }
-
-    fn children(&self, path: &str, folders: bool) -> Vec<String> {
-        let mut names: Vec<String> = match self {
-            Self::Listed(dir) => list(&dir.join(path))
-                .into_iter()
-                .filter(|(_, is_dir)| *is_dir == folders)
-                .map(|(name, _)| name)
-                .collect(),
-            Self::Written { paths, .. } => {
-                let prefix = folder_prefix(path);
-                paths
-                    .iter()
-                    .filter_map(|file| file.strip_prefix(&prefix))
-                    .filter_map(|rest| match rest.split_once('/') {
-                        Some((folder, _)) if folders => Some(folder.to_string()),
-                        None if !folders => Some(rest.to_string()),
-                        _ => None,
-                    })
-                    .collect()
-            }
-        };
-        names.sort();
-        names.dedup();
-        names
-    }
-
-    /// Every file below folder `path`, relative to it, sorted.
-    pub(super) fn files_under(&self, path: &str) -> Vec<String> {
-        let mut found = Vec::new();
-        match self {
-            Self::Written { paths, .. } => {
-                let prefix = folder_prefix(path);
-                found.extend(
+    pub(crate) fn unread_warnings_from_source(&self, source: &AppFileSource) -> Vec<String> {
+        let app_dir = source.dir();
+        let relative = |path: &Path| super::app_relative_path(app_dir, path);
+        let mut warnings: Vec<String> = self
+            .shadowed
+            .iter()
+            .map(|file| {
+                format!(
+                    "{} is not read: {} is read in its place",
+                    relative(&file.path),
+                    relative(&file.read_instead)
+                )
+            })
+            .collect();
+        let mut elsewhere = Vec::new();
+        match source {
+            AppFileSource::Listed(_) => collect_stray_ioa(app_dir, app_dir, &mut elsewhere),
+            AppFileSource::Written { paths, .. } => {
+                elsewhere.extend(
                     paths
                         .iter()
-                        .filter_map(|file| file.strip_prefix(&prefix))
-                        .map(str::to_string),
+                        .filter(|path| {
+                            let path = Path::new(path);
+                            path.to_string_lossy().ends_with(".ioa.toml")
+                                && path.parent().is_some_and(|parent| {
+                                    parent != Path::new("") && parent != Path::new("specs")
+                                })
+                                && !path.components().any(|part| {
+                                    matches!(
+                                        part.as_os_str().to_str(),
+                                        Some("target" | ".git" | "node_modules")
+                                    )
+                                })
+                        })
+                        .map(|path| app_dir.join(path)),
                 );
             }
-            Self::Listed(_) => {
-                let mut folders = vec![String::new()];
-                while let Some(folder) = folders.pop() {
-                    let full = join(path, &folder);
-                    folders.extend(self.dirs_in(&full).iter().map(|d| join(&folder, d)));
-                    found.extend(self.files_in(&full).iter().map(|f| join(&folder, f)));
-                }
-            }
         }
-        found.sort();
-        found
+        warnings.extend(elsewhere.iter().map(|path| {
+            format!(
+                "{} is not read: specs are read from the app root and specs/ only",
+                relative(path)
+            )
+        }));
+        warnings
     }
+}
 
-    /// The bytes of the file at `path`. A file the app names that cannot be
-    /// read is an error naming it, never a file left out.
-    pub(crate) fn read(&self, path: &str) -> Result<Vec<u8>, String> {
-        let full = self.dir().join(path);
-        if made_unreadable(&full) {
-            return Err(format!(
-                "{path} could not be read: made unreadable by a test"
-            ));
+/// The app directory `dir` belongs to: its parent when `dir` is the `specs/`
+/// of an app, since an install reads the whole app; otherwise `dir`.
+pub fn app_dir_of(dir: &Path) -> &Path {
+    match dir.parent() {
+        Some(parent)
+            if dir.file_name().is_some_and(|name| name == "specs")
+                && parent.join("app.toml").is_file() =>
+        {
+            parent
         }
-        std::fs::read(&full).map_err(|error| format!("{path} could not be read: {error}"))
-    }
-
-    /// The text of the file at `path`, as [`Self::read`].
-    pub(crate) fn read_text(&self, path: &str) -> Result<String, String> {
-        String::from_utf8(self.read(path)?).map_err(|_| format!("{path} is not UTF-8 text"))
+        _ => dir,
     }
 }
 
-fn folder_prefix(path: &str) -> String {
-    if path.is_empty() {
-        String::new()
-    } else {
-        format!("{path}/")
+/// The first binary of `module` that exists, looking where the app is
+/// packaged before the build output a local checkout leaves: `wasm/<name>/`,
+/// then `wasm/`, then the module's own `target/`, by its underscored and
+/// dashed names.
+pub(super) fn module_binary(
+    source: &AppFileSource,
+    module: &WasmModuleManifest,
+) -> Option<PathBuf> {
+    let wasm_dir = source.dir().join("wasm");
+    let name = &module.name;
+    let module_dir = wasm_dir.join(name);
+    if !source.has_dir(&format!("wasm/{name}")) {
+        return None;
     }
-}
-
-/// Every app folder of install directory `root`, each with every file below
-/// it, found by listing `root` once. Folders whose names start with a dot
-/// (an install's staging folders) are not apps.
-///
-/// Only for adopting an install cache written before installs kept their
-/// file list (see `genesis_install::restore::cache_recovery`); delete it with
-/// that adoption.
-pub fn list_install_dir(root: &Path) -> Vec<(String, BTreeSet<String>)> {
-    list(root)
-        .into_iter()
-        .filter(|(name, is_dir)| *is_dir && !name.starts_with('.'))
-        .map(|(name, _)| {
-            let files = AppFiles::Listed(root.join(&name)).files_under("");
-            (name, files.into_iter().collect())
-        })
-        .collect()
-}
-
-/// `folder/name`, where an empty `folder` is the app's own.
-pub(super) fn join(folder: &str, name: &str) -> String {
-    match (folder.is_empty(), name.is_empty()) {
-        (true, _) => name.to_string(),
-        (_, true) => folder.to_string(),
-        _ => format!("{folder}/{name}"),
-    }
-}
-
-/// The names in folder `dir`, each with whether it is a folder: the one place
-/// the catalog and the loader list a folder. Empty when it cannot be listed.
-pub(super) fn list(dir: &Path) -> Vec<(String, bool)> {
-    if made_to_list_empty(dir) {
-        return Vec::new();
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+    let dashed = name.replace('_', "-");
+    let targets: Vec<&str> = match module.target.as_deref() {
+        Some(target) => vec![target],
+        None => vec!["wasm32-unknown-unknown", "wasm32-wasip1"],
     };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = entry.file_name().into_string().ok()?;
-            if path.is_dir() {
-                Some((name, true))
-            } else if path.is_file() {
-                Some((name, false))
-            } else {
-                None
-            }
+    let mut candidates = Vec::new();
+    for dir in [&module_dir, &wasm_dir] {
+        for file in [name, &dashed] {
+            candidates.push(dir.join(format!("{file}.wasm")));
+        }
+    }
+    for file in [name, &dashed] {
+        for target in &targets {
+            candidates.push(
+                module_dir
+                    .join("target")
+                    .join(target)
+                    .join("release")
+                    .join(format!("{file}.wasm")),
+            );
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|path| source.has(&super::app_relative_path(source.dir(), path)))
+}
+
+/// Cedar policy files in `dir`, sorted: a `.cedar` extension in any case,
+/// as `temper serve` loads them.
+fn cedar_files_in(source: &AppFileSource, folder: &str) -> Vec<PathBuf> {
+    source
+        .files_in(folder)
+        .into_iter()
+        .filter(|name| {
+            Path::new(name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("cedar"))
         })
+        .map(|name| source.dir().join(join(folder, &name)))
         .collect()
 }
 
+/// Files in `folder` (not below it) whose name ends in `suffix`, sorted.
+fn files_ending_in(source: &AppFileSource, folder: &str, suffix: &str) -> Vec<PathBuf> {
+    source
+        .files_in(folder)
+        .into_iter()
+        .filter(|name| name.ends_with(suffix))
+        .map(|name| source.dir().join(join(folder, &name)))
+        .collect()
+}
+
+/// `.ioa.toml` files below `app_dir` outside the root and `specs/`, skipping
+/// build output and dependencies.
+fn collect_stray_ioa(app_dir: &Path, dir: &Path, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if !matches!(name.as_ref(), "target" | ".git" | "node_modules") {
+                collect_stray_ioa(app_dir, &path, found);
+            }
+        } else if name.ends_with(".ioa.toml") && dir != app_dir && dir != app_dir.join("specs") {
+            found.push(path);
+        }
+    }
+}
+
 #[cfg(test)]
-fn made_to_list_empty(dir: &Path) -> bool {
-    seam::lists_empty(dir)
-}
-
-#[cfg(not(test))]
-fn made_to_list_empty(_: &Path) -> bool {
-    false
-}
-
-#[cfg(test)]
-fn made_unreadable(path: &Path) -> bool {
-    seam::unreadable(path)
-}
-
-#[cfg(not(test))]
-fn made_unreadable(_: &Path) -> bool {
-    false
-}
-
-/// Folders that list empty and files that cannot be read, set by tests.
-#[cfg(test)]
-pub(crate) mod seam {
-    use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
-
-    static LIST_EMPTY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-    static UNREADABLE: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
-
-    /// From now on every folder at or below `root` lists empty, as a folder
-    /// just renamed into place can on a drive whose listings lag. Each test
-    /// passes its own temporary folder, so tests that run at once never see
-    /// each other's.
-    pub(crate) fn list_empty_under(root: &Path) {
-        LIST_EMPTY
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(root.to_path_buf());
-    }
-
-    /// From now on reading any file at or below `root` whose path ends in
-    /// `name` fails.
-    pub(crate) fn unreadable_under(root: &Path, name: &str) {
-        UNREADABLE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push((root.to_path_buf(), name.to_string()));
-    }
-
-    pub(super) fn lists_empty(dir: &Path) -> bool {
-        LIST_EMPTY
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .any(|root| dir.starts_with(root))
-    }
-
-    pub(super) fn unreadable(path: &Path) -> bool {
-        UNREADABLE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .any(|(root, name)| path.starts_with(root) && path.ends_with(name))
-    }
-}
+#[path = "app_files_test.rs"]
+mod tests;

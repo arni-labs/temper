@@ -1,113 +1,45 @@
 //! Which of an app's files make each part of its bundle: its specs, CSDL,
 //! policies, WASM modules, agents, skills, ADRs and seed data. Each part is
-//! picked from the app's [`AppFiles`] and read by its path.
+//! picked from the app's [`AppFileSource`] and read by its path.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use super::app_files::{AppFiles, join};
+use super::file_source::{AppFileSource, join};
 use super::{
-    AdrEntry, AgentDefinition, AppSkillDefinition, CompanionFile, SeedFile, SeedInstance,
+    AdrEntry, AgentDefinition, AppFiles, AppSkillDefinition, CompanionFile, SeedFile, SeedInstance,
     WasmModuleManifest, extract_description,
 };
 
 /// Every IOA spec of the app: `*.ioa.toml` in its own folder first, then in
 /// `specs/`. A name in both is taken from the app's own folder.
-pub(crate) fn find_ioa_files(files: &AppFiles) -> Vec<String> {
-    let mut found = Vec::new();
-    let mut seen = HashSet::new();
-    for folder in ["", "specs"] {
-        for name in files.files_in(folder) {
-            if name.ends_with(".ioa.toml") && seen.insert(name.clone()) {
-                found.push(join(folder, &name));
-            }
-        }
-    }
-    found
-}
-
-/// The CSDL model: `model.csdl.xml`, then `specs/model.csdl.xml`, then the
-/// first `csdl/*.csdl.xml`.
-pub(super) fn find_csdl(files: &AppFiles) -> Option<String> {
-    ["model.csdl.xml", "specs/model.csdl.xml"]
-        .into_iter()
-        .find(|path| files.has(path))
-        .map(str::to_string)
-        .or_else(|| {
-            files
-                .files_in("csdl")
-                .into_iter()
-                .find(|name| name.ends_with(".csdl.xml"))
-                .map(|name| format!("csdl/{name}"))
-        })
-}
-
-/// The Cedar policies directly in `folder`, sorted.
-pub(super) fn find_cedar_policies(files: &AppFiles, folder: &str) -> Vec<String> {
-    files
-        .files_in(folder)
-        .into_iter()
-        .filter(|name| name.ends_with(".cedar"))
-        .map(|name| format!("{folder}/{name}"))
+pub(crate) fn find_ioa_files(files: &AppFileSource) -> Vec<String> {
+    AppFiles::from_source(files)
+        .ioa
+        .iter()
+        .map(|path| super::app_relative_path(files.dir(), path))
         .collect()
 }
 
-/// The compiled WASM module of every module `app.toml` declares.
-///
-/// Prefers packaged artifacts copied next to the module, then
-/// manifest-selected target outputs and common WASM release outputs.
+/// The compiled WASM module of every module `app.toml` declares, selected
+/// by the same reader used by `temper verify`.
 pub(super) fn find_wasm_modules(
-    files: &AppFiles,
+    files: &AppFileSource,
     module_configs: &BTreeMap<String, WasmModuleManifest>,
 ) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut modules = BTreeMap::new();
-    if !files.has_dir("wasm") {
-        return Ok(modules);
-    }
-
     for (module_name, config) in module_configs {
-        let module_dir = format!("wasm/{module_name}");
-        if !files.has_dir(&module_dir) {
-            continue;
-        }
-        // Prefer packaged sibling artifacts because they are the deployable
-        // copy left after Docker target pruning. Target output remains a local
-        // development fallback.
-        let dashed_name = module_name.replace('_', "-");
-        let mut candidates = vec![
-            format!("{module_dir}/{module_name}.wasm"),
-            format!("{module_dir}/{dashed_name}.wasm"),
-            format!("wasm/{module_name}.wasm"),
-            format!("wasm/{dashed_name}.wasm"),
-        ];
-        let targets = match config.target.as_deref() {
-            Some(target) => vec![target],
-            None => vec!["wasm32-unknown-unknown", "wasm32-wasip1"],
-        };
-        for name in [module_name.as_str(), dashed_name.as_str()] {
-            for target in &targets {
-                candidates.push(format!("{module_dir}/target/{target}/release/{name}.wasm"));
-            }
-        }
-
-        if let Some(path) = candidates.iter().find(|path| files.has(path)) {
-            let bytes = files.read(path)?;
-            tracing::debug!(
-                module = %module_name,
-                path = %path,
-                size = bytes.len(),
-                "Found WASM module in OS app"
-            );
+        if let Some(path) = super::app_files::module_binary(files, config) {
+            let bytes = files.read(&super::app_relative_path(files.dir(), &path))?;
             modules.insert(module_name.clone(), bytes);
         }
     }
-
     warn_undeclared_wasm_artifacts(files, module_configs);
     Ok(modules)
 }
 
 fn warn_undeclared_wasm_artifacts(
-    files: &AppFiles,
+    files: &AppFileSource,
     module_configs: &BTreeMap<String, WasmModuleManifest>,
 ) {
     for module_name in files.dirs_in("wasm") {
@@ -130,7 +62,7 @@ fn warn_undeclared_wasm_artifacts(
 /// Each folder is one agent. Its `.md` files are concatenated in name order.
 /// The platform is filename-agnostic: conventions like SOUL.md, STYLE.md and
 /// AGENT.md are for humans.
-pub(super) fn find_agents(files: &AppFiles) -> Result<Vec<AgentDefinition>, String> {
+pub(super) fn find_agents(files: &AppFileSource) -> Result<Vec<AgentDefinition>, String> {
     let mut results = Vec::new();
     for agent_name in files.dirs_in("agents") {
         let agent_dir = format!("agents/{agent_name}");
@@ -169,7 +101,7 @@ pub(super) fn find_agents(files: &AppFiles) -> Result<Vec<AgentDefinition>, Stri
 ///
 /// A skill's folder holds its `SKILL.md`; every other file in it is a
 /// companion file. A folder without a `SKILL.md` is not a skill.
-pub(super) fn find_app_skills(files: &AppFiles) -> Result<Vec<AppSkillDefinition>, String> {
+pub(super) fn find_app_skills(files: &AppFileSource) -> Result<Vec<AppSkillDefinition>, String> {
     let mut results = Vec::new();
     scan_skill_dirs(files, "system/skills", None, &mut results)?;
     for agent_name in files.dirs_in("agents") {
@@ -180,7 +112,7 @@ pub(super) fn find_app_skills(files: &AppFiles) -> Result<Vec<AppSkillDefinition
 }
 
 fn scan_skill_dirs(
-    files: &AppFiles,
+    files: &AppFileSource,
     skills_dir: &str,
     agent_name: Option<&str>,
     results: &mut Vec<AppSkillDefinition>,
@@ -225,7 +157,7 @@ fn scan_skill_dirs(
 }
 
 /// App-local ADRs from `adrs/*.md`, in name order.
-pub(super) fn find_adrs(files: &AppFiles) -> Result<Vec<AdrEntry>, String> {
+pub(super) fn find_adrs(files: &AppFileSource) -> Result<Vec<AdrEntry>, String> {
     let mut results = Vec::new();
     for file_name in files.files_in("adrs") {
         let path = Path::new(&file_name);
@@ -253,7 +185,7 @@ pub(super) fn find_adrs(files: &AppFiles) -> Result<Vec<AdrEntry>, String> {
 /// Seed data instances from `seed-data/*.toml`, each holding `[[instance]]`
 /// blocks of entities to create on first install. A file that does not
 /// parse is left out with a warning.
-pub(super) fn find_seed_data(files: &AppFiles) -> Result<Vec<SeedInstance>, String> {
+pub(super) fn find_seed_data(files: &AppFileSource) -> Result<Vec<SeedInstance>, String> {
     let mut all_instances = Vec::new();
     for name in files.files_in("seed-data") {
         if !name.ends_with(".toml") {

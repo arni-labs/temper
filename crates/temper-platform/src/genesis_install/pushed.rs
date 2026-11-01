@@ -16,7 +16,7 @@ use serde::Deserialize;
 
 use super::closure_install::{ClosureRefused, ClosureSource, MaterializedApp, MaterializedClosure};
 use super::*;
-use crate::os_apps::{AppFiles, read_app_guide, read_app_manifest, tenant_os_app_dir};
+use crate::os_apps::{AppFileSource, read_app_guide, read_app_manifest, tenant_os_app_dir};
 
 mod files;
 
@@ -131,7 +131,7 @@ async fn install_in_turn(
     let app_dir = root.join(app);
     // The installer reads exactly these files, by name: a folder just renamed
     // into place can list short, and is never listed here.
-    let written = AppFiles::written(app_dir.clone(), files.keys().cloned());
+    let written = AppFileSource::written(app_dir.clone(), files.keys().cloned());
     let named = read_app_manifest(&app_dir).is_some_and(|manifest| manifest.name == app);
     if !named || read_app_guide(&app_dir).is_none() {
         discard();
@@ -219,7 +219,7 @@ pub async fn adopt_catalog_app(
         files::materialize(&root, app, &tree)
             .map_err(|error| format!("the files of '{app}' could not be copied: {error}"))?;
     }
-    let written = AppFiles::written(root.join(app), tree.keys().cloned());
+    let written = AppFileSource::written(root.join(app), tree.keys().cloned());
     register_written_apps(tenant, root, vec![(app.to_string(), written.clone())]);
     let app_ref = pushed_ref(app, &digest);
     let adopted = closure(&app_ref, app, &digest, written);
@@ -260,7 +260,7 @@ fn closure<'a>(
     app_ref: &'a str,
     app: &str,
     digest: &str,
-    files: AppFiles,
+    files: AppFileSource,
 ) -> MaterializedClosure<'a> {
     let version = RegistryAppRef {
         owner: SOURCE_KIND.to_string(),

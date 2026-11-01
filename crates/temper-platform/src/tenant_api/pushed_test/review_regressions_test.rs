@@ -2,7 +2,7 @@
 //! and verified, and filesystem paths round-trip through the JSON listing.
 
 use super::*;
-use crate::os_apps::{AppFiles, add_tenant_written_apps};
+use crate::os_apps::{AppFileSource, add_tenant_written_apps};
 
 /// The files [`dependency`] writes for an app.
 const DEPENDENCY_FILES: [&str; 4] = ["app.toml", "APP.md", "model.csdl.xml", SPEC];
@@ -14,7 +14,10 @@ fn register(tenant: &str, root: &Path, apps: &[(&str, &[&str])]) {
         .iter()
         .map(|(name, files)| {
             let files = files.iter().map(ToString::to_string);
-            (name.to_string(), AppFiles::written(root.join(name), files))
+            (
+                name.to_string(),
+                AppFileSource::written(root.join(name), files),
+            )
         })
         .collect();
     add_tenant_written_apps(tenant, root.to_path_buf(), apps);

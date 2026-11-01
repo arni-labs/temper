@@ -8,10 +8,10 @@ use super::*;
 pub(super) async fn migrate(
     ps: &dyn PlatformStore,
     destination: &Path,
-    apps: Vec<(String, AppFiles)>,
+    apps: Vec<(String, AppFileSource)>,
     record: &InstalledAppRecord,
     recorded: &[InstalledAppRecord],
-) -> Result<Vec<(String, AppFiles)>, String> {
+) -> Result<Vec<(String, AppFileSource)>, String> {
     let parent = destination.parent().ok_or("Genesis cache has no parent")?;
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("create tenant cache parent: {error}"))?;
@@ -21,7 +21,7 @@ pub(super) async fn migrate(
         .map_err(|error| format!("stage pre-tenant Genesis cache: {error}"))?;
     let mut listed = Written::new();
     for (app, files) in apps {
-        let AppFiles::Written { dir, paths } = files else {
+        let AppFileSource::Written { dir, paths } = files else {
             return Err("pre-tenant migration requires an exact file list".to_string());
         };
         let target = app_cache_dir(staged.path(), &app)?;

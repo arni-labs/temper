@@ -56,7 +56,7 @@ use crate::genesis_install_verify::{
     restore_prior_install, verify_install_closure_runtime_ready, verify_install_runtime_ready,
 };
 use crate::os_apps::{
-    AppFiles, AppManifest, InstallResult, InstallWarning, OsAppReconcileResult,
+    AppFileSource, AppManifest, InstallResult, InstallWarning, OsAppReconcileResult,
     add_tenant_written_apps, add_written_apps_preferred, reconcile_os_app,
     resolve_tenant_os_app_install_order, tenant_os_app_bundle_digest,
 };
@@ -1420,7 +1420,7 @@ async fn materialize_app_closure(
     tenant: &TenantId,
     cache_root: &Path,
     root: GenesisAppBundle,
-) -> Result<Vec<(String, AppFiles)>, String> {
+) -> Result<Vec<(String, AppFileSource)>, String> {
     let mut stack = vec![root];
     let mut admission = GenesisClosureAdmission::default();
     let mut materialized = Written::new();
@@ -1817,7 +1817,7 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
 /// tenant's are its own, so they never change what another tenant or a
 /// shared app resolves. Each app is registered with the files its install
 /// wrote ([`written`]), so nothing lists the directory.
-fn register_written_apps(tenant: &str, cache_root: PathBuf, apps: Vec<(String, AppFiles)>) {
+fn register_written_apps(tenant: &str, cache_root: PathBuf, apps: Vec<(String, AppFileSource)>) {
     if tenant == TenantId::default().as_str() {
         add_written_apps_preferred(cache_root, apps);
     } else {
@@ -2025,7 +2025,11 @@ mod tests {
     }
 
     /// `app_name` written into `root`, as an install names it.
-    fn write_catalog_app(root: &Path, app_name: &str, marker: &str) -> Vec<(String, AppFiles)> {
+    fn write_catalog_app(
+        root: &Path,
+        app_name: &str,
+        marker: &str,
+    ) -> Vec<(String, AppFileSource)> {
         let app_dir = root.join(app_name);
         std::fs::create_dir_all(&app_dir).expect("app dir");
         std::fs::write(app_dir.join("app.toml"), format!("name = \"{app_name}\"\n"))
@@ -2036,7 +2040,7 @@ mod tests {
         )
         .expect("APP.md");
         let paths = ["app.toml".to_string(), "APP.md".to_string()];
-        vec![(app_name.to_string(), AppFiles::written(app_dir, paths))]
+        vec![(app_name.to_string(), AppFileSource::written(app_dir, paths))]
     }
 
     #[test]

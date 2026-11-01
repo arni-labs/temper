@@ -17,7 +17,7 @@ use super::{
     GenesisRegistryBundleApp, GenesisRegistryBundleFile, GenesisRegistryBundleResponse,
     RegistryAppRef, parse_registry_app_ref,
 };
-use crate::os_apps::AppFiles;
+use crate::os_apps::AppFileSource;
 
 pub(super) const MAX_GENESIS_BUNDLE_FILES: usize = 4096;
 pub(super) const MAX_GENESIS_BUNDLE_APPS: usize = 256;
@@ -87,7 +87,7 @@ pub(super) async fn materialize_registry_app_closure_via_bundle(
         let paths = write_bundle_app(&app_cache_dir(staged_cache.path(), &app.name)?, &app)?;
         written.insert(app.name.clone(), paths.iter().cloned().collect());
         // Where the app is once the staged closure is renamed into place.
-        let files = AppFiles::written(app_cache_dir(cache_root, &app.name)?, paths);
+        let files = AppFileSource::written(app_cache_dir(cache_root, &app.name)?, paths);
         let version = RegistryAppRef {
             owner: app.owner,
             name: app.name,

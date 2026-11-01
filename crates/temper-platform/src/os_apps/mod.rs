@@ -26,6 +26,8 @@ mod apps_dir;
 mod bundle_files;
 mod closure_bootstrap;
 mod entity_aliases;
+mod entity_owners;
+mod file_source;
 mod install_checks;
 mod install_guard;
 mod install_lines;
@@ -45,14 +47,9 @@ pub use app_catalog::{
     tenant_os_app,
 };
 pub(crate) use app_catalog::{load_tenant_os_app, tenant_os_app_dir};
-#[cfg(test)]
-pub(crate) use app_files::seam as app_files_seam;
-pub use app_files::{AppFiles, list_install_dir};
+pub use app_files::{AppFiles, Shadowed, app_dir_of};
 pub(crate) use bundle_files::find_ioa_files;
-use bundle_files::{
-    find_adrs, find_agents, find_app_skills, find_cedar_policies, find_csdl, find_seed_data,
-    find_wasm_modules,
-};
+use bundle_files::{find_adrs, find_agents, find_app_skills, find_seed_data, find_wasm_modules};
 pub use closure_bootstrap::{
     ClosureBootstrapResult, OS_APP_CLOSURE_RESOLVER_VERSION, OsAppClosure,
     bootstrap_closure_manifest, os_app_closure_for_roots, parse_bootstrap_manifest_str,
@@ -62,6 +59,10 @@ use entity_aliases::{
     content_sha256, ensure_created_file_initialized, ensure_entity_field_aliases,
     file_already_contains, slug_fragment,
 };
+pub use entity_owners::unspecified_entity_types;
+#[cfg(test)]
+pub(crate) use file_source::seam as app_files_seam;
+pub use file_source::{AppFileSource, list_install_dir};
 pub use install_lines::{installed_line, stored_line, waiting_line};
 pub(crate) use materialized_closure::resolve_materialized_app_closure;
 #[cfg(test)]
@@ -226,6 +227,13 @@ struct SeedFile {
 pub type OsAppEntry = AppEntry;
 pub type OsAppBundle = AppBundle;
 
+fn app_relative_path(app_dir: &Path, path: &Path) -> String {
+    path.strip_prefix(app_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 fn effective_app_deployment_mode(manifest: &AppManifest) -> AppDeploymentMode {
     let app_key = manifest
         .name
@@ -377,7 +385,7 @@ fn extract_description(guide: &str) -> Option<String> {
 
 /// Load a complete app bundle from its files, or say why not. A file the
 /// app has that cannot be read is an error naming it.
-fn load_app_bundle(files: &AppFiles) -> Result<AppBundle, String> {
+fn load_app_bundle(files: &AppFileSource) -> Result<AppBundle, String> {
     let app_dir = files.dir();
     let manifest = read_app_manifest(app_dir).ok_or("its app.toml is missing or invalid")?;
     let deployment_mode = effective_app_deployment_mode(&manifest);
@@ -390,9 +398,12 @@ fn load_app_bundle(files: &AppFiles) -> Result<AppBundle, String> {
         return Err("legacy reactions.toml is no longer supported".to_string());
     }
 
+    let selected = AppFiles::from_source(files);
+
     // Read IOA specs, extracting entity type from the parsed automaton name.
     let mut specs = Vec::new();
-    for path in find_ioa_files(files) {
+    for path in &selected.ioa {
+        let path = app_relative_path(app_dir, path);
         let source = files.read_text(&path)?;
         let parsed = automaton::parse_automaton(&source)
             .map_err(|error| format!("{path} is refused: {error}"))?;
@@ -400,8 +411,10 @@ fn load_app_bundle(files: &AppFiles) -> Result<AppBundle, String> {
     }
 
     // Read CSDL (optional: apps without specs won't have CSDL).
-    let csdl = find_csdl(files)
-        .map(|path| files.read_text(&path))
+    let csdl = selected
+        .csdl
+        .as_ref()
+        .map(|path| files.read_text(&app_relative_path(app_dir, path)))
         .transpose()?;
     let cross_invariants = "specs/cross-invariants.toml";
     let cross_invariants_toml = if files.has(cross_invariants) {
@@ -411,12 +424,9 @@ fn load_app_bundle(files: &AppFiles) -> Result<AppBundle, String> {
     };
 
     // Read Cedar policies.
-    let mut cedar_policy_files = find_cedar_policies(files, "policies");
-    if deployment_mode == AppDeploymentMode::Commons {
-        cedar_policy_files.extend(find_cedar_policies(files, "policies/commons"));
-    }
     let mut cedar_policy_sources = Vec::new();
-    for relative_path in cedar_policy_files {
+    for path in &selected.policies {
+        let relative_path = app_relative_path(app_dir, path);
         let text = files.read_text(&relative_path)?;
         cedar_policy_sources.push(CedarPolicySource {
             text: policy_rows::labelled_policy_text(&manifest.name, &relative_path, text),
@@ -633,6 +643,28 @@ async fn install_once(
             missing.join(", ")
         ));
     }
+    // A spec its own app does not declare, or an entity set another app
+    // already declares, serves one app's records under the other's schema.
+    // A request that would newly do so is refused before any write. A pair
+    // the tenant holds from before goes ahead with a warning, and a boot
+    // replay only logs, since refusing either would take a running app away.
+    let ownership = if plan.specs {
+        entity_owners::ownership(state, tenant, app_name, &bundle).await?
+    } else {
+        entity_owners::Ownership::default()
+    };
+    if !ownership.refused.is_empty() {
+        let problems = ownership.refused.join("; ");
+        if origin == InstallOrigin::Request {
+            return Err(format!(
+                "Refusing to install os-app '{app_name}' for tenant '{tenant}': {problems}"
+            ));
+        }
+        tracing::warn!(tenant, app = %app_name, problems, "replayed app has entity ownership problems");
+    }
+    for standing in &ownership.standing {
+        tracing::warn!(tenant, app = %app_name, "{standing}");
+    }
     if bundle.deployment_mode == AppDeploymentMode::Commons {
         state.server.enable_commons_guardrails(tenant);
     }
@@ -736,6 +768,17 @@ async fn install_once(
         policies,
     )
     .await?;
+    if plan.specs {
+        warnings.extend(entity_owners::unrun_declarations(
+            &app_files, app_name, &bundle,
+        )?);
+    }
+    warnings.extend(
+        ownership
+            .standing
+            .into_iter()
+            .map(InstallWarning::entity_ownership),
+    );
     let specs = &bundle.specs;
     let checked = install_checks::model_warnings(
         state, tenant, app_name, specs, new_specs, policies, attempt,

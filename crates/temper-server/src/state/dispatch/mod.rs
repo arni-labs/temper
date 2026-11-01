@@ -40,6 +40,7 @@ mod state_timer_rows;
 mod strict_test_support;
 mod timer_cause;
 mod timer_standing;
+mod trigger_failures;
 mod wasm;
 pub(crate) use wasm::authorized_http_endpoint_host;
 #[cfg(feature = "observe")]

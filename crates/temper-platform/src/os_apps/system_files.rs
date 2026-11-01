@@ -10,7 +10,7 @@ use std::path::Path;
 use temper_runtime::tenant::TenantId;
 
 use super::{
-    APP_DOCS_ROOT_DIR_ID, APP_DOCS_WORKSPACE_ID, AppFiles, DirectoryBootstrapTarget,
+    APP_DOCS_ROOT_DIR_ID, APP_DOCS_WORKSPACE_ID, AppFileSource, DirectoryBootstrapTarget,
     MarkdownFileBootstrapTarget, ensure_directory, ensure_markdown_file, slug_fragment,
 };
 use crate::state::PlatformState;
@@ -26,7 +26,7 @@ pub struct SystemFileEntry {
 }
 
 /// Every file under the app's `system/` folder, by its path inside it.
-pub(super) fn find_system_files(files: &AppFiles) -> Result<Vec<SystemFileEntry>, String> {
+pub(super) fn find_system_files(files: &AppFileSource) -> Result<Vec<SystemFileEntry>, String> {
     let mut results = Vec::new();
     for relative in files.files_under("system") {
         let path = Path::new(&relative);
