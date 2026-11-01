@@ -97,6 +97,26 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Whether a cache still names and holds exactly the requested files.
+/// Read by explicit path, including the saved list; no directory listing is
+/// needed for either validation or repair.
+pub(super) fn matches(root: &Path, app: &str, files: &BTreeMap<String, Vec<u8>>) -> bool {
+    let Ok(apps) = written::read(root) else {
+        return false;
+    };
+    let [(name, source)] = apps.as_slice() else {
+        return false;
+    };
+    let crate::os_apps::AppFileSource::Written { paths, .. } = source else {
+        return false;
+    };
+    name == app
+        && paths.iter().eq(files.keys())
+        && files
+            .iter()
+            .all(|(path, bytes)| source.read(path).is_ok_and(|stored| stored == *bytes))
+}
+
 /// Write `files` as `<root>/<app>/`, with their list ([`written`]). They are
 /// written to a directory beside `root` and renamed into place, so a directory
 /// with a version's name always holds all of that version's files.
@@ -123,7 +143,7 @@ pub(super) fn materialize(
     let paths = files.keys().cloned().collect();
     written::keep(staging.path(), &Written::from([(app.to_string(), paths)]))
         .map_err(std::io::Error::other)?;
-    std::fs::rename(staging.path(), root)?;
+    super::replace_directory(staging.path().to_path_buf(), root).map_err(std::io::Error::other)?;
     // Renamed into place: nothing is left for the staging guard to remove.
     let _ = staging.keep();
     Ok(())

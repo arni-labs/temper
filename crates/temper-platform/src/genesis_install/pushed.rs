@@ -112,18 +112,22 @@ async fn install_in_turn(
     let files = files::resolve(files, kept_from.as_deref())?;
     let digest = files::digest(&files);
     let root = pushed_root(platform, tenant, app, &digest);
-    // A version already on disk holds exactly these files: its directory got
-    // its name only once they were all written.
+    // A directory's name does not prove its bytes or saved list still match.
+    // Repair a damaged cache from the request before it can be installed.
     let created = !root.is_dir();
-    if created {
+    if created || !files::matches(&root, app, &files) {
         files::materialize(&root, app, &files).map_err(|error| {
             PushRefused::Server(format!("the pushed files could not be written: {error}"))
         })?;
     }
-    // Only a version this push wrote is deleted when it is refused before it
-    // was registered; one already on disk may be what the tenant resolves.
+    // Only discard a new version proven inactive. A repeated push can also
+    // recreate a missing cache for the prior install; never delete that if
+    // rollback selected it again.
     let discard = || {
-        if created && let Err(error) = std::fs::remove_dir_all(&root) {
+        if created
+            && tenant_os_app_dir(tenant, app).as_deref() != Some(root.join(app).as_path())
+            && let Err(error) = std::fs::remove_dir_all(&root)
+        {
             tracing::warn!(app, path = %root.display(), %error, "a refused pushed version could not be deleted");
         }
     };
@@ -163,6 +167,10 @@ async fn install_in_turn(
         Err(ClosureRefused::Unparsed(error)) => {
             discard();
             Err(PushRefused::Unparsed(error))
+        }
+        Err(ClosureRefused::Inactive(error)) => {
+            discard();
+            Err(PushRefused::Install(error))
         }
         Err(ClosureRefused::Failed(error)) => Err(PushRefused::Install(error)),
     }

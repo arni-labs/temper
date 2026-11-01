@@ -25,7 +25,7 @@ fn register(tenant: &str, root: &Path, apps: &[(&str, &[&str])]) {
 
 /// The dependency owns its own types and sets, rather than also claiming
 /// Evolution's copied EvolutionRuns set before the WASM rollback is reached.
-fn dependency_csdl() -> String {
+pub(super) fn dependency_csdl() -> String {
     app_files()["model.csdl.xml"]
         .replace("SentinelMonitor", "PushDependency")
         .replace("\"EvolutionRun\"", "\"DependencyRun\"")

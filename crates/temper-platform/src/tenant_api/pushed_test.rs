@@ -25,6 +25,9 @@ use crate::tenant_api::tenant_api_router;
 #[path = "pushed_test/review_regressions_test.rs"]
 mod review_regressions;
 
+#[path = "pushed_test/source_and_cache_test.rs"]
+mod source_and_cache;
+
 const APP: &str = "evolution";
 const SPEC: &str = "sentinel_monitor.ioa.toml";
 

@@ -379,7 +379,10 @@ pub async fn install_genesis_app_from_registry(
     drop(turn);
     let installed = match installed {
         Ok(installed) => installed,
-        Err(closure_install::ClosureRefused::Failed(error)) => return Err(error),
+        Err(
+            closure_install::ClosureRefused::Failed(error)
+            | closure_install::ClosureRefused::Inactive(error),
+        ) => return Err(error),
         Err(closure_install::ClosureRefused::Unparsed(error)) => {
             return Err(format!(
                 "Genesis install of {} refused: {error}",

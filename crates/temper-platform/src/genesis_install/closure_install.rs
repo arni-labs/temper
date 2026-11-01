@@ -64,6 +64,9 @@ pub(super) enum ClosureRefused {
     /// The installer or its verification refused the closure; the version
     /// installed before it, if any, is installed again. Says why.
     Failed(String),
+    /// Refused before registration, or successfully rolled back. The caller
+    /// may discard a newly created cache unless the prior install uses it.
+    Inactive(String),
 }
 
 /// Install the closure in `cache_root` for `tenant`.
@@ -83,7 +86,7 @@ pub(super) async fn install_materialized_closure(
         .map(|app| (app.version.name.clone(), app.files.clone()))
         .collect();
     let apps = resolve_materialized_app_closure(tenant, cache_root, &written)
-        .map_err(ClosureRefused::Failed)?;
+        .map_err(ClosureRefused::Inactive)?;
     let materialized: Vec<String> = apps.iter().map(|(name, _)| name.clone()).collect();
 
     // One complete order drives the parse, snapshots, reconcile and verification.
@@ -102,7 +105,7 @@ pub(super) async fn install_materialized_closure(
                 Ok(Some(record)) => prior_records.push(record),
                 Ok(None) => {}
                 Err(error) => {
-                    return Err(ClosureRefused::Failed(format!(
+                    return Err(ClosureRefused::Inactive(format!(
                         "Genesis install of {} aborted before mutating: could not read prior install record for {app_name} (rollback safety net): {error}",
                         closure.app_ref
                     )));
@@ -173,7 +176,7 @@ pub(super) async fn install_materialized_closure(
                     closure.app_ref, prior.app_ref
                 )));
             }
-            Err(ClosureRefused::Failed(format!(
+            Err(ClosureRefused::Inactive(format!(
                 "Genesis install of {} {failed}\nRolled back to previous pinned ref {}",
                 closure.app_ref, prior.app_ref
             )))
@@ -283,7 +286,7 @@ fn parse_closure_specs(
             };
             let source = files
                 .read_text(&path)
-                .map_err(|error| ClosureRefused::Failed(format!("spec '{key}': {error}")))?;
+                .map_err(|error| ClosureRefused::Inactive(format!("spec '{key}': {error}")))?;
             if let Err(error) = temper_spec::automaton::parse_automaton(&source) {
                 return Err(ClosureRefused::Unparsed(format!(
                     "spec '{key}' does not parse: {error}"

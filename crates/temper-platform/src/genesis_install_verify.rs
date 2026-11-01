@@ -161,7 +161,7 @@ pub(crate) fn platform_store(
 /// Re-reconcile the prior bundle and restore its provenance record — the network-free core of
 /// rollback, and the seam the deterministic simulator drives.
 ///
-/// `reconcile_os_app` overwrites the durable record with a local-provenance row, so after
+/// `reconcile_os_app` can replace a changed bundle's record with a local-provenance row. After
 /// re-reconciling the prior bundle this restores the prior Genesis provenance record. If the prior
 /// version itself does not reach runtime-ready, that is a hard both-broken error: neither the new
 /// nor the previous version is serviceable.
