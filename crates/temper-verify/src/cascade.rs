@@ -283,7 +283,7 @@ impl VerificationCascade {
         let mut levels = Vec::new();
         let (model, prop_model) = match self.models(spending) {
             Ok(models) => models,
-            Err(failed) => return finish(vec![failed], Vec::new(), None, None),
+            Err(failed) => return finish(vec![*failed], Vec::new(), None, None),
         };
 
         let mut warnings = Vec::new();

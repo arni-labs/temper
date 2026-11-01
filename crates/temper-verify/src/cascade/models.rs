@@ -11,16 +11,16 @@ impl VerificationCascade {
     pub(super) fn models(
         &self,
         spending: Option<&Spending>,
-    ) -> Result<(TemperModel, TemperModel), LevelResult> {
-        let build = |max_counter: usize| -> Result<TemperModel, LevelResult> {
-            let model = model::build_model_from_ioa(&self.ioa_source, max_counter)
-                .map_err(does_not_parse)?;
+    ) -> Result<(TemperModel, TemperModel), Box<LevelResult>> {
+        let build = |max_counter: usize| -> Result<TemperModel, String> {
+            let model = model::build_model_from_ioa(&self.ioa_source, max_counter)?;
             Ok(match spending {
                 Some(spending) => spending.limit(model),
                 None => model,
             })
         };
-        Ok((build(self.max_counter)?, build(2)?))
+        let both = || -> Result<_, String> { Ok((build(self.max_counter)?, build(2)?)) };
+        both().map_err(|error| Box::new(does_not_parse(error)))
     }
 }
 
