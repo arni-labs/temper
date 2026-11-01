@@ -30,12 +30,14 @@
 //! the timer reads it again (`follow_owned_state_timer`).
 //!
 //! A timer fires as someone: the caller of the dispatch that reconciles, else
-//! whoever armed the timer it replaces (its row's `armed_by`), else (a record
-//! nobody armed a timer for, as when an install adds a timeout to its type)
-//! the kernel's
-//! [`STATE_TIMER_SERVICE`]. A timeout action that binds its caller's identity
-//! (`authenticated_subject`) refuses a service caller by design, so such a
-//! record waits for its next action, whose caller arms it.
+//! whoever armed the timer it replaces (its row's `armed_by`), else, when
+//! nothing names a setter or only the state-timer service does (a record that
+//! entered its state before rows were kept, or lost its row), the principal of
+//! the record's newest move made by request, as its journal keeps it
+//! (`state_timer_setter`), else the kernel's [`STATE_TIMER_SERVICE`]. A
+//! timeout action that binds its caller's identity (`authenticated_subject`)
+//! refuses a service caller by design, so such a record waits for its next
+//! action, whose caller arms it.
 //!
 //! The walks that reconcile every record of a type, after an install and at
 //! boot, are in `state_timer_follow`.
@@ -51,13 +53,10 @@ use super::state_timeouts::{
     Reservation, deadline, declared_timer, rearm_clock_start, remaining_budget,
 };
 use super::state_timer_follow::{FOLLOW_RETRY_FIRST, FOLLOW_RETRY_MAX};
+use super::state_timer_setter::{STATE_TIMER_SERVICE, is_state_timer_service};
 use crate::entity_actor::{EntityState, RehydrateHook};
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
-
-/// The service a timer fires as when nobody armed it: a record found in a
-/// timed state by an install with no timer armed and no row.
-const STATE_TIMER_SERVICE: &str = "state-timer";
 
 /// What a reconcile left a record with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -247,6 +246,21 @@ impl ServerState {
             .or_else(|| armed_by.cloned())
             .or_else(|| armed.as_ref().map(|armed| armed.agent_ctx.clone()))
             .or_else(|| row.as_ref().and_then(super::state_timer_rows::row_armed_by));
+        // Nothing names a setter, or only the service does and no timer of
+        // this process holds it: the journal may name who the record follows.
+        let known = if armed.is_none() && known.as_ref().is_none_or(is_state_timer_service) {
+            match self.journal_setter(tenant, entity_type, entity_id).await {
+                Ok(Some(setter)) => Some(setter),
+                Ok(None) => known,
+                Err(error) => {
+                    tracing::warn!(tenant = %tenant, entity_type, entity_id, %error,
+                        "record journal not readable; its timer's setter is not known yet");
+                    return TimerFollow::RetryRead;
+                }
+            }
+        } else {
+            known
+        };
         let identity = match known {
             Some(identity) => identity,
             None if self.action_binds_caller(tenant, entity_type, &st.on_timeout) => {
@@ -264,7 +278,11 @@ impl ServerState {
             started_at,
         );
         let reservation = if let Some(committed) = committed {
+            // The committed arm's identity, unless the journal named its setter
+            // in place of the service.
+            let agent_ctx = std::mem::take(&mut timer.agent_ctx);
             timer = committed;
+            timer.agent_ctx = agent_ctx;
             // Keep the durable arm's clock, payload, caller and row identity,
             // but fence its replacement at the record we just reconciled.
             // Non-resetting actions advance the journal without a new arm.
