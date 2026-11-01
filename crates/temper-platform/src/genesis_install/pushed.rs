@@ -260,8 +260,9 @@ fn pushed_ref(app: &str, digest: &str) -> String {
     format!("{SOURCE_KIND}/{app}@{digest}")
 }
 
-/// Pushed version `digest` of `app`: a closure of that one app, recorded
-/// as pushed and pinned.
+/// The files this push supplies: version `digest` of `app`, recorded as
+/// pushed and pinned. The shared core resolves its complete dependency
+/// closure over the tenant catalog before checking or mutating anything.
 fn closure<'a>(
     app_ref: &'a str,
     app: &str,

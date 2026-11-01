@@ -26,6 +26,7 @@ mod entity_aliases;
 mod install_checks;
 mod install_guard;
 mod install_lines;
+mod materialized_closure;
 mod module_review_step;
 mod policy_rows;
 mod proofs;
@@ -51,6 +52,7 @@ use entity_aliases::{
     file_already_contains, slug_fragment,
 };
 pub use install_lines::{installed_line, stored_line, waiting_line};
+pub(crate) use materialized_closure::resolve_materialized_app_closure;
 #[cfg(test)]
 pub(super) use policy_rows::os_app_policy_row_id;
 pub(crate) use reconcile::{
@@ -1020,7 +1022,11 @@ fn load_app_bundle(app_dir: &Path) -> Result<AppBundle, String> {
 fn os_app_dependencies(tenant: Option<&str>, name: &str) -> Vec<String> {
     // Check manifest first.
     let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-    if let Some(entry) = cat.app_entry(tenant, name)
+    dependencies_for_entry(name, cat.app_entry(tenant, name))
+}
+
+fn dependencies_for_entry(name: &str, entry: Option<&AppEntry>) -> Vec<String> {
+    if let Some(entry) = entry
         && !entry.dependencies.is_empty()
     {
         return entry

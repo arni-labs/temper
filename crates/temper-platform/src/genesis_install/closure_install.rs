@@ -12,7 +12,7 @@ use std::time::Duration;
 use temper_verify::CascadeResult;
 
 use super::*;
-use crate::os_apps::{find_ioa_files, installed_line};
+use crate::os_apps::{find_ioa_files, installed_line, resolve_materialized_app_closure};
 
 /// Where an installed closure came from, as its install records name it.
 pub(super) struct ClosureSource<'a> {
@@ -23,13 +23,15 @@ pub(super) struct ClosureSource<'a> {
     pub(super) follow_policy: &'a str,
 }
 
-/// An app closure whose files are in its cache directory, ready to install.
+/// A source's app files in its cache directory, ready to resolve and install.
 pub(super) struct MaterializedClosure<'a> {
     /// The ref the install was asked for, as messages name it.
     pub(super) app_ref: &'a str,
     /// The closure's root app.
     pub(super) root: RegistryAppRef,
-    /// Every app the directory holds at its version, the root among them.
+    /// Every app this source materialized at its version, the root among
+    /// them. Dependencies already in the tenant catalog are resolved by the
+    /// core before any checks; they retain their own source provenance.
     pub(super) refs: Vec<RegistryAppRef>,
     pub(super) source: ClosureSource<'a>,
     /// Time each spec's check may take.
@@ -41,7 +43,8 @@ pub(super) struct ClosureInstalled {
     /// What the installer did for the root app.
     pub(super) install: InstallResult,
     pub(super) closure_id: String,
-    /// The names of every app in the closure.
+    /// The names of every app in the resolved closure, including dependencies
+    /// read from the tenant's existing catalog.
     pub(super) materialized: Vec<String>,
     /// Each spec's check, by its path: the root app's relative to it, every
     /// other app's under its name.
@@ -68,18 +71,18 @@ pub(super) async fn install_materialized_closure(
     cache_root: &Path,
     closure: MaterializedClosure<'_>,
 ) -> Result<ClosureInstalled, ClosureRefused> {
-    let materialized: Vec<String> = closure.refs.iter().map(|r| r.name.clone()).collect();
+    // A push materializes only its root; its dependencies still resolve from
+    // the tenant's catalog. Resolve that entire closure before mutation, and
+    // use the same order for checks, snapshots, reconcile and verification.
+    let roots: Vec<String> = closure.refs.iter().map(|r| r.name.clone()).collect();
+    let apps = resolve_materialized_app_closure(tenant, cache_root, &roots)
+        .map_err(ClosureRefused::Failed)?;
+    let materialized: Vec<String> = apps.iter().map(|(name, _)| name.clone()).collect();
 
     // Checked before anything changes, so a refusal leaves the tenant as it was.
-    let checks = check_closure_specs(
-        platform,
-        cache_root,
-        &closure.root.name,
-        &materialized,
-        closure.budget,
-    )
-    .await
-    .map_err(ClosureRefused::Failed)?;
+    let checks = check_closure_specs(platform, &closure.root.name, &apps, closure.budget)
+        .await
+        .map_err(ClosureRefused::Failed)?;
     if checks
         .values()
         .any(|check| !check.all_passed || check.stopped.is_some())
@@ -113,11 +116,15 @@ pub(super) async fn install_materialized_closure(
         .find(|record| record.app_name == closure.root.name)
         .cloned();
 
-    register_install_cache(tenant, cache_root.to_path_buf(), DirApps::Every);
+    register_install_cache(
+        tenant,
+        cache_root.to_path_buf(),
+        DirApps::Only(materialized.iter().cloned().collect()),
+    );
 
     let reconcile_started = Instant::now();
     let reconcile_result =
-        reconcile_materialized_app_closure(platform, tenant, &closure.root.name).await;
+        reconcile_app_install_order(platform, tenant, &closure.root.name, &materialized).await;
 
     // Verify EVERY app in the reconciled closure reached runtime-ready — specs/policies/wasm
     // registered AND every app-required wasm module compiles. A reconcile error counts as
@@ -271,17 +278,15 @@ pub(super) async fn record_closure(
 /// read what an earlier passing check read gets that kept verdict back at once.
 async fn check_closure_specs(
     platform: &PlatformState,
-    cache_root: &Path,
     root_app: &str,
-    apps: &[String],
+    apps: &[(String, PathBuf)],
     budget: Duration,
 ) -> Result<BTreeMap<String, CascadeResult>, String> {
     let mut checks = BTreeMap::new();
-    for app in apps {
-        let app_dir = cache_root.join(app);
-        for (_, path) in find_ioa_files(&app_dir) {
+    for (app, app_dir) in apps {
+        for (_, path) in find_ioa_files(app_dir) {
             let relative = path
-                .strip_prefix(&app_dir)
+                .strip_prefix(app_dir)
                 .ok()
                 .and_then(Path::to_str)
                 .ok_or_else(|| format!("spec '{}' is outside its app", path.display()))?;

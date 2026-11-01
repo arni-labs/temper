@@ -78,7 +78,9 @@ to = "Closed"
             level.summary
         );
         assert!(
-            VerificationCascade::from_ioa(OLD_SYNTAX).digest().is_none(),
+            VerificationCascade::from_ioa(OLD_SYNTAX)
+                .kept_key()
+                .is_none(),
             "a spec that does not parse has no verdict to keep"
         );
     }

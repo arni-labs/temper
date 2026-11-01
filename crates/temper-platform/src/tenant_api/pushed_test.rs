@@ -22,6 +22,9 @@ use crate::os_apps::tenant_os_app;
 use crate::state::PlatformState;
 use crate::tenant_api::tenant_api_router;
 
+#[path = "pushed_test/review_regressions.rs"]
+mod review_regressions;
+
 const APP: &str = "evolution";
 const SPEC: &str = "sentinel_monitor.ioa.toml";
 
@@ -153,25 +156,15 @@ struct Listed {
     dir: String,
 }
 
-/// The app's install as the listing gives it, its `dir` read the way
-/// Katagami's scripts read it:
-/// `tr '}' '\n' | grep "\"app_name\":\"$app\"" | grep -o '"dir":"[^"]*"'`.
-/// Asserts the app's object is flat and its `dir` needs no JSON escaping.
-/// `None` when the listing holds no install of the app.
+/// The app's install as the listing gives it. Read JSON as JSON so every
+/// valid filesystem path survives escaping. None when the app is absent.
 fn listed(body: &str) -> Option<Listed> {
-    let line = body
-        .split('}')
-        .find(|line| line.contains(&format!("\"app_name\":\"{APP}\"")))?;
-    let start = line.find("\"dir\":\"").expect("a dir field") + "\"dir\":\"".len();
-    let dir = &line[start..start + line[start..].find('"').expect("dir ends")];
-
     let value: serde_json::Value = serde_json::from_str(body).expect("json");
     let entry = value["value"]
         .as_array()
         .expect("a list")
         .iter()
-        .find(|entry| entry["app_name"] == APP)
-        .expect("the parsed listing has the app");
+        .find(|entry| entry["app_name"] == APP)?;
     assert!(
         entry
             .as_object()
@@ -180,18 +173,13 @@ fn listed(body: &str) -> Option<Listed> {
             .all(|field| field.is_string() || field.is_null()),
         "flat: {entry}"
     );
-    assert_eq!(
-        entry["dir"].as_str(),
-        Some(dir),
-        "dir needs no JSON escaping"
-    );
     let field = |name: &str| entry[name].as_str().unwrap_or_default().to_string();
     Some(Listed {
         source_kind: field("source_kind"),
         app_ref: field("app_ref"),
         version_hash: field("version_hash"),
         status: field("status"),
-        dir: dir.to_string(),
+        dir: field("dir"),
     })
 }
 
@@ -417,7 +405,7 @@ async fn a_good_push_is_installed_recorded_and_restored_at_boot() {
     assert_eq!(recorded.app_ref, format!("pushed/{APP}@{digest}"));
 
     // The listing names the pushed version and the folder it is served from,
-    // its `dir` read with grep, flat and unescaped.
+    // its `dir` read from JSON.
     let served = listed_for(&server.state, &tenant).await.expect("listed");
     assert_eq!(
         served,

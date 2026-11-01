@@ -439,12 +439,22 @@ pub(crate) async fn reconcile_materialized_app_closure(
     root_app_name: &str,
 ) -> Result<InstallResult, String> {
     let order = resolve_tenant_os_app_install_order(tenant, &[root_app_name.to_string()])?;
+    reconcile_app_install_order(platform, tenant, root_app_name, &order).await
+}
+
+/// Reconcile exactly the closure resolved before its checks and snapshots.
+async fn reconcile_app_install_order(
+    platform: &PlatformState,
+    tenant: &str,
+    root_app_name: &str,
+    order: &[String],
+) -> Result<InstallResult, String> {
     let mut root_result = InstallResult::default();
     let (mut warnings, mut reviewed) = (Vec::new(), Vec::new());
 
     for app_name in order {
         let started = Instant::now();
-        match reconcile_os_app(platform, tenant, &app_name).await? {
+        match reconcile_os_app(platform, tenant, app_name).await? {
             OsAppReconcileResult::Skipped { bundle_digest, .. } => {
                 tracing::info!(
                     tenant = %tenant,
