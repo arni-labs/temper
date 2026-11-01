@@ -23,6 +23,19 @@ fn register(tenant: &str, root: &Path, apps: &[(&str, &[&str])]) {
     add_tenant_written_apps(tenant, root.to_path_buf(), apps);
 }
 
+/// The dependency owns its own types and sets, rather than also claiming
+/// Evolution's copied EvolutionRuns set before the WASM rollback is reached.
+fn dependency_csdl() -> String {
+    app_files()["model.csdl.xml"]
+        .replace("SentinelMonitor", "PushDependency")
+        .replace("\"EvolutionRun\"", "\"DependencyRun\"")
+        .replace("\"EvolutionRuns\"", "\"DependencyRuns\"")
+        .replace(
+            "Temper.Evolution.EvolutionRun",
+            "Temper.Evolution.DependencyRun",
+        )
+}
+
 fn dependency(root: &Path, name: &str, dependencies: &[&str]) {
     let dir = root.join(name);
     std::fs::create_dir_all(&dir).unwrap();
@@ -32,11 +45,7 @@ fn dependency(root: &Path, name: &str, dependencies: &[&str]) {
     )
     .unwrap();
     std::fs::write(dir.join("APP.md"), "# Install dependency").unwrap();
-    std::fs::write(
-        dir.join("model.csdl.xml"),
-        app_files()["model.csdl.xml"].replace("SentinelMonitor", "PushDependency"),
-    )
-    .unwrap();
+    std::fs::write(dir.join("model.csdl.xml"), dependency_csdl()).unwrap();
     std::fs::write(
         dir.join(SPEC),
         app_files()[SPEC].replace("SentinelMonitor", "PushDependency"),
@@ -113,7 +122,7 @@ async fn a_dependency_with_broken_required_wasm_refuses_and_rolls_back() {
             "app.toml": "name = \"push-wasm\"\n",
             "APP.md": "# Prior dependency",
             (SPEC): app_files()[SPEC].replace("SentinelMonitor", "PushDependency"),
-            "model.csdl.xml": app_files()["model.csdl.xml"].replace("SentinelMonitor", "PushDependency")
+            "model.csdl.xml": dependency_csdl()
         }}),
     );
     *request.uri_mut() = "/os-apps/push-wasm/install".parse().unwrap();
