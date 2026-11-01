@@ -14,7 +14,7 @@ use std::time::Instant;
 use serde::Serialize;
 use temper_runtime::tenant::TenantId;
 use temper_spec::automaton;
-use temper_spec::csdl::{emit_csdl_xml, merge_csdl, parse_csdl};
+use temper_spec::csdl::emit_csdl_xml;
 
 use crate::bootstrap;
 use crate::state::PlatformState;
@@ -28,6 +28,7 @@ mod entity_owners;
 mod install_checks;
 mod install_guard;
 mod module_review_step;
+mod own_schema;
 mod policy_rows;
 mod proofs;
 mod reconcile;
@@ -52,6 +53,7 @@ use entity_aliases::{
     file_already_contains, slug_fragment,
 };
 pub use entity_owners::unspecified_entity_types;
+pub(crate) use own_schema::converge_installed_schemas;
 #[cfg(test)]
 pub(super) use policy_rows::os_app_policy_row_id;
 pub(crate) use reconcile::{
@@ -1021,6 +1023,14 @@ async fn install_once(
         );
     }
 
+    // The tenant's schema once this app's own contribution is replaced; only
+    // when the reconcile plan needs spec work.
+    let own = match bundle.csdl.as_deref() {
+        Some(csdl) if plan.specs => {
+            Some(own_schema::for_install(state, tenant, app_name, csdl).await?)
+        }
+        _ => None,
+    };
     // Classify each bundle spec as added / updated / skipped, and compute the
     // merged CSDL only when the reconcile plan needs spec work.
     let (mut added, mut updated, mut skipped, merged_csdl) = if plan.specs {
@@ -1050,20 +1060,13 @@ async fn install_once(
         }
         // Parsed before any write, with the CSDL below (see `install_checks`).
         install_checks::parse_cross_invariants(bundle.cross_invariants_toml.as_deref(), app_name)?;
-        // App installs must preserve existing tenant types.
-        let merged_csdl = if let Some(ref csdl) = bundle.csdl {
-            let incoming = parse_csdl(csdl)
-                .map_err(|e| format!("Failed to parse CSDL for os-app '{app_name}': {e}"))?;
-            if let Some(existing) = registry.get_tenant(&tenant_id) {
-                Some(emit_csdl_xml(&merge_csdl(&existing.csdl, &incoming)))
-            } else {
-                Some(csdl.clone())
-            }
-        } else {
+        // The tenant's whole schema, computed above from every installed app.
+        let merged_csdl = match &own {
+            Some(own) => Some(own.csdl_xml.clone()),
             // No CSDL in bundle; keep existing if any.
-            registry
+            None => registry
                 .get_tenant(&tenant_id)
-                .map(|t| emit_csdl_xml(&t.csdl))
+                .map(|t| emit_csdl_xml(&t.csdl)),
         };
         (added, updated, skipped, merged_csdl)
     } else {
@@ -1111,6 +1114,7 @@ async fn install_once(
             &app_dir, app_name, &bundle,
         )?);
     }
+    warnings.extend(own.into_iter().flat_map(|own| own.warnings));
     warnings.extend(
         ownership
             .standing
@@ -1266,6 +1270,8 @@ async fn install_once(
                 &specs_to_bootstrap,
                 bootstrap::BootstrapTenantSpecsOptions {
                     merge: true,
+                    // `merged` is the tenant's whole schema, app by app.
+                    csdl_mode: bootstrap::CsdlMode::Whole,
                     label: &format!("OsApp({app_name})"),
                     verified_cache: &verified_cache,
                     cross_invariants_source: bundle.cross_invariants_toml.as_deref(),
