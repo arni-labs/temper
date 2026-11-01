@@ -209,3 +209,109 @@ async fn matching_cached_apps(
             .collect(),
     )
 }
+
+/// The files of installed app `app_name` in `tenant` at the version its record
+/// holds, from its own cache or a recorded closure's cache. Only Genesis and
+/// pushed installs keep their version's files apart from the next version's; a local
+/// install replaces its files in place, so its installed version cannot be
+/// read once its folder holds another. A pre-tenant shared cache is not read
+/// here, since using one means copying it into the tenant first.
+pub(crate) async fn installed_version_files(
+    platform: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+) -> Result<AppFileSource, String> {
+    let ps = platform
+        .server
+        .storage_stack
+        .as_ref()
+        .and_then(|stack| stack.platform.clone())
+        .ok_or_else(|| "the server has no platform store".to_string())?;
+    let record = ps
+        .get_installed_app(tenant, app_name)
+        .await
+        .map_err(|error| format!("its install record does not read: {error}"))?
+        .ok_or_else(|| "it has no install record".to_string())?;
+    if record.source_kind != "genesis" && record.source_kind != pushed::SOURCE_KIND {
+        return Err(format!(
+            "it was installed from {} files, which are replaced in place",
+            if record.source_kind.is_empty() {
+                "local"
+            } else {
+                record.source_kind.as_str()
+            }
+        ));
+    }
+    if let Some(files) = installed_files_in_cache(platform, ps.as_ref(), &record, &record).await {
+        return Ok(files);
+    }
+    // A dependency's own ref names its version, but its files may have been
+    // written into a parent's closure. Only this tenant's recorded installs
+    // contribute candidates, and each must match the dependency's digest.
+    let installed = ps
+        .list_all_installed_apps()
+        .await
+        .map_err(|error| format!("its tenant's install records do not read: {error}"))?;
+    for (cache_tenant, name) in installed {
+        if cache_tenant != tenant || name == app_name {
+            continue;
+        }
+        let Some(closure) = ps.get_installed_app(tenant, &name).await.map_err(|error| {
+            format!("its tenant's install record for '{name}' does not read: {error}")
+        })?
+        else {
+            continue;
+        };
+        if closure.source_kind != "genesis" && closure.source_kind != pushed::SOURCE_KIND {
+            continue;
+        }
+        if let Some(files) =
+            installed_files_in_cache(platform, ps.as_ref(), &record, &closure).await
+        {
+            return Ok(files);
+        }
+    }
+    Err(format!(
+        "no cache directory holds its installed version {}",
+        record.app_ref
+    ))
+}
+
+/// Read `record`'s app from a recorded install's private cache, checking the
+/// app's own digest even when a different app's install wrote the cache.
+async fn installed_files_in_cache(
+    platform: &PlatformState,
+    ps: &dyn PlatformStore,
+    record: &InstalledAppRecord,
+    cache_record: &InstalledAppRecord,
+) -> Option<AppFileSource> {
+    let registry_tenant = match cache_record.registry_tenant.trim() {
+        "" => "default",
+        named => named,
+    };
+    for candidate in install_cache_candidates(
+        platform,
+        &record.tenant,
+        registry_tenant,
+        &cache_record.app_ref,
+    )
+    .into_iter()
+    .filter(|candidate| !candidate.legacy)
+    {
+        let Some(apps) = matching_cached_apps(
+            ps,
+            &candidate.path,
+            record,
+            std::slice::from_ref(record),
+            true,
+        )
+        .await
+        else {
+            continue;
+        };
+        if let Some((_, files)) = apps.into_iter().find(|(app, _)| app == &record.app_name) {
+            return Some(files);
+        }
+    }
+    None
+}

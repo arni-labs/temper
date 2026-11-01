@@ -425,6 +425,9 @@ mod rollback_tests;
 #[path = "legacy_cache_tests.rs"]
 mod legacy_cache_tests;
 
+#[path = "upgrade_owner_tests.rs"]
+mod upgrade_owner_tests;
+
 #[path = "stall_tests.rs"]
 mod stall_tests;
 

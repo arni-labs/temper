@@ -47,6 +47,7 @@ pub use pushed::{
 };
 pub(crate) use registry::configured_registry;
 use registry::{RegistryUrl, registry_client};
+pub(crate) use restore::installed_version_files;
 use restore::rollback_to_prior;
 pub use restore::{
     CacheFetchSummary, CacheFetches, GenesisCacheRecovery, restore_genesis_app_cache_roots,
