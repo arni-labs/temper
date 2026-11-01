@@ -440,7 +440,8 @@ async fn inline_failure_without_on_failure_is_answered_committed_and_compensated
         response.trigger_failures
     );
     assert_eq!(
-        response.state.status, "Failed",
+        poll_status(&state, &tenant, "adapter-inline-nofail", "Failed").await,
+        "Failed",
         "the record is compensated through its Fail step"
     );
 }
