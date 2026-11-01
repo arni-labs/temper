@@ -427,3 +427,6 @@ mod legacy_cache_tests;
 
 #[path = "stall_tests.rs"]
 mod stall_tests;
+
+#[path = "late_fetch_tests.rs"]
+mod late_fetch_tests;

@@ -29,7 +29,7 @@ mod entity_aliases;
 mod entity_owners;
 mod file_source;
 mod install_checks;
-mod install_guard;
+pub(crate) mod install_guard;
 mod install_lines;
 mod materialized_closure;
 mod module_review_step;
