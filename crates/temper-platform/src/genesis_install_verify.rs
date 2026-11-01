@@ -29,18 +29,18 @@ pub(crate) enum InstallVerifyDecision {
 ///
 /// Pure and side-effect free so it is unit- and simulation-testable. `new_version_ready` is the
 /// verification verdict (runtime-ready AND every app-required wasm module compiles). A rollback
-/// target must itself be a Genesis install that was in the `installed` status — anything else
-/// (absent, a non-Genesis local install, or a prior failed install) is not a safe last-good state
-/// to revert to, so the install fails cleanly instead.
+/// target must itself be a Genesis or pushed install that was in the `installed` status — anything
+/// else (absent, a local install, or a prior failed install) is not a safe last-good state to
+/// revert to, so the install fails cleanly instead.
 pub(crate) fn classify_install_verify(
     new_version_ready: bool,
     prior_record: Option<&InstalledAppRecord>,
 ) -> InstallVerifyDecision {
     if new_version_ready {
         InstallVerifyDecision::Commit
-    } else if prior_record
-        .is_some_and(|record| record.source_kind == "genesis" && record.status == "installed")
-    {
+    } else if prior_record.is_some_and(|record| {
+        matches!(record.source_kind.as_str(), "genesis" | "pushed") && record.status == "installed"
+    }) {
         InstallVerifyDecision::RollBackToPrevious
     } else {
         InstallVerifyDecision::FailNoRollback
@@ -161,7 +161,7 @@ pub(crate) fn platform_store(
 /// Re-reconcile the prior bundle and restore its provenance record — the network-free core of
 /// rollback, and the seam the deterministic simulator drives.
 ///
-/// `reconcile_os_app` overwrites the durable record with a local-provenance row, so after
+/// `reconcile_os_app` can replace a changed bundle's record with a local-provenance row. After
 /// re-reconciling the prior bundle this restores the prior Genesis provenance record. If the prior
 /// version itself does not reach runtime-ready, that is a hard both-broken error: neither the new
 /// nor the previous version is serviceable.

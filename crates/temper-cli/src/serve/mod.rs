@@ -13,6 +13,8 @@ mod loader;
 mod local_sandbox;
 mod observe_ui;
 pub(crate) mod options;
+#[cfg(test)]
+mod pushed_boot_tests;
 mod storage;
 mod sync_copy;
 #[cfg(test)]
@@ -115,9 +117,16 @@ pub async fn run(
             temper_platform::module_review::ModuleReviewer::new(judge),
         ));
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let data_dir = Path::new(&home).join(".local/share/temper");
-    state.server.data_dir = data_dir.clone();
+    // TEMPER_DATA_DIR puts this server's files (pushed app versions, blobs,
+    // caches) where they outlive the machine, such as a mounted volume.
+    let data_dir = match std::env::var_os("TEMPER_DATA_DIR").filter(|dir| !dir.is_empty()) {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            Path::new(&home).join(".local/share/temper")
+        }
+    };
+    state.server.data_dir = data_dir;
     state.server.files_need_object_store = storage::files_need_object_store();
 
     seed_cedar_policies(&state, tenant_policy_seed);

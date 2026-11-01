@@ -7,7 +7,6 @@
 //! nothing saying so.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 use temper_spec::csdl::{CsdlDocument, parse_csdl};
 
@@ -76,7 +75,7 @@ pub(super) async fn ownership(
 /// machine, and each spec or CSDL file under `app_dir` the install does not
 /// read, named with the file it reads in its place.
 pub(super) fn unrun_declarations(
-    app_dir: &Path,
+    source: &super::AppFileSource,
     app_name: &str,
     bundle: &AppBundle,
 ) -> Result<Vec<InstallWarning>, String> {
@@ -90,8 +89,8 @@ pub(super) fn unrun_declarations(
         .map(InstallWarning::entity_ownership)
         .collect();
     warnings.extend(
-        AppFiles::find(app_dir)
-            .unread_warnings(app_dir)
+        AppFiles::from_source(source)
+            .unread_warnings_from_source(source)
             .into_iter()
             .map(InstallWarning::entity_ownership),
     );
@@ -210,27 +209,24 @@ pub(super) async fn installed_apps(
 
 fn read_app_csdl(tenant: &str, app: &str) -> Result<Option<CsdlDocument>, String> {
     let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-    let app_dir = cat.app_dir(Some(tenant), app).cloned();
+    let source = cat.app_files(Some(tenant), app).cloned();
     drop(cat);
-    let Some(app_dir) = app_dir else {
+    let Some(source) = source else {
         return Err("the app is not in the catalog".to_string());
     };
     // A boot or install that reads an app as declaring nothing rebuilds the
     // schema without it, so only an app whose files are on disk and hold no
     // specs may read as having no CSDL. A missing or half-written app is
     // unreadable, and callers keep the schema the tenant already has.
-    if !app_dir.join("app.toml").is_file() {
-        return Err(format!("{} holds no app.toml", app_dir.display()));
-    }
-    let files = AppFiles::find(&app_dir);
+    source.read_text("app.toml")?;
+    let files = AppFiles::from_source(&source);
     let Some(path) = files.csdl else {
         if files.ioa.is_empty() {
             return Ok(None);
         }
         return Err("it has specs but no CSDL".to_string());
     };
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("{} does not read: {e}", path.display()))?;
+    let text = source.read_text(&super::app_relative_path(source.dir(), &path))?;
     parse_csdl(&text)
         .map(Some)
         .map_err(|e| format!("its CSDL does not parse: {e}"))

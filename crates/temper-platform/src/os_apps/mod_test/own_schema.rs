@@ -315,6 +315,15 @@ async fn a_restart_does_not_bring_a_dropped_type_back() {
 /// its types, even one that has no spec to keep it.
 #[tokio::test]
 async fn a_restart_keeps_the_schema_of_an_app_it_cannot_read() {
+    restart_keeps_unreadable_schema(false).await;
+}
+
+#[tokio::test]
+async fn a_restart_keeps_the_schema_of_a_written_app_whose_manifest_cannot_be_read() {
+    restart_keeps_unreadable_schema(true).await;
+}
+
+async fn restart_keeps_unreadable_schema(written: bool) {
     let fx = Fixture::new("unreadable").await;
     let (tenant, first, second) = (unique("own-tenant"), unique("own-a"), unique("own-b"));
     fx.write_app(&first, "Test.Shared", &["Counter"], &["Counter"]);
@@ -336,9 +345,27 @@ async fn a_restart_keeps_the_schema_of_an_app_it_cannot_read() {
             .expect("restore the registry");
         *state.registry.write().unwrap() = restored;
     }
-    // The catalog lists the second app, but its files are gone.
     add_os_apps_dir(fx.apps_root.clone());
-    fs::remove_dir_all(fx.apps_root.join(&second)).expect("remove the second app's files");
+    let second_dir = fx.apps_root.join(&second);
+    if written {
+        let source = AppFileSource::written(
+            second_dir.clone(),
+            ["app.toml", "APP.md"].map(str::to_string),
+        );
+        add_tenant_written_apps(
+            &tenant,
+            fx.apps_root.clone(),
+            vec![(second.clone(), source)],
+        );
+        // Its recorded files no longer declare a schema, but an unreadable
+        // manifest means the app cannot be treated as intentionally empty.
+        // Unrecorded CSDL on disk and empty listings must not change that.
+        app_files_seam::list_empty_under(&second_dir);
+        app_files_seam::unreadable_under(&second_dir, "app.toml");
+    } else {
+        // The catalog lists the second app, but its files are gone.
+        fs::remove_dir_all(second_dir).expect("remove the second app's files");
+    }
 
     // Recovery, then the replay of the first app as a server boot runs it.
     crate::recovery::restore_installed_apps(&state, &restarted).await;

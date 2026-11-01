@@ -694,7 +694,7 @@ pub async fn bootstrap_operator_credential(
     if operator_credential_is_current(state, &tenant_id, &key_hash, agent_type_id, instance_id)
         .await
     {
-        crate::operator_manage_policies::seed_operator_manage_policies(state, tenant).await;
+        crate::operator_manage_policies::seed_operator_permits(state, tenant).await;
         tracing::info!(
             "Operator credential already current for tenant '{tenant}' (key_hash={}...)",
             &key_hash[..8]
@@ -726,7 +726,7 @@ pub async fn bootstrap_operator_credential(
             format!("failed to issue operator AgentCredential for tenant '{tenant}': {e}")
         })?;
 
-    crate::operator_manage_policies::seed_operator_manage_policies(state, tenant).await;
+    crate::operator_manage_policies::seed_operator_permits(state, tenant).await;
 
     tracing::info!(
         "Operator credential bootstrapped for tenant '{tenant}' (key_hash={}...)",

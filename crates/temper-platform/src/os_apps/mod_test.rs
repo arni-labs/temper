@@ -1013,7 +1013,8 @@ fn test_find_wasm_modules_discovers_packaged_root_wasm() {
         },
     );
 
-    let modules = find_wasm_modules(&root, &configs);
+    let modules = find_wasm_modules(&AppFileSource::Listed(root.clone()), &configs)
+        .expect("wasm modules read");
     fs::remove_dir_all(&root).expect("remove temp app");
 
     assert_eq!(
@@ -1958,7 +1959,8 @@ mode = "commons"
     let manifest = read_app_manifest(&temp_dir).expect("manifest should parse");
     assert_eq!(manifest.mode, AppDeploymentMode::Commons);
 
-    let bundle = load_app_bundle(&temp_dir).expect("bundle should load policies");
+    let bundle = load_app_bundle(&AppFileSource::Listed(temp_dir.clone()))
+        .expect("bundle should load policies");
     assert_eq!(bundle.deployment_mode, AppDeploymentMode::Commons);
     assert_eq!(bundle.cedar_policies.len(), 2);
     let source_paths: Vec<&str> = bundle
@@ -2021,7 +2023,8 @@ startup_loading = "lazy"
     )
     .unwrap();
 
-    let bundle = load_app_bundle(&temp_dir).expect("bundle should load");
+    let bundle =
+        load_app_bundle(&AppFileSource::Listed(temp_dir.clone())).expect("bundle should load");
     assert!(bundle.wasm_modules.contains_key("echo"));
     assert!(bundle.cross_invariants_toml.is_none());
     let config = bundle
@@ -2057,7 +2060,8 @@ version = "1.0.0"
     )
     .unwrap();
 
-    let bundle = load_app_bundle(&temp_dir).expect("bundle should load");
+    let bundle =
+        load_app_bundle(&AppFileSource::Listed(temp_dir.clone())).expect("bundle should load");
     assert_eq!(
         bundle.cross_invariants_toml.as_deref(),
         Some("version = 1\ndefault_delete_policy = \"restrict\"\n")
@@ -2684,7 +2688,7 @@ field = "file_id"
     )
     .unwrap();
 
-    let bundle = load_app_bundle(&temp_dir);
+    let bundle = load_app_bundle(&AppFileSource::Listed(temp_dir.clone()));
     assert!(
         bundle.is_err(),
         "legacy reactions.toml should be rejected after the ADR-0046 hard cut"
@@ -2737,7 +2741,8 @@ fn test_find_wasm_modules_respects_manifest_target() {
         },
     );
 
-    let modules = find_wasm_modules(&temp_dir, &configs);
+    let modules = find_wasm_modules(&AppFileSource::Listed(temp_dir.clone()), &configs)
+        .expect("wasm modules read");
     assert!(modules.contains_key("echo"), "echo module should be found");
     assert_eq!(
         modules["echo"], correct_bytes,
@@ -2782,7 +2787,8 @@ fn test_find_wasm_modules_prefers_packaged_sibling_over_target_output() {
         },
     );
 
-    let modules = find_wasm_modules(&temp_dir, &configs);
+    let modules = find_wasm_modules(&AppFileSource::Listed(temp_dir.clone()), &configs)
+        .expect("wasm modules read");
     assert_eq!(
         modules["echo"], packaged_bytes,
         "packaged sibling artifact should win over target output"
@@ -2819,7 +2825,8 @@ fn test_find_wasm_modules_finds_sibling_artifact() {
         },
     );
 
-    let modules = find_wasm_modules(&temp_dir, &configs);
+    let modules = find_wasm_modules(&AppFileSource::Listed(temp_dir.clone()), &configs)
+        .expect("wasm modules read");
     assert!(
         modules.contains_key("echo"),
         "echo module should be found at sibling path"
@@ -2840,7 +2847,8 @@ fn test_find_wasm_modules_ignores_undeclared_artifact() {
     fs::create_dir_all(&module_dir).unwrap();
     fs::write(module_dir.join("echo.wasm"), b"undeclared").unwrap();
 
-    let modules = find_wasm_modules(&temp_dir, &BTreeMap::new());
+    let modules = find_wasm_modules(&AppFileSource::Listed(temp_dir.clone()), &BTreeMap::new())
+        .expect("wasm modules read");
     assert!(
         modules.is_empty(),
         "WASM artifacts must be declared in app.toml before install"
@@ -2858,7 +2866,7 @@ fn test_find_adrs_discovers_markdown_in_sorted_order() {
     fs::write(adrs_dir.join("001-first.md"), "# first").unwrap();
     fs::write(adrs_dir.join("notes.txt"), "ignore").unwrap();
 
-    let adrs = find_adrs(&temp_dir);
+    let adrs = find_adrs(&AppFileSource::Listed(temp_dir.clone())).expect("adrs read");
     assert_eq!(adrs.len(), 2);
     assert_eq!(adrs[0].file_name, "001-first.md");
     assert_eq!(adrs[1].file_name, "002-second.md");

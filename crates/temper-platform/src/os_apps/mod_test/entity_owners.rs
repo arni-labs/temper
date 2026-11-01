@@ -251,3 +251,42 @@ async fn a_type_with_no_spec_and_a_shadowed_file_are_warnings() {
         ]
     );
 }
+
+#[tokio::test]
+async fn written_installs_keep_entity_ownership_when_folders_list_empty() {
+    let fx = Fixture::new("written-owners").await;
+    let tenant = unique("owners-tenant");
+    let first = unique("owners-first");
+    let second = unique("owners-second");
+    let sources = [&first, &second]
+        .into_iter()
+        .map(|app| {
+            let dir = fx.write_app(app, true, &["Counter"]);
+            let source = AppFileSource::written(
+                dir,
+                [
+                    "app.toml",
+                    "APP.md",
+                    "specs/counter.ioa.toml",
+                    "specs/model.csdl.xml",
+                ]
+                .map(str::to_string),
+            );
+            (app.clone(), source)
+        })
+        .collect();
+    add_tenant_written_apps(&tenant, fx.apps_root.clone(), sources);
+    app_files_seam::list_empty_under(&fx.apps_root);
+    install_os_app(&fx.state, &tenant, &first)
+        .await
+        .expect("first written owner installs without listings");
+    let error = install_os_app(&fx.state, &tenant, &second)
+        .await
+        .expect_err("the recorded first owner's CSDL still reserves Counters");
+    assert!(
+        error.contains(&format!(
+            "entity set Counters is already owned by app '{first}'"
+        )),
+        "{error}"
+    );
+}
