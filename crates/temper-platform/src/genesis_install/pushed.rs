@@ -4,7 +4,7 @@
 //! A push only materializes its files into a cache directory of its own
 //! ([`InstallSource::Pushed`], named by the digest of the files); from there
 //! it is installed like a registry closure
-//! ([`closure_install::install_materialized_closure`]): checks, register,
+//! ([`closure_install::install_materialized_closure`]): parse, register,
 //! reconcile, verify, then commit or roll back. Its install record says
 //! `pushed` and names the version as `pushed/<app>@<digest>`, so boot restores
 //! it from that directory and a later failed install rolls back to it, as for
@@ -13,7 +13,6 @@
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
-use temper_verify::CascadeResult;
 
 use super::closure_install::{ClosureRefused, ClosureSource, MaterializedApp, MaterializedClosure};
 use super::*;
@@ -60,8 +59,6 @@ pub struct PushedInstall {
     pub digest: String,
     /// What the installer did.
     pub result: InstallResult,
-    /// Each spec's check, by its path in the app.
-    pub checks: BTreeMap<String, CascadeResult>,
 }
 
 /// Why a push was refused.
@@ -70,9 +67,8 @@ pub enum PushRefused {
     /// The request is wrong: a name, a path, a kept file, or files that are
     /// not the app named. Nothing changed.
     Request(String),
-    /// A spec failed its check or ran out of its budget; every spec's check,
-    /// by its path in the app. Nothing changed.
-    Checks(BTreeMap<String, CascadeResult>),
+    /// A spec does not parse; says which and why. Nothing changed.
+    Unparsed(String),
     /// The installer refused the version, saying why; the version installed
     /// before it, if any, is installed again.
     Install(String),
@@ -87,7 +83,6 @@ pub async fn install_pushed_app(
     tenant: &str,
     app: &str,
     files: BTreeMap<String, PushedFile>,
-    budget: Duration,
 ) -> (Duration, Result<PushedInstall, PushRefused>) {
     for (label, value) in [("tenant", tenant), ("app name", app)] {
         if let Err(error) = validate_identity_component(label, value) {
@@ -98,7 +93,7 @@ pub async fn install_pushed_app(
     let turn = temper_server::host_turn::take().await;
     let waited = asked.elapsed();
     let result = match turn {
-        Ok(_turn) => install_in_turn(platform, tenant, app, files, budget).await,
+        Ok(_turn) => install_in_turn(platform, tenant, app, files).await,
         Err(error) => Err(PushRefused::Server(error)),
     };
     (waited, result)
@@ -109,7 +104,6 @@ async fn install_in_turn(
     tenant: &str,
     app: &str,
     files: BTreeMap<String, PushedFile>,
-    budget: Duration,
 ) -> Result<PushedInstall, PushRefused> {
     let prior = recorded_digest(platform, tenant, app).await;
     let kept_from = prior
@@ -151,7 +145,7 @@ async fn install_in_turn(
         platform,
         tenant,
         &root,
-        closure(&app_ref, app, &digest, budget, written),
+        closure(&app_ref, app, &digest, written),
     )
     .await;
     match installed {
@@ -164,12 +158,11 @@ async fn install_in_turn(
             Ok(PushedInstall {
                 digest,
                 result: installed.install,
-                checks: installed.checks,
             })
         }
-        Err(ClosureRefused::Checks(checks)) => {
+        Err(ClosureRefused::Unparsed(error)) => {
             discard();
-            Err(PushRefused::Checks(checks))
+            Err(PushRefused::Unparsed(error))
         }
         Err(ClosureRefused::Failed(error)) => Err(PushRefused::Install(error)),
     }
@@ -229,7 +222,7 @@ pub async fn adopt_catalog_app(
     let written = AppFiles::written(root.join(app), tree.keys().cloned());
     register_written_apps(tenant, root, vec![(app.to_string(), written.clone())]);
     let app_ref = pushed_ref(app, &digest);
-    let adopted = closure(&app_ref, app, &digest, Duration::ZERO, written);
+    let adopted = closure(&app_ref, app, &digest, written);
     closure_install::record_closure(platform, tenant, &adopted).await?;
     Ok(Some(digest))
 }
@@ -267,7 +260,6 @@ fn closure<'a>(
     app_ref: &'a str,
     app: &str,
     digest: &str,
-    budget: Duration,
     files: AppFiles,
 ) -> MaterializedClosure<'a> {
     let version = RegistryAppRef {
@@ -285,7 +277,6 @@ fn closure<'a>(
             registry_tenant: "",
             follow_policy: "pinned",
         },
-        budget,
     }
 }
 

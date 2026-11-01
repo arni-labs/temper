@@ -356,7 +356,7 @@ pub async fn install_genesis_app_from_registry(
             ));
         }
     };
-    // Every source ends in the same install: checks, register, reconcile,
+    // Every source ends in the same install: parse, register, reconcile,
     // verify, then commit or go back to the version before.
     let turn = temper_server::host_turn::take().await?;
     let installed = closure_install::install_materialized_closure(
@@ -373,7 +373,6 @@ pub async fn install_genesis_app_from_registry(
                 registry_tenant: &registry_tenant,
                 follow_policy: &follow_policy,
             },
-            budget: std::time::Duration::from_millis(temper_server::observe::DEFAULT_BUDGET_MS),
         },
     )
     .await;
@@ -381,27 +380,10 @@ pub async fn install_genesis_app_from_registry(
     let installed = match installed {
         Ok(installed) => installed,
         Err(closure_install::ClosureRefused::Failed(error)) => return Err(error),
-        Err(closure_install::ClosureRefused::Checks(checks)) => {
-            // Each failed spec with the first level it failed, so the answer
-            // says what to fix.
-            let failed: Vec<String> = checks
-                .iter()
-                .filter(|(_, check)| !check.all_passed || check.stopped.is_some())
-                .map(|(path, check)| {
-                    let why = check.levels.iter().find(|level| !level.passed);
-                    match why
-                        .map(|level| level.summary.as_str())
-                        .or(check.stopped.as_deref())
-                    {
-                        Some(why) => format!("{path} ({why})"),
-                        None => path.clone(),
-                    }
-                })
-                .collect();
+        Err(closure_install::ClosureRefused::Unparsed(error)) => {
             return Err(format!(
-                "Genesis install of {} refused: these specs did not pass their checks: {}",
-                request.app_ref,
-                failed.join("; ")
+                "Genesis install of {} refused: {error}",
+                request.app_ref
             ));
         }
     };
