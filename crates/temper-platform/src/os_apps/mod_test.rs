@@ -891,6 +891,7 @@ fn test_intent_discovery_specs_verify() {
 
 mod bundle_refusal;
 mod directed_evolution;
+mod entity_owners;
 #[path = "mod_test/policy_joint.rs"]
 mod policy_joint;
 mod policy_reinstall;
@@ -3025,6 +3026,31 @@ name = "Publish"
 kind = "input"
 from = ["Created", "Published"]
 to = "Published"
+"#,
+    )
+    .unwrap();
+
+    // The app declares the type its Soul spec runs, as an app that runs one must.
+    fs::write(
+        app_dir.join("specs/model.csdl.xml"),
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="Test.SkillDoc" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Soul">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Edm.String"/>
+        <Property Name="name" Type="Edm.String"/>
+        <Property Name="description" Type="Edm.String"/>
+        <Property Name="content_file_id" Type="Edm.String"/>
+      </EntityType>
+      <EntityContainer Name="SkillDoc">
+        <EntitySet Name="Souls" EntityType="Test.SkillDoc.Soul"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
 "#,
     )
     .unwrap();

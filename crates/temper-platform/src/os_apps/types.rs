@@ -78,6 +78,16 @@ impl InstallWarning {
         }
     }
 
+    /// An entity type the app declares and does not run, or a spec file the
+    /// installer does not read (`entity_ownership`).
+    pub fn entity_ownership(message: String) -> Self {
+        Self {
+            check: "entity_ownership".to_string(),
+            message,
+            detail: None,
+        }
+    }
+
     /// A rule over several entities the install check could not prove,
     /// with why: only a rule found broken refuses an install.
     pub fn joint_invariants(message: String) -> Self {
