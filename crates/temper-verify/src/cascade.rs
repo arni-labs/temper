@@ -21,6 +21,7 @@ use crate::smt::{self, SmtResult};
 use temper_runtime::scheduler::FaultConfig;
 
 mod digest;
+mod models;
 
 /// Result of an actor simulation level (Level 2b).
 ///
@@ -280,8 +281,10 @@ impl VerificationCascade {
         let spending = self.budget.map(Spending::start);
         let spending = spending.as_ref();
         let mut levels = Vec::new();
-        let model = self.build_temper_model(self.max_counter, spending);
-        let prop_model = self.build_temper_model(2, spending);
+        let (model, prop_model) = match self.models(spending) {
+            Ok(models) => models,
+            Err(failed) => return finish(vec![failed], Vec::new(), None, None),
+        };
 
         let mut warnings = Vec::new();
 
@@ -370,16 +373,6 @@ impl VerificationCascade {
             .and_then(|cfg| build_composite_report(cfg, &mut warnings));
 
         finish(levels, warnings, reachable_paths, composite_report)
-    }
-
-    /// The model the levels explore, limited by the budget being spent.
-    fn build_temper_model(&self, max_counter: usize, spending: Option<&Spending>) -> TemperModel {
-        let model = model::build_model_from_ioa(&self.ioa_source, max_counter)
-            .expect("cascade: IOA spec should have been validated before model building");
-        match spending {
-            Some(spending) => spending.limit(model),
-            None => model,
-        }
     }
 
     /// The result of a cascade whose budget ran out in its last level.

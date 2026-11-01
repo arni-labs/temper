@@ -583,3 +583,105 @@ async fn an_adopted_catalog_version_is_the_version_a_push_builds_on() {
     assert_ne!(body["digest"], digest.as_str());
     assert!(resolved_spec(&tenant).contains("# pushed after adoption"));
 }
+
+/// The app's files with one spec in the old syntax this kernel refuses: a
+/// bool written as a string, as TemperPaw's paw-patrol has it.
+fn old_syntax_files() -> BTreeMap<String, String> {
+    let mut files = app_files();
+    let spec = files.get_mut(SPEC).expect("sentinel spec");
+    assert!(
+        spec.contains("initial = false"),
+        "the spec has a bool to spell the old way"
+    );
+    *spec = spec.replacen("initial = false", r#"initial = "false""#, 1);
+    files
+}
+
+/// A spec the checker cannot parse is refused with what to fix, not a panic
+/// or a 500, and nothing is installed.
+#[tokio::test]
+async fn a_push_with_an_old_syntax_spec_is_refused_with_its_problem() {
+    let tenant = unique_tenant("old-syntax");
+    let server = server(&tenant);
+    let (status, body) = send(
+        &server.state,
+        push(&tenant, serde_json::json!({ "files": old_syntax_files() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["checks"][SPEC]["all_passed"], false, "{body}");
+    let summary = body["checks"][SPEC]["levels"][0]["summary"].as_str();
+    assert!(
+        summary.is_some_and(|s| s.contains("does not parse") && s.contains("migrate-predicates")),
+        "{body}"
+    );
+    assert!(record(&server.ps, &tenant).await.is_none());
+    assert!(pushed_versions(server.data_dir.path()).is_empty());
+    assert!(listed_for(&server.state, &tenant).await.is_none());
+}
+
+/// The same spec from a Genesis registry: the registry route answers 422
+/// naming the spec and why, and installs nothing.
+#[tokio::test]
+async fn a_registry_install_with_an_old_syntax_spec_is_refused_with_its_problem() {
+    use base64::Engine as _;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+    let registry = MockServer::start().await;
+    let files: Vec<serde_json::Value> = old_syntax_files()
+        .into_iter()
+        .map(|(path, text)| {
+            serde_json::json!({
+                "path": path,
+                "content_base64": base64::engine::general_purpose::STANDARD.encode(text),
+            })
+        })
+        .collect();
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/api/genesis/apps/acme/{APP}/versions/{HASH}/bundle"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "app_ref": format!("acme/{APP}@{HASH}"),
+            "registry_tenant": "default",
+            "apps": [{ "owner": "acme", "name": APP, "version_hash": HASH, "files": files }],
+        })))
+        .mount(&registry)
+        .await;
+    // SAFETY: the only test in this crate that sets the registry; the others
+    // that read it pass with any value.
+    unsafe { std::env::set_var("TEMPER_GENESIS_REGISTRY_URL", registry.uri()) };
+
+    let tenant = unique_tenant("old-syntax-registry");
+    let server = server(&tenant);
+    let mut request = Request::post("/genesis/apps/install")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "tenant": tenant,
+                "app_ref": format!("acme/{APP}@{HASH}"),
+                "follow_policy": "pinned",
+            })
+            .to_string(),
+        ))
+        .expect("request should build");
+    request
+        .extensions_mut()
+        .insert(AuthenticatedRequestContext::new(
+            TenantId::new(&tenant),
+            SecurityContext::from_resolved_identity("agent-1", "operator", None),
+        ));
+    let (status, body) = send(&server.state, request).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains(SPEC)
+            && error.contains("does not parse")
+            && error.contains("migrate-predicates"),
+        "{body}"
+    );
+    assert!(record(&server.ps, &tenant).await.is_none());
+    assert!(listed_for(&server.state, &tenant).await.is_none());
+}

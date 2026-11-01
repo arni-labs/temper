@@ -283,13 +283,14 @@ pub(crate) async fn install_genesis_app(
     }
     match crate::genesis_install::install_genesis_app_from_registry(&state, req).await {
         Ok(result) => (StatusCode::OK, Json(serde_json::json!(result))),
-        Err(error) if error.contains("not found") => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": error })),
-        ),
-        // A spec of the closure failed its check: nothing changed.
+        // A spec of the closure failed its check: nothing changed. Matched
+        // first, since the check's own words may say "not found".
         Err(error) if error.contains("did not pass their checks") => (
             StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": error })),
+        ),
+        Err(error) if error.contains("not found") => (
+            StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": error })),
         ),
         Err(error) => (

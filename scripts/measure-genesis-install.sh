@@ -34,6 +34,13 @@
 #   TENANT_PREFIX  default kgtiming; never a person's tenant
 #   TENANT         unset by default; one tenant for every run (see above)
 #   RUNS           default 3
+#   GRANT_INSTALL  1 to permit the key's operator install_app and
+#                  read_app_installs in TENANT before timing, through the
+#                  manage_policies permit every kernel seeds for its operator
+#                  (POST /api/tenants/<TENANT>/policies/create). For a kernel
+#                  that seeds no install_app permit (main before #301); only
+#                  with TENANT, and only on a Temper at 127.0.0.1 or localhost,
+#                  so it can never add a permit to a shared Temper.
 #
 # Kept check verdicts are shared by the whole server, keyed by what a spec's
 # checks read, not by tenant: only run 1 of the first `after` round meets
@@ -73,6 +80,33 @@ trap 'rm -rf "$out"' EXIT
 # The key goes to curl through a file only this user can read, never argv.
 umask 077
 printf 'Authorization: Bearer %s\n' "$TEMPER_API_KEY" > "$out/auth"
+
+if [ "${GRANT_INSTALL:-}" = 1 ]; then
+    if [ -z "$TENANT" ]; then
+        echo "GRANT_INSTALL needs TENANT" >&2
+        exit 2
+    fi
+    case "$base" in
+        http://127.0.0.1 | http://127.0.0.1:* | http://localhost | http://localhost:*) ;;
+        *)
+            echo "GRANT_INSTALL only on a Temper at 127.0.0.1 or localhost, not $base" >&2
+            exit 2
+            ;;
+    esac
+    # temper_authz::VERIFIED_OPERATOR_WHEN, as the kernel's own operator permits read.
+    when='principal has agent_type && principal.agent_type == "operator" && principal has agentTypeVerified && principal.agentTypeVerified == true'
+    cedar="permit(principal is Agent, action == Action::\"install_app\", resource is App) when { $when };
+permit(principal is Agent, action == Action::\"read_app_installs\", resource is AppInstall) when { $when };"
+    jq -n --arg cedar "$cedar" '{policy_id: "timing-install-app", cedar_text: $cedar}' > "$out/grant.json"
+    code=$(curl -sS -o "$out/grant-answer" -w '%{http_code}' \
+        -H @"$out/auth" -H "X-Tenant-Id: $TENANT" -H 'Content-Type: application/json' \
+        -X POST --data @"$out/grant.json" "$base/api/tenants/$TENANT/policies/create" || true)
+    if [ "$code" != 201 ]; then
+        echo "# granting install_app in $TENANT answered $code: $(head -c 2000 "$out/grant-answer" 2>/dev/null)" >&2
+        exit 1
+    fi
+    echo "# granted the operator install_app and read_app_installs in $TENANT"
+fi
 
 # The tenant run $1 installs into.
 tenant_for() {
