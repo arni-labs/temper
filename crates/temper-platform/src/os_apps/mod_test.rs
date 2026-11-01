@@ -3030,6 +3030,31 @@ to = "Published"
     )
     .unwrap();
 
+    // The app declares the type its Soul spec runs, as an app that runs one must.
+    fs::write(
+        app_dir.join("specs/model.csdl.xml"),
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="Test.SkillDoc" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Soul">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Edm.String"/>
+        <Property Name="name" Type="Edm.String"/>
+        <Property Name="description" Type="Edm.String"/>
+        <Property Name="content_file_id" Type="Edm.String"/>
+      </EntityType>
+      <EntityContainer Name="SkillDoc">
+        <EntitySet Name="Souls" EntityType="Test.SkillDoc.Soul"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
+"#,
+    )
+    .unwrap();
+
     let db_path = format!("/tmp/temper-skill-doc-test-{}.db", uuid::Uuid::new_v4());
     let db_url = format!("file:{db_path}");
     let turso = TursoEventStore::new(&db_url, None).await.unwrap();
