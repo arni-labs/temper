@@ -5,8 +5,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use super::app_catalog::{DirApps, add_os_apps_dir_preferred, catalog};
 use super::types::WasmModuleManifest;
-use super::{AppDeploymentMode, effective_app_deployment_mode, read_app_manifest};
+use super::{
+    AppDeploymentMode, effective_app_deployment_mode, local_os_app_dependency_name,
+    read_app_manifest, resolve_os_app_install_order,
+};
 
 /// The files of an app an install reads, and those it holds but does not read.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -93,6 +97,48 @@ impl AppFiles {
             })
             .collect();
         files
+    }
+
+    /// The compiled modules the specs of the app at `app_dir` can call once
+    /// installed: those of every app it depends on, which its install
+    /// installs first, then its own; a later app's module of a name replaces
+    /// an earlier one's, as each install's registration does. The app's own
+    /// directory and its neighbours resolve its dependencies ahead of the
+    /// rest of the catalog.
+    pub fn closure_modules(app_dir: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
+        let own = Self::find(app_dir).modules;
+        let Some(manifest) = read_app_manifest(app_dir).filter(|m| !m.dependencies.is_empty())
+        else {
+            return Ok(own);
+        };
+        if let Some(neighbours) = app_dir.parent() {
+            add_os_apps_dir_preferred(neighbours.to_path_buf(), DirApps::Every);
+        }
+        let dependencies: Vec<String> = manifest
+            .dependencies
+            .iter()
+            .filter_map(|dependency| local_os_app_dependency_name(dependency))
+            .collect();
+        let mut modules = BTreeMap::new();
+        for dependency in resolve_os_app_install_order(&dependencies)?
+            .iter()
+            .filter(|app| **app != manifest.name)
+        {
+            let dir = catalog()
+                .read()
+                .map_err(|_| "app catalog lock poisoned".to_string())?
+                .app_dir(None, dependency)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "app '{}' depends on '{dependency}', which is neither next to it nor in the app catalog",
+                        manifest.name
+                    )
+                })?;
+            modules.extend(Self::find(&dir).modules);
+        }
+        modules.extend(own);
+        Ok(modules)
     }
 
     /// One line for each spec or CSDL file under `app_dir` the install does

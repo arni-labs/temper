@@ -855,7 +855,7 @@ fn os_app_dependencies(tenant: Option<&str>, name: &str) -> Vec<String> {
     }
 }
 
-fn local_os_app_dependency_name(dependency: &str) -> Option<String> {
+pub(super) fn local_os_app_dependency_name(dependency: &str) -> Option<String> {
     let unpinned = dependency
         .trim()
         .split_once('@')
