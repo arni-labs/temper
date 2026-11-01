@@ -24,7 +24,7 @@ use temper_store_turso::{TenantStoreRouter, TursoEventStore};
 
 use crate::StorageBackend;
 
-use super::data_dir::data_dir;
+use super::data_dir::{self, data_dir};
 use super::loader::load_into_registry;
 use super::storage::{
     connect_postgres_store, redact_connection_url, upsert_loaded_specs_to_postgres,
@@ -75,10 +75,7 @@ pub(super) async fn init_storage(
                     );
                 }
                 let platform_token = std::env::var("TURSO_PLATFORM_AUTH_TOKEN").ok();
-                let local_base_dir = Some(
-                    std::env::var("TURSO_LOCAL_BASE_DIR")
-                        .unwrap_or_else(|_| data_dir().join("tenants").display().to_string()),
-                );
+                let local_base_dir = data_dir::routed_local_base_dir(&data_dir::env);
 
                 let room = local_base_dir.clone().map(StorageRoom::on_disk);
                 let mut router = TenantStoreRouter::new(
