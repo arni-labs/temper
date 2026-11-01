@@ -424,3 +424,6 @@ mod rollback_tests;
 
 #[path = "legacy_cache_tests.rs"]
 mod legacy_cache_tests;
+
+#[path = "stall_tests.rs"]
+mod stall_tests;

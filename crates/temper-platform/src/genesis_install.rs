@@ -48,7 +48,10 @@ pub use pushed::{
 pub(crate) use registry::configured_registry;
 use registry::{RegistryUrl, registry_client};
 use restore::rollback_to_prior;
-pub use restore::{restore_genesis_app_cache_roots, restore_genesis_registry_cache_roots};
+pub use restore::{
+    CacheFetchSummary, CacheFetches, GenesisCacheRecovery, restore_genesis_app_cache_roots,
+    restore_genesis_registry_cache_roots, start_genesis_registry_cache_recovery,
+};
 use written::Written;
 
 use crate::genesis_install_verify::{
