@@ -252,7 +252,7 @@ async fn a_new_version_has_its_module_in_before_its_spec() {
         "install-order-new",
         (false, REFUSING_MODULE),
         (true, &answering),
-        Swap::ModulesFirst,
+        Swap::SpecsFirst,
     )
     .await;
     assert!(
@@ -270,7 +270,7 @@ async fn a_version_put_back_has_its_spec_back_before_its_module() {
         "install-order-back",
         (true, &answering),
         (false, REFUSING_MODULE),
-        Swap::SpecsFirst,
+        Swap::ModulesFirst,
     )
     .await;
     assert!(
