@@ -35,6 +35,8 @@ pub(crate) struct AppCatalog {
 enum Added {
     /// Every app of a folder, found by listing it ([`add_os_apps_dir`]).
     Folder(PathBuf),
+    /// Static checkout apps preferred by `temper verify`, including on reload.
+    PreferredFolder(PathBuf),
     /// Apps of an install's directory, each with the files the install
     /// wrote; they win over apps of the same name merged before them.
     Written(PathBuf, Vec<(String, AppFileSource)>),
@@ -169,6 +171,15 @@ pub fn add_os_apps_dir(dir: PathBuf) {
     lock.added.push(Added::Folder(dir));
 }
 
+/// Prefer a local checkout and its neighbours while verifying their modules.
+pub(super) fn add_os_apps_dir_preferred(dir: PathBuf) {
+    let mut lock = catalog().write().unwrap(); // ci-ok: infallible lock
+    lock.merge_catalog_preferred(AppCatalog::from_dir(dir.clone()));
+    lock.added
+        .retain(|added| !matches!(added, Added::PreferredFolder(known) if known == &dir));
+    lock.added.push(Added::PreferredFolder(dir));
+}
+
 /// Add the apps an install wrote into `dir`, each its folder name and the
 /// files the install named, and prefer them over existing catalog entries.
 ///
@@ -224,6 +235,9 @@ pub fn reload_os_apps() {
     for added in &added {
         match added {
             Added::Folder(dir) => new.merge_catalog(AppCatalog::from_dir(dir.clone())),
+            Added::PreferredFolder(dir) => {
+                new.merge_catalog_preferred(AppCatalog::from_dir(dir.clone()))
+            }
             Added::Written(dir, apps) => {
                 new.merge_catalog_preferred(AppCatalog::from_apps(dir.clone(), apps.clone()));
             }

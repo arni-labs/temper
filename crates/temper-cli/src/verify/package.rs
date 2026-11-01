@@ -3,8 +3,9 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// Require each module the specs reference among the app's compiled
-/// `modules` (`AppFiles::modules`, where its install finds them), then parse
+/// Require each module the specs reference among the compiled `modules`
+/// its install makes available (`AppFiles::closure_modules`: the app's own
+/// and those of the apps it depends on), then parse
 /// all `policies` and return their text, with a warning for each entity no
 /// permit reaches. A permit in any policy file counts for any entity.
 pub(super) fn validate(
@@ -39,8 +40,9 @@ pub(super) fn validate(
             );
             anyhow::ensure!(
                 modules.contains_key(module),
-                "missing compiled WASM module {module}: app.toml must declare it in \
-                 [[wasm_modules]], with its binary under wasm/{module}/"
+                "missing compiled WASM module {module}: app.toml, or that of an app it \
+                 depends on, must declare it in [[wasm_modules]], with its binary under \
+                 wasm/{module}/"
             );
         }
     }

@@ -516,7 +516,7 @@ fn dependencies_for_entry(name: &str, entry: Option<&AppEntry>) -> Vec<String> {
     }
 }
 
-fn local_os_app_dependency_name(dependency: &str) -> Option<String> {
+pub(super) fn local_os_app_dependency_name(dependency: &str) -> Option<String> {
     let unpinned = dependency
         .trim()
         .split_once('@')
