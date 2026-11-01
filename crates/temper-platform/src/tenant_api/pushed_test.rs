@@ -843,10 +843,19 @@ async fn a_registry_install_reads_the_files_its_bundle_named() {
     const OLD: &str = "0123456789abcdef0123456789abcdef01234567";
     const GOOD: &str = "89abcdef0123456789abcdef0123456789abcdef";
     let registry = MockServer::start().await;
-    for (hash, files) in [
-        (OLD, old_syntax_files()),
-        (GOOD, with_comment("from the registry")),
-    ] {
+    // The parse refusal wins over the route's "not found" classification.
+    let mut old = old_syntax_files();
+    let unparsed = old.remove(SPEC).expect("old-syntax spec");
+    old.insert(format!("not found {SPEC}"), unparsed);
+    // Registry installs accept the same single-spec counterexample as pushes.
+    let mut counterexample = with_comment("from the registry");
+    let spec = counterexample.get_mut(SPEC).expect("sentinel spec");
+    *spec = spec.replace(
+        r#"effect = ["has_alerts = true", "alert_count += 1"]"#,
+        r#"effect = ["alert_count += 1"]"#,
+    );
+    assert!(!spec.contains("has_alerts = true"));
+    for (hash, files) in [(OLD, old), (GOOD, counterexample)] {
         let files: Vec<serde_json::Value> = files
             .into_iter()
             .map(|(path, text)| {
