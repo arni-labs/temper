@@ -5,8 +5,8 @@ use std::sync::{OnceLock, RwLock, RwLockReadGuard};
 use temper_spec::automaton;
 
 use super::{
-    AppBundle, AppEntry, StartupInstallMode, extract_description, find_ioa_files, load_app_bundle,
-    read_app_guide, read_app_manifest,
+    AppBundle, AppEntry, StartupInstallMode, extract_description, load_app_bundle, read_app_guide,
+    read_app_manifest,
 };
 
 pub(crate) struct AppCatalog {
@@ -373,10 +373,10 @@ impl AppCatalog {
             };
 
             let app_name = manifest.name.clone();
-            let ioa_files = find_ioa_files(&app_dir);
-            let entity_types: Vec<String> = ioa_files
+            let entity_types: Vec<String> = super::AppFiles::find(&app_dir)
+                .ioa
                 .iter()
-                .filter_map(|(_, ioa_path)| {
+                .filter_map(|ioa_path| {
                     let source = std::fs::read_to_string(ioa_path).ok()?;
                     let parsed = automaton::parse_automaton(&source).ok()?;
                     Some(parsed.automaton.name)

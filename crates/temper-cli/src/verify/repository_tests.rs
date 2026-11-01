@@ -51,7 +51,7 @@ fn verify_source_collection(directory: &Path) -> Result<()> {
     input::validate_ioa_entities(&csdl, &sources)?;
     let model = build_spec_model(csdl, read_tla_sources(directory)?);
     anyhow::ensure!(model.validation.is_valid(), "{:?}", model.validation.errors);
-    package::validate_policy_files(directory)?;
+    package::validate_policy_files(&AppFiles::find(directory).policies)?;
     verify_ioa_sources(&sources)
 }
 
@@ -69,7 +69,7 @@ fn verify_fixture_catalog(directory: &Path) -> Result<()> {
     input::validate_ioa_entities(&csdl, &BTreeMap::from([(name, order)]))?;
     let model = build_spec_model(csdl, read_tla_sources(directory)?);
     anyhow::ensure!(model.validation.is_valid(), "{:?}", model.validation.errors);
-    package::validate_policy_files(directory)?;
+    package::validate_policy_files(&AppFiles::find(directory).policies)?;
     for entry in fs::read_dir(directory)? {
         let path = entry?.path();
         if path.to_string_lossy().ends_with(".ioa.toml") {

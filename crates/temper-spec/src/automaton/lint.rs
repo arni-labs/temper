@@ -257,6 +257,9 @@ fn lint_spawn_effect(
     );
     let mut available_params = available_spawn_params(action, parent_snake);
     available_params.extend(copy.iter().cloned());
+    // A param the spawn leaves unset that names one of the child's declared
+    // variables reads as that variable's initial value, so it needs no mapping.
+    available_params.extend(target_automaton.state.iter().map(|var| var.name.clone()));
     lint_spawn_param_mapping(
         entity_name,
         &action.name,

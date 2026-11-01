@@ -891,6 +891,7 @@ fn test_intent_discovery_specs_verify() {
 
 mod bundle_refusal;
 mod directed_evolution;
+mod entity_owners;
 #[path = "mod_test/policy_joint.rs"]
 mod policy_joint;
 mod policy_reinstall;
