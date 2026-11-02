@@ -163,8 +163,8 @@ impl SimReactionSystem {
             .cloned()
             .collect();
 
-        // Guards read the source record as every guard does: a variable it
-        // stores no value for reads as its declared initial value.
+        // Guards and args read the source record as every guard does: a
+        // variable it stores no value for reads as its declared initial value.
         let read = match self.declared.get(entity_type) {
             Some(declared) => declared.fields_as_read(fields),
             None => fields.clone(),
@@ -231,7 +231,7 @@ impl SimReactionSystem {
 
             // Execute the target action
             let effective_params =
-                super::params::build_effective_params(&rule.then, entity_id, fields, &rule.name);
+                super::params::build_effective_params(&rule.then, entity_id, &read, &rule.name);
             let params_str = match serde_json::to_string(&effective_params) {
                 Ok(s) => s,
                 Err(e) => {

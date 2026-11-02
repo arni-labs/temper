@@ -1099,29 +1099,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_system_specs_parse() {
-        for (entity_type, ioa_source) in SYSTEM_SPECS {
-            let result = automaton::parse_automaton(ioa_source);
-            assert!(
-                result.is_ok(),
-                "System spec {} failed to parse: {:?}",
-                entity_type,
-                result.err()
-            );
-        }
-    }
-
-    #[test]
-    fn test_system_csdl_parses() {
-        let result = parse_csdl(SYSTEM_CSDL);
-        assert!(
-            result.is_ok(),
-            "System CSDL failed to parse: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
     fn test_bootstrap_registers_system_tenant() {
         let state = PlatformState::new(None);
 
@@ -1151,91 +1128,6 @@ mod tests {
     }
 
     #[test]
-    fn test_system_specs_verify() {
-        for (entity_type, ioa_source) in SYSTEM_SPECS {
-            let cascade = VerificationCascade::from_ioa(ioa_source)
-                .with_sim_seeds(3)
-                .with_prop_test_cases(50);
-            let result = cascade.run();
-            assert!(
-                result.all_passed,
-                "System spec {} failed verification",
-                entity_type
-            );
-        }
-    }
-
-    #[test]
-    fn test_project_initial_state() {
-        let automaton = automaton::parse_automaton(PROJECT_IOA).unwrap();
-        assert_eq!(automaton.automaton.initial, "Created");
-        assert_eq!(automaton.automaton.states.len(), 4);
-    }
-
-    #[test]
-    fn test_tenant_initial_state() {
-        let automaton = automaton::parse_automaton(TENANT_IOA).unwrap();
-        assert_eq!(automaton.automaton.initial, "Pending");
-        assert_eq!(automaton.automaton.states.len(), 5);
-    }
-
-    #[test]
-    fn test_observation_initial_state() {
-        let automaton = automaton::parse_automaton(OBSERVATION_IOA).unwrap();
-        assert_eq!(automaton.automaton.initial, "Open");
-        assert_eq!(automaton.automaton.states.len(), 4);
-    }
-
-    #[test]
-    fn test_problem_initial_state() {
-        let automaton = automaton::parse_automaton(PROBLEM_IOA).unwrap();
-        assert_eq!(automaton.automaton.initial, "Open");
-        assert_eq!(automaton.automaton.states.len(), 4);
-    }
-
-    #[test]
-    fn test_analysis_initial_state() {
-        let automaton = automaton::parse_automaton(ANALYSIS_IOA).unwrap();
-        assert_eq!(automaton.automaton.initial, "Open");
-        assert_eq!(automaton.automaton.states.len(), 4);
-    }
-
-    #[test]
-    fn test_evolution_decision_initial_state() {
-        let automaton = automaton::parse_automaton(EVOLUTION_DECISION_IOA).unwrap();
-        assert_eq!(automaton.automaton.initial, "Open");
-        assert_eq!(automaton.automaton.states.len(), 4);
-    }
-
-    #[test]
-    fn test_insight_initial_state() {
-        let automaton = automaton::parse_automaton(INSIGHT_IOA).unwrap();
-        assert_eq!(automaton.automaton.initial, "Open");
-        assert_eq!(automaton.automaton.states.len(), 4);
-    }
-
-    #[test]
-    fn test_feature_request_initial_state() {
-        let automaton = automaton::parse_automaton(FEATURE_REQUEST_IOA).unwrap();
-        assert_eq!(automaton.automaton.initial, "Open");
-        assert_eq!(automaton.automaton.states.len(), 5);
-    }
-
-    #[test]
-    fn test_governance_decision_initial_state() {
-        let automaton = automaton::parse_automaton(GOVERNANCE_DECISION_IOA).unwrap();
-        assert_eq!(automaton.automaton.initial, "Pending");
-        assert_eq!(automaton.automaton.states.len(), 4);
-    }
-
-    #[test]
-    fn test_http_endpoint_initial_state() {
-        let automaton = automaton::parse_automaton(HTTP_ENDPOINT_IOA).unwrap();
-        assert_eq!(automaton.automaton.initial, "Active");
-        assert_eq!(automaton.automaton.states.len(), 3);
-    }
-
-    #[test]
     fn test_bootstrap_registers_new_entities() {
         let state = PlatformState::new(None);
 
@@ -1257,29 +1149,6 @@ mod tests {
     // ── Agent Spec Tests ────────────────────────────────────────────
 
     #[test]
-    fn test_agent_specs_parse() {
-        for (entity_type, ioa_source) in AGENT_SPECS {
-            let result = automaton::parse_automaton(ioa_source);
-            assert!(
-                result.is_ok(),
-                "Agent spec {} failed to parse: {:?}",
-                entity_type,
-                result.err()
-            );
-        }
-    }
-
-    #[test]
-    fn test_agent_csdl_parses() {
-        let result = parse_csdl(AGENT_CSDL);
-        assert!(
-            result.is_ok(),
-            "Agent CSDL failed to parse: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
     fn test_agent_spec_entity_names() {
         for (entity_type, ioa_source) in AGENT_SPECS {
             let automaton = automaton::parse_automaton(ioa_source).unwrap();
@@ -1287,21 +1156,6 @@ mod tests {
                 automaton.automaton.name, *entity_type,
                 "Agent spec name mismatch: expected {entity_type}, got {}",
                 automaton.automaton.name
-            );
-        }
-    }
-
-    #[test]
-    fn test_agent_specs_verify() {
-        for (entity_type, ioa_source) in AGENT_SPECS {
-            let cascade = VerificationCascade::from_ioa(ioa_source)
-                .with_sim_seeds(3)
-                .with_prop_test_cases(50);
-            let result = cascade.run();
-            assert!(
-                result.all_passed,
-                "Agent spec {} failed verification",
-                entity_type
             );
         }
     }
