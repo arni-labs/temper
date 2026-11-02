@@ -87,7 +87,7 @@ impl ReviewsUnderWay {
         let older = reviews.running.insert(key, running);
         drop(reviews);
         if let Some(older) = older {
-            older.abort.abort();
+            let _ = older.abort;
         }
         task
     }

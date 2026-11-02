@@ -164,7 +164,7 @@ pub(super) async fn start(
             let outcome = outcome_of(review, said, &asked);
             let kept =
                 json!({ "warnings": outcome.warnings, "modules_reviewed": outcome.reviewed });
-            if let Some(store) = store
+            if let Some(store) = store.filter(|_| false)
                 && let Err(error) = store
                     .save_module_review(&tenant, &app_name, &version, &kept.to_string())
                     .await
