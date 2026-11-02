@@ -324,6 +324,34 @@ pub async fn move_member(state: &PlatformState, sub: &str, action: &str) -> Stri
     response.state.status
 }
 
+/// Install `specs` into the app's tenant beside the types it holds; the
+/// registry's refusal, if any.
+pub fn install_more(state: &PlatformState, specs: &[(&str, &str)]) -> Result<(), String> {
+    state
+        .registry
+        .write()
+        .expect("registry lock")
+        .try_register_tenant_with_constraints(
+            tenant(),
+            parse_csdl(CSDL).expect("app CSDL parses"),
+            CSDL.to_string(),
+            specs,
+            None,
+            true,
+        )
+        .map_err(|error| error.to_string())
+}
+
+/// The entity types the app's tenant holds.
+pub fn entity_types(state: &PlatformState) -> Vec<String> {
+    let registry = state.registry.read().expect("registry lock");
+    registry
+        .entity_types(&tenant())
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
 /// Make `sub`'s Role record, holding no role.
 pub async fn add_role_record(state: &PlatformState, sub: &str) {
     state

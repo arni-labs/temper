@@ -83,9 +83,9 @@ pub(super) async fn principal_records(
                             .as_ref()
                             .and_then(|table| table.initial_values.list(&record.lists, field))
                             .unwrap_or_default();
-                        put(&mut records, format!("{attribute}_{field}"), items.into())?;
+                        put(&mut records, format!("{attribute}_{field}"), items.into());
                     }
-                    put(&mut records, attribute, record.status.into())?;
+                    put(&mut records, attribute, record.status.into());
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -99,19 +99,13 @@ pub(super) async fn principal_records(
     Ok(records)
 }
 
-/// Two records can name one attribute: type `A` with set field `b_c` and type
-/// `A_b` with set field `c` both reach `A_b_c`. Neither value is certainly the
-/// one a policy means, so the request fails rather than Cedar reading either.
+/// The registry refuses a tenant where two principal-record types would set
+/// one attribute (`registry/principal_attributes.rs`), so none is set twice.
 fn put(
     records: &mut BTreeMap<String, serde_json::Value>,
     attribute: String,
     value: serde_json::Value,
-) -> Result<(), IdentityError> {
-    if records.contains_key(&attribute) {
-        return Err(IdentityError::Unavailable(format!(
-            "two principal records reach principal.{attribute}"
-        )));
-    }
-    records.insert(attribute, value);
-    Ok(())
+) {
+    let previous = records.insert(attribute, value);
+    debug_assert!(previous.is_none(), "a principal attribute set twice");
 }
