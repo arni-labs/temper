@@ -777,12 +777,21 @@ impl ArmedTimer {
     pub(super) fn fire_context(&self, fire_key: &IdempotencyKey) -> AgentContext {
         let mut agent = self.agent_ctx.clone();
         agent.idempotency_key = Some(fire_key.clone());
-        super::timer_cause::mark_timer_fire(&mut agent);
+        super::timer_cause::mark_timer_fire(
+            &mut agent,
+            Some(temper_authz::TimerRecord {
+                entity_type: self.entity_type.clone(),
+                entity_id: self.entity_id.clone(),
+                state: self.state.clone(),
+                action: self.action.clone(),
+            }),
+        );
         agent.event_origin = None;
         agent.fires_state_timer = Some(StateTimerFire {
             tenant: self.tenant.to_string(),
             entity_type: self.entity_type.clone(),
             entity_id: self.entity_id.clone(),
+            state: self.state.clone(),
             action: self.action.clone(),
             armed_seq: self.sequence_nr,
         });
