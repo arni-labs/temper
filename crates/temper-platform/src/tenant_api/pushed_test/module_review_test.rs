@@ -455,3 +455,6 @@ async fn the_route_answers_only_for_the_credentials_own_tenant() {
         serde_json::json!({ "app": APP, "version": "c1", "state": "none" })
     );
 }
+
+#[path = "module_review_lifecycle_test.rs"]
+mod lifecycle;

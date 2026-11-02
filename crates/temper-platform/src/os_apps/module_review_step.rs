@@ -7,17 +7,18 @@
 //! the specs that run it: a new guard or a split state can answer a finding, or make one.
 
 use std::path::{Component, Path};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::Serialize;
 use serde_json::json;
 use temper_runtime::tenant::TenantId;
-use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::sync::{oneshot, watch};
+use tokio::task::AbortHandle;
 
 use super::reconcile;
 use super::types::{AppBundle, InstallWarning, WasmModuleManifest};
 use crate::module_review::{
-    BundleReview, Finding, ModuleSource, SPEC_BYTES, SpecSource, said_left_out,
+    BundleReview, Finding, ModuleSource, ReviewSaveFailure, SPEC_BYTES, SpecSource, said_left_out,
 };
 use crate::state::PlatformState;
 
@@ -51,9 +52,43 @@ pub struct ReviewAsked {
 pub(crate) struct ReviewAnswer {
     said: watch::Receiver<Option<ReviewOutcome>>,
     asked: Vec<String>,
+    publication: Arc<ReviewPublication>,
+}
+
+/// The final successful boundary owns publication. Dropping all copies before
+/// that boundary also stops paid work when a closure fails after reconciliation.
+#[derive(Debug)]
+struct ReviewPublication {
+    installed: Mutex<Option<oneshot::Sender<()>>>,
+    abort: AbortHandle,
+}
+
+impl Drop for ReviewPublication {
+    fn drop(&mut self) {
+        if self
+            .installed
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+        {
+            self.abort.abort();
+        }
+    }
 }
 
 impl ReviewAnswer {
+    pub(super) fn publish(&self) {
+        if let Some(installed) = self
+            .publication
+            .installed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            let _ = installed.send(());
+        }
+    }
+
     /// Never fails: a review that stopped before it answered is said as one note.
     pub(super) async fn read(mut self) -> ReviewOutcome {
         match self.said.wait_for(Option::is_some).await {
@@ -72,24 +107,13 @@ impl ReviewAnswer {
 /// A review under way beside the install.
 #[derive(Default)]
 pub(super) struct PendingReview {
-    task: Option<JoinHandle<()>>,
     left: Option<(ReviewAsked, ReviewAnswer)>,
 }
 
-/// An install that fails before it answers leaves no review running behind it.
-impl Drop for PendingReview {
-    fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-    }
-}
-
 impl PendingReview {
-    /// The install answers now, and the review goes on without it.
-    pub(super) fn left_running(mut self) -> (Vec<ReviewAsked>, Vec<ReviewAnswer>) {
-        self.task = None;
-        self.left.take().into_iter().unzip()
+    /// Pass the review to the caller that decides whether the whole install succeeded.
+    pub(super) fn left_running(self) -> (Vec<ReviewAsked>, Vec<ReviewAnswer>) {
+        self.left.into_iter().unzip()
     }
 }
 
@@ -149,6 +173,7 @@ pub(super) async fn start(
         .as_ref()
         .and_then(|stack| stack.platform.clone());
     let (tell, answer) = watch::channel(None);
+    let (install_succeeded, installed) = oneshot::channel();
     let review = {
         let (tenant, app_name, version, asked) = (
             tenant.to_string(),
@@ -162,24 +187,41 @@ pub(super) async fn start(
                 _ => BundleReview::default(),
             };
             let outcome = outcome_of(review, said, &asked);
+            // Reviewing overlaps the install, but publishing must not replace
+            // saved findings if any later install write or readiness check fails.
+            if installed.await.is_err() {
+                return Ok(());
+            }
             let kept =
                 json!({ "warnings": outcome.warnings, "modules_reviewed": outcome.reviewed });
-            if let Some(store) = store
-                && let Err(error) = store
-                    .save_module_review(&tenant, &app_name, &version, &kept.to_string())
-                    .await
-            {
-                tracing::warn!(error = %error, app = %app_name, "module review was not kept");
-            }
-            // Nobody is listening when the caller went without it.
+            // Startup and Genesis wait for Jev, never for the store's write gate.
+            // HTTP callers may already have dropped their receivers.
             let _ = tell.send(Some(outcome));
+            let saved = match store {
+                Some(store) => {
+                    store
+                        .save_module_review(&tenant, &app_name, &version, &kept.to_string())
+                        .await
+                }
+                None => Err("No platform store is configured for module reviews.".to_string()),
+            };
+            saved.map_err(|error| {
+                tracing::warn!(error = %error, app = %app_name, "module review was not kept");
+                ReviewSaveFailure {
+                    result: kept,
+                    error,
+                }
+            })
         }
     };
     let task = state
         .module_reviews
         .start(tenant, app_name, &version, review);
+    let publication = Arc::new(ReviewPublication {
+        installed: Mutex::new(Some(install_succeeded)),
+        abort: task.abort_handle(),
+    });
     PendingReview {
-        task: Some(task),
         left: Some((
             ReviewAsked {
                 app: app_name.to_string(),
@@ -189,6 +231,7 @@ pub(super) async fn start(
             ReviewAnswer {
                 said: answer,
                 asked,
+                publication,
             },
         )),
     }

@@ -579,6 +579,7 @@ async fn install_os_app_and_dependencies(
     for app in order {
         let result =
             install_os_app_with_plan(state, tenant, &app, OsAppInstallPlan::all(), origin).await?;
+        result.publish_reviews();
         if app == app_name {
             final_result = Some(result);
         }

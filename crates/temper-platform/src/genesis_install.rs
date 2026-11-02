@@ -918,6 +918,7 @@ impl BoundActionHook for GenesisInstallHook {
                     }),
                 )
                 .await;
+                result.publish_reviews();
                 Ok(Some(serde_json::json!({
                     "kind": "genesis_app_install",
                     "appRef": app_ref,

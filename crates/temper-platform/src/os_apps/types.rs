@@ -54,6 +54,14 @@ pub struct InstallResult {
 }
 
 impl InstallResult {
+    /// Allow completed reviews to replace saved findings only after the whole
+    /// install succeeds, including closure readiness and provenance writes.
+    pub(crate) fn publish_reviews(&self) {
+        for answer in &self.review_answers {
+            answer.publish();
+        }
+    }
+
     /// Wait for the reviews this install left running and add what they said, for a caller that answers with all of
     /// it. A review that stopped says so; none of them fails the install.
     pub async fn with_reviews_read(mut self) -> Self {

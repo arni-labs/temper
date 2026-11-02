@@ -19,6 +19,8 @@
 //! digest. 200 with `{"app", "version", "state"}` unless denied:
 //! - `reading`: Jev is still reading.
 //! - `done`: and `warnings`, `modules_reviewed`, as an install's answer has them.
+//!   `persistence_error`, when present, says the save failed: findings remain
+//!   readable in this process until a newer review replaces them or it restarts.
 //! - `none`: nothing is kept for that version: no module of it changed, or a
 //!   newer review took its place, or a restart stopped it.
 
@@ -40,6 +42,7 @@ use super::auth::{
 };
 use super::authorization_error;
 use crate::genesis_install::{PushRefused, PushedFile, install_pushed_app};
+use crate::module_review::ReviewStatus;
 use crate::state::PlatformState;
 
 /// The largest push this server reads. A push is held in memory while it is
@@ -104,9 +107,18 @@ async fn review(
         Err(denial) => return denial,
     };
     let said = |word: &str| serde_json::json!({ "app": name, "version": version, "state": word });
-    // A review keeps what it said before it comes off this list, so nothing it said is missed between the two.
-    if state.module_reviews.reading(&tenant, &name, &version) {
-        return (StatusCode::OK, Json(said("reading")));
+    // Keep a review listed until it is saved, or retain its findings and failure
+    // here. A failed save must never turn a completed review into `none`.
+    match state.module_reviews.status(&tenant, &name, &version) {
+        Some(ReviewStatus::Reading) => return (StatusCode::OK, Json(said("reading"))),
+        Some(ReviewStatus::SaveFailed(failure)) => {
+            let mut answer = said("done");
+            answer["warnings"] = failure.result["warnings"].clone();
+            answer["modules_reviewed"] = failure.result["modules_reviewed"].clone();
+            answer["persistence_error"] = failure.error.into();
+            return (StatusCode::OK, Json(answer));
+        }
+        None => {}
     }
     let store = state
         .server

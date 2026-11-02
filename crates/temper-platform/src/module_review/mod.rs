@@ -28,6 +28,7 @@ pub use types::{
     SpecSource,
 };
 pub use under_way::ReviewsUnderWay;
+pub(crate) use under_way::{ReviewSaveFailure, ReviewStatus};
 
 #[cfg(test)]
 mod tests;
