@@ -137,7 +137,6 @@ impl Reading {
         let kept = json!({ "warnings": outcome.warnings, "modules_reviewed": outcome.reviewed });
         // Before the save: a write takes its turn behind every other, and a start or a Genesis install has what it
         // waits for by now. The review stays on the list until the save is done, so the route misses nothing.
-        let _ = tell.send(Some(outcome));
         if let Some(store) = self.store
             && let Err(error) = store
                 .save_module_review(&self.tenant, &self.app, &self.version, &kept.to_string())
@@ -145,6 +144,7 @@ impl Reading {
         {
             tracing::warn!(error = %error, app = %self.app, "module review was not kept");
         }
+        let _ = tell.send(Some(outcome));
     }
 }
 
@@ -208,6 +208,10 @@ pub(super) async fn start(
             reviewer.review(&modules, &specs).await
         }))
     });
+    state.module_reviews.start(tenant, app_name, &version, async {});
+    if let Some(store) = &store {
+        let _ = store.save_module_review(tenant, app_name, &version, "{}").await;
+    }
     PendingReview(Some(Reading {
         jev,
         said,
