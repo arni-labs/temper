@@ -141,8 +141,11 @@ async fn actor_backed_lists_return_null_for_absent_agent_metadata() {
         let listed = get(&state, uri, &agent()).await;
         let rows = listed["value"].as_array().expect("list has rows");
         assert_eq!(rows.len(), 3, "{listed}");
-        for row in rows {
-            let id = row["entity_id"].as_str().expect("row has id");
+        for id in ["person", "unlabelled", "labelled"] {
+            let row = rows
+                .iter()
+                .find(|row| row["entity_id"] == id)
+                .expect("the list holds the record");
             let single = read(&state, "Jobs", id).await;
             for property in [
                 "last_event_by",
