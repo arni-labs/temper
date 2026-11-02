@@ -88,6 +88,16 @@ impl StateTimerStore for CommittedRows {
 
 /// A started server over `store`, with Shipment's timer at `after` seconds.
 pub(super) async fn server(name: &str, store: &SimEventStore, after: u32) -> ServerState {
+    server_over(name, store, after, None).await
+}
+
+/// [`server`], reading and writing its journal through `events` when given.
+pub(super) async fn server_over(
+    name: &str,
+    store: &SimEventStore,
+    after: u32,
+    events: Option<temper_server::storage::BoxedEventStore>,
+) -> ServerState {
     let shipment = SHIPMENT_IOA.replace("AFTER", &after.to_string());
     let mut registry = SpecRegistry::new();
     registry.register_tenant(
@@ -103,9 +113,11 @@ pub(super) async fn server(name: &str, store: &SimEventStore, after: u32) -> Ser
         ],
     );
     let mut state = ServerState::from_registry(ActorSystem::new(name), registry);
-    state.set_storage_stack(
-        StorageStack::from_sim(store.clone(), None).with_entity_rows_in_journal(),
-    );
+    let mut storage = StorageStack::from_sim(store.clone(), None).with_entity_rows_in_journal();
+    if let Some(events) = events {
+        storage.events = events;
+    }
+    state.set_storage_stack(storage);
     state.state_timer_rows = Some(Arc::new(CommittedRows(store.clone())));
     state
         .authz

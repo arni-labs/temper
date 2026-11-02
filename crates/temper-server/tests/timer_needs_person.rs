@@ -42,3 +42,6 @@ mod chains;
 
 #[path = "timer_needs_person/stops.rs"]
 mod stops;
+
+#[path = "timer_needs_person/race.rs"]
+mod race;
