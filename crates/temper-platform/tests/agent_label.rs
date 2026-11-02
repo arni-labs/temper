@@ -758,7 +758,8 @@ async fn a_caller_cannot_supply_the_label() {
     for (id, supplied) in [("forged", "someone-else"), ("true", LABEL)] {
         let body = json!({ "author": supplied }).to_string();
         let (status, answer) = post_move(&state, id, "Publish", &agent(), &body).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{id}: {answer}");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{id}: {answer}");
+        assert_eq!(answer["error"]["code"], "AuthenticatedParameter", "{answer}");
         let post = read(&state, "Posts", id).await;
         assert_eq!(post["status"], "Draft", "{post}");
         assert_eq!(post["fields"]["author"], "", "{post}");
