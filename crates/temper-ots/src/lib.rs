@@ -26,3 +26,11 @@ pub use models::{
     OTSDecision, OTSEntity, OTSEvaluator, OTSMessage, OTSMessageContent, OTSMetadata, OTSResource,
     OTSSystemMessage, OTSTrajectory, OTSTurn, OTSUser, OutcomeType,
 };
+
+#[cfg(test)]
+mod ci_audit_defect {
+    #[test]
+    fn deliberate_defect_must_fail() {
+        assert_eq!(1 + 1, 3, "deliberate defect");
+    }
+}
