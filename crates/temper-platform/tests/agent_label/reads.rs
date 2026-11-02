@@ -121,7 +121,15 @@ async fn a_label_is_not_an_authorization_input() {
 #[tokio::test(flavor = "multi_thread")]
 async fn actor_backed_lists_return_null_for_absent_agent_metadata() {
     let state = server(&SimEventStore::no_faults(9), 3600).await;
-    assert!(state.server.query_plane_store().is_none());
+    assert!(
+        state
+            .server
+            .storage_stack
+            .as_ref()
+            .expect("sim storage")
+            .query_plane
+            .is_none()
+    );
     act(&state, "person", "Touch", &person()).await;
     act(&state, "unlabelled", "Touch", &agent_labelled("")).await;
     act(&state, "labelled", "Touch", &agent()).await;
