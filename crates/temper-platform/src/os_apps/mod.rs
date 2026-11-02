@@ -67,6 +67,7 @@ pub(crate) use file_source::seam as app_files_seam;
 pub use file_source::{AppFileSource, list_install_dir};
 pub use install_lines::{installed_line, stored_line, waiting_line};
 pub(crate) use materialized_closure::resolve_materialized_app_closure;
+pub use module_review_step::ReviewAsked;
 pub(crate) use own_schema::converge_installed_schemas;
 #[cfg(test)]
 pub(super) use policy_rows::os_app_policy_row_id;
@@ -843,10 +844,11 @@ async fn install_once(
         ControlFlow::Continue(proof) => return Ok(ControlFlow::Continue(proof)),
         ControlFlow::Break(found) => warnings.extend(found),
     }
-    // Jev reads the changed modules beside the install's writes; joined
-    // before it answers. It starts once no proof is left to wait for, since
-    // a try that waits drops it, and its paid calls with it.
-    let review = module_review_step::start(state, tenant, app_dir, &bundle, plan.wasm).await;
+    // Jev reads the changed modules beside the install's writes, and goes on
+    // after it answers. It starts once no proof is left to wait for, since a
+    // try that waits drops it, and its paid calls with it.
+    let review =
+        module_review_step::start(state, tenant, app_name, app_dir, &bundle, plan.wasm).await;
     if plan.policies {
         policy_rows::rewrite_primary_snapshot(state, tenant, &superseded).await?;
     }
@@ -1107,8 +1109,7 @@ async fn install_once(
 
     reconcile::record_app_install_metadata_for_bundle(state, tenant, app_name, &bundle, origin)
         .await;
-    let review = review.finish().await;
-    warnings.extend(review.warnings);
+    let (reviewing, review_answers) = review.left_running();
 
     Ok(ControlFlow::Break(InstallResult {
         added,
@@ -1122,7 +1123,9 @@ async fn install_once(
         adrs_bootstrapped,
         seed_instances: seed_created,
         warnings,
-        modules_reviewed: review.reviewed,
+        modules_reviewed: Vec::new(),
+        reviewing,
+        review_answers,
     }))
 }
 

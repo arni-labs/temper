@@ -11,15 +11,26 @@
 //! `budget_ms` bounds no check yet; it is still validated, because the
 //! caller (Katagami's apps_build) sends it for the per-spec check. Every answer
 //! says how long the push waited for this host's install turn (`waited_ms`).
+//!
+//! The answer does not wait for Jev's review of the app's changed modules. It
+//! names the reviews left running (`result.reviewing`), and
+//! `GET /api/os-apps/{name}/review/{version}` says what became of one, to whoever
+//! may install the app. `version` is the push's `COMMIT` file, else the bundle's
+//! digest. 200 with `{"app", "version", "state"}` unless denied:
+//! - `reading`: Jev is still reading.
+//! - `done`: and `warnings`, `modules_reviewed`, as an install's answer has them.
+//! - `none`: nothing is kept for that version: no module of it changed, or a
+//!   newer review took its place, or a restart stopped it.
 
 use std::collections::BTreeMap;
 
 use axum::Json;
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{MethodRouter, post};
+use axum::routing::{get, post};
 use serde::Deserialize;
 use temper_authz::AuthenticatedRequestContext;
 use temper_server::observe::{DEFAULT_BUDGET_MS, MAX_BUDGET_MS};
@@ -48,9 +59,79 @@ struct PushRequest {
     budget_ms: Option<u64>,
 }
 
-/// The route, with the body limit a push needs.
-pub(super) fn route() -> MethodRouter<PlatformState> {
-    post(install).layer(DefaultBodyLimit::max(PUSH_BODY_LIMIT_BYTES))
+/// The routes: a push, with the body limit it needs, and what became of its review.
+pub(super) fn routes() -> Router<PlatformState> {
+    Router::new()
+        .route(
+            "/os-apps/{name}/install",
+            post(install).layer(DefaultBodyLimit::max(PUSH_BODY_LIMIT_BYTES)),
+        )
+        .route("/os-apps/{name}/review/{version}", get(review))
+}
+
+/// Whoever may install the app may read what its installs found. The tenant is the credential's own.
+async fn authorize(
+    state: &PlatformState,
+    authenticated: Option<&AuthenticatedRequestContext>,
+    name: &str,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let authenticated = require_authenticated(authenticated).map_err(authorization_error)?;
+    let tenant = authenticated.tenant().as_str();
+    require_requested_resource_authorization(
+        state,
+        authenticated,
+        PlatformResourceAuthorization {
+            action: "install_app",
+            resource_type: "App",
+            resource_id: name,
+            attrs: BTreeMap::from([(
+                "targetTenant".to_string(),
+                serde_json::Value::String(tenant.to_string()),
+            )]),
+        },
+    )
+    .await?;
+    Ok(tenant.to_string())
+}
+
+async fn review(
+    State(state): State<PlatformState>,
+    authenticated: Option<Extension<AuthenticatedRequestContext>>,
+    Path((name, version)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let tenant = match authorize(&state, authenticated.as_deref(), &name).await {
+        Ok(tenant) => tenant,
+        Err(denial) => return denial,
+    };
+    let said = |word: &str| serde_json::json!({ "app": name, "version": version, "state": word });
+    // A review keeps what it said before it comes off this list, so nothing it said is missed between the two.
+    if state.module_reviews.reading(&tenant, &name, &version) {
+        return (StatusCode::OK, Json(said("reading")));
+    }
+    let store = state
+        .server
+        .storage_stack
+        .as_ref()
+        .and_then(|stack| stack.platform.clone());
+    let kept = match store {
+        Some(store) => store.load_module_review(&tenant, &name).await,
+        None => Ok(None),
+    };
+    let row = match kept {
+        Ok(row) => row.filter(|row| row.version == version),
+        Err(error) => return refusal(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let Some(row) = row else {
+        return (StatusCode::OK, Json(said("none")));
+    };
+    let result: serde_json::Value = match serde_json::from_str(&row.result) {
+        Ok(result) => result,
+        Err(error) => return refusal(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    };
+    let mut answer = said("done");
+    answer["warnings"] = result["warnings"].clone();
+    answer["modules_reviewed"] = result["modules_reviewed"].clone();
+    (StatusCode::OK, Json(answer))
 }
 
 async fn install(
@@ -59,28 +140,11 @@ async fn install(
     Path(name): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let authenticated = match require_authenticated(authenticated.as_deref()) {
-        Ok(authenticated) => authenticated,
-        Err(status) => return authorization_error(status),
+    let tenant = match authorize(&state, authenticated.as_deref(), &name).await {
+        Ok(tenant) => tenant,
+        Err(denial) => return denial,
     };
-    let tenant = authenticated.tenant().as_str();
-    if let Err(denial) = require_requested_resource_authorization(
-        &state,
-        authenticated,
-        PlatformResourceAuthorization {
-            action: "install_app",
-            resource_type: "App",
-            resource_id: &name,
-            attrs: BTreeMap::from([(
-                "targetTenant".to_string(),
-                serde_json::Value::String(tenant.to_string()),
-            )]),
-        },
-    )
-    .await
-    {
-        return denial;
-    }
+    let tenant = tenant.as_str();
 
     let request: PushRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
