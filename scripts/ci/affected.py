@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Decide what a CI run tests, for .github/workflows/ci.yml.
 
-Lane "full" (push, schedule, a plain dispatch) runs every check as before.
-Lane "pr" (a pull request, a merge group, or a dispatch given changed paths)
+Lane "full" (schedule, a plain dispatch, a first push of a branch) runs every check.
+Lane "pr" (a push, a pull request, a merge group, or a dispatch given changed paths)
 tests only the workspace packages a change can reach: the packages whose files
 changed plus every package that depends on them (normal, dev and build
 dependencies all count), worked out from `cargo metadata`. A change to anything outside a
@@ -127,20 +127,19 @@ def shards(packages, libraries):
     cells = []
     if SERVER in packages:
         for i in (1, 2):
-            cells.append({"name": f"temper-server {i}/2", "args": f"-p {SERVER} --features {SERVER_FEATURES}",
+            cells.append({"name": f"temper-server {i}/2", "filter": f"package({SERVER})",
                           "partition": f"hash:{i}/2", "gepa": True, "doc": ""})
     rest = sorted(packages - {SERVER})
     if rest:
         count = 2 if rest and HEAVY & set(rest) else 1
-        args = " ".join(f"-p {name}" for name in rest)
         for i in range(1, count + 1):
-            cells.append({"name": f"other packages {i}/{count}" if count > 1 else "other packages", "args": args,
+            cells.append({"name": f"other packages {i}/{count}" if count > 1 else "other packages", "filter": f"not package({SERVER})",
                           "partition": f"hash:{i}/{count}", "gepa": False, "doc": ""})
     documented = sorted(packages & libraries)
     if documented:
         # Doctests build the libraries with other features than the test binaries,
         # so they get a machine of their own rather than lengthening a shard.
-        cells.append({"name": "doctests", "args": "", "partition": "", "gepa": False,
+        cells.append({"name": "doctests", "filter": "", "partition": "", "gepa": False,
                       "doc": " ".join(f"-p {name}" for name in documented)})
     return cells
 
@@ -154,9 +153,11 @@ def test_args(packages):
 def main():
     # A merge group takes the pr lane too: the full lane splits platform-random into seed
     # shards, so the required "DST/Platform Tests (platform-random)" check would never report.
+    # A push tests what it moved the branch by; the nightly full lane catches what that misses.
     queued = os.environ.get("EVENT") in ("pull_request", "merge_group")
+    pushed = os.environ.get("EVENT") == "push" and os.environ.get("BASE_SHA", "").strip("0")
     verified = os.environ.get("VERIFIED_RUN", "").strip()
-    lane = "pr" if queued or verified or os.environ.get("CHANGED_PATHS", "").strip() else "full"
+    lane = "pr" if queued or pushed or verified or os.environ.get("CHANGED_PATHS", "").strip() else "full"
     dirs, names, dependents, libraries = workspace()
     out = {"lane": lane, "mode": "full", "packages": " ".join(sorted(names)), "test_args": "--workspace", "rust": "true",
            "specs": "true", "tests": "false" if os.environ.get("EVENT") == "pull_request" else "true"}

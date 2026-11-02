@@ -68,10 +68,10 @@ env:
 
 jobs:
   # ─────────────────────────────────────────────────────
-  # What this run tests. Push, schedule and a plain dispatch: everything (lane "full").
-  # A pull request or a merge group: only the packages its changes can reach (lane "pr"),
-  # see scripts/ci/affected.py. A merge group's changes are those of every pull request in it.
-  # A push whose tree already passed in a merge group: nothing to test, like a docs-only change.
+  # What this run tests. Schedule and a plain dispatch: everything (lane "full"). A push, a pull
+  # request or a merge group: only the packages its changes can reach (lane "pr"), see
+  # scripts/ci/affected.py. A merge group's changes are those of every pull request in it; a push's
+  # are what it moved main by. A push whose tree already passed in a merge group: nothing to test.
   # Every test runs once, in the merge group (Rita, 31 Oct 2026: "CI 2 times is insane"): a pull
   # request only compiles and lints (Compile & Lint, Integrity, Instrumentation Hygiene, the
   # SDK's type check), so its author sees a broken build in about four minutes, and every job
@@ -121,8 +121,8 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           VERIFIED_RUN: ${{ steps.verified.outputs.run }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
           CHANGED_PATHS: ${{ inputs.changed }}
           # cargo metadata --no-deps needs no particular toolchain; skip installing the pinned one.
           RUSTUP_TOOLCHAIN: stable
@@ -373,6 +373,61 @@ jobs:
           echo "Dependency isolation: OK"
 
   # ─────────────────────────────────────────────────────
+  # Every test binary this run needs, built once. The jobs that run them download the archive
+  # instead of compiling the same code each: compiling took 7 of 8 minutes of a platform-boot cell,
+  # in each of ten jobs (1 Nov 2026). Extracted at the workspace root, so paths compiled into the
+  # tests (CARGO_MANIFEST_DIR, CARGO_BIN_EXE_*) still hold.
+  # ─────────────────────────────────────────────────────
+  build-tests:
+    name: Build tests
+    needs: changes
+    if: needs.changes.outputs.test_args != '' && needs.changes.outputs.tests == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libz3-dev
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Set up mold linker
+        uses: rui314/setup-mold@v1
+
+      # rust-cache hashes every installed toolchain into its key. The runner image's own
+      # stable Rust changes between image versions, which split one cache into several.
+      - name: Keep only the pinned toolchain
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: ${{ env.SAVE_RUST_CACHE }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Build the test binaries
+        env:
+          TEST_ARGS: ${{ needs.changes.outputs.test_args }}
+        run: cargo nextest archive --locked $TEST_ARGS --archive-file "$RUNNER_TEMP/tests.tar.zst"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tests
+          path: ${{ runner.temp }}/tests.tar.zst
+          retention-days: 1
+          # The archive is zstd already.
+          compression-level: 0
+
+  # ─────────────────────────────────────────────────────
   # Gate 3a: pull-request tests, split across machines
   # Only the packages a change can reach (scripts/ci/affected.py), by test-name hash.
   # temper-server runs with observe and sim on, the features the workspace run gives it,
@@ -380,7 +435,7 @@ jobs:
   # ─────────────────────────────────────────────────────
   test-shards:
     name: Tests (${{ matrix.name }})
-    needs: changes
+    needs: [changes, build-tests]
     if: needs.changes.outputs.lane == 'pr' && needs.changes.outputs.mode != 'none' && needs.changes.outputs.tests == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -392,7 +447,7 @@ jobs:
     # or key, so a parallel run can share one database and one Redis.
     services:
       postgres:
-        image: ${{ matrix.args != '' && 'postgres:18' || '' }}
+        image: ${{ matrix.filter != '' && 'postgres:18' || '' }}
         env:
           POSTGRES_PASSWORD: temper
         ports: ["5432:5432"]
@@ -400,7 +455,7 @@ jobs:
           --health-cmd "pg_isready -U postgres"
           --health-interval 2s --health-timeout 5s --health-retries 30
       redis:
-        image: ${{ matrix.args != '' && 'redis:7' || '' }}
+        image: ${{ matrix.filter != '' && 'redis:7' || '' }}
         ports: ["6379:6379"]
         options: >-
           --health-cmd "redis-cli ping"
@@ -419,23 +474,24 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
+      # The doctests compile here: they build the libraries with other features than the archive's test binaries.
       - name: Set up mold linker
+        if: matrix.doc != ''
         uses: rui314/setup-mold@v1
 
-      # Restores what main's full Tests job saved.
-      # rust-cache hashes every installed toolchain into its key. The runner image's own
-      # stable Rust changes between image versions, which split one cache into several.
       - name: Keep only the pinned toolchain
+        if: matrix.doc != ''
         run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
 
       - name: Cache Rust build
+        if: matrix.doc != ''
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: test
           save-if: false
 
       - name: Install cargo-nextest
-        if: matrix.args != ''
+        if: matrix.filter != ''
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -468,12 +524,21 @@ jobs:
           tar -xJf /tmp/tursodb.tar.xz -C /tmp
           echo "TEMPER_TEST_TURSODB=/tmp/turso_cli-x86_64-unknown-linux-gnu/tursodb" >> "$GITHUB_ENV"
 
+      - uses: actions/download-artifact@v4
+        if: matrix.filter != ''
+        with:
+          name: tests
+          path: ${{ runner.temp }}
+
+      - run: echo "::add-matcher::.github/rust-test-failures.json"
+
       - name: cargo nextest run (affected packages, skip dst_)
-        if: matrix.args != ''
+        if: matrix.filter != ''
         env:
           DATABASE_URL: postgres://postgres:temper@localhost:5432/postgres
           REDIS_URL: redis://localhost:6379
-        run: cargo nextest run --locked ${{ matrix.args }} -E 'not test(dst_)' --partition ${{ matrix.partition }}
+          FILTER: ${{ matrix.filter }}
+        run: cargo nextest run --archive-file "$RUNNER_TEMP/tests.tar.zst" --extract-to . --extract-overwrite -E "($FILTER) and not test(dst_)" --partition ${{ matrix.partition }}
 
       - name: cargo test --doc (affected packages)
         if: matrix.doc != ''
@@ -508,15 +573,15 @@ jobs:
 
   # ─────────────────────────────────────────────────────
   # Gate 3: Full test suite (minutes)
-  # The required "Tests" check. Full lane (push, schedule, plain dispatch): the
-  # whole workspace on one machine, exactly as before. Pull-request lane: passes
+  # The required "Tests" check. Full lane (schedule, plain dispatch): the
+  # whole workspace on one machine, exactly as before. Pull-request lane (also a push): passes
   # when every test shard above passed, or nothing needed testing, or on a pull
   # request, which runs no tests (its merge group runs them). Either lane also
   # needs Other workspaces to have passed, or to have had nothing to test.
   # ─────────────────────────────────────────────────────
   test:
     name: Tests
-    needs: [changes, test-shards, workspaces]
+    needs: [changes, build-tests, test-shards, workspaces]
     if: ${{ !cancelled() && inputs.tests == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -544,6 +609,7 @@ jobs:
         env:
           CHANGES: ${{ needs.changes.result }}
           SHARDS: ${{ needs.test-shards.result }}
+          BUILD: ${{ needs.build-tests.result }}
           PACKAGES: ${{ needs.changes.outputs.packages }}
         run: |
           if [ "${{ needs.changes.outputs.tests }}" != true ]; then
@@ -551,8 +617,10 @@ jobs:
           else
             echo "Packages tested: ${PACKAGES:-none}"
           fi
-          echo "changes: $CHANGES; test shards: $SHARDS"
+          echo "changes: $CHANGES; test binaries: $BUILD; test shards: $SHARDS"
           [ "$CHANGES" = success ] || exit 1
+          # Shards are skipped when their binaries failed to build, so that result alone would read as passed.
+          case "$BUILD" in success|skipped) ;; *) exit 1 ;; esac
           case "$SHARDS" in success|skipped) ;; *) exit 1 ;; esac
 
       - uses: actions/checkout@v4
@@ -670,7 +738,7 @@ jobs:
   # ─────────────────────────────────────────────────────
   postgres-migrations:
     name: Postgres rollback migrations
-    needs: changes
+    needs: [changes, build-tests]
     if: needs.changes.outputs.packages != '' && needs.changes.outputs.tests == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -704,13 +772,11 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
-      - name: Set up mold linker
+      - uses: actions/download-artifact@v4
         if: steps.select.outputs.args != ''
-        uses: rui314/setup-mold@v1
-
-      - name: Cache Rust build
-        if: steps.select.outputs.args != ''
-        uses: Swatinem/rust-cache@v2
+        with:
+          name: tests
+          path: ${{ runner.temp }}
 
       - name: Install cargo-nextest
         if: steps.select.outputs.args != ''
@@ -724,9 +790,8 @@ jobs:
         env:
           TEMPER_TEST_POSTGRES_URL: postgres://postgres:temper@localhost:5432/postgres
           TEST_POLICY_DATABASE_URL: postgres://postgres:temper@localhost:5432/morrow_temper
-          ARGS: ${{ steps.select.outputs.args }}
           FILTER: ${{ steps.select.outputs.filter }}
-        run: cargo nextest run --locked $ARGS --run-ignored only --test-threads 1 --no-fail-fast -E "$FILTER"
+        run: cargo nextest run --archive-file "$RUNNER_TEMP/tests.tar.zst" --extract-to . --extract-overwrite --run-ignored only --test-threads 1 --no-fail-fast -E "$FILTER"
 
   # ─────────────────────────────────────────────────────
   # Gate 3b: DST/platform coverage (matrixed)
@@ -746,7 +811,9 @@ jobs:
   # ─────────────────────────────────────────────────────
   dst-platform-tests:
     name: DST/Platform Tests (${{ matrix.suite }}${{ matrix.shard_count && format(' {0}/{1}', matrix.shard_index, matrix.shard_count) || '' }})
-    needs: changes
+    needs: [changes, build-tests]
+    # Runs whatever Build tests did, so a required cell reports: a skipped matrix job reports under no cell's name.
+    if: ${{ !cancelled() && needs.changes.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -759,6 +826,10 @@ jobs:
     env:
       DST_NEEDED: ${{ needs.changes.outputs.test_args != '' && needs.changes.outputs.tests == 'true' }}
     steps:
+      - name: The test binaries built
+        if: env.DST_NEEDED == 'true'
+        run: '[ "${{ needs.build-tests.result }}" = success ]'
+
       - name: Not affected
         if: env.DST_NEEDED != 'true'
         run: echo "No dst_ tests run here. Nothing new to test, or a pull request, whose merge group runs this suite."
@@ -776,23 +847,11 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
-      - name: Set up mold linker
+      - uses: actions/download-artifact@v4
         if: env.DST_NEEDED == 'true'
-        uses: rui314/setup-mold@v1
-
-      # rust-cache hashes every installed toolchain into its key. The runner image's own
-      # stable Rust changes between image versions, which split one cache into several.
-      - name: Keep only the pinned toolchain
-        if: env.DST_NEEDED == 'true'
-        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
-
-      # The same packages and features as Tests, so main's full Tests cache fits.
-      - name: Cache Rust build
-        if: env.DST_NEEDED == 'true'
-        uses: Swatinem/rust-cache@v2
         with:
-          shared-key: test
-          save-if: false
+          name: tests
+          path: ${{ runner.temp }}
 
       - name: Install cargo-nextest
         if: env.DST_NEEDED == 'true'
@@ -800,17 +859,19 @@ jobs:
         with:
           tool: cargo-nextest
 
+      - run: echo "::add-matcher::.github/rust-test-failures.json"
+        if: env.DST_NEEDED == 'true'
+
       # A package set can hold no test of a cell (a change only to temper-cli), so an
       # empty selection passes with a warning.
       - name: cargo nextest DST/platform suite
         if: env.DST_NEEDED == 'true'
         env:
-          TEST_ARGS: ${{ needs.changes.outputs.test_args }}
           FILTER: ${{ matrix.filter }}
           TEMPER_DST_RANDOM_MODE: ${{ matrix.suite == 'platform-random' && needs.changes.outputs.lane == 'pr' && 'smoke' || 'full' }}
           TEMPER_DST_SHARD_INDEX: ${{ matrix.shard_index }}
           TEMPER_DST_SHARD_COUNT: ${{ matrix.shard_count }}
-        run: cargo nextest run --locked $TEST_ARGS --no-tests=warn -E "$FILTER"
+        run: cargo nextest run --archive-file "$RUNNER_TEMP/tests.tar.zst" --extract-to . --extract-overwrite --no-tests=warn -E "$FILTER"
 
   # ─────────────────────────────────────────────────────
   # Gate 4: Spec verification (minutes)
