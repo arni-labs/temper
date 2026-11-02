@@ -243,13 +243,7 @@ fn resolve_transitions(
                     params.entry(param.name().to_string()).or_insert(kind);
                 }
             }
-            let string_params = string_params(
-                action,
-                tracked_strings,
-                &params,
-                !automaton.entry_rules.is_empty()
-                    || automaton.liveness.iter().any(|l| !l.can_reach.is_empty()),
-            );
+            let string_params = string_params(action, tracked_strings, &params);
             ResolvedTransition {
                 name: a.name,
                 from_states: a.from_states,

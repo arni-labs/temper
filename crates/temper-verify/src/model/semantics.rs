@@ -103,8 +103,8 @@ pub fn guard_may_hold(
 ///
 /// A parameter is an unknown value, so each candidate is explored:
 /// counts up to as far as the move's effects can carry them inside the
-/// bounds (`count_bounds`), both booleans, and for list elements every literal a
-/// guard or invariant compares that list against plus one fresh string.
+/// bounds (`count_bounds`), both booleans, and for list elements held values,
+/// relevant literals and concrete fresh equality symbols.
 /// Assignments that grow a counter or a list past its bound are pruned, as
 /// in bounded exploration.
 pub fn successors(
@@ -180,7 +180,7 @@ fn successors_with(
 ) -> Vec<(BTreeMap<String, ParamValue>, TemperModelState)> {
     let mut out = Vec::new();
     any_inputs(model, t, state, values, budget, |params| {
-        if !model.entry_rules.is_empty()
+        if (!model.entry_rules.is_empty() || !t.string_params.is_empty())
             && !super::parameters::inputs_allow(model, t, state, &params)
         {
             return false;

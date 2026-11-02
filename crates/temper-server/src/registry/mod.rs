@@ -192,20 +192,13 @@ impl SpecRegistry {
             }
             parsed.push((*entity_type, *ioa_source, automaton));
         }
-        // The types the tenant holds after this install: a merge keeps the
-        // ones it does not replace, and a later spec of a type wins.
-        let kept = self
-            .tenants
-            .get(&tenant)
-            .filter(|_| merge)
-            .into_iter()
-            .flat_map(|config| &config.entities)
-            .map(|(name, spec)| (name.as_str(), &spec.automaton.automaton));
-        let incoming = parsed
-            .iter()
-            .map(|(name, _, automaton)| (*name, &automaton.automaton));
-        let after: BTreeMap<_, _> = kept.chain(incoming).collect();
-        principal_attributes::refuse_shared_principal_attributes(&tenant_name, after)?;
+        self.check_principal_attribute_metas(
+            &tenant,
+            parsed
+                .iter()
+                .map(|(name, _, automaton)| (*name, &automaton.automaton)),
+            merge,
+        )?;
 
         let relation_graph = build_relation_graph(&csdl, cross_invariants.as_ref());
 

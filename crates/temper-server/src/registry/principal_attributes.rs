@@ -15,13 +15,14 @@
 
 use std::collections::BTreeMap;
 
-use temper_spec::automaton::AutomatonMeta;
+use temper_runtime::tenant::TenantId;
+use temper_spec::automaton::{AutomatonMeta, parse_automaton};
 
-use super::types::RegistryError;
+use super::{SpecRegistry, types::RegistryError};
 
 /// Refuse `types`, every type the tenant would hold after an install, when
 /// two principal-record types reach one principal attribute.
-pub(super) fn refuse_shared_principal_attributes<'a>(
+fn refuse_shared_principal_attributes<'a>(
     tenant: &str,
     types: impl IntoIterator<Item = (&'a str, &'a AutomatonMeta)>,
 ) -> Result<(), RegistryError> {
@@ -46,4 +47,52 @@ pub(super) fn refuse_shared_principal_attributes<'a>(
         }
     }
     Ok(())
+}
+
+impl SpecRegistry {
+    /// Check the principal attributes of an install before persistent writes.
+    /// Registration repeats this check against the registry at the swap.
+    pub fn check_principal_attributes(
+        &self,
+        tenant: &TenantId,
+        sources: &[(&str, &str)],
+        merge: bool,
+    ) -> Result<(), RegistryError> {
+        let parsed = sources
+            .iter()
+            .map(|(name, source)| {
+                parse_automaton(source)
+                    .map(|automaton| (*name, automaton.automaton))
+                    .map_err(|error| RegistryError::IoaParse {
+                        tenant: tenant.to_string(),
+                        entity_type: (*name).to_string(),
+                        source: error.to_string(),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.check_principal_attribute_metas(
+            tenant,
+            parsed.iter().map(|(name, meta)| (*name, meta)),
+            merge,
+        )
+    }
+
+    /// Check the types the tenant will hold: a merge keeps types it does not
+    /// replace, and a later spec of the same registered type wins.
+    pub(super) fn check_principal_attribute_metas<'a>(
+        &'a self,
+        tenant: &TenantId,
+        incoming: impl IntoIterator<Item = (&'a str, &'a AutomatonMeta)>,
+        merge: bool,
+    ) -> Result<(), RegistryError> {
+        let kept = self
+            .tenants
+            .get(tenant)
+            .filter(|_| merge)
+            .into_iter()
+            .flat_map(|config| &config.entities)
+            .map(|(name, spec)| (name.as_str(), &spec.automaton.automaton));
+        let after: BTreeMap<_, _> = kept.chain(incoming).collect();
+        refuse_shared_principal_attributes(tenant.as_str(), after)
+    }
 }
