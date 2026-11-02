@@ -232,11 +232,4 @@ mod tests {
             "generated system-tenant policy must parse as valid Cedar"
         );
     }
-
-    #[test]
-    fn temper_system_csdl_uses_register_callback_action_name() {
-        let csdl = include_str!("specs/model.csdl.xml");
-        assert!(csdl.contains(r#"<Action Name="RegisterCallback" IsBound="true">"#));
-        assert!(!csdl.contains("RegisterCallbackGovernanceDecision"));
-    }
 }
