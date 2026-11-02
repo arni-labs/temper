@@ -12,7 +12,7 @@ use super::types::{
 
 use super::count_bounds::{CountRange, count_ranges};
 pub(crate) use super::expansion::Expansion;
-use super::parameters::any_inputs;
+use super::parameters::{any_inputs, checks_inputs, inputs_allow};
 pub use super::strings::{
     apply_string_params, canonical_state, canonical_strings, canonical_values, string_values,
 };
@@ -180,9 +180,7 @@ fn successors_with(
 ) -> Vec<(BTreeMap<String, ParamValue>, TemperModelState)> {
     let mut out = Vec::new();
     any_inputs(model, t, state, values, budget, |params| {
-        if (!model.entry_rules.is_empty() || !t.string_params.is_empty())
-            && !super::parameters::inputs_allow(model, t, state, &params)
-        {
+        if checks_inputs(model, t) && !inputs_allow(model, t, state, &params) {
             return false;
         }
         let mut next = state.clone();
