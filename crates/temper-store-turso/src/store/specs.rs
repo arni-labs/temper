@@ -142,7 +142,7 @@ impl TursoEventStore {
             let (entity_type, ioa_source, csdl_xml, content_hash) = specs[index];
             tx.execute(
                 "INSERT INTO specs (tenant, entity_type, ioa_source, csdl_xml, content_hash, committed, version, verified, verification_status, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 1, 1, 1, 'completed', datetime('now'))
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, 1, 0, 'pending', datetime('now'))
                  ON CONFLICT (tenant, entity_type) DO UPDATE SET
                      ioa_source = CASE
                          WHEN specs.content_hash IS NOT excluded.content_hash OR specs.csdl_xml IS NOT excluded.csdl_xml
@@ -159,7 +159,7 @@ impl TursoEventStore {
                          THEN specs.version + 1 ELSE specs.version END,
                      verified = CASE
                          WHEN specs.content_hash IS NOT excluded.content_hash OR specs.csdl_xml IS NOT excluded.csdl_xml
-                         THEN 1 ELSE specs.verified END,
+                         THEN 0 ELSE specs.verified END,
                      verification_status = CASE
                          WHEN specs.content_hash IS NOT excluded.content_hash OR specs.csdl_xml IS NOT excluded.csdl_xml
                          THEN 'completed' ELSE specs.verification_status END,

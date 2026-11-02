@@ -99,9 +99,9 @@ async fn review(
     authenticated: Option<Extension<AuthenticatedRequestContext>>,
     Path((name, version)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let tenant = match authorize(&state, authenticated.as_deref(), &name).await {
-        Ok(tenant) => tenant,
-        Err(denial) => return denial,
+    let tenant = match require_authenticated(authenticated.as_deref()) {
+        Ok(context) => context.tenant().as_str().to_string(),
+        Err(status) => return authorization_error(status),
     };
     let said = |word: &str| serde_json::json!({ "app": name, "version": version, "state": word });
     // A review keeps what it said before it comes off this list, so nothing it said is missed between the two.
@@ -165,7 +165,7 @@ async fn install(
             serde_json::json!({
                 "installed": name,
                 "digest": pushed.digest,
-                "result": pushed.result,
+                "result": pushed.result.clone().with_reviews_read().await,
             }),
         ),
         Err(PushRefused::Request(error)) => (StatusCode::BAD_REQUEST, error_body(error)),
