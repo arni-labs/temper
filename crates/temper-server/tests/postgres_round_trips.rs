@@ -2,10 +2,11 @@
 //!
 //! The server talks to Postgres through a wire proxy that counts the client
 //! messages that wait for an answer: a simple `Query` ('Q') and a `Sync` ('S')
-//! that ends an extended-protocol batch (sqlx's acquire-time ping is a bare
-//! Sync). A move writes its event and every row it changes in one statement,
-//! and a list read reads one page, so neither cost grows with the number of
-//! records of the type.
+//! that ends an extended-protocol batch. sqlx's pool pings, when it hands a
+//! connection out and when it takes it back, are bare Syncs and are counted
+//! apart from statements (`Cost`). A move writes its event and every row it
+//! changes in one statement, and a list read reads one page, so neither cost
+//! grows with the number of records of the type.
 //!
 //! Gated on DATABASE_URL (skips without it, runs in CI); the store works in a
 //! schema of its own.
@@ -324,13 +325,47 @@ async fn quiet(trips: &RoundTrips) {
     panic!("the connection never went idle");
 }
 
-/// Send `request` and return its status and JSON body, and the round trips it
-/// cost.
+/// What one request cost, from its start until the connection is idle again:
+/// the statements it ran, and the pool's pings around them. sqlx 0.8 pings a
+/// connection when the pool hands it out (`test_before_acquire`, on by
+/// default) and again when the pool takes it back (`return_to_pool` in
+/// sqlx-core 0.8.6 `pool/connection.rs`, always), so each use of the pool
+/// costs its statements and two pings. The release ping runs in a task sqlx
+/// spawns when the connection is dropped, so the request does not wait for
+/// it, but it can land before or after the answer: counting until the
+/// connection is idle counts it every time. The pings stay as they are; the
+/// design leaves them to a change of their own.
+#[derive(Debug)]
+struct Cost {
+    statements: usize,
+    pings: usize,
+    messages: Vec<String>,
+}
+
+impl Cost {
+    fn of(messages: Vec<String>) -> Self {
+        let pings = messages
+            .iter()
+            .filter(|message| message.starts_with("S (bare Sync"))
+            .count();
+        Self {
+            statements: messages.len() - pings,
+            pings,
+            messages,
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.statements + self.pings
+    }
+}
+
+/// Send `request` and return its status and JSON body, and what it cost.
 async fn send(
     state: &ServerState,
     trips: &RoundTrips,
     request: Request<Body>,
-) -> (StatusCode, serde_json::Value, u64) {
+) -> (StatusCode, serde_json::Value, Cost) {
     quiet(trips).await;
     let before = trips.now();
     let response = build_router(state.clone())
@@ -341,12 +376,13 @@ async fn send(
     let bytes = axum::body::to_bytes(response.into_body(), 4_000_000)
         .await
         .unwrap();
-    let cost = trips.now() - before;
+    quiet(trips).await;
+    let cost = Cost::of(trips.since(before));
     let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, body, cost)
 }
 
-async fn edit(state: &ServerState, trips: &RoundTrips, id: &str, body: &str) -> u64 {
+async fn edit(state: &ServerState, trips: &RoundTrips, id: &str, body: &str) -> Cost {
     let request = Request::builder()
         .method(Method::POST)
         .uri(format!("/tdata/Surfaces('{id}')/Panels.Edit"))
@@ -358,7 +394,7 @@ async fn edit(state: &ServerState, trips: &RoundTrips, id: &str, body: &str) -> 
     cost
 }
 
-async fn list(state: &ServerState, trips: &RoundTrips) -> u64 {
+async fn list(state: &ServerState, trips: &RoundTrips) -> Cost {
     let request = Request::builder().uri(LIST).body(Body::empty()).unwrap();
     let (status, body, cost) = send(state, trips, request).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -413,22 +449,14 @@ async fn a_move_and_a_filtered_page_cost_a_fixed_number_of_round_trips() {
         // Warm up: the first use of each statement prepares it.
         edit(&state, &trips, "s-003", "first").await;
         edit(&state, &trips, "s-003", "second").await;
-        quiet(&trips).await;
-        let from = trips.now();
-        let move_cost = edit(&state, &trips, "s-003", "third").await;
-        let messages = trips.since(from);
-        // What follows the move once it has answered, until the connection is
-        // idle: a statement the request started but did not wait for.
-        quiet(&trips).await;
-        let after: Vec<String> = trips.since(from).split_off(messages.len());
-        eprintln!(
-            "warm move messages:\n  {}\nafter its answer:\n  {}",
-            messages.join("\n  "),
-            after.join("\n  ")
-        );
-        assert!(
-            move_cost <= 2,
-            "a warm move costs {move_cost} round trips, want at most 2: {messages:#?}, then {after:#?}"
+        let moved = edit(&state, &trips, "s-003", "third").await;
+        eprintln!("warm move:\n  {}", moved.messages.join("\n  "));
+        // The move's one statement writes its event and every row with it;
+        // its two pings are the pool's, for the one connection it took.
+        assert_eq!(
+            (moved.statements, moved.pings),
+            (1, 2),
+            "a warm move runs one statement on one pooled connection: {moved:#?}"
         );
 
         list(&state, &trips).await;
@@ -436,14 +464,21 @@ async fn a_move_and_a_filtered_page_cost_a_fixed_number_of_round_trips() {
         keep_surfaces(&state, 40, 300).await;
         list(&state, &trips).await;
         let at_300 = list(&state, &trips).await;
-        eprintln!("round trips: move {move_cost}, list at 40 {at_40}, at 300 {at_300}");
+        eprintln!(
+            "round trips: move {}, list at 40 {}, at 300 {}\nlist at 300:\n  {}",
+            moved.total(),
+            at_40.total(),
+            at_300.total(),
+            at_300.messages.join("\n  ")
+        );
         assert_eq!(
-            at_40, at_300,
-            "a filtered first page costs the same at 40 and 300 records"
+            (at_40.statements, at_40.pings),
+            (at_300.statements, at_300.pings),
+            "a filtered first page costs the same at 40 and 300 records: {at_40:#?} {at_300:#?}"
         );
         assert!(
-            at_300 <= 4,
-            "a filtered first page costs {at_300} round trips, want at most 4"
+            at_300.statements <= 2,
+            "a filtered first page runs at most 2 statements: {at_300:#?}"
         );
     })
     .await
