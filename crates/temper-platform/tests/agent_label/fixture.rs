@@ -26,9 +26,13 @@ use tower::ServiceExt;
 
 const ISSUER: &str = "https://issuer.agent-label.local";
 const AUD: &str = "temper-agent-label";
+/// The agent's authenticated id.
 pub(super) const AGENT: &str = "kc_hub";
+/// The person the agent acts for.
 pub(super) const PERSON: &str = "ann";
+/// The type signed into the agent token.
 pub(super) const KIND: &str = "claude-code";
+/// The instance name signed into the agent token.
 pub(super) const LABEL: &str = "hub-session";
 
 const CSDL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
@@ -215,6 +219,7 @@ pub(super) fn agent_labelled(label: &str) -> String {
     }))
 }
 
+/// A token for the named agent instance.
 pub(super) fn agent() -> String {
     agent_labelled(LABEL)
 }
@@ -227,6 +232,7 @@ pub(super) fn person() -> String {
     }))
 }
 
+/// The tenant registered by this fixture.
 pub(super) fn tenant() -> TenantId {
     TenantId::new("default")
 }
@@ -261,6 +267,7 @@ impl StateTimerStore for CommittedRows {
     }
 }
 
+/// Permit the test calls independently of their labels.
 pub(super) const PERMIT_ALL: &str = "permit(principal, action, resource);";
 
 /// A started server over `store`, under `policy`, with Job's timer at `after`
@@ -341,10 +348,12 @@ pub(super) async fn server_with(
     state
 }
 
+/// Start the test server with a policy permitting every call.
 pub(super) async fn server(store: &SimEventStore, after: u32) -> PlatformState {
     server_under(store, after, PERMIT_ALL).await
 }
 
+/// Send a request through the platform router and decode its response.
 pub(super) async fn call(state: &PlatformState, request: Request<Body>) -> (StatusCode, Value) {
     let response = build_platform_router(state.clone())
         .oneshot(request)
@@ -357,6 +366,7 @@ pub(super) async fn call(state: &PlatformState, request: Request<Body>) -> (Stat
     (status, serde_json::from_slice(&bytes).unwrap_or_default())
 }
 
+/// Read an endpoint as the bearer token's caller.
 pub(super) async fn get(state: &PlatformState, uri: &str, token: &str) -> Value {
     let request = Request::get(uri)
         .header("Authorization", format!("Bearer {token}"))
@@ -368,6 +378,7 @@ pub(super) async fn get(state: &PlatformState, uri: &str, token: &str) -> Value 
 }
 
 /// Make `action` on a Job, as `token`, creating the record first.
+/// Create a Job if needed and move it as the bearer token's caller.
 pub(super) async fn act(state: &PlatformState, id: &str, action: &str, token: &str) {
     state
         .server
@@ -383,6 +394,7 @@ pub(super) async fn act(state: &PlatformState, id: &str, action: &str, token: &s
     assert!(status.is_success(), "{action} on {id}: {status}: {body}");
 }
 
+/// Read a record as the named agent instance.
 pub(super) async fn read(state: &PlatformState, set: &str, id: &str) -> Value {
     get(state, &format!("/tdata/{set}('{id}')"), &agent()).await
 }
