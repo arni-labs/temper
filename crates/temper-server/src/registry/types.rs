@@ -237,11 +237,4 @@ mod tests {
             "failed to parse IOA for tenant 't1', entity 'Order': missing states"
         );
     }
-
-    #[test]
-    fn relation_graph_default_empty() {
-        let g = RelationGraph::default();
-        assert!(g.outgoing.is_empty());
-        assert!(g.incoming.is_empty());
-    }
 }

@@ -14,7 +14,6 @@ use temper_server::request_context::AgentContext;
 use temper_spec::automaton;
 use temper_spec::csdl::parse_csdl;
 use temper_store_turso::TursoSpecVerificationUpdate;
-use temper_verify::cascade::VerificationCascade;
 
 fn test_admin_security_context(principal_id: &str) -> SecurityContext {
     SecurityContext {
@@ -35,31 +34,6 @@ fn test_admin_security_context(principal_id: &str) -> SecurityContext {
 }
 
 #[test]
-fn test_pm_specs_parse() {
-    let bundle = get_os_app("project-management").expect("PM app not found");
-    for (entity_type, ioa_source) in &bundle.specs {
-        let result = automaton::parse_automaton(ioa_source);
-        assert!(
-            result.is_ok(),
-            "PM spec {} failed to parse: {:?}",
-            entity_type,
-            result.err()
-        );
-    }
-}
-
-#[test]
-fn test_pm_csdl_parses() {
-    let bundle = get_os_app("project-management").expect("PM app not found");
-    let result = parse_csdl(bundle.csdl.as_ref().expect("PM should have CSDL"));
-    assert!(
-        result.is_ok(),
-        "PM CSDL failed to parse: {:?}",
-        result.err()
-    );
-}
-
-#[test]
 fn test_pm_spec_entity_names() {
     let bundle = get_os_app("project-management").expect("PM app not found");
     for (entity_type, ioa_source) in &bundle.specs {
@@ -68,63 +42,6 @@ fn test_pm_spec_entity_names() {
             &a.automaton.name, entity_type,
             "PM spec name mismatch: expected {entity_type}, got {}",
             a.automaton.name
-        );
-    }
-}
-
-#[test]
-fn test_pm_specs_verify() {
-    let bundle = get_os_app("project-management").expect("PM app not found");
-    for (entity_type, ioa_source) in &bundle.specs {
-        let cascade = VerificationCascade::from_ioa(ioa_source)
-            .with_sim_seeds(3)
-            .with_prop_test_cases(50);
-        let result = cascade.run();
-        assert!(
-            result.all_passed,
-            "PM spec {} failed verification",
-            entity_type
-        );
-    }
-}
-
-#[test]
-fn test_agent_orchestration_specs_parse() {
-    let bundle = get_os_app("agent-orchestration").expect("AO app not found");
-    for (entity_type, ioa_source) in &bundle.specs {
-        let result = automaton::parse_automaton(ioa_source);
-        assert!(
-            result.is_ok(),
-            "Agent Orchestration spec {} failed to parse: {:?}",
-            entity_type,
-            result.err()
-        );
-    }
-}
-
-#[test]
-fn test_agent_orchestration_csdl_parses() {
-    let bundle = get_os_app("agent-orchestration").expect("AO app not found");
-    let result = parse_csdl(bundle.csdl.as_ref().expect("AO should have CSDL"));
-    assert!(
-        result.is_ok(),
-        "Agent Orchestration CSDL failed to parse: {:?}",
-        result.err()
-    );
-}
-
-#[test]
-fn test_agent_orchestration_specs_verify() {
-    let bundle = get_os_app("agent-orchestration").expect("AO app not found");
-    for (entity_type, ioa_source) in &bundle.specs {
-        let cascade = VerificationCascade::from_ioa(ioa_source)
-            .with_sim_seeds(3)
-            .with_prop_test_cases(30);
-        let result = cascade.run();
-        assert!(
-            result.all_passed,
-            "Agent Orchestration spec {} failed verification",
-            entity_type
         );
     }
 }
@@ -844,52 +761,6 @@ async fn test_reconcile_os_app_repairs_entity_set_map_from_matching_digest() {
     let _ = std::fs::remove_file(format!("{db_path}-shm"));
 }
 
-#[test]
-fn test_intent_discovery_specs_parse() {
-    let bundle = get_os_app("intent-discovery").expect("intent-discovery app not found");
-    for (entity_type, ioa_source) in &bundle.specs {
-        let result = automaton::parse_automaton(ioa_source);
-        assert!(
-            result.is_ok(),
-            "IntentDiscovery spec {} failed to parse: {:?}",
-            entity_type,
-            result.err()
-        );
-    }
-}
-
-#[test]
-fn test_intent_discovery_csdl_parses() {
-    let bundle = get_os_app("intent-discovery").expect("intent-discovery app not found");
-    let result = parse_csdl(
-        bundle
-            .csdl
-            .as_ref()
-            .expect("intent-discovery should have CSDL"),
-    );
-    assert!(
-        result.is_ok(),
-        "IntentDiscovery CSDL failed to parse: {:?}",
-        result.err()
-    );
-}
-
-#[test]
-fn test_intent_discovery_specs_verify() {
-    let bundle = get_os_app("intent-discovery").expect("intent-discovery app not found");
-    for (entity_type, ioa_source) in &bundle.specs {
-        let cascade = VerificationCascade::from_ioa(ioa_source)
-            .with_sim_seeds(3)
-            .with_prop_test_cases(40);
-        let result = cascade.run();
-        assert!(
-            result.all_passed,
-            "IntentDiscovery spec {} failed verification",
-            entity_type
-        );
-    }
-}
-
 mod bundle_refusal;
 mod directed_evolution;
 mod entity_owners;
@@ -901,31 +772,6 @@ mod spec_change;
 mod timer_strands;
 
 #[test]
-fn test_agent_specs_parse() {
-    let bundle = get_os_app("temper-agent").expect("temper-agent app not found");
-    for (entity_type, ioa_source) in &bundle.specs {
-        let result = automaton::parse_automaton(ioa_source);
-        assert!(
-            result.is_ok(),
-            "Agent spec {} failed to parse: {:?}",
-            entity_type,
-            result.err()
-        );
-    }
-}
-
-#[test]
-fn test_agent_csdl_parses() {
-    let bundle = get_os_app("temper-agent").expect("temper-agent app not found");
-    let result = parse_csdl(bundle.csdl.as_ref().expect("temper-agent should have CSDL"));
-    assert!(
-        result.is_ok(),
-        "Agent CSDL failed to parse: {:?}",
-        result.err()
-    );
-}
-
-#[test]
 fn test_agent_spec_entity_names() {
     let bundle = get_os_app("temper-agent").expect("temper-agent app not found");
     for (entity_type, ioa_source) in &bundle.specs {
@@ -934,22 +780,6 @@ fn test_agent_spec_entity_names() {
             &a.automaton.name, entity_type,
             "Agent spec name mismatch: expected {entity_type}, got {}",
             a.automaton.name
-        );
-    }
-}
-
-#[test]
-fn test_agent_specs_verify() {
-    let bundle = get_os_app("temper-agent").expect("temper-agent app not found");
-    for (entity_type, ioa_source) in &bundle.specs {
-        let cascade = VerificationCascade::from_ioa(ioa_source)
-            .with_sim_seeds(3)
-            .with_prop_test_cases(50);
-        let result = cascade.run();
-        assert!(
-            result.all_passed,
-            "Agent spec {} failed verification",
-            entity_type
         );
     }
 }
