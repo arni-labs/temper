@@ -26,6 +26,7 @@ use temper_runtime::tenant::TenantId;
 
 use super::DispatchError;
 use super::authenticated_params::refused_for_no_caller;
+use crate::entity_actor::TimerStop;
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
 
@@ -68,64 +69,93 @@ impl ServerState {
         else {
             return;
         };
-        let armed = self.armed_state_timer(tenant, &entity_type, &entity_id);
-        if armed.is_some_and(|armed| armed.agent_ctx.caller().is_some()) {
-            // Its next arming already names someone.
-            return;
-        }
-        let current = match self
-            .get_tenant_entity_state(tenant, &entity_type, &entity_id)
-            .await
-        {
-            Ok(current) => current.state,
-            Err(error) => {
-                tracing::warn!(tenant = %tenant, entity_type, entity_id, %error,
-                    "record of a timer no one can run not readable; its next refusal stops it");
+        // Decided against the record as read, and again whenever a move lands
+        // before the stop is written: that move may name someone. Each pass
+        // follows a newer event, so this ends once the record stops moving.
+        loop {
+            let armed = self.armed_state_timer(tenant, &entity_type, &entity_id);
+            if armed.is_some_and(|armed| armed.agent_ctx.caller().is_some()) {
+                // Its next arming already names someone.
                 return;
             }
-        };
-        let setter = match self.journal_setter(tenant, &entity_type, &entity_id).await {
-            Ok(setter) => setter,
-            Err(error) => {
-                tracing::warn!(tenant = %tenant, entity_type, entity_id, %error,
-                    "record journal not readable; its timer's setter is not known yet");
-                None
-            }
-        };
-        self.cancel_state_timer(tenant, &entity_type, &entity_id, current.sequence_nr)
-            .await;
-        if let Some(setter) = setter {
-            // Armed for no one before a move named someone, which kept that
-            // timer: it runs as them from here.
-            self.reconcile_state_timers(tenant, &entity_type, &entity_id, &current, Some(&setter))
+            let current = match self
+                .get_tenant_entity_state(tenant, &entity_type, &entity_id)
+                .await
+            {
+                Ok(current) => current.state,
+                Err(error) => {
+                    tracing::warn!(tenant = %tenant, entity_type, entity_id, %error,
+                        "record of a timer no one can run not readable; its next refusal stops it");
+                    return;
+                }
+            };
+            let setter = match self.journal_setter(tenant, &entity_type, &entity_id).await {
+                Ok(setter) => setter,
+                Err(error) => {
+                    tracing::warn!(tenant = %tenant, entity_type, entity_id, %error,
+                        "record journal not readable; its timer's setter is not known yet");
+                    None
+                }
+            };
+            self.cancel_state_timer(tenant, &entity_type, &entity_id, current.sequence_nr)
                 .await;
-            return;
+            if let Some(setter) = setter {
+                // Armed for no one before a move named someone, which kept that
+                // timer: it runs as them from here.
+                self.reconcile_state_timers(
+                    tenant,
+                    &entity_type,
+                    &entity_id,
+                    &current,
+                    Some(&setter),
+                )
+                .await;
+                return;
+            }
+            let said = self
+                .say_timer_needs_person(
+                    tenant,
+                    &entity_type,
+                    &entity_id,
+                    action,
+                    current.sequence_nr,
+                )
+                .await;
+            if said != Some(TimerStop::Moved) {
+                return;
+            }
         }
-        self.say_timer_needs_person(tenant, &entity_type, &entity_id, action)
-            .await;
     }
 
-    /// Leave `action` on the record as what its timer stopped for, and the
-    /// log line. A write that fails leaves only the line: the timer's next
-    /// arming, at the next boot at the latest, fires and asks again.
+    /// Leave `action` on the record as what its timer stopped for, decided
+    /// with the record at journal sequence `checked`, and the log line. A
+    /// record that moved since is left as it is, with no line
+    /// ([`TimerStop::Moved`]). A write that fails leaves only the line (`None`):
+    /// the timer's next arming, at the next boot at the latest, fires and asks
+    /// again.
     pub(super) async fn say_timer_needs_person(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
         action: &str,
-    ) {
+        checked: u64,
+    ) -> Option<TimerStop> {
         let recorded = self
-            .record_timer_needs_person(tenant, entity_type, entity_id, action)
+            .record_timer_needs_person(tenant, entity_type, entity_id, action, checked)
             .await;
+        if recorded == Ok(TimerStop::Moved) {
+            return Some(TimerStop::Moved);
+        }
         tracing::warn!(
             tenant = %tenant,
             entity_type,
             entity_id,
             action,
             recorded = recorded.is_ok(),
-            error = recorded.err(),
+            error = recorded.as_ref().err(),
             "{STOPPED}"
         );
+        recorded.ok()
     }
 }

@@ -276,8 +276,16 @@ impl ServerState {
             Some(identity) => identity,
             None if self.action_binds_caller(tenant, entity_type, &st.on_timeout) => {
                 if current.last_event.timer_needs_person.is_none() {
-                    self.say_timer_needs_person(tenant, entity_type, entity_id, &st.on_timeout)
-                        .await;
+                    // A record that moved since this read has a newer follow
+                    // of its own, which decides its timer.
+                    self.say_timer_needs_person(
+                        tenant,
+                        entity_type,
+                        entity_id,
+                        &st.on_timeout,
+                        current.sequence_nr,
+                    )
+                    .await;
                 }
                 return TimerFollow::WaitsForCaller;
             }

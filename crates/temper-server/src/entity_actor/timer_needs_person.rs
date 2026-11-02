@@ -37,18 +37,32 @@ fn event_of(state: &EntityState, action: &str) -> EntityEvent {
     }
 }
 
-/// Journal that the record's timer stopped for `action`, unless it says so
-/// already, or a record that cannot take it. `Ok(())` means the record says so
-/// durably; on `Err` it is unchanged.
+/// What a [`commit`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stop {
+    /// The record says so durably.
+    Said,
+    /// The record moved past the sequence the stop was decided at, so the
+    /// stop was not recorded: whoever moved it may name a caller.
+    Moved,
+}
+
+/// Journal that the record's timer stopped for `action`, decided with the
+/// record at journal sequence `checked`, unless it says so already, the record
+/// moved since, or it cannot take it. On `Err` it is unchanged.
 pub(super) async fn commit(
     actor: &EntityActor,
     state: &mut EntityState,
     action: &str,
-) -> Result<(), String> {
+    checked: u64,
+) -> Result<Stop, String> {
     let mut attempt: u32 = 0;
     loop {
         if state.last_event.timer_needs_person.is_some() {
-            return Ok(());
+            return Ok(Stop::Said);
+        }
+        if state.sequence_nr != checked {
+            return Ok(Stop::Moved);
         }
         if state.status == "Deleted" {
             return Err("the record was deleted".to_owned());
@@ -63,7 +77,7 @@ pub(super) async fn commit(
         let (Some(store), Some(backend)) = (actor.event_journal.as_ref(), actor.event_backend)
         else {
             state.push_event_bounded(event);
-            return Ok(());
+            return Ok(Stop::Said);
         };
         match actor
             .persist_event(
@@ -90,7 +104,7 @@ pub(super) async fn commit(
                     tracing::warn!(entity = %state.entity_id, seq = state.sequence_nr, error = %e,
                         "failed to persist snapshot");
                 }
-                return Ok(());
+                return Ok(Stop::Said);
             }
             Err(PersistenceError::ConcurrencyViolation { actual, .. }) if attempt < MAX_RETRIES => {
                 attempt += 1;

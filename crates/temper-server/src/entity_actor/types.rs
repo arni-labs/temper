@@ -81,6 +81,9 @@ pub enum EntityMsg {
     RecordTimerNeedsPerson {
         /// The refused action.
         action: String,
+        /// The journal sequence the stop was decided at. A record that moved
+        /// past it is left as it is: the newer move decides its timer.
+        checked: u64,
     },
     /// Delete this entity.
     Delete {

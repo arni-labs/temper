@@ -13,6 +13,7 @@ pub(crate) mod entity_rows;
 mod field_updates;
 mod last_event;
 pub use last_event::{EventOrigin, EventVia, LastEvent};
+pub(crate) use timer_needs_person::Stop as TimerStop;
 mod move_invariants;
 pub(crate) mod related;
 mod replay_validation;
