@@ -1,8 +1,20 @@
-//! A server over a store that outlives it, and how the tests move and read.
+//! A simulated server process over a store that outlives it, and how the
+//! tests move and read.
+//!
+//! Each process runs on a single-threaded runtime with a paused clock, so its
+//! timers and tasks run in one order for a seed. A seed's clock and journal
+//! outlive each process, and dropping a process's runtime stops all its tasks,
+//! as an exit would (the timer restart harness, `state_timer_restart`).
 
 use super::*;
 
+/// How long, on the simulated clock, a test waits for what it expects.
 pub(super) const WITHIN: Duration = Duration::from_secs(20);
+
+/// How many seeds each test runs. A seed sets the simulation's ids and the
+/// times the tests draw: when the first move lands and how long a stopped
+/// server stays down.
+pub(super) const SEEDS: u64 = 8;
 
 /// The log line the kernel leaves each time it stops a timer.
 pub(super) const STOPPED: &str = "state timer stopped: nothing names its caller";
@@ -21,27 +33,21 @@ impl Write for CapturedLog {
 }
 
 impl CapturedLog {
-    /// This test process's log. One subscriber is installed for the whole
-    /// process, the first time a test asks, so tests that share a process
-    /// (plain `cargo test`) share it too. The timer tasks that log run on any
-    /// of the runtime's threads, which a per-test scoped subscriber would not
-    /// see. Each test reads only the records it made (`stops`).
-    pub(super) fn install() -> Self {
-        static LOG: std::sync::OnceLock<CapturedLog> = std::sync::OnceLock::new();
-        LOG.get_or_init(|| {
-            let logs = Self::default();
-            let writer = logs.clone();
-            tracing::subscriber::set_global_default(
-                tracing_subscriber::fmt()
-                    .json()
-                    .without_time()
-                    .with_writer(move || writer.clone())
-                    .finish(),
-            )
-            .expect("nothing else installs a subscriber in this test");
-            logs
-        })
-        .clone()
+    /// Capture what this thread logs until the guard drops. Every process of
+    /// a simulation runs its tasks on the test's own thread, so this sees all
+    /// of them, and tests that share a process (plain `cargo test`) each see
+    /// only their own.
+    fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+        let logs = Self::default();
+        let writer = logs.clone();
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .json()
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        (logs, guard)
     }
 
     /// The times a timer of record `id` was stopped.
@@ -86,13 +92,100 @@ impl StateTimerStore for CommittedRows {
     }
 }
 
-/// A started server over `store`, with Shipment's timer at `after` seconds.
-pub(super) async fn server(name: &str, store: &SimEventStore, after: u32) -> ServerState {
-    server_over(name, store, after, None).await
+/// One seed's simulation: its clock, ids, draws, store and log, across the
+/// server processes it runs.
+pub(super) struct Sim {
+    pub(super) seed: u64,
+    pub(super) store: SimEventStore,
+    pub(super) logs: CapturedLog,
+    clock: Arc<ProcessClock>,
+    rng: DeterministicRng,
+    _log: tracing::subscriber::DefaultGuard,
+    _context: SimContextGuard,
 }
 
-/// [`server`], reading and writing its journal through `events` when given.
-pub(super) async fn server_over(
+impl Sim {
+    fn new(seed: u64) -> Self {
+        let clock = Arc::new(ProcessClock::new());
+        let context = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+        let (logs, log) = CapturedLog::install();
+        Self {
+            seed,
+            store: SimEventStore::no_faults(seed),
+            logs,
+            clock,
+            rng: DeterministicRng::new(seed ^ 0x7173_e0ff),
+            _log: log,
+            _context: context,
+        }
+    }
+
+    /// Run `test` once for each of [`SEEDS`] seeds, each a simulation of its
+    /// own.
+    pub(super) fn each_seed(test: impl Fn(&mut Sim)) {
+        for seed in 0..SEEDS {
+            test(&mut Sim::new(seed));
+        }
+    }
+
+    /// A drawn time under `bound_ms` milliseconds.
+    pub(super) fn draw(&mut self, bound_ms: u64) -> Duration {
+        Duration::from_millis(self.rng.next_bound(bound_ms as usize) as u64)
+    }
+
+    /// A started server process, with Shipment's timer at `after` seconds.
+    pub(super) fn start(&self, after: u32) -> Process {
+        self.start_over(after, None)
+    }
+
+    /// [`Self::start`], reading and writing the journal through `events`
+    /// when given.
+    pub(super) fn start_over(
+        &self,
+        after: u32,
+        events: Option<temper_server::storage::BoxedEventStore>,
+    ) -> Process {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let state = runtime.block_on(async {
+            self.clock.begin();
+            server_over(&format!("seed-{}", self.seed), &self.store, after, events).await
+        });
+        Process { runtime, state }
+    }
+
+    /// Stop `process` as an exit would, timers and all, and leave the store
+    /// with no server for a drawn time, up to three seconds, which can leave
+    /// timers overdue at the next start.
+    pub(super) fn stop(&mut self, process: Process) {
+        let downtime = self.draw(3000);
+        let Process { state, runtime } = process;
+        runtime.block_on(async { self.clock.end(downtime) });
+        drop(state);
+        drop(runtime);
+    }
+}
+
+/// One simulated server process.
+pub(super) struct Process {
+    // The server goes before the runtime its tasks run on.
+    pub(super) state: ServerState,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl Process {
+    /// Run `work` on this process until it ends.
+    pub(super) fn run<T>(&self, work: impl Future<Output = T>) -> T {
+        self.runtime.block_on(work)
+    }
+}
+
+/// A started server over `store`, with Shipment's timer at `after` seconds,
+/// reading and writing its journal through `events` when given.
+async fn server_over(
     name: &str,
     store: &SimEventStore,
     after: u32,
@@ -134,7 +227,12 @@ pub(super) async fn server_over(
         .write()
         .expect("wasm registry lock") // ci-ok: infallible lock
         .register(&TenantId::default(), "trigger_principal_echo", &hash);
-    state.start_runtime().await;
+    state
+        .start_runtime()
+        .await
+        .expect("server starts")
+        .await
+        .expect("boot walk completes");
     state
 }
 
@@ -211,6 +309,19 @@ pub(super) async fn read(state: &ServerState, set: &str, id: &str) -> Value {
     serde_json::from_slice(&bytes).unwrap_or(Value::Null)
 }
 
+/// Let all work due at this simulated instant finish.
+pub(super) async fn settle() {
+    for _ in 0..600 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Wait on the simulated clock, `for_` long, letting the work it brings run.
+pub(super) async fn wait(for_: Duration) {
+    tokio::time::sleep(for_).await;
+    settle().await;
+}
+
 /// Wait until `holds` holds of the record, or fail saying what it read.
 pub(super) async fn until(
     state: &ServerState,
@@ -219,45 +330,21 @@ pub(super) async fn until(
     what: &str,
     holds: fn(&Value) -> bool,
 ) -> Value {
-    let deadline = Instant::now() + WITHIN; // determinism-ok: real-time test
+    let deadline = tokio::time::Instant::now() + WITHIN;
     loop {
+        settle().await;
         let record = read(state, set, id).await;
         if holds(&record) {
             return record;
         }
         assert!(
-            Instant::now() < deadline, // determinism-ok: real-time test
+            tokio::time::Instant::now() < deadline,
             "{set} {id} never {what}: {record}"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await; // determinism-ok: real-time test
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
 pub(super) fn is_stopped(record: &Value) -> bool {
     record["timer_needs_person"].is_string()
-}
-
-/// Run `first` on a server of its own, stopped afterward as a process exit
-/// would stop it, timers and all, and return what it returned.
-pub(super) fn on_a_server_that_stops<T, F, Fut>(store: &SimEventStore, after: u32, first: F) -> T
-where
-    T: Send + 'static,
-    F: FnOnce(ServerState) -> Fut + Send + 'static,
-    Fut: Future<Output = T>,
-{
-    let store = store.clone();
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let answer = runtime.block_on(async move {
-            let state = server("first", &store, after).await;
-            first(state).await
-        });
-        drop(runtime);
-        answer
-    })
-    .join()
-    .expect("the first server ran")
 }
