@@ -417,10 +417,18 @@ async fn a_move_and_a_filtered_page_cost_a_fixed_number_of_round_trips() {
         let from = trips.now();
         let move_cost = edit(&state, &trips, "s-003", "third").await;
         let messages = trips.since(from);
-        eprintln!("warm move messages:\n  {}", messages.join("\n  "));
+        // What follows the move once it has answered, until the connection is
+        // idle: a statement the request started but did not wait for.
+        quiet(&trips).await;
+        let after: Vec<String> = trips.since(from).split_off(messages.len());
+        eprintln!(
+            "warm move messages:\n  {}\nafter its answer:\n  {}",
+            messages.join("\n  "),
+            after.join("\n  ")
+        );
         assert!(
             move_cost <= 2,
-            "a warm move costs {move_cost} round trips, want at most 2: {messages:#?}"
+            "a warm move costs {move_cost} round trips, want at most 2: {messages:#?}, then {after:#?}"
         );
 
         list(&state, &trips).await;
