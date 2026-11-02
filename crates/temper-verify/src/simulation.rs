@@ -331,6 +331,9 @@ fn check_liveness_post_simulation(
                         }
                     }
                 }
+                // Whether a record can still get somewhere needs every state
+                // after it, not one run's last: the model check's walk has them.
+                LivenessKind::CanReach { .. } => {}
                 LivenessKind::ReachesState { from, targets } => {
                     if targets.is_empty() {
                         continue;
@@ -468,7 +471,8 @@ mod tests {
                     [[liveness]]\nname = \"KeepsMoving\"\nfrom = [\"On\"]\nhas_actions = true\n";
         let mut model = build_model_from_ioa(spec, 2).unwrap();
         model.limit = Some(crate::model::ExploreLimit {
-            until: std::time::Instant::now(),
+            elapsed: crate::budget::Elapsed::start(crate::budget::Clock::Wall),
+            time: std::time::Duration::ZERO,
             states: 1,
             lifted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),

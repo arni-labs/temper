@@ -364,6 +364,7 @@ impl ServerState {
                 spec_governed: true,
                 refused: false,
                 answered_action: None,
+                trigger_failures: Vec::new(),
                 store_unavailable: false,
             }
         };
@@ -1914,6 +1915,7 @@ impl ServerState {
             spec_governed: true,
             refused: false,
             answered_action: None,
+            trigger_failures: Vec::new(),
             store_unavailable: false,
         }))
     }

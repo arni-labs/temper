@@ -96,8 +96,19 @@ const AGENT_SPECS: &[(&str, &str)] = &[
 /// parse or verify. The registry is shared by every tenant, so nothing here
 /// panics: a caller with built-in specs treats the error as fatal, a caller
 /// installing one tenant's app returns it to that install.
+/// What a bootstrap's CSDL is to the tenant's schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CsdlMode {
+    /// Merged into the schema the tenant already has.
+    MergedIntoExisting,
+    /// All of the tenant's schema: a type or set it leaves out leaves.
+    Whole,
+}
+
 pub(crate) struct BootstrapTenantSpecsOptions<'a> {
     pub(crate) merge: bool,
+    /// Whether `csdl_source` is merged into the tenant's schema or is all of it.
+    pub(crate) csdl_mode: CsdlMode,
     pub(crate) label: &'a str,
     pub(crate) verified_cache: &'a BTreeMap<String, (String, bool)>,
     pub(crate) cross_invariants_source: Option<&'a str>,
@@ -124,6 +135,7 @@ pub(crate) fn bootstrap_tenant_specs(
 ) -> Result<Vec<(String, String)>, String> {
     let BootstrapTenantSpecsOptions {
         merge,
+        csdl_mode,
         label,
         verified_cache,
         cross_invariants_source,
@@ -187,6 +199,7 @@ pub(crate) fn bootstrap_tenant_specs(
     let tenant_id = TenantId::new(tenant);
     {
         let mut registry = state.registry.write().unwrap(); // ci-ok: infallible lock
+        let whole = (merge && csdl_mode == CsdlMode::Whole).then(|| csdl.clone());
         registry
             .try_register_tenant_with_constraints(
                 tenant_id.clone(),
@@ -197,6 +210,10 @@ pub(crate) fn bootstrap_tenant_specs(
                 merge,
             )
             .map_err(|e| format!("failed to register {label} specs for '{tenant}': {e}"))?;
+        // A merge keeps every type the schema had; a whole schema replaces it.
+        if let Some(csdl) = whole {
+            registry.set_tenant_schema(&tenant_id, csdl, csdl_source.to_string());
+        }
         let now = temper_runtime::scheduler::sim_now().to_rfc3339();
         for (entity_type, _) in specs {
             registry.set_verification_status(
@@ -240,6 +257,7 @@ pub fn bootstrap_system_tenant(
         SYSTEM_SPECS,
         BootstrapTenantSpecsOptions {
             merge: false,
+            csdl_mode: CsdlMode::Whole,
             label: "System",
             verified_cache,
             cross_invariants_source: None,
@@ -268,6 +286,11 @@ pub fn bootstrap_agent_specs(
         AGENT_SPECS,
         BootstrapTenantSpecsOptions {
             merge,
+            csdl_mode: if merge {
+                CsdlMode::MergedIntoExisting
+            } else {
+                CsdlMode::Whole
+            },
             label: "Agent",
             verified_cache,
             cross_invariants_source: None,
@@ -671,7 +694,7 @@ pub async fn bootstrap_operator_credential(
     if operator_credential_is_current(state, &tenant_id, &key_hash, agent_type_id, instance_id)
         .await
     {
-        crate::operator_manage_policies::seed_operator_manage_policies(state, tenant).await;
+        crate::operator_manage_policies::seed_operator_permits(state, tenant).await;
         tracing::info!(
             "Operator credential already current for tenant '{tenant}' (key_hash={}...)",
             &key_hash[..8]
@@ -703,7 +726,7 @@ pub async fn bootstrap_operator_credential(
             format!("failed to issue operator AgentCredential for tenant '{tenant}': {e}")
         })?;
 
-    crate::operator_manage_policies::seed_operator_manage_policies(state, tenant).await;
+    crate::operator_manage_policies::seed_operator_permits(state, tenant).await;
 
     tracing::info!(
         "Operator credential bootstrapped for tenant '{tenant}' (key_hash={}...)",

@@ -240,6 +240,12 @@ pub struct Liveness {
     /// Target states that must eventually be reached.
     #[serde(default)]
     pub reaches: Vec<String>,
+    /// Places a record in `from` (in any place when `from` is empty) can
+    /// always still reach: from each such state, some moves lead to one of
+    /// them. Unlike `reaches`, not every path has to get there; the way must
+    /// never be closed off. Checked on the model check's whole walk.
+    #[serde(default)]
+    pub can_reach: Vec<String>,
     /// If true, asserts that actions are always available (no deadlock).
     #[serde(default)]
     pub has_actions: Option<bool>,

@@ -1260,6 +1260,11 @@ fn session_read_follows_capture_order_not_insert_order() {
 
 /// Every listing's tombstone probe reads `idx_events_deleted` (migration 0017)
 /// instead of scanning the whole journal. Gated on DATABASE_URL.
+///
+/// The catalog read names this test's schema: other tests migrate their own
+/// schemas, each with an `events` table and this index, and drop them when
+/// they finish. Reading every schema's index definition raced those drops
+/// ("could not open relation with OID").
 #[test]
 fn migrations_create_the_tombstone_index() {
     let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
@@ -1271,7 +1276,8 @@ fn migrations_create_the_tombstone_index() {
         run_migrations(&pool).await.unwrap();
         let definition: Option<String> = crate::dbm::postgres_query_scalar!(
             "SELECT indexdef FROM pg_indexes \
-             WHERE tablename = 'events' AND indexname = 'idx_events_deleted'",
+             WHERE schemaname = current_schema() \
+             AND tablename = 'events' AND indexname = 'idx_events_deleted'",
         )
         .fetch_optional(&pool)
         .await

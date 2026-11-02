@@ -79,10 +79,13 @@ async fn validate_ioa_rejects_empty_source() {
 /// A spec whose model check runs for minutes with no budget.
 const HEAVY_FEED: &str = include_str!("../../../test-fixtures/budget/heavy_feed.toml");
 
+/// The endpoint passes `budget_ms` to the cascade and answers with what
+/// stopped it. Unbudgeted, this spec takes minutes, so it always stops; which
+/// level it stops in depends on how fast the machine is, and is checked with
+/// a clock that moves only when read in temper-verify's budget tests.
 #[tokio::test]
 async fn validate_ioa_answers_a_spec_too_large_to_check_within_its_budget() {
     let app = build_router(test_state_with_registry());
-    let started = std::time::Instant::now();
     let response = app
         .oneshot(authenticated_post(
             "/api/specs/validate-ioa",
@@ -90,15 +93,8 @@ async fn validate_ioa_answers_a_spec_too_large_to_check_within_its_budget() {
         ))
         .await
         .unwrap();
-    let took = started.elapsed();
 
     assert_eq!(response.status(), StatusCode::OK);
-    // 1 s of budget, then a queue that no longer grows drains; 10 s leaves
-    // room for a loaded CI machine, against the minutes it takes unbudgeted.
-    assert!(
-        took < std::time::Duration::from_secs(10),
-        "answered in {took:?}"
-    );
     let body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
         .await
         .unwrap();
@@ -108,7 +104,7 @@ async fn validate_ioa_answers_a_spec_too_large_to_check_within_its_budget() {
         .as_str()
         .expect("stopped names the type and why");
     assert!(
-        stopped.starts_with("HeavyFeed: L1 Model Check STOPPED: ran out of its 1 s budget"),
+        stopped.starts_with("HeavyFeed: ") && stopped.contains(" STOPPED: "),
         "{stopped}"
     );
 }
@@ -132,7 +128,7 @@ async fn validate_ioa_rejects_a_budget_out_of_range() {
 async fn validate_ioa_answers_a_move_with_too_many_parameter_choices() {
     let flags: Vec<String> = (0..13).map(|i| format!("f{i}")).collect();
     let ioa = format!(
-        "[automaton]\nname = \"Flags\"\nstates = [\"On\"]\ninitial = \"On\"\n\n{}\n[[action]]\nname = \"Set\"\nkind = \"input\"\nfrom = [\"On\"]\nparams = [{}]\neffect = [{}]\n",
+        "[automaton]\nname = \"Flags\"\nstates = [\"On\"]\ninitial = \"On\"\n\n{}\n[[action]]\nname = \"Set\"\nkind = \"input\"\nfrom = [\"On\"]\nparams = [{}]\neffect = [{}]\n\n[[invariant]]\nname = \"Held\"\nassert = \"{}\"\n",
         flags
             .iter()
             .map(|f| format!("[[state]]\nname = \"{f}\"\ntype = \"bool\"\ninitial = false\n"))
@@ -148,6 +144,12 @@ async fn validate_ioa_answers_a_move_with_too_many_parameter_choices() {
             .map(|f| format!("\"{f} = params.{f}\""))
             .collect::<Vec<_>>()
             .join(", "),
+        // The model holds only the fields some rule reads.
+        flags
+            .iter()
+            .map(|f| format!("({f} || !{f})"))
+            .collect::<Vec<_>>()
+            .join(" && "),
     );
     let app = build_router(test_state_with_registry());
     let response = app
@@ -222,6 +224,34 @@ async fn validate_ioa_keeps_a_passing_verdict_for_a_change_no_level_reads() {
     );
 }
 
+/// A move that stays in place, has no guard and writes a field no rule
+/// reads keeps the note's verdict; one from a place the note never reaches
+/// keeps its digest, but its own check refuses it, so it is checked.
+#[tokio::test]
+async fn validate_ioa_keeps_a_verdict_for_a_silent_move_only_where_it_stands() {
+    let state = test_state_with_registry();
+    let note = NOTE.replace(
+        "states = [\"Open\", \"Closed\"]",
+        "states = [\"Open\", \"Closed\", \"Gone\"]",
+    );
+    assert_ne!(note, NOTE);
+    let remark = |from: &str| {
+        format!(
+            "{note}\n[[state]]\nname = \"memo\"\ntype = \"string\"\ninitial = \"\"\n\n[[action]]\nname = \"Remark\"\nkind = \"input\"\nfrom = [\"{from}\"]\nparams = [{{ name = \"memo\", type = \"string\" }}]\n"
+        )
+    };
+    let checked = validate(&state, &note).await;
+    assert_eq!(checked["all_passed"], true, "{checked}");
+
+    let kept = validate(&state, &remark("Open")).await;
+    assert_eq!(kept["all_passed"], true, "{kept}");
+    assert!(kept["kept"].is_string(), "a silent move keeps it: {kept}");
+
+    let dead = validate(&state, &remark("Gone")).await;
+    assert_eq!(dead["all_passed"], false, "{dead}");
+    assert!(dead.get("kept").is_none(), "{dead}");
+}
+
 #[tokio::test]
 async fn validate_ioa_checks_a_failing_spec_again() {
     let state = test_state_with_registry();
@@ -233,3 +263,6 @@ async fn validate_ioa_checks_a_failing_spec_again() {
         assert!(answer.get("kept").is_none(), "attempt {attempt}: {answer}");
     }
 }
+
+#[path = "spec_validate_endpoint/queue.rs"]
+mod queue;

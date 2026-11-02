@@ -49,6 +49,7 @@ fn make_response(status: &str) -> EntityResponse {
         spec_governed: true,
         refused: false,
         answered_action: None,
+        trigger_failures: Vec::new(),
         store_unavailable: false,
     }
 }

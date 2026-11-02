@@ -1652,6 +1652,7 @@ impl EntityActor {
                         spec_governed: true,
                         refused: false,
                         answered_action,
+                        trigger_failures: Vec::new(),
                         store_unavailable: false,
                     });
                     return Ok(());
@@ -2247,6 +2248,7 @@ impl EntityActor {
                         spec_governed: true,
                         refused: false,
                         answered_action: None,
+                        trigger_failures: Vec::new(),
                         store_unavailable: false,
                     };
                     // ADR-0048 sub-decision 5: cache the successful response
@@ -2315,16 +2317,9 @@ impl EntityActor {
                     spec_governed: true,
                     refused: false,
                     answered_action: None,
+                    trigger_failures: Vec::new(),
                     store_unavailable: false,
                 });
-            }
-            EntityMsg::GetField { field } => {
-                let value = state
-                    .fields
-                    .get(&field)
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                ctx.reply(value);
             }
             EntityMsg::UpdateFields {
                 caller,
@@ -2367,6 +2362,7 @@ impl EntityActor {
                         spec_governed: true,
                         refused: false,
                         answered_action: None,
+                        trigger_failures: Vec::new(),
                         store_unavailable: false,
                     },
                     Err(NotUpdated::RecordChanged) => EntityResponse::record_changed(
@@ -2395,6 +2391,7 @@ impl EntityActor {
                     spec_governed: true,
                     refused: false,
                     answered_action: None,
+                    trigger_failures: Vec::new(),
                     store_unavailable: false,
                 });
             }
@@ -2412,6 +2409,7 @@ impl EntityActor {
                     spec_governed: true,
                     refused: false,
                     answered_action: None,
+                    trigger_failures: Vec::new(),
                     store_unavailable: false,
                 });
             }
@@ -2461,6 +2459,7 @@ impl EntityActor {
                         spec_governed: true,
                         refused: false,
                         answered_action: None,
+                        trigger_failures: Vec::new(),
                         store_unavailable: false,
                     });
                     return Ok(());
@@ -2517,6 +2516,7 @@ impl EntityActor {
                     spec_governed: true,
                     refused: false,
                     answered_action: None,
+                    trigger_failures: Vec::new(),
                     store_unavailable: false,
                 });
             }

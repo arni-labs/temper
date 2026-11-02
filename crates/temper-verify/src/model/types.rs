@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Instant;
 
 use std::collections::BTreeSet;
 
@@ -186,6 +185,9 @@ pub struct ResolvedTransition {
     /// one. Entry-rule models also choose guard inputs and list inputs here
     /// to retain identity and evaluate the guard with the chosen assignment.
     pub string_params: Vec<StringParam>,
+    /// Original input constraints. Route proofs must identify any that
+    /// string parameter exploration does not enforce.
+    pub constraints: Vec<temper_spec::automaton::ActionConstraint>,
 }
 
 /// A string parameter of an action, with what the action's constraints allow
@@ -246,6 +248,13 @@ pub enum LivenessKind {
     /// From any `from` state, there is always at least one enabled action.
     /// This is actually a safety property (always has actions).
     NoDeadlock { from: Vec<String> },
+    /// From every reachable state in one of `from` (any state when it is
+    /// empty), some moves lead to one of `targets`. Checked on the model
+    /// check's whole walk, after a complete exploration.
+    CanReach {
+        from: Vec<String>,
+        targets: Vec<String>,
+    },
 }
 
 /// A resolved liveness property.
@@ -289,8 +298,9 @@ pub struct TemperModel {
     pub(crate) initial_lists: BTreeMap<String, Vec<ModelString>>,
     /// Initial values of the tracked string variables.
     pub(crate) initial_strings: BTreeMap<String, ModelString>,
-    /// The string variables the verifier tracks: those guards/invariants read or effects write,
-    /// and those whose value reaches one through a constraint or a reaction.
+    /// The string variables the verifier tracks: those guards/invariants read
+    /// or effects write, and those whose value reaches one through a
+    /// constraint or a reaction.
     pub tracked_strings: BTreeSet<String>,
     /// Concrete initial, predicate and effect literals for tracked string inputs,
     /// including literals tied to them indirectly through related statuses.
@@ -313,9 +323,12 @@ pub struct TemperModel {
 /// How far one model may be explored: a [`crate::Budget`] in force.
 #[derive(Clone, Debug)]
 pub(crate) struct ExploreLimit {
-    /// Past this instant the model offers no actions, so every walk of it
-    /// (model check, simulation, property tests) ends at once.
-    pub(crate) until: Instant,
+    /// The time the budget has used. Past `time` the model offers no
+    /// actions, so every walk of it (model check, simulation, property
+    /// tests) ends at once.
+    pub(crate) elapsed: crate::budget::Elapsed,
+    /// The budget's time.
+    pub(crate) time: std::time::Duration,
     /// States the model check may generate before it stops (a state reached
     /// twice counts twice).
     pub(crate) states: usize,
@@ -342,6 +355,11 @@ impl ExploreLimit {
 
     pub(crate) fn lift(&self) {
         self.lifted.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the budget's time is spent.
+    pub(crate) fn past_time(&self) -> bool {
+        self.elapsed.now() >= self.time
     }
 }
 
@@ -397,6 +415,14 @@ impl fmt::Debug for TemperModel {
 }
 
 impl TemperModel {
+    /// Whether the model holds a value for the counter, boolean or list
+    /// `field`: some rule reads it.
+    pub fn holds(&self, field: &str) -> bool {
+        self.initial_counters.contains_key(field)
+            || self.initial_booleans.contains_key(field)
+            || self.initial_lists.contains_key(field)
+    }
+
     /// Whether the model gives `action`'s string parameter `param` a value.
     pub fn models_string(&self, action: &str, param: &str) -> bool {
         self.transitions
@@ -409,7 +435,7 @@ impl TemperModel {
     pub fn out_of_time(&self) -> bool {
         self.limit.as_ref().is_some_and(|limit| {
             !limit.lifted.load(Ordering::Relaxed)
-                && (Instant::now() >= limit.until || limit.exhausted.load(Ordering::Relaxed))
+                && (limit.past_time() || limit.exhausted.load(Ordering::Relaxed))
         })
     }
 }

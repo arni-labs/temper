@@ -58,8 +58,6 @@ pub enum EntityMsg {
     },
     /// Get the current entity state.
     GetState,
-    /// Get a specific field value.
-    GetField { field: String },
     /// Update entity fields (PATCH: merge, PUT: replace).
     UpdateFields {
         /// Kernel dispatch context; never populated from field values.
@@ -387,6 +385,11 @@ pub struct EntityResponse {
     /// effects and reactions that follow belong to that recorded action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answered_action: Option<String>,
+    /// The triggers of this committed action that failed, or whose answer
+    /// was refused, each as `trigger: error`. The action stands: they are
+    /// reported beside its success, and the record shows each failure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trigger_failures: Vec<String>,
     /// Whether the store could not take the action's write: it failed, or its
     /// disk is under the floor. Answered 503, so the caller tries again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -445,6 +448,7 @@ impl EntityResponse {
             spec_governed: true,
             refused: false,
             answered_action: None,
+            trigger_failures: Vec::new(),
             store_unavailable: false,
         }
     }

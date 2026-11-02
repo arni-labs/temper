@@ -10,6 +10,7 @@
 //! clock moves only when no task can run, so how fast the machine is decides
 //! nothing.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +26,7 @@ use temper_runtime::scheduler::{
 use temper_runtime::{ActorSystem, tenant::TenantId};
 use temper_server::registry::SpecRegistry;
 use temper_server::request_context::AgentContext;
+use temper_server::state::BootTimers;
 use temper_server::{ServerState, StorageStack};
 use temper_store_postgres::{PostgresEventStore, PostgresSchema};
 use temper_store_turso::TursoEventStore;
@@ -161,6 +163,8 @@ pub(crate) fn millis_between(rng: &mut DeterministicRng, from: u64, to: u64) -> 
 pub(crate) struct Server {
     runtime: tokio::runtime::Runtime,
     state: ServerState,
+    /// The boot's walk of every timed type, until [`Self::boot_counts`] waits for it.
+    boot: RefCell<Option<tokio::task::JoinHandle<BootTimers>>>,
 }
 
 impl Server {
@@ -172,7 +176,7 @@ impl Server {
             .start_paused(true)
             .build()
             .unwrap();
-        let state = runtime.block_on(async {
+        let (state, boot) = runtime.block_on(async {
             world.clock.begin();
             let mut registry = SpecRegistry::new();
             registry.register_tenant(
@@ -187,16 +191,20 @@ impl Server {
                 .authz
                 .reload_tenant_policies("default", PERMIT_ALL)
                 .unwrap();
-            state.start_runtime().await;
-            state
+            let boot = state.start_runtime().await;
+            (state, boot)
         });
-        Self { runtime, state }
+        Self {
+            runtime,
+            state,
+            boot: RefCell::new(boot),
+        }
     }
 
     /// Kill the server the way a process exit would, every task stopping,
     /// and keep it down until `until` on the simulation clock.
     pub(crate) fn kill(self, world: &World, until: DateTime<Utc>) {
-        let Self { runtime, state } = self;
+        let Self { runtime, state, .. } = self;
         runtime.block_on(async {
             let down = (until - sim_now())
                 .to_std()
@@ -205,6 +213,13 @@ impl Server {
         });
         drop(state);
         drop(runtime);
+    }
+
+    /// What the boot did with each tenant's and type's timers, once its walk
+    /// of every timed type has ended.
+    pub(crate) fn boot_counts(&self) -> BootTimers {
+        let walk = self.boot.borrow_mut().take().expect("the boot walk, once");
+        self.runtime.block_on(walk).expect("the boot walk ends")
     }
 
     /// Now, on the simulation clock.
@@ -289,6 +304,24 @@ impl Server {
     /// Remove every timer row, as for timers armed before rows were kept.
     pub(crate) fn forget_rows(&self) {
         for row in self.rows() {
+            self.runtime.block_on(async {
+                let store = self
+                    .state
+                    .metadata_store_for_tenant("default")
+                    .await
+                    .unwrap();
+                store
+                    .delete_state_timer("default", &row.entity_type, &row.entity_id, &row.arm_id)
+                    .await
+                    .unwrap();
+            });
+        }
+    }
+
+    /// Remove `id`'s timer rows, as for a record whose process stopped
+    /// between its event and its row.
+    pub(crate) fn forget_row(&self, id: &str) {
+        for row in self.rows().into_iter().filter(|row| row.entity_id == id) {
             self.runtime.block_on(async {
                 let store = self
                     .state

@@ -1,6 +1,6 @@
-//! An overdue install timer cannot dispatch while module storage is awaiting,
-//! not even when another tenant's install finishes in the meantime and starts
-//! a walk of its own.
+//! An overdue install timer cannot dispatch while module storage is awaiting
+//! after its spec went live (`Swap::SpecsFirst`), not even when another
+//! tenant's install finishes in the meantime and starts a walk of its own.
 use super::*;
 use std::sync::Arc;
 use temper_runtime::persistence::{EventStore, PersistenceError};
@@ -232,9 +232,18 @@ on_timeout = "Expire"
     )
     .expect("write timed spec");
     add_os_apps_dir(root.clone());
+    // Specs first, as a version put back goes in: its timers are live while
+    // its modules are still being stored, which the hold must cover.
     let install = INSTALLER.scope(
         true,
-        install_os_app_with_plan(&state, tenant.as_str(), app, plan, InstallOrigin::Request),
+        install_os_app_swapping(
+            &state,
+            tenant.as_str(),
+            app,
+            plan,
+            InstallOrigin::Request,
+            Swap::SpecsFirst,
+        ),
     );
     tokio::pin!(install);
     tokio::select! {

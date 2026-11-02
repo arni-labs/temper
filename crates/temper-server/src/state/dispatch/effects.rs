@@ -538,7 +538,7 @@ impl crate::state::ServerState {
     /// callback response. They are fire-and-forget (background tasks), so the
     /// caller is free to return the (possibly integration-updated) response
     /// afterwards.
-    fn dispatch_transition_deferred_effects(
+    pub(super) fn dispatch_transition_deferred_effects(
         &self,
         ctx: &PostDispatchContext<'_>,
         response: &EntityResponse,
@@ -661,6 +661,9 @@ impl crate::state::ServerState {
                     action_params: ctx.action_params,
                     mode: super::WasmDispatchMode::Inline,
                 };
+                // Each trigger runs whether or not one before it failed, so a
+                // failure is kept and the triggers after it still run.
+                let mut failures: Vec<String> = Vec::new();
                 match super::wasm::dispatch_wasm_integrations_boxed(self, &req).await {
                     Ok(Some(final_response)) => {
                         // Silent-exit regression guard: trigger integration
@@ -690,23 +693,7 @@ impl crate::state::ServerState {
                         inline_response = Some(final_response);
                     }
                     Ok(None) => {}
-                    Err(err) => {
-                        // Committed with its event: its scheduled actions still fire.
-                        self.arm_scheduled_actions(ctx, &response);
-                        return EntityResponse {
-                            success: false,
-                            refusal: None,
-                            state: response.state.clone(),
-                            error: Some(format!("WASM integration failed: {err}")),
-                            custom_effects: response.custom_effects.clone(),
-                            scheduled_actions: Vec::new(),
-                            spawn_requests: Vec::new(),
-                            spec_governed: response.spec_governed,
-                            refused: false,
-                            answered_action: None,
-                            store_unavailable: false,
-                        };
-                    }
+                    Err(err) => failures.push(format!("WASM integration failed: {err}")),
                 }
 
                 let adapter_state = inline_response
@@ -730,25 +717,16 @@ impl crate::state::ServerState {
                         inline_response = Some(final_response);
                     }
                     Ok(None) => {}
-                    Err(err) => {
-                        // Committed with its event: its scheduled actions still fire.
-                        self.arm_scheduled_actions(ctx, &response);
-                        return EntityResponse {
-                            success: false,
-                            refusal: None,
-                            state: response.state.clone(),
-                            error: Some(format!("adapter integration failed: {err}")),
-                            custom_effects: response.custom_effects.clone(),
-                            scheduled_actions: Vec::new(),
-                            spawn_requests: Vec::new(),
-                            spec_governed: response.spec_governed,
-                            refused: false,
-                            answered_action: None,
-                            store_unavailable: false,
-                        };
-                    }
+                    Err(err) => failures.push(format!("adapter integration failed: {err}")),
                 }
 
+                if !failures.is_empty()
+                    || inline_response
+                        .as_ref()
+                        .is_some_and(|answer| !answer.success)
+                {
+                    return self.answer_failed_triggers(ctx, response, inline_response, failures);
+                }
                 if let Some(final_response) = inline_response {
                     // ARN-188: the inline integration produced a callback
                     // response (a separate action), but the ORIGINAL

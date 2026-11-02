@@ -9,19 +9,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use temper_spec::automaton::{
-    ActionConstraint, ActionKind, Automaton, Initial, ResolvedEffect, translate_actions,
-};
+use temper_spec::automaton::{ActionKind, Automaton, Initial, ResolvedEffect, translate_actions};
 use temper_spec::predicate::{Arg, Expr, Literal, Operand, ParamKind, Set, VarKind};
 
+mod fields;
 mod strings;
 
-use strings::{string_literals, tracked_strings};
+use fields::read_fields;
+use strings::{string_literals, string_params, tracked_strings};
 
+use super::counters::leave_out_unread_counters;
 use super::entry::resolve_entry_rules;
 use super::types::{
     LivenessKind, ModelEffect, ModelString, ResolvedInvariant, ResolvedLiveness,
-    ResolvedTransition, StringParam, TemperModel,
+    ResolvedTransition, TemperModel,
 };
 
 /// Build a `TemperModel` from I/O Automaton TOML source.
@@ -36,9 +37,12 @@ pub fn build_model_from_ioa(ioa_toml: &str, max_counter: usize) -> Result<Temper
     Ok(build_model_from_automaton(&automaton, max_counter))
 }
 
-/// Build a `TemperModel` directly from a parsed [`Automaton`].
+/// Build a `TemperModel` directly from a parsed [`Automaton`], without the
+/// counters nothing reads.
 pub fn build_model_from_automaton(automaton: &Automaton, max_counter: usize) -> TemperModel {
-    build_model_tracking(automaton, max_counter, &BTreeSet::new())
+    let mut model = build_model_tracking(automaton, max_counter, &BTreeSet::new());
+    leave_out_unread_counters(automaton, &mut model);
+    model
 }
 
 /// [`build_model_from_automaton`], also tracking the string variables in
@@ -57,8 +61,9 @@ pub fn build_model_tracking(
     let mut initial_booleans = BTreeMap::new();
     let mut initial_lists: BTreeMap<String, Vec<ModelString>> = BTreeMap::new();
     let mut counter_bounds = BTreeMap::new();
+    let read = read_fields(automaton, also_tracked);
 
-    for sv in &automaton.state {
+    for sv in automaton.state.iter().filter(|sv| read.contains(&sv.name)) {
         match &sv.initial {
             Initial::Counter(n) => {
                 initial_counters.insert(sv.name.clone(), *n);
@@ -73,7 +78,7 @@ pub fn build_model_tracking(
                     items.iter().cloned().map(Into::into).collect(),
                 );
             }
-            // Tracked strings are initialized below; ints are not modeled.
+            // Strings are initialized below; ints are not modeled.
             Initial::String(_) | Initial::Int(_) => {}
         }
     }
@@ -91,7 +96,7 @@ pub fn build_model_tracking(
             (sv.name.clone(), value.into())
         })
         .collect();
-    let transitions = resolve_transitions(automaton, &tracked_strings);
+    let transitions = resolve_transitions(automaton, &tracked_strings, &read);
     // A counter written with a literal larger than the exploration bound is
     // explored up to that literal, so the write is not pruned away.
     for t in &transitions {
@@ -194,6 +199,7 @@ fn list_literals(automaton: &Automaton) -> BTreeMap<String, BTreeSet<String>> {
 fn resolve_transitions(
     automaton: &Automaton,
     tracked_strings: &BTreeSet<String>,
+    read: &BTreeSet<String>,
 ) -> Vec<ResolvedTransition> {
     // `translate_actions` keeps every action but outputs, in order.
     let declared = automaton
@@ -204,8 +210,12 @@ fn resolve_transitions(
         .into_iter()
         .zip(declared)
         .map(|(a, action)| {
-            let effects: Vec<ModelEffect> =
-                a.effects.into_iter().filter_map(convert_effect).collect();
+            let effects: Vec<ModelEffect> = a
+                .effects
+                .into_iter()
+                .filter_map(convert_effect)
+                .filter(|effect| holds_written(effect, read, tracked_strings))
+                .collect();
             let mut params = effect_params(&effects);
             if !automaton.entry_rules.is_empty() {
                 // A guard-only input still determines whether entry is legal.
@@ -237,7 +247,8 @@ fn resolve_transitions(
                 action,
                 tracked_strings,
                 &params,
-                !automaton.entry_rules.is_empty(),
+                !automaton.entry_rules.is_empty()
+                    || automaton.liveness.iter().any(|l| !l.can_reach.is_empty()),
             );
             ResolvedTransition {
                 name: a.name,
@@ -251,65 +262,8 @@ fn resolve_transitions(
                 effects,
                 params,
                 string_params,
+                constraints: action.constraints.clone(),
             }
-        })
-        .collect()
-}
-
-/// The parameters of `action` that write a tracked string variable, or that
-/// a constraint ties to one (`failed_commit` must equal `commit`), with the
-/// action's constraints on each. The model needs the value of the second
-/// kind to decide whether the record takes the action, though it writes
-/// nothing it tracks. With entry rules, list inputs also use equality classes
-/// so independent inputs can name equal or distinct related records.
-fn string_params(
-    action: &temper_spec::automaton::Action,
-    tracked_strings: &BTreeSet<String>,
-    effect_params: &BTreeMap<String, ParamKind>,
-    entry_rules: bool,
-) -> Vec<StringParam> {
-    let tied = |name: &str| {
-        action.constraints.iter().any(|c| {
-            c.param() == name
-                && matches!(
-                    c,
-                    ActionConstraint::ParamEqualsField { .. }
-                        | ActionConstraint::ParamNotEqualsField { .. }
-                )
-                && c.field()
-                    .is_some_and(|field| tracked_strings.contains(field))
-        })
-    };
-    action
-        .params
-        .iter()
-        .map(|param| param.name())
-        .filter(|name| {
-            tracked_strings.contains(*name)
-                || tied(name)
-                || (entry_rules && effect_params.get(*name) == Some(&ParamKind::Str))
-        })
-        .map(|name| {
-            let mut param = StringParam {
-                name: name.to_string(),
-                writes: tracked_strings.contains(name),
-                nonempty: false,
-                equals: Vec::new(),
-                not_equals: Vec::new(),
-            };
-            for constraint in action.constraints.iter().filter(|c| c.param() == name) {
-                match constraint {
-                    ActionConstraint::ParamNonempty { .. } => param.nonempty = true,
-                    ActionConstraint::ParamEqualsField { field, .. } => {
-                        param.equals.push(field.clone());
-                    }
-                    ActionConstraint::ParamNotEqualsField { field, .. } => {
-                        param.not_equals.push(field.clone());
-                    }
-                    _ => {}
-                }
-            }
-            param
         })
         .collect()
 }
@@ -376,6 +330,24 @@ fn convert_effect(effect: ResolvedEffect) -> Option<ModelEffect> {
     })
 }
 
+/// Whether the model holds the field `effect` writes: a tracked string
+/// (applying a write to any other is a no-op) or a field in `read`.
+fn holds_written(
+    effect: &ModelEffect,
+    read: &BTreeSet<String>,
+    tracked_strings: &BTreeSet<String>,
+) -> bool {
+    match effect {
+        ModelEffect::SetString { var, .. } => tracked_strings.contains(var),
+        ModelEffect::SetCounter { var, .. }
+        | ModelEffect::AddCounter { var, .. }
+        | ModelEffect::SubCounter { var, .. }
+        | ModelEffect::SetBool { var, .. }
+        | ModelEffect::ListAppend { var, .. }
+        | ModelEffect::ListRemoveAt { var, .. } => read.contains(var),
+    }
+}
+
 /// The kind of every `params.p` the effects read (checked consistent at load).
 pub(crate) fn effect_params(effects: &[ModelEffect]) -> BTreeMap<String, ParamKind> {
     let mut params = BTreeMap::new();
@@ -421,6 +393,11 @@ fn resolve_liveness(automaton: &Automaton) -> Vec<ResolvedLiveness> {
                 LivenessKind::ReachesState {
                     from: l.from.clone(),
                     targets: l.reaches.clone(),
+                }
+            } else if !l.can_reach.is_empty() {
+                LivenessKind::CanReach {
+                    from: l.from.clone(),
+                    targets: l.can_reach.clone(),
                 }
             } else if l.has_actions == Some(true) {
                 LivenessKind::NoDeadlock {
