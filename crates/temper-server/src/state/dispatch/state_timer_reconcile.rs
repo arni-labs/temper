@@ -258,7 +258,6 @@ impl ServerState {
         let mut timer = declared_timer(
             tenant,
             entity_type,
-            entity_id,
             &st,
             current,
             &ReadDefaults::for_entity(self, tenant, entity_type),

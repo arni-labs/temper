@@ -456,7 +456,6 @@ impl crate::state::ServerState {
         let mut timer = declared_timer(
             ctx.tenant,
             ctx.entity_type,
-            ctx.entity_id,
             &st,
             &response.state,
             &ReadDefaults::for_entity(self, ctx.tenant, ctx.entity_type),
@@ -826,17 +825,16 @@ pub(super) fn rearm_clock_start(
 /// are read when the timer is armed, against the entity as it entered the
 /// state, as guards read it: a variable it stores no value for reads as its
 /// declared initial value in `declared`.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn declared_timer(
     tenant: &TenantId,
     entity_type: &str,
-    entity_id: &str,
     st: &temper_spec::automaton::StateTimeout,
     state: &EntityState,
     declared: &ReadDefaults,
     armed_by: &AgentContext,
     started_at: DateTime<Utc>,
 ) -> ArmedTimer {
+    let entity_id = state.entity_id.as_str();
     let read = declared.fields_as_read(&state.fields);
     let (params, missing) = temper_spec::automaton::resolve_args(&st.args, entity_id, &read);
     for field in missing {
