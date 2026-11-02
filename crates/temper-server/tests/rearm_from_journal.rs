@@ -134,8 +134,24 @@ impl StateTimerStore for CommittedRows {
 }
 
 /// A started server over `store`, merging after `looks` looks.
+/// Watch's spec, merging at `looks` looks a look every `every` seconds.
+fn watch_ioa(looks: u32, every: u32) -> String {
+    WATCH_IOA
+        .replace("LOOKS", &looks.to_string())
+        .replace("after_seconds = 1", &format!("after_seconds = {every}"))
+}
+
 async fn server(name: &str, store: &SimEventStore, looks: u32) -> ServerState {
-    let ioa = WATCH_IOA.replace("LOOKS", &looks.to_string());
+    server_looking_every(name, store, looks, 1).await
+}
+
+async fn server_looking_every(
+    name: &str,
+    store: &SimEventStore,
+    looks: u32,
+    every: u32,
+) -> ServerState {
+    let ioa = watch_ioa(looks, every);
     let mut registry = SpecRegistry::new();
     registry.register_tenant(
         TENANT,
@@ -244,6 +260,13 @@ async fn reaches(
 /// server is down, and return the server started after, which merges at the
 /// next look.
 async fn poll_then_restart(id: &str, by: &AgentContext, spoil: Spoil) -> ServerState {
+    let store = poll_and_stop(id, by, spoil);
+    server(&format!("{id}-after"), &store, 1).await
+}
+
+/// Start watch `id` polling as `by` on a server that stops, and spoil its row
+/// as `spoil` while the server is down.
+fn poll_and_stop(id: &str, by: &AgentContext, spoil: Spoil) -> SimEventStore {
     let store = SimEventStore::no_faults(7);
     let (first_store, first_id, by) = (store.clone(), id.to_string(), by.clone());
     std::thread::spawn(move || {
@@ -286,7 +309,7 @@ async fn poll_then_restart(id: &str, by: &AgentContext, spoil: Spoil) -> ServerS
             ..row
         }),
     }
-    server(&format!("{id}-after"), &store, 1).await
+    store
 }
 
 async fn reaches_looks(state: &ServerState, id: &str, looks: i64) {
@@ -330,6 +353,38 @@ async fn a_service_armed_poll_runs_as_the_person_who_started_it() {
         merged_by("w-service", &person("person-2"), Spoil::Service).await,
         "person-2"
     );
+}
+
+/// A boot names the person in place of the row's service and keeps the row. An
+/// install that then changes the timer's budget replaces the live timer, and
+/// the replacement still runs as that person.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_install_keeps_the_person_a_boot_found_in_the_journal() {
+    let store = poll_and_stop("w-install", &person("person-3"), Spoil::Service);
+    let state = server_looking_every("w-install-after", &store, 1, 3600).await;
+    // The boot arms the record's timer, as the journal's person, an hour out.
+    tokio::time::sleep(Duration::from_secs(2)).await; // determinism-ok: real-time test
+    let (status, _) = watch(&state, "w-install").await;
+    assert_eq!(status, "Checking", "the look an hour out has not run");
+
+    let ioa = watch_ioa(1, 1);
+    state
+        .registry
+        .write()
+        .expect("registry lock") // ci-ok: infallible lock
+        .register_tenant(
+            TENANT,
+            parse_csdl(CSDL).expect("CSDL should parse"),
+            CSDL.to_string(),
+            &[("Watch", ioa.as_str())],
+        );
+    state.rebuild_reaction_dispatcher();
+    state.follow_spec_changes().await;
+
+    let fields = reaches(&state, "w-install", "Merged", Duration::from_secs(20))
+        .await
+        .unwrap_or_else(|error| panic!("the reaction after a look never ran: {error}"));
+    assert_eq!(fields["merged_by"], "person-3");
 }
 
 #[tokio::test(flavor = "multi_thread")]
