@@ -400,8 +400,8 @@ async fn list(state: &ServerState, trips: &RoundTrips) -> Cost {
     assert_eq!(status, StatusCode::OK, "{body}");
     let page = body["value"].as_array().expect("a page of surfaces");
     assert_eq!(page.len(), 1, "{body}");
-    assert_eq!(page[0]["app"], "app-3", "{body}");
-    assert_eq!(page[0]["kind"], "react", "{body}");
+    assert_eq!(page[0]["fields"]["app"], "app-3", "{body}");
+    assert_eq!(page[0]["fields"]["kind"], "react", "{body}");
     cost
 }
 
