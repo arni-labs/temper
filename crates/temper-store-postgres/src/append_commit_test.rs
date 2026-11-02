@@ -389,10 +389,12 @@ fn racing_writer_aborts_with_none_of_its_rows() {
                 .await
         });
         // Wait until the store's statement is blocked on the rival's row: it
-        // has passed its sequence check and reached the journal insert.
+        // has passed its sequence check and reached the journal insert. The
+        // match is on the statement's opening, since pg_stat_activity keeps
+        // only the first `track_activity_query_size` bytes of its text.
         let waiting = format!(
             "SELECT COUNT(*)::bigint FROM pg_stat_activity \
-             WHERE wait_event_type = 'Lock' AND query LIKE '%{}%entity_projection_delta%'",
+             WHERE wait_event_type = 'Lock' AND query LIKE 'WITH locked AS (%{}%'",
             schema.prefix().trim_end_matches('.').trim_matches('"')
         );
         let mut blocked = false;
