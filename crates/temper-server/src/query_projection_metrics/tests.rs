@@ -2,15 +2,7 @@ use std::time::Duration;
 
 #[test]
 fn projection_metrics_record_all_observability_slices() {
-    super::record_update_enqueued("tenant", "Session", "upsert", "background_dispatch");
     super::record_update_started("tenant", "Session", "upsert", "background_dispatch");
-    super::record_update_queue_wait(
-        "tenant",
-        "Session",
-        "upsert",
-        "background_dispatch",
-        Duration::from_millis(2),
-    );
     super::record_update_duration(
         "tenant",
         "Session",

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use temper_runtime::tenant::TenantId;
 
-use crate::state::{ProjectionEnqueueOutcome, ServerState};
+use crate::state::ServerState;
 use crate::storage::QueryProjectionUpsert;
 
 use super::{AtomicCompositeStream, DispatchError};
@@ -13,12 +13,9 @@ impl ServerState {
         tenant: &TenantId,
         streams: &BTreeMap<String, AtomicCompositeStream>,
     ) -> Result<(), DispatchError> {
+        // A composite batch appends its streams without their rows, so their
+        // projections are written here, before the batch answers.
         let query_plane = self.query_plane_store();
-        let projection_queue = self
-            .query_projection_queue
-            .lock()
-            .ok()
-            .and_then(|slot| slot.clone());
         let mut projection_upserts = Vec::new();
 
         for stream in streams.values().filter(|stream| !stream.events.is_empty()) {
@@ -27,12 +24,7 @@ impl ServerState {
             self.clear_commons_storage_projection_cache_for_entity(&stream.entity_type);
 
             if query_plane.is_some() {
-                self.queue_or_stage_projection(
-                    tenant,
-                    stream,
-                    projection_queue.as_ref(),
-                    &mut projection_upserts,
-                );
+                projection_upserts.push(self.composite_projection(tenant, stream));
             }
         }
 
@@ -68,66 +60,23 @@ impl ServerState {
         Ok(())
     }
 
-    fn queue_or_stage_projection(
+    fn composite_projection(
         &self,
         tenant: &TenantId,
         stream: &AtomicCompositeStream,
-        projection_queue: Option<&std::sync::Arc<crate::state::QueryProjectionWriteQueue>>,
-        projection_upserts: &mut Vec<QueryProjectionUpsert>,
-    ) {
+    ) -> QueryProjectionUpsert {
         let fields = stream.state.fields.clone();
         let projected_state = self.query_projection_state(&stream.state);
-        if let Some(queue) = projection_queue {
-            let outcome = queue.enqueue_upsert(
-                tenant.to_string(),
-                stream.entity_type.clone(),
-                stream.entity_id.clone(),
-                stream.state.status.clone(),
-                fields,
-                projected_state,
-                stream.state.sequence_nr,
-                "queued_composite",
-            );
-            record_composite_projection_enqueue(tenant, stream, outcome);
-        } else {
-            let indexed_fields = self.query_projection_fields(tenant, &stream.entity_type, &fields);
-            projection_upserts.push(QueryProjectionUpsert {
-                entity_type: stream.entity_type.clone(),
-                entity_id: stream.entity_id.clone(),
-                status: stream.state.status.clone(),
-                fields,
-                state: projected_state,
-                indexed_fields,
-                sequence_nr: stream.state.sequence_nr,
-                known_new: !stream.target_existed,
-            });
-        }
-    }
-}
-
-fn record_composite_projection_enqueue(
-    tenant: &TenantId,
-    stream: &AtomicCompositeStream,
-    outcome: ProjectionEnqueueOutcome,
-) {
-    match outcome {
-        ProjectionEnqueueOutcome::Enqueued | ProjectionEnqueueOutcome::Coalesced => {
-            crate::query_projection_metrics::record_update_enqueued(
-                tenant.as_str(),
-                &stream.entity_type,
-                "upsert",
-                "queued_composite",
-            );
-        }
-        ProjectionEnqueueOutcome::StaleSkipped => {}
-        ProjectionEnqueueOutcome::Full => {
-            tracing::error!(
-                tenant = %tenant,
-                entity_type = %stream.entity_type,
-                entity_id = %stream.entity_id,
-                sequence_nr = stream.state.sequence_nr,
-                "bounded query projection queue full after composite batch"
-            );
+        let indexed_fields = self.query_projection_fields(tenant, &stream.entity_type, &fields);
+        QueryProjectionUpsert {
+            entity_type: stream.entity_type.clone(),
+            entity_id: stream.entity_id.clone(),
+            status: stream.state.status.clone(),
+            fields,
+            state: projected_state,
+            indexed_fields,
+            sequence_nr: stream.state.sequence_nr,
+            known_new: !stream.target_existed,
         }
     }
 }

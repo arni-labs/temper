@@ -9,17 +9,11 @@ use opentelemetry::{
 };
 
 struct QueryProjectionMetrics {
-    update_enqueued_total: Counter<u64>,
     update_started_total: Counter<u64>,
     update_error_total: Counter<u64>,
-    update_queue_wait_ms: Histogram<f64>,
     update_duration_ms: Histogram<f64>,
     update_end_to_end_duration_ms: Histogram<f64>,
     update_applied_sequence_nr: Gauge<u64>,
-    update_coalesced_total: Counter<u64>,
-    update_stale_skipped_total: Counter<u64>,
-    update_dropped_total: Counter<u64>,
-    update_queue_depth: Gauge<u64>,
     backfill_entities_total: Counter<u64>,
     backfill_duration_ms: Histogram<f64>,
     backfill_replay_events: Histogram<u64>,
@@ -42,12 +36,6 @@ fn metrics() -> &'static QueryProjectionMetrics {
     METRICS.get_or_init(|| {
         let meter = global::meter("temper.runtime");
         QueryProjectionMetrics {
-            update_enqueued_total: meter
-                .u64_counter("temper_query_projection_update_enqueued_total")
-                .with_description(
-                    "Durable query-plane projection updates enqueued after entity dispatch.",
-                )
-                .build(),
             update_started_total: meter
                 .u64_counter("temper_query_projection_update_started_total")
                 .with_description("Durable query-plane projection updates that started running.")
@@ -55,13 +43,6 @@ fn metrics() -> &'static QueryProjectionMetrics {
             update_error_total: meter
                 .u64_counter("temper_query_projection_update_error_total")
                 .with_description("Durable query-plane projection updates that failed.")
-                .build(),
-            update_queue_wait_ms: meter
-                .f64_histogram("temper_query_projection_update_queue_wait_ms")
-                .with_unit("ms")
-                .with_description(
-                    "Time a background durable query-plane projection update waited before running.",
-                )
                 .build(),
             update_duration_ms: meter
                 .f64_histogram("temper_query_projection_update_duration_ms")
@@ -82,28 +63,6 @@ fn metrics() -> &'static QueryProjectionMetrics {
                 .with_description(
                     "Latest authoritative entity sequence number applied to the durable query projection.",
                 )
-                .build(),
-            update_coalesced_total: meter
-                .u64_counter("temper_query_projection_update_coalesced_total")
-                .with_description(
-                    "Durable query-plane projection updates replaced by a newer pending sequence before DB access.",
-                )
-                .build(),
-            update_stale_skipped_total: meter
-                .u64_counter("temper_query_projection_update_stale_skipped_total")
-                .with_description(
-                    "Durable query-plane projection updates skipped before DB access because a newer sequence is pending.",
-                )
-                .build(),
-            update_dropped_total: meter
-                .u64_counter("temper_query_projection_update_dropped_total")
-                .with_description(
-                    "Durable query-plane projection updates rejected because the bounded queue was full.",
-                )
-                .build(),
-            update_queue_depth: meter
-                .u64_gauge("temper_query_projection_update_queue_depth")
-                .with_description("Current pending durable query-plane projection updates.")
                 .build(),
             backfill_entities_total: meter
                 .u64_counter("temper_query_projection_backfill_entities_total")
@@ -207,17 +166,6 @@ fn projection_attrs(
     ]
 }
 
-pub(crate) fn record_update_enqueued(
-    tenant: &str,
-    entity_type: &str,
-    operation: &str,
-    source: &str,
-) {
-    metrics()
-        .update_enqueued_total
-        .add(1, &projection_attrs(tenant, entity_type, operation, source));
-}
-
 pub(crate) fn record_update_started(
     tenant: &str,
     entity_type: &str,
@@ -227,19 +175,6 @@ pub(crate) fn record_update_started(
     metrics()
         .update_started_total
         .add(1, &projection_attrs(tenant, entity_type, operation, source));
-}
-
-pub(crate) fn record_update_queue_wait(
-    tenant: &str,
-    entity_type: &str,
-    operation: &str,
-    source: &str,
-    duration: Duration,
-) {
-    metrics().update_queue_wait_ms.record(
-        duration.as_secs_f64() * 1000.0,
-        &projection_attrs(tenant, entity_type, operation, source),
-    );
 }
 
 pub(crate) fn record_update_duration(
@@ -299,43 +234,6 @@ pub(crate) fn record_update_error(tenant: &str, entity_type: &str, operation: &s
     metrics()
         .update_error_total
         .add(1, &projection_attrs(tenant, entity_type, operation, source));
-}
-
-pub(crate) fn record_update_coalesced(
-    tenant: &str,
-    entity_type: &str,
-    operation: &str,
-    source: &str,
-) {
-    metrics()
-        .update_coalesced_total
-        .add(1, &projection_attrs(tenant, entity_type, operation, source));
-}
-
-pub(crate) fn record_update_stale_skipped(
-    tenant: &str,
-    entity_type: &str,
-    operation: &str,
-    source: &str,
-) {
-    metrics()
-        .update_stale_skipped_total
-        .add(1, &projection_attrs(tenant, entity_type, operation, source));
-}
-
-pub(crate) fn record_update_dropped(
-    tenant: &str,
-    entity_type: &str,
-    operation: &str,
-    source: &str,
-) {
-    metrics()
-        .update_dropped_total
-        .add(1, &projection_attrs(tenant, entity_type, operation, source));
-}
-
-pub(crate) fn record_update_queue_depth(depth: u64) {
-    metrics().update_queue_depth.record(depth, &[]);
 }
 
 pub(crate) fn record_backfill_entities(

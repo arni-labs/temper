@@ -7,8 +7,6 @@
 mod fixtures;
 #[path = "query_projection_snapshot_tail/postgres.rs"]
 mod postgres;
-#[path = "query_projection_snapshot_tail/read_failures.rs"]
-mod read_failures;
 
 use fixtures::{ENTITY_ID, build_state, projected_state, run_isolated, write_snapshot_and_tail};
 use temper_runtime::scheduler::install_deterministic_context;

@@ -203,9 +203,9 @@ async fn postgres_off_page_index_gap_cannot_inflate_declared_default_count() {
     pool.close().await;
 }
 
-async fn assert_count_during_write(mut stack: StorageStack, seed: u64) {
+async fn assert_count_during_write(stack: StorageStack, seed: u64) {
     let tenant = TenantId::from(format!("count-race-{seed}"));
-    let store = stack.query_plane.clone().unwrap();
+    let store = stack.query_plane().cloned().unwrap();
     for (id, currency) in [("ord-00", "USD"), ("ord-99", "EUR")] {
         write_projection(store.as_ref(), tenant.as_str(), id, currency, 1).await;
     }
@@ -214,7 +214,7 @@ async fn assert_count_during_write(mut stack: StorageStack, seed: u64) {
         write_pending: AtomicBool::new(true),
         replacement: format!("{seed:02001}"),
     });
-    stack.query_plane = Some(qp.clone());
+    let stack = stack.with_read_probe(qp.clone());
     let mut state = build_order_state("declared-default-count-race");
     state.set_storage_stack(stack);
     let spec = format!(
