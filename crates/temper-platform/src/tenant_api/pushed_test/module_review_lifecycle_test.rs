@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[path = "module_review_storage.rs"]
+#[path = "module_review_storage_test.rs"]
 mod storage;
 use storage::ReviewStore;
 
