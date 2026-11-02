@@ -551,39 +551,48 @@ impl PostgresEventStore {
             // took that lock and the batch's transaction still holds it. On
             // its own, the first run committed and let it go, so the second
             // takes it first, in a transaction of its own.
-            None => match scope {
-                AppendScope::InBatch => {
-                    self.run_append(conn, &params, expected_sequence, entity_type, timer)
+            None => {
+                let raced_again = || {
+                    PersistenceError::Storage(format!(
+                        "the {entity_type} record's catalog row changed while this append \
+                         held its lock"
+                    ))
+                };
+                match scope {
+                    AppendScope::InBatch => self
+                        .run_append(conn, &params, expected_sequence, entity_type, timer)
                         .await?
-                }
-                AppendScope::Alone => {
-                    let mut tx = sqlx::Connection::begin(&mut *conn)
-                        .await
-                        .map_err(storage_error)?;
-                    let _held: Option<i32> = crate::dbm::postgres_query_scalar!(
-                        &self.schema,
-                        "SELECT 1 FROM {schema}entity_catalog \
-                         WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 \
-                         FOR UPDATE",
-                    )
-                    .bind(tenant)
-                    .bind(entity_type)
-                    .bind(entity_id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(storage_error)?;
-                    let written = self
-                        .run_append(&mut tx, &params, expected_sequence, entity_type, timer)
-                        .await?;
-                    tx.commit().await.map_err(storage_error)?;
-                    written
+                        .ok_or_else(raced_again)?,
+                    AppendScope::Alone => {
+                        retry_seam::before_retry(self.schema.prefix()).await;
+                        let mut tx = sqlx::Connection::begin(&mut *conn)
+                            .await
+                            .map_err(storage_error)?;
+                        if retry_seam::takes_retry_lock(self.schema.prefix()) {
+                            let _held: Option<i32> = crate::dbm::postgres_query_scalar!(
+                                &self.schema,
+                                "SELECT 1 FROM {schema}entity_catalog \
+                                 WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 \
+                                 FOR UPDATE",
+                            )
+                            .bind(tenant)
+                            .bind(entity_type)
+                            .bind(entity_id)
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(storage_error)?;
+                        }
+                        // A second race returns before the commit: the
+                        // transaction rolls back with nothing written.
+                        let written = self
+                            .run_append(&mut tx, &params, expected_sequence, entity_type, timer)
+                            .await?
+                            .ok_or_else(raced_again)?;
+                        tx.commit().await.map_err(storage_error)?;
+                        written
+                    }
                 }
             }
-            .ok_or_else(|| {
-                PersistenceError::Storage(format!(
-                    "the {entity_type} record's catalog row changed while this append held its lock"
-                ))
-            })?,
         };
         if params.projection.op == Some("upsert") {
             record_postgres_projection_index_fields(
@@ -608,6 +617,7 @@ impl PostgresEventStore {
         entity_type: &str,
         timer: &mut PostgresTransactionTimer,
     ) -> Result<Option<u64>, PersistenceError> {
+        retry_seam::ran(self.schema.prefix());
         let answer = params
             .bind(crate::dbm::postgres_query_as!(
                 &self.schema,
@@ -625,6 +635,79 @@ impl PostgresEventStore {
                 Err(error)
             }
         }
+    }
+}
+
+/// Hooks into a raced append's retry, for tests: they count the statement's
+/// runs and can force the second run to race. Outside tests they do nothing.
+#[cfg(not(test))]
+mod retry_seam {
+    pub(super) fn ran(_schema: &str) {}
+    pub(super) async fn before_retry(_schema: &str) {}
+    pub(super) fn takes_retry_lock(_schema: &str) -> bool {
+        true
+    }
+}
+
+/// Hooks into a raced append's retry, keyed by the store's schema so tests
+/// running at once do not share them. A schema with no seam installed runs as
+/// production does.
+#[cfg(test)]
+pub(crate) mod retry_seam {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    use tokio::sync::oneshot;
+
+    /// What one test asks of the appends in its schema.
+    #[derive(Default)]
+    pub(crate) struct Seam {
+        /// How many times the append statement ran.
+        pub(crate) runs: usize,
+        /// Leave out the retry's lock statement, so its run can race again.
+        pub(crate) skip_retry_lock: bool,
+        /// Told when a retry starts; the retry waits for the answer.
+        pub(crate) before_retry: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    }
+
+    static SEAMS: Mutex<BTreeMap<String, Seam>> = Mutex::new(BTreeMap::new());
+
+    pub(crate) fn install(schema: &str, seam: Seam) {
+        SEAMS.lock().unwrap().insert(schema.to_string(), seam);
+    }
+
+    pub(crate) fn runs(schema: &str) -> usize {
+        SEAMS
+            .lock()
+            .unwrap()
+            .get(schema)
+            .map_or(0, |seam| seam.runs)
+    }
+
+    pub(super) fn ran(schema: &str) {
+        if let Some(seam) = SEAMS.lock().unwrap().get_mut(schema) {
+            seam.runs += 1;
+        }
+    }
+
+    pub(super) async fn before_retry(schema: &str) {
+        let pair = SEAMS
+            .lock()
+            .unwrap()
+            .get_mut(schema)
+            .and_then(|seam| seam.before_retry.take());
+        if let Some((started, go)) = pair {
+            let _ = started.send(());
+            let _ = go.await;
+        }
+    }
+
+    pub(super) fn takes_retry_lock(schema: &str) -> bool {
+        SEAMS
+            .lock()
+            .unwrap()
+            .get(schema)
+            .is_none_or(|seam| !seam.skip_retry_lock)
     }
 }
 

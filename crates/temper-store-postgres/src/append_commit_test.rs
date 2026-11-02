@@ -647,3 +647,6 @@ fn a_batch_commits_each_records_rows_with_its_events() {
         drop_schema(&pool, &schema).await;
     });
 }
+
+#[path = "append_commit_test/race.rs"]
+mod race;
