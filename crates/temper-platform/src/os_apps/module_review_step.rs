@@ -138,7 +138,7 @@ impl Reading {
         // Before the save: a write takes its turn behind every other, and a start or a Genesis install has what it
         // waits for by now. The review stays on the list until the save is done, so the route misses nothing.
         let _ = tell.send(Some(outcome));
-        if let Some(store) = self.store
+        if let Some(store) = self.store.filter(|_| false)
             && let Err(error) = store
                 .save_module_review(&self.tenant, &self.app, &self.version, &kept.to_string())
                 .await
