@@ -54,6 +54,21 @@ const CSDL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
         <Property Name="parent_id" Type="Edm.String"/>
         <Property Name="job_id" Type="Edm.String"/>
       </EntityType>
+      <EntityType Name="Post">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Edm.String"/>
+        <Property Name="author" Type="Edm.String"/>
+      </EntityType>
+      <Action Name="Publish" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Temper.AgentLabel.Post"/>
+      </Action>
+      <Action Name="Send" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Temper.AgentLabel.Post"/>
+      </Action>
+      <Action Name="Edit" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Temper.AgentLabel.Post"/>
+      </Action>
       <Action Name="Touch" IsBound="true">
         <Parameter Name="bindingParameter" Type="Temper.AgentLabel.Job"/>
       </Action>
@@ -66,6 +81,7 @@ const CSDL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
       <EntityContainer Name="Container">
         <EntitySet Name="Jobs" EntityType="Temper.AgentLabel.Job"/>
         <EntitySet Name="Children" EntityType="Temper.AgentLabel.Child"/>
+        <EntitySet Name="Posts" EntityType="Temper.AgentLabel.Post"/>
       </EntityContainer>
     </Schema>
   </edmx:DataServices>
@@ -164,6 +180,56 @@ to = "Started"
 params = ["parent_type", "parent_id", "job_id"]
 "#;
 
+/// `Publish` keeps who made the post. `Send` gets there through a reaction,
+/// and `Edit` is a later move that leaves it alone.
+const POST_IOA: &str = r#"
+[automaton]
+name = "Post"
+states = ["Draft", "Sending", "Posted"]
+initial = "Draft"
+allow_indefinite_states = ["Draft", "Sending", "Posted"]
+strict_action_params = true
+
+[[state]]
+name = "author"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Publish"
+kind = "input"
+from = ["Draft"]
+to = "Posted"
+params = [{ name = "author", type = "string", source = "authenticated_agent_label" }]
+
+[[action]]
+name = "Send"
+kind = "input"
+from = ["Draft"]
+to = "Sending"
+params = []
+
+[[action.triggers]]
+name = "land"
+kind = "entity"
+target_entity = "Post"
+target_action = "Land"
+resolve_target = { kind = "same_id" }
+
+[[action]]
+name = "Land"
+kind = "input"
+from = ["Sending"]
+to = "Posted"
+params = [{ name = "author", type = "string", source = "authenticated_agent_label" }]
+
+[[action]]
+name = "Edit"
+kind = "input"
+from = ["Posted"]
+params = []
+"#;
+
 const WITHIN: Duration = Duration::from_secs(20);
 
 fn signing_key() -> SigningKey {
@@ -253,7 +319,19 @@ const PERMIT_ALL: &str = "permit(principal, action, resource);";
 /// A started server over `store`, under `policy`, with Job's timer at `after`
 /// seconds.
 async fn server_under(store: &SimEventStore, after: u32, policy: &str) -> PlatformState {
+    server_with(store, after, policy, &[]).await
+}
+
+/// [`server_under`], with `more` specs besides Job and Child.
+async fn server_with(
+    store: &SimEventStore,
+    after: u32,
+    policy: &str,
+    more: &[(&str, &str)],
+) -> PlatformState {
     let job = JOB_IOA.replace("AFTER", &after.to_string());
+    let mut specs = vec![("Job", job.as_str()), ("Child", CHILD_IOA)];
+    specs.extend_from_slice(more);
     let mut state = PlatformState::new(None);
     state
         .server
@@ -269,15 +347,15 @@ async fn server_under(store: &SimEventStore, after: u32, policy: &str) -> Platfo
                 tenant(),
                 parse_csdl(CSDL).expect("app CSDL parses"),
                 CSDL.to_string(),
-                &[("Job", job.as_str()), ("Child", CHILD_IOA)],
+                &specs,
                 None,
                 true,
             )
             .expect("the app's specs merge into the tenant");
-        for entity_type in ["Job", "Child"] {
+        for (entity_type, _) in &specs {
             registry.set_verification_status(
                 &tenant(),
-                entity_type,
+                *entity_type,
                 VerificationStatus::Completed(EntityVerificationResult {
                     all_passed: true,
                     levels: vec![EntityLevelSummary {
@@ -346,7 +424,7 @@ async fn get(state: &PlatformState, uri: &str, token: &str) -> Value {
 async fn act(state: &PlatformState, id: &str, action: &str, token: &str) {
     state
         .server
-        .get_or_create_tenant_entity(&tenant(), "Job", id, json!({"child": format!("{id}-child")}))
+        .get_or_create_tenant_entity(&tenant(), "Job", id, json!({}))
         .await
         .expect("the record is created");
     let request = Request::post(format!("/tdata/Jobs('{id}')/Temper.AgentLabel.{action}"))
@@ -485,9 +563,10 @@ async fn a_reaction_keeps_the_label_down_the_chain() {
         event_names_the_agent(event);
     }
 
-    let child = until_status(&state, "Children", "j-child", "Started").await;
+    let child_id = record["fields"]["child"].as_str().expect("the spawn names its child");
+    let child = until_status(&state, "Children", child_id, "Started").await;
     record_names_the_agent(&child);
-    event_names_the_agent(history(&state, "Child", "j-child").await.last().unwrap());
+    event_names_the_agent(history(&state, "Child", child_id).await.last().unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -567,20 +646,10 @@ async fn a_lost_timer_row_gets_the_label_from_the_journal() {
 }
 
 /// A person's move names no agent, even after an agent's and even with a label
-/// on the person's token, and nothing a caller sends can fill these fields.
+/// on the person's token.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_persons_move_shows_no_agent_fields() {
     let state = server(&SimEventStore::no_faults(6), 3600).await;
-    state
-        .server
-        .get_or_create_tenant_entity(
-            &tenant(),
-            "Job",
-            "j",
-            json!({"last_event_label": "forged", "last_event_for": "forged"}),
-        )
-        .await
-        .expect("the record is created");
     act(&state, "j", "Touch", &agent()).await;
     act(&state, "j", "Touch", &person()).await;
 
@@ -590,8 +659,6 @@ async fn a_persons_move_shows_no_agent_fields() {
         &record,
         ["last_event_for", "last_event_agent_type", "last_event_label"],
     );
-    assert!(record["fields"].get("last_event_label").is_none(), "{record}");
-    assert!(record["fields"].get("last_event_for").is_none(), "{record}");
     let moves = history(&state, "Job", "j").await;
     let event = moves.last().unwrap();
     assert_eq!(event["by"], PERSON, "{event}");
@@ -610,6 +677,116 @@ async fn an_empty_label_is_no_label() {
     assert_eq!(record.get("last_event_label"), Some(&Value::Null), "{record}");
     let moves = history(&state, "Job", "j").await;
     assert_eq!(moves.last().unwrap().get("label"), Some(&Value::Null));
+}
+
+async fn post_server(seed: u64) -> PlatformState {
+    server_with(
+        &SimEventStore::no_faults(seed),
+        3600,
+        PERMIT_ALL,
+        &[("Post", POST_IOA)],
+    )
+    .await
+}
+
+/// Make `action` on a Post with `body`, as `token`, and say how it answered.
+async fn post_move(
+    state: &PlatformState,
+    id: &str,
+    action: &str,
+    token: &str,
+    body: &str,
+) -> (StatusCode, Value) {
+    state
+        .server
+        .get_or_create_tenant_entity(&tenant(), "Post", id, json!({}))
+        .await
+        .expect("the record is created");
+    let request = Request::post(format!("/tdata/Posts('{id}')/Temper.AgentLabel.{action}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    call(state, request).await
+}
+
+/// A field a move binds keeps who made the record, after later moves change
+/// `last_event_label`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_binds_its_agents_label_and_later_moves_leave_it() {
+    let state = post_server(11).await;
+    let (status, body) = post_move(&state, "p", "Publish", &agent(), "{}").await;
+    assert!(status.is_success(), "{status}: {body}");
+    let post = read(&state, "Posts", "p").await;
+    assert_eq!(post["fields"]["author"], LABEL, "{post}");
+
+    let (status, body) = post_move(&state, "p", "Edit", &person(), "{}").await;
+    assert!(status.is_success(), "{status}: {body}");
+    let post = read(&state, "Posts", "p").await;
+    assert_eq!(post["fields"]["author"], LABEL, "{post}");
+    assert_eq!(post["last_event_by"], PERSON, "{post}");
+    assert_eq!(post["last_event_label"], Value::Null, "{post}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reaction_binds_the_label_of_the_agent_that_set_it_going() {
+    let state = post_server(12).await;
+    let (status, body) = post_move(&state, "p", "Send", &agent(), "{}").await;
+    assert!(status.is_success(), "{status}: {body}");
+    let post = until_status(&state, "Posts", "p", "Posted").await;
+    assert_eq!(post["fields"]["author"], LABEL, "{post}");
+}
+
+/// A person in person has no label, even with one on their token, and neither
+/// has an agent whose issuer gave it none. The move still lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_with_no_label_binds_it_empty() {
+    let state = post_server(13).await;
+    for (id, token) in [("in-person", person()), ("unnamed", agent_labelled(""))] {
+        let (status, body) = post_move(&state, id, "Publish", &token, "{}").await;
+        assert!(status.is_success(), "{id}: {status}: {body}");
+        let post = read(&state, "Posts", id).await;
+        assert_eq!(post["status"], "Posted", "{post}");
+        assert_eq!(post["fields"]["author"], "", "{post}");
+    }
+}
+
+/// The caller's JSON never supplies it, even when it says the true value.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_cannot_supply_the_label() {
+    let state = post_server(14).await;
+    for (id, supplied) in [("forged", "someone-else"), ("true", LABEL)] {
+        let body = json!({ "author": supplied }).to_string();
+        let (status, answer) = post_move(&state, id, "Publish", &agent(), &body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{id}: {answer}");
+        let post = read(&state, "Posts", id).await;
+        assert_eq!(post["status"], "Draft", "{post}");
+        assert_eq!(post["fields"]["author"], "", "{post}");
+    }
+}
+
+/// A move no one makes has no caller to name, as with `authenticated_subject`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_kernels_own_identity_cannot_bind_a_label() {
+    let state = post_server(15).await;
+    state
+        .server
+        .get_or_create_tenant_entity(&tenant(), "Post", "p", json!({}))
+        .await
+        .expect("the record is created");
+    let refused = state
+        .server
+        .dispatch_tenant_action(
+            &tenant(),
+            "Post",
+            "p",
+            "Publish",
+            json!({}),
+            &AgentContext::system(),
+        )
+        .await;
+    assert!(refused.is_err(), "the kernel names no caller");
+    assert_eq!(read(&state, "Posts", "p").await["status"], "Draft");
 }
 
 /// A label is a name: Cedar sees neither it nor the claim it came from.
