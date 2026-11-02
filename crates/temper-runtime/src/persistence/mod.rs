@@ -168,7 +168,7 @@ pub struct EntityVectorCandidate {
 
 /// One armed `[[state_timeout]]`, kept so that a restarted server arms it
 /// again (ADR-0056). One row per entity: a state declares at most one timeout.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateTimerRecord {
     pub tenant: String,
     pub entity_type: String,
@@ -707,6 +707,10 @@ pub struct PersistenceAppend {
     /// transaction, as [`CommitRows::projection`] in a single append.
     #[serde(default)]
     pub projection: Option<AppendProjection>,
+    /// The last timer mutation in this append. None preserves the existing
+    /// arm, including when a later event does not reset its clock.
+    #[serde(default)]
+    pub state_timer: Option<AppendStateTimer>,
 }
 
 /// An entity's query-plane row, owned, for an append in a batch.
@@ -740,11 +744,31 @@ impl AppendProjection {
     }
 }
 
+/// An owned timer mutation committed with a batch stream's events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AppendStateTimer {
+    /// Entering or resetting a timed state replaces its durable arm.
+    Arm(StateTimerRecord),
+    /// Leaving a timed state or consuming a one-shot timer removes its arm.
+    End,
+}
+
+impl AppendStateTimer {
+    /// Borrow this mutation for the same writer a single append uses.
+    pub fn as_row(&self) -> StateTimerRow<'_> {
+        match self {
+            Self::Arm(row) => StateTimerRow::Arm(row),
+            Self::End => StateTimerRow::End,
+        }
+    }
+}
+
 impl PersistenceAppend {
-    /// The rows this append commits with its events: only its projection.
+    /// The rows this append commits with its events.
     pub fn commit_rows(&self) -> CommitRows<'_> {
         CommitRows {
             projection: self.projection.as_ref().map(AppendProjection::as_row),
+            state_timer: self.state_timer.as_ref().map(AppendStateTimer::as_row),
             ..CommitRows::default()
         }
     }

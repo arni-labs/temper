@@ -121,6 +121,8 @@ impl ServerState {
                         actor_id: persistence_id,
                     },
                 }],
+                state_timer: commits_rows
+                    .then_some(temper_runtime::persistence::AppendStateTimer::End),
                 projection: commits_rows.then_some(AppendProjection::Remove),
             });
             member.record_tombstone(tombstone);

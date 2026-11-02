@@ -24,6 +24,11 @@ impl ServerState {
                 persistence_id: persistence_id.clone(),
                 expected_sequence: stream.expected_sequence,
                 events: stream.events.clone(),
+                state_timer: if commits_rows {
+                    stream.state_timer.clone()
+                } else {
+                    None
+                },
                 projection: commits_rows
                     .then(|| self.append_projection(tenant, &stream.entity_type, &stream.state)),
             })

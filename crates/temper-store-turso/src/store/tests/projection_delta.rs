@@ -116,6 +116,7 @@ async fn projection_delta_covers_batch_snapshot_wrapped_and_removed_rows() {
             persistence_id: "t:Payment:batch".into(),
             expected_sequence: 0,
             events: vec![test_envelope("Create", serde_json::json!({}))],
+            state_timer: None,
             projection: None,
         }])
         .await
@@ -272,6 +273,7 @@ async fn a_batch_commits_each_records_projection_with_its_events() {
         persistence_id: format!("t:Payment:{id}"),
         expected_sequence: 0,
         events: vec![test_envelope("Create", serde_json::json!({}))],
+        state_timer: None,
         projection: Some(temper_runtime::persistence::AppendProjection::Upsert {
             status: "Draft".into(),
             fields: serde_json::json!({"Id": id, "app": "needle"}),
@@ -294,9 +296,96 @@ async fn a_batch_commits_each_records_projection_with_its_events() {
                 "Deleted",
                 serde_json::json!({"kind": "tombstone"}),
             )],
+            state_timer: None,
             projection: Some(temper_runtime::persistence::AppendProjection::Remove),
         }])
         .await
         .unwrap();
     assert_eq!(candidates(&store, "t").await.0, vec!["two".to_string()]);
+}
+
+#[tokio::test]
+async fn a_batch_commits_timer_resets_and_ends_or_none_of_its_rows() {
+    use temper_runtime::persistence::{AppendStateTimer, StateTimerRecord};
+    let store = make_store("projection-delta-batch-timers").await;
+    let arm = |id: &str, seq: u64| StateTimerRecord {
+        tenant: "t".into(),
+        entity_type: "Payment".into(),
+        entity_id: id.into(),
+        state: "Draft".into(),
+        arm_id: format!("Draft-{seq}"),
+        sequence_nr: seq,
+        started_at: format!("2026-11-02T00:00:{seq:02}Z"),
+        params: format!("{{\"version\":{seq}}}"),
+        armed_by: format!("{{\"agent_id\":\"caller-{seq}\"}}"),
+    };
+    let append = |id: &str, expected, timer| PersistenceAppend {
+        persistence_id: format!("t:Payment:{id}"),
+        expected_sequence: expected,
+        events: vec![test_envelope("Move", serde_json::json!({}))],
+        state_timer: timer,
+        projection: Some(temper_runtime::persistence::AppendProjection::Upsert {
+            status: "Draft".into(),
+            fields: serde_json::json!({"Id": id}),
+            state: serde_json::json!({}),
+        }),
+    };
+    let a = arm("one", 1);
+    let b = arm("two", 1);
+    store
+        .append_batch(&[
+            append("one", 0, Some(AppendStateTimer::Arm(a.clone()))),
+            append("two", 0, Some(AppendStateTimer::Arm(b.clone()))),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        {
+            let mut rows = store.list_state_timers("t").await.unwrap();
+            rows.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
+            rows
+        },
+        vec![a.clone(), b.clone()]
+    );
+    let reset = arm("one", 2);
+    let refused = store
+        .append_batch(&[
+            append("one", 1, Some(AppendStateTimer::Arm(reset.clone()))),
+            append("two", 0, Some(AppendStateTimer::End)),
+        ])
+        .await;
+    assert!(matches!(
+        refused,
+        Err(PersistenceError::ConcurrencyViolation { .. })
+    ));
+    assert_eq!(
+        store.read_events("t:Payment:one", 0).await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        {
+            let mut rows = store.list_state_timers("t").await.unwrap();
+            rows.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
+            rows
+        },
+        vec![a, b]
+    );
+    store
+        .append_batch(&[
+            append("one", 1, Some(AppendStateTimer::Arm(reset.clone()))),
+            append("two", 1, Some(AppendStateTimer::End)),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.list_state_timers("t").await.unwrap(),
+        vec![reset.clone()]
+    );
+    store.append_batch(&[append("one", 2, None)]).await.unwrap();
+    assert_eq!(store.list_state_timers("t").await.unwrap(), vec![reset]);
+    store
+        .append_batch(&[append("one", 3, Some(AppendStateTimer::End))])
+        .await
+        .unwrap();
+    assert!(store.list_state_timers("t").await.unwrap().is_empty());
 }

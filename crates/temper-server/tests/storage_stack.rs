@@ -220,6 +220,7 @@ async fn boxed_event_store_delegates_through_object_safe_adapter() {
                 persistence_id: "default:Ticket:t-1".to_string(),
                 expected_sequence: 0,
                 events: events.clone(),
+                state_timer: None,
                 projection: None,
             }])
             .await

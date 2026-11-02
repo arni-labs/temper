@@ -90,7 +90,7 @@ impl ServerState {
     }
 
     /// The timer row `input`'s event writes, or None to leave it.
-    fn committed_timer_row(
+    pub(super) fn committed_timer_row(
         &self,
         tenant: &TenantId,
         entity_type: &str,

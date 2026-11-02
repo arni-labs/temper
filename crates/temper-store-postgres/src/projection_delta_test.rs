@@ -226,6 +226,7 @@ fn projection_delta_covers_batch_snapshot_wrapped_removed_and_native_rows() {
                 persistence_id: "t:Payment:batch".into(),
                 expected_sequence: 0,
                 events: vec![created()],
+                state_timer: None,
                 projection: None,
             }])
             .await

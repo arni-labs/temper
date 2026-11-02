@@ -78,6 +78,7 @@ struct AtomicCompositeStream {
     state: EntityState,
     expected_sequence: u64,
     events: Vec<PersistenceEnvelope>,
+    state_timer: Option<temper_runtime::persistence::AppendStateTimer>,
 }
 
 #[derive(Debug, Clone)]
@@ -378,7 +379,14 @@ impl crate::state::ServerState {
                 .push(composite_envelope(&persistence_id, &event, &stream.state)?);
             stream.state.sequence_nr = stream.state.sequence_nr.saturating_add(1);
             stream.state.push_event_bounded(event);
-            timed.extend(self.timed_transition(&parent, write, &stream.state));
+            if let Some(transition) = self.timed_transition(&parent, write, &stream.state) {
+                // Keep the latest mutation, even if subsequent sub-writes
+                // leave this timer's clock and captured arguments unchanged.
+                if let Some(row) = transition.timer_row(self, tenant) {
+                    stream.state_timer = Some(row);
+                }
+                timed.push(transition);
+            }
         }
         let stage_ms = stage_started_at.map(|started| started.elapsed().as_millis() as u64);
 
@@ -539,6 +547,7 @@ impl crate::state::ServerState {
                 state,
                 expected_sequence,
                 events,
+                state_timer: None,
             },
         );
         Ok(())
@@ -834,6 +843,7 @@ impl crate::state::ServerState {
             state: before.state.clone(),
             expected_sequence: before.state.sequence_nr,
             events: Vec::new(),
+            state_timer: None,
         };
         if should_skip_existing_pack_object_create(write, &stream)
             || (!is_incomplete_existing_pack_object_create(write, &stream)
