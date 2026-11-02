@@ -68,10 +68,10 @@ env:
 
 jobs:
   # ─────────────────────────────────────────────────────
-  # What this run tests. Push, schedule and a plain dispatch: everything (lane "full").
-  # A pull request or a merge group: only the packages its changes can reach (lane "pr"),
-  # see scripts/ci/affected.py. A merge group's changes are those of every pull request in it.
-  # A push whose tree already passed in a merge group: nothing to test, like a docs-only change.
+  # What this run tests. Schedule and a plain dispatch: everything (lane "full"). A push, a pull
+  # request or a merge group: only the packages its changes can reach (lane "pr"), see
+  # scripts/ci/affected.py. A merge group's changes are those of every pull request in it; a push's
+  # are what it moved main by. A push whose tree already passed in a merge group: nothing to test.
   # Every test runs once, in the merge group (Rita, 31 Oct 2026: "CI 2 times is insane"): a pull
   # request only compiles and lints (Compile & Lint, Integrity, Instrumentation Hygiene, the
   # SDK's type check), so its author sees a broken build in about four minutes, and every job
@@ -121,8 +121,8 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           VERIFIED_RUN: ${{ steps.verified.outputs.run }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
           CHANGED_PATHS: ${{ inputs.changed }}
           # cargo metadata --no-deps needs no particular toolchain; skip installing the pinned one.
           RUSTUP_TOOLCHAIN: stable
@@ -468,6 +468,9 @@ jobs:
           tar -xJf /tmp/tursodb.tar.xz -C /tmp
           echo "TEMPER_TEST_TURSODB=/tmp/turso_cli-x86_64-unknown-linux-gnu/tursodb" >> "$GITHUB_ENV"
 
+      - run: echo "::add-matcher::.github/rust-test-failures.json"
+        if: matrix.args != ''
+
       - name: cargo nextest run (affected packages, skip dst_)
         if: matrix.args != ''
         env:
@@ -508,8 +511,8 @@ jobs:
 
   # ─────────────────────────────────────────────────────
   # Gate 3: Full test suite (minutes)
-  # The required "Tests" check. Full lane (push, schedule, plain dispatch): the
-  # whole workspace on one machine, exactly as before. Pull-request lane: passes
+  # The required "Tests" check. Full lane (schedule, plain dispatch): the
+  # whole workspace on one machine, exactly as before. Pull-request lane (also a push): passes
   # when every test shard above passed, or nothing needed testing, or on a pull
   # request, which runs no tests (its merge group runs them). Either lane also
   # needs Other workspaces to have passed, or to have had nothing to test.
@@ -621,6 +624,9 @@ jobs:
           tar -xJf /tmp/tursodb.tar.xz -C /tmp
           echo "TEMPER_TEST_TURSODB=/tmp/turso_cli-x86_64-unknown-linux-gnu/tursodb" >> "$GITHUB_ENV"
 
+      - run: echo "::add-matcher::.github/rust-test-failures.json"
+        if: needs.changes.outputs.lane == 'full'
+
       - name: cargo nextest run --workspace (skip dst_)
         if: needs.changes.outputs.lane == 'full'
         env:
@@ -708,9 +714,18 @@ jobs:
         if: steps.select.outputs.args != ''
         uses: rui314/setup-mold@v1
 
+      # rust-cache hashes every installed toolchain into its key, so this job shares the
+      # test jobs' cache only with the runner image's own stable Rust gone, as in theirs.
+      - name: Keep only the pinned toolchain
+        if: steps.select.outputs.args != ''
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
+
       - name: Cache Rust build
         if: steps.select.outputs.args != ''
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: false
 
       - name: Install cargo-nextest
         if: steps.select.outputs.args != ''
@@ -800,6 +815,9 @@ jobs:
         with:
           tool: cargo-nextest
 
+      - run: echo "::add-matcher::.github/rust-test-failures.json"
+        if: env.DST_NEEDED == 'true'
+
       # A package set can hold no test of a cell (a change only to temper-cli), so an
       # empty selection passes with a warning.
       - name: cargo nextest DST/platform suite
@@ -819,10 +837,12 @@ jobs:
     name: Spec Verification (L0-L3)
     needs: changes
     # These are temper-cli's verify:: tests, which read every spec collection in the
-    # repository. The full lane runs them; the pr lane runs them when a spec file
-    # changed (scripts/ci/affected.py, SPEC_FILES). The Tests shards also run them
-    # whenever a change reaches temper-cli.
-    if: needs.changes.outputs.specs == 'true' && needs.changes.outputs.tests == 'true'
+    # repository. The pr lane runs them here when a spec file
+    # changed (scripts/ci/affected.py, SPEC_FILES). A run that tests temper-cli runs them
+    # in Tests already, so this job only runs when it does not.
+    if: >-
+      needs.changes.outputs.specs == 'true' && needs.changes.outputs.tests == 'true'
+      && !contains(format(' {0} ', needs.changes.outputs.packages), ' temper-cli ')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -848,9 +868,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ env.SAVE_RUST_CACHE }}
-
-      - name: Build temper-cli
-        run: cargo build --locked -p temper-cli
 
       # Source collections include partial fixtures and examples whose Rust
       # hosts/build scripts supply policies and modules. Keep checking every
