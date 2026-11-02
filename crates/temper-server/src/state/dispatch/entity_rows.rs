@@ -23,6 +23,7 @@ use super::state_timeouts::{rearm_clock_start, timer_agent};
 use crate::entity_actor::entity_rows::{
     EntityRows, EntityRowsHook, Projection, RowsInput, TimerRow,
 };
+use crate::odata::read_defaults::ReadDefaults;
 use crate::request_context::armed_by::encode_armed_by;
 use crate::state::ServerState;
 
@@ -130,8 +131,10 @@ impl ServerState {
                 .then_some(TimerRow::End);
         }
         let caller = input.caller?;
+        let read =
+            ReadDefaults::for_entity(self, tenant, entity_type).fields_as_read(&after.fields);
         let (params, _missing) =
-            temper_spec::automaton::resolve_args(&st.args, &after.entity_id, &after.fields);
+            temper_spec::automaton::resolve_args(&st.args, &after.entity_id, &read);
         let armed_by = match encode_armed_by(&timer_agent(caller)) {
             Ok(armed_by) => armed_by,
             Err(error) => {

@@ -57,6 +57,7 @@ use temper_runtime::tenant::TenantId;
 
 use crate::entity_actor::{EntityEvent, EntityResponse, EntityState};
 use crate::idempotency::IdempotencyKey;
+use crate::odata::read_defaults::ReadDefaults;
 use crate::request_context::{AgentContext, StateTimerFire};
 
 use super::effects::PostDispatchContext;
@@ -455,9 +456,9 @@ impl crate::state::ServerState {
         let mut timer = declared_timer(
             ctx.tenant,
             ctx.entity_type,
-            ctx.entity_id,
             &st,
             &response.state,
+            &ReadDefaults::for_entity(self, ctx.tenant, ctx.entity_type),
             ctx.agent_ctx,
             started_at,
         );
@@ -822,18 +823,20 @@ pub(super) fn rearm_clock_start(
 
 /// The timer `st` arms on an entity, firing as `armed_by`. ADR-0181: `args`
 /// are read when the timer is armed, against the entity as it entered the
-/// state.
+/// state, as guards read it: a variable it stores no value for reads as its
+/// declared initial value in `declared`.
 pub(super) fn declared_timer(
     tenant: &TenantId,
     entity_type: &str,
-    entity_id: &str,
     st: &temper_spec::automaton::StateTimeout,
     state: &EntityState,
+    declared: &ReadDefaults,
     armed_by: &AgentContext,
     started_at: DateTime<Utc>,
 ) -> ArmedTimer {
-    let (params, missing) =
-        temper_spec::automaton::resolve_args(&st.args, entity_id, &state.fields);
+    let entity_id = state.entity_id.as_str();
+    let read = declared.fields_as_read(&state.fields);
+    let (params, missing) = temper_spec::automaton::resolve_args(&st.args, entity_id, &read);
     for field in missing {
         tracing::warn!(
             entity_type,
