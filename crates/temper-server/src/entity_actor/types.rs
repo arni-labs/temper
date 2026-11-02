@@ -448,6 +448,9 @@ impl EntityResponse {
     }
 }
 
+#[path = "module_record.rs"]
+mod module_record;
+
 #[cfg(test)]
 #[path = "types_test.rs"]
 mod tests;
