@@ -402,7 +402,7 @@ pub async fn install_genesis_app_from_registry(
         0,
     );
     // This answer says what Jev found in every app it installed, so it waits for him.
-    let install = installed.install.with_reviews_read().await;
+    let install = installed.install;
     Ok(GenesisRegistryInstallResult {
         app_ref: request.app_ref,
         tenant: request.tenant,

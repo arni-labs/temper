@@ -998,4 +998,4 @@ jobs:
           set -f
           ARGS=$(python3 -c 'import sys; sys.path.insert(0, "scripts/ci"); import affected; print(affected.test_args(set(sys.argv[1:])) or "--workspace")' $PACKAGES)
           echo "cargo nextest run --locked $ARGS --run-ignored all --no-tests=fail -E '$TESTS'"
-          cargo nextest run --locked $ARGS --run-ignored all --no-tests=fail -E "$TESTS"
+          cargo nextest run --locked $ARGS --run-ignored all --no-tests=fail --no-fail-fast -E "$TESTS"
