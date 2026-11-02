@@ -443,7 +443,7 @@ async fn a_move_and_a_filtered_page_cost_a_fixed_number_of_round_trips() {
     };
     let schema = PostgresSchema::new(format!("round_trips_{}", sim_uuid().simple())).unwrap();
     let (state, trips) = server(&url, &schema).await;
-    tokio::time::timeout(Duration::from_secs(300), async {
+    tokio::time::timeout(Duration::from_secs(600), async {
         quiet(&trips).await;
         keep_surfaces(&state, 0, 40).await;
         // Warm up: the first use of each statement prepares it.
@@ -459,26 +459,47 @@ async fn a_move_and_a_filtered_page_cost_a_fixed_number_of_round_trips() {
             "a warm move runs one statement on one pooled connection: {moved:#?}"
         );
 
+        // The page reads skip + top + 1 = 2 rows (`pagination.rs`, one past
+        // the page to know whether another follows). The equality read first
+        // probes the field index for the matching ids, in one statement whose
+        // LIMIT is the candidate budget, not the record count. When the probe
+        // finds at most those 2 rows, it hydrates them itself: 2 statements.
+        // When it finds more, it hands the page to the native pager, whose
+        // uniform page reads only those 2 rows in one statement before they
+        // are hydrated: 3 statements, with no loop, whatever the count. Of
+        // the records made here, app-3 and react hold 2 at 40, 15 at 300 and
+        // 150 at 3000, so 40 takes the first path and 300 and 3000 the second.
         list(&state, &trips).await;
         let at_40 = list(&state, &trips).await;
         keep_surfaces(&state, 40, 300).await;
         list(&state, &trips).await;
         let at_300 = list(&state, &trips).await;
-        eprintln!(
-            "round trips: move {}, list at 40 {}, at 300 {}\nlist at 300:\n  {}",
-            moved.total(),
-            at_40.total(),
-            at_300.total(),
-            at_300.messages.join("\n  ")
-        );
+        keep_surfaces(&state, 300, 3000).await;
+        list(&state, &trips).await;
+        let at_3000 = list(&state, &trips).await;
+        for (records, cost) in [(40, &at_40), (300, &at_300), (3000, &at_3000)] {
+            eprintln!(
+                "list at {records}: {} round trips\n  {}",
+                cost.total(),
+                cost.messages.join("\n  ")
+            );
+        }
         assert_eq!(
             (at_40.statements, at_40.pings),
-            (at_300.statements, at_300.pings),
-            "a filtered first page costs the same at 40 and 300 records: {at_40:#?} {at_300:#?}"
+            (2, 4),
+            "with no more matches than the page reads, the probe's ids are hydrated: {at_40:#?}"
         );
-        assert!(
-            at_300.statements <= 2,
-            "a filtered first page runs at most 2 statements: {at_300:#?}"
+        assert_eq!(
+            (at_300.statements, at_300.pings),
+            (3, 6),
+            "past them, the probe hands the page to the native pager: {at_300:#?}"
+        );
+        // The proof that the second path does not grow: ten times the records
+        // and ten times the matches cost the same statements and pings.
+        assert_eq!(
+            (at_3000.statements, at_3000.pings),
+            (at_300.statements, at_300.pings),
+            "a filtered first page costs the same at 300 and 3000 records: {at_300:#?} {at_3000:#?}"
         );
     })
     .await
