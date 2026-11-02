@@ -660,7 +660,7 @@ impl crate::state::ServerState {
                     trigger_action: ctx.action.to_string(),
                     wasm_module: Some(module_name.clone()),
                     trigger_params,
-                    entity_state: serde_json::to_value(entity_state).unwrap_or_default(),
+                    entity_state: entity_state.for_module(),
                     agent_id: ctx.agent_ctx.agent_id.clone(),
                     session_id: ctx.agent_ctx.session_id.clone(),
                     integration_config: match self.secrets_vault.as_ref() {

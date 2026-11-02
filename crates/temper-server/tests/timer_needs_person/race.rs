@@ -119,38 +119,48 @@ impl EventStore for HeldRead {
 /// A system-made Check fires `Finish`, which binds its caller, and is refused.
 /// While the stop that follows holds what it read of the journal, a person
 /// moves the record. The person's move wins: the timer runs as them.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_persons_move_during_a_stop_runs_the_timer_as_them() {
-    let store = SimEventStore::no_faults(7);
-    let journal = HeldRead {
-        journal: store.clone(),
-        hold: Arc::new(Mutex::new(None)),
-        reached: Arc::new(Notify::new()),
-        go: Arc::new(Notify::new()),
-    };
-    let state = server_over(
-        "race",
-        &store,
-        1,
-        Some(BoxedEventStore::new(journal.clone())),
-    )
-    .await;
-    act(&state, "Check", "c-race", "Begin", &AgentContext::system()).await;
-    // Begin's own follow has read what it reads; the next read of this record's
-    // newest events is the stop's, after the timer's fire is refused.
-    tokio::time::sleep(Duration::from_millis(300)).await; // determinism-ok: real-time test
-    *journal.hold.lock().unwrap() = Some("default:Check:c-race".to_string());
-    tokio::time::timeout(WITHIN, journal.reached.notified())
-        .await
-        .expect("the refused fire's stop reads the journal");
+#[test]
+fn a_persons_move_during_a_stop_runs_the_timer_as_them() {
+    Sim::each_seed(|sim| {
+        let journal = HeldRead {
+            journal: sim.store.clone(),
+            hold: Arc::new(Mutex::new(None)),
+            reached: Arc::new(Notify::new()),
+            go: Arc::new(Notify::new()),
+        };
+        let begin_at = sim.draw(500);
+        let server = sim.start_over(1, Some(BoxedEventStore::new(journal.clone())));
+        let state = &server.state;
+        server.run(async {
+            wait(begin_at).await;
+            act(state, "Check", "c-race", "Begin", &AgentContext::system()).await;
+            // Begin's own follow has read what it reads; the next read of this
+            // record's newest events is the stop's, after the timer's fire is
+            // refused.
+            wait(Duration::from_millis(300)).await;
+            *journal.hold.lock().unwrap() = Some("default:Check:c-race".to_string());
+            tokio::time::timeout(WITHIN, journal.reached.notified())
+                .await
+                .expect("the refused fire's stop reads the journal");
 
-    act(&state, "Check", "c-race", "Nudge", &person("gil")).await;
-    journal.go.notify_one();
+            act(state, "Check", "c-race", "Nudge", &person("gil")).await;
+            journal.go.notify_one();
 
-    let record = until(&state, "Checks", "c-race", "finished", |record| {
-        record["status"] == "Done"
-    })
-    .await;
-    assert_eq!(record["fields"]["fired_by"], "gil", "{record}");
-    assert_eq!(record["timer_needs_person"], Value::Null, "{record}");
+            let record = until(state, "Checks", "c-race", "finished", |record| {
+                record["status"] == "Done"
+            })
+            .await;
+            assert_eq!(
+                record["fields"]["fired_by"], "gil",
+                "seed {}: {record}",
+                sim.seed
+            );
+            assert_eq!(
+                record["timer_needs_person"],
+                Value::Null,
+                "seed {}: {record}",
+                sim.seed
+            );
+        });
+    });
 }

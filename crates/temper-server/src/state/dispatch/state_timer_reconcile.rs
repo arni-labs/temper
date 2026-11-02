@@ -56,6 +56,7 @@ use super::state_timeouts::{
 use super::state_timer_follow::{FOLLOW_RETRY_FIRST, FOLLOW_RETRY_MAX};
 use super::state_timer_setter::{STATE_TIMER_SERVICE, is_state_timer_service};
 use crate::entity_actor::{EntityState, RehydrateHook};
+use crate::odata::read_defaults::ReadDefaults;
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
 
@@ -294,9 +295,9 @@ impl ServerState {
         let mut timer = declared_timer(
             tenant,
             entity_type,
-            entity_id,
             &st,
             current,
+            &ReadDefaults::for_entity(self, tenant, entity_type),
             &identity,
             started_at,
         );
