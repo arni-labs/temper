@@ -78,6 +78,26 @@ impl InstallWarning {
         }
     }
 
+    /// An entity type the app declares and does not run, or a spec file the
+    /// installer does not read (`entity_ownership`).
+    pub fn entity_ownership(message: String) -> Self {
+        Self {
+            check: "entity_ownership".to_string(),
+            message,
+            detail: None,
+        }
+    }
+
+    /// What an install did to the tenant's schema beyond the app's own
+    /// declarations (`own_schema`): a type kept, or apps that could not be read.
+    pub fn own_schema(message: String) -> Self {
+        Self {
+            check: "own_schema".to_string(),
+            message,
+            detail: None,
+        }
+    }
+
     /// A rule over several entities the install check could not prove,
     /// with why: only a rule found broken refuses an install.
     pub fn joint_invariants(message: String) -> Self {

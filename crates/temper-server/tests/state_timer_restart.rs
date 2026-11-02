@@ -13,6 +13,8 @@
 //! a seed draws the scenario's times within the bounds each one states, and
 //! its ids.
 
+#[path = "state_timer_restart/boot_walk.rs"]
+mod boot_walk;
 #[path = "dst_state_timers_follow_state/process_clock.rs"]
 mod process_clock;
 #[path = "state_timer_restart/recovery.rs"]

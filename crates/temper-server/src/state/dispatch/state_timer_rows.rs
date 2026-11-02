@@ -25,6 +25,7 @@ use tracing::instrument;
 use super::state_timeouts::{ArmedTimer, remaining_budget};
 use super::state_timer_follow::{BootCallers, BootTimers};
 use super::state_timer_setter::is_state_timer_service;
+use super::state_timer_settled::BootRows;
 use crate::entity_actor::EntityState;
 use crate::request_context::AgentContext;
 use crate::request_context::armed_by::{decode_armed_by, encode_armed_by};
@@ -169,8 +170,9 @@ impl ServerState {
         let gate = Arc::new(Semaphore::new(BOOT_FIRES_AT_ONCE));
         let mut callers = BootCallers::new();
         let mut counts = BootTimers::new();
+        let mut rows = BootRows::new();
         let (armed, overdue) = self
-            .rearm_state_timer_rows(&gate, &mut callers, &mut counts)
+            .rearm_state_timer_rows(&gate, &mut callers, &mut counts, &mut rows)
             .await;
         self.follow_repaired_records(repaired, &callers, &gate)
             .await;
@@ -192,19 +194,21 @@ impl ServerState {
         }
         let server = self.clone();
         // determinism-ok: boot follow-up runs in the background, as boot timers do.
-        tokio::spawn(async move { server.follow_timed_types(callers, gate, counts).await })
+        tokio::spawn(async move { server.follow_timed_types(callers, gate, counts, rows).await })
     }
 
     /// Arm again each state timer row the last process left, as
     /// [`Self::rearm_state_timers`] describes, keeping the callers of rows it
-    /// drops in `callers` and counting into `counts`. Returns how many it
-    /// armed and how many of those were overdue.
+    /// drops in `callers`, the state each row it arms was armed for in
+    /// `rows`, and counting into `counts`. Returns how many it armed and how
+    /// many of those were overdue.
     #[instrument(skip_all, fields(otel.name = "boot.state_timer_rows"))]
     async fn rearm_state_timer_rows(
         &self,
         gate: &Arc<Semaphore>,
         callers: &mut BootCallers,
         counts: &mut BootTimers,
+        rows_armed: &mut BootRows,
     ) -> (usize, usize) {
         let mut armed = 0usize;
         let mut overdue = 0usize;
@@ -293,6 +297,14 @@ impl ServerState {
                     continue;
                 };
                 counted.rearmed += 1;
+                rows_armed.insert(
+                    (
+                        tenant.clone(),
+                        row.entity_type.clone(),
+                        row.entity_id.clone(),
+                    ),
+                    row.state.clone(),
+                );
                 self.spawn_state_timer(timer, Some(gate.clone()), armed_seq);
                 armed += 1;
             }

@@ -241,6 +241,11 @@ impl SpecRegistry {
                         source: e.to_string(),
                     }
                 })?;
+                // Restoring an old spec must not turn a new install check into
+                // a boot refusal. Use the registered type, not just its TOML name.
+                for finding in automaton::lint_trigger_target_args(&automaton, entity_type) {
+                    tracing::warn!(tenant = %tenant_name, entity_type, "{}", finding.message);
+                }
                 let table = transition_table(&tenant_name, entity_type, &automaton);
                 let integrations = automaton.integrations.clone();
 
@@ -314,6 +319,11 @@ impl SpecRegistry {
                         source: e.to_string(),
                     }
                 })?;
+                // Restoring an old spec must not turn a new install check into
+                // a boot refusal. Use the registered type, not just its TOML name.
+                for finding in automaton::lint_trigger_target_args(&automaton, entity_type) {
+                    tracing::warn!(tenant = %tenant_name, entity_type, "{}", finding.message);
+                }
                 let table = transition_table(&tenant_name, entity_type, &automaton);
                 let integrations = automaton.integrations.clone();
                 entities.insert(
@@ -377,6 +387,34 @@ impl SpecRegistry {
             }
         }
         registry
+    }
+
+    /// Make `csdl` the whole schema of the registered `tenant`, and rebuild
+    /// its entity-set map and relation graph from it, so a type or set the
+    /// schema no longer declares leaves. Its specs are left as they are. An
+    /// app install that computed the tenant's schema itself calls this after
+    /// registering its specs in merge mode, which keeps what it leaves out.
+    pub fn set_tenant_schema(&mut self, tenant: &TenantId, csdl: CsdlDocument, csdl_xml: String) {
+        let Some(config) = self.tenants.get_mut(tenant) else {
+            return;
+        };
+        config.relation_graph = build_relation_graph(&csdl, config.cross_invariants.as_ref());
+        config.entity_set_map = csdl
+            .schemas
+            .iter()
+            .flat_map(|schema| &schema.entity_containers)
+            .flat_map(|container| &container.entity_sets)
+            .map(|set| {
+                let type_name = set
+                    .entity_type
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&set.entity_type);
+                (set.name.clone(), type_name.to_string())
+            })
+            .collect();
+        config.csdl = Arc::new(csdl);
+        config.csdl_xml = Arc::new(csdl_xml);
     }
 
     /// Look up a tenant's configuration.
