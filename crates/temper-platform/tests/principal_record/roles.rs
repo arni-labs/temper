@@ -128,3 +128,21 @@ async fn two_revokes_of_different_roles_both_land() {
         StatusCode::FORBIDDEN
     );
 }
+
+/// The record's actor takes one move at a time, so the second grant's guard
+/// sees the first grant's append and refuses: the role is held once.
+#[tokio::test]
+async fn two_grants_of_one_role_at_once_hold_it_once() {
+    let state = app(26).await;
+    add_role_record(&state, ALICE).await;
+    let (first, second) = tokio::join!(
+        move_role(&state, ALICE, "Grant", "Cook"),
+        move_role(&state, ALICE, "Grant", "Cook"),
+    );
+    assert!(
+        first ^ second,
+        "one grant lands and the other is refused (first {first}, second {second})"
+    );
+    assert_eq!(roles(&state, ALICE).await, ["Cook"]);
+    assert_eq!(cook_note(&state, &in_person(ALICE)).await, StatusCode::OK);
+}
