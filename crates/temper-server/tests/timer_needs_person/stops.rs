@@ -173,6 +173,26 @@ async fn a_refusal_after_an_integrations_answer_stops_the_timer_that_asked() {
     );
 }
 
+/// A refusal whose timer is gone stops nothing: the timer that asked fired
+/// once and the record moved on to a state whose own timer needs no caller.
+/// That timer keeps running, and the record never says it needs anyone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_refusal_does_not_stop_the_next_states_timer() {
+    let store = SimEventStore::no_faults(7);
+    let state = server("hopper", &store, 1).await;
+    act(&state, "Hopper", "h-1", "Begin", &AgentContext::system()).await;
+    until(&state, "Hoppers", "h-1", "heard its answer", |record| {
+        record["fields"]["seen"] != ""
+    })
+    .await;
+    let record = until(&state, "Hoppers", "h-1", "kept ticking", |record| {
+        record["fields"]["ticks"].as_i64().unwrap_or(0) >= 3
+    })
+    .await;
+    assert_eq!(record["status"], "Waiting");
+    assert_eq!(record["timer_needs_person"], Value::Null, "{record}");
+}
+
 /// A person's move finds a timer armed for no one and keeps it, as it keeps
 /// any live timer. Its refusal then finds the person in the journal: it runs
 /// as them, and the record never says it needs anyone.

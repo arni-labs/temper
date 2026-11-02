@@ -272,6 +272,100 @@ to = "Stuck"
 params = [{ name = "fired_by", type = "string", source = "authenticated_subject" }]
 "#;
 
+/// `Ask`, a timed action that fires once, moves the record on to Waiting,
+/// whose own timer `Tick` needs no caller, and asks an integration. The
+/// answer's reaction, `Diagnose`, binds its caller and is refused, after the
+/// record left the timer's state.
+pub(super) const HOPPER_IOA: &str = r#"
+[automaton]
+name = "Hopper"
+states = ["Idle", "Asking", "Waiting", "Failed", "Stuck"]
+initial = "Idle"
+allow_indefinite_states = ["Idle", "Failed", "Stuck"]
+strict_action_params = true
+
+[[state]]
+name = "ticks"
+type = "counter"
+initial = 0
+
+[[state]]
+name = "seen"
+type = "string"
+initial = ""
+
+[[state]]
+name = "fired_by"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Begin"
+kind = "input"
+from = ["Idle"]
+to = "Asking"
+params = []
+
+[[state_timeout]]
+state = "Asking"
+after_seconds = 1
+on_timeout = "Ask"
+
+[[action]]
+name = "Ask"
+kind = "internal"
+from = ["Asking"]
+to = "Waiting"
+params = []
+
+[[action.triggers]]
+name = "ask"
+kind = "wasm"
+module = "trigger_principal_echo"
+on_success = "Saw"
+on_failure = "Fail"
+
+[[state_timeout]]
+state = "Waiting"
+after_seconds = 1
+on_timeout = "Tick"
+reset_on = ["Tick"]
+
+[[action]]
+name = "Tick"
+kind = "internal"
+from = ["Waiting"]
+params = []
+effect = ["ticks += 1"]
+
+[[action]]
+name = "Saw"
+kind = "input"
+from = ["Waiting"]
+params = ["seen"]
+
+[[action.triggers]]
+name = "diagnose"
+kind = "entity"
+target_entity = "Hopper"
+target_action = "Diagnose"
+resolve_target = { kind = "same_id" }
+
+[[action]]
+name = "Fail"
+kind = "input"
+from = ["Waiting"]
+to = "Failed"
+params = []
+
+[[action]]
+name = "Diagnose"
+kind = "input"
+from = ["Waiting"]
+to = "Stuck"
+params = [{ name = "fired_by", type = "string", source = "authenticated_subject" }]
+"#;
+
 pub(super) const CSDL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
   <edmx:DataServices>
@@ -307,12 +401,20 @@ pub(super) const CSDL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
         <Property Name="seen" Type="Edm.String"/>
         <Property Name="fired_by" Type="Edm.String"/>
       </EntityType>
+      <EntityType Name="Hopper">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.String" Nullable="false"/>
+        <Property Name="ticks" Type="Edm.Int64"/>
+        <Property Name="seen" Type="Edm.String"/>
+        <Property Name="fired_by" Type="Edm.String"/>
+      </EntityType>
       <EntityContainer Name="Container">
         <EntitySet Name="Lines" EntityType="Temper.Needs.Line"/>
         <EntitySet Name="Shipments" EntityType="Temper.Needs.Shipment"/>
         <EntitySet Name="Checks" EntityType="Temper.Needs.Check"/>
         <EntitySet Name="Pollers" EntityType="Temper.Needs.Poller"/>
         <EntitySet Name="Askers" EntityType="Temper.Needs.Asker"/>
+        <EntitySet Name="Hoppers" EntityType="Temper.Needs.Hopper"/>
       </EntityContainer>
     </Schema>
   </edmx:DataServices>

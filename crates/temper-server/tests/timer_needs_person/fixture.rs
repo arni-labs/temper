@@ -110,6 +110,7 @@ pub(super) async fn server_over(
             ("Check", CHECK_IOA),
             ("Poller", POLLER_IOA),
             ("Asker", ASKER_IOA),
+            ("Hopper", HOPPER_IOA),
         ],
     );
     let mut state = ServerState::from_registry(ActorSystem::new(name), registry);
