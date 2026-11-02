@@ -190,6 +190,25 @@ async fn a_refusal_after_a_persons_move_runs_as_that_person() {
     assert_eq!(record["timer_needs_person"], Value::Null, "{record}");
 }
 
+/// The same, when the journal can't be read at the refusal: a read that
+/// failed is not proof that no one moved the record. The decision waits for
+/// the journal, which names the person.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_journal_that_cannot_be_read_does_not_stop_the_timer() {
+    let store = SimEventStore::no_faults(7);
+    let state = server("unread", &store, 1).await;
+    act(&state, "Check", "c-3", "Begin", &AgentContext::system()).await;
+    act(&state, "Check", "c-3", "Nudge", &person("hal")).await;
+    // The record's actor is live, so the stop reads only the journal.
+    store.fail_next_reads("default:Check:c-3", 2);
+    let record = until(&state, "Checks", "c-3", "finished", |record| {
+        record["status"] == "Done"
+    })
+    .await;
+    assert_eq!(record["fields"]["fired_by"], "hal");
+    assert_eq!(record["timer_needs_person"], Value::Null, "{record}");
+}
+
 /// A person's chain never stops: this is the same Poller, started by a person.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_chain_a_person_started_is_not_stopped() {
