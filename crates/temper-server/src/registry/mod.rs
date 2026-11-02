@@ -502,15 +502,19 @@ impl SpecRegistry {
     }
 
     /// The tenant's types marked `principal_record`: a record of one, keyed by
-    /// a user's `sub`, describes that user to Cedar.
-    pub fn principal_record_types(&self, tenant: &TenantId) -> Vec<String> {
+    /// a user's `sub`, describes that user to Cedar. Each comes with its
+    /// `principal_record_set` field, if it names one.
+    pub fn principal_record_types(&self, tenant: &TenantId) -> Vec<(String, Option<String>)> {
         self.tenants
             .get(tenant)
             .map(|tc| {
                 tc.entities
                     .iter()
                     .filter(|(_, spec)| spec.automaton.automaton.principal_record)
-                    .map(|(name, _)| name.clone())
+                    .map(|(name, spec)| {
+                        let set = spec.automaton.automaton.principal_record_set.clone();
+                        (name.clone(), set)
+                    })
                     .collect()
             })
             .unwrap_or_default()

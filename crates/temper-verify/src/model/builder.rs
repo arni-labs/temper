@@ -323,6 +323,7 @@ fn convert_effect(effect: ResolvedEffect) -> Option<ModelEffect> {
         ResolvedEffect::SetString { var, value } => ModelEffect::SetString { var, value },
         ResolvedEffect::ListAppend { var, value } => ModelEffect::ListAppend { var, value },
         ResolvedEffect::ListRemoveAt { var, index } => ModelEffect::ListRemoveAt { var, index },
+        ResolvedEffect::ListRemove { var, value } => ModelEffect::ListRemove { var, value },
         ResolvedEffect::Dispatch(_)
         | ResolvedEffect::Schedule { .. }
         | ResolvedEffect::ScheduleAt { .. }
@@ -344,6 +345,7 @@ fn holds_written(
         | ModelEffect::SubCounter { var, .. }
         | ModelEffect::SetBool { var, .. }
         | ModelEffect::ListAppend { var, .. }
+        | ModelEffect::ListRemove { var, .. }
         | ModelEffect::ListRemoveAt { var, .. } => read.contains(var),
     }
 }
@@ -358,7 +360,9 @@ pub(crate) fn effect_params(effects: &[ModelEffect]) -> BTreeMap<String, ParamKi
             | ModelEffect::SubCounter { value, .. } => (value, ParamKind::Count),
             ModelEffect::SetBool { value, .. } => (value, ParamKind::Bool),
             ModelEffect::SetString { .. } => continue,
-            ModelEffect::ListAppend { value, .. } => (value, ParamKind::Str),
+            ModelEffect::ListAppend { value, .. } | ModelEffect::ListRemove { value, .. } => {
+                (value, ParamKind::Str)
+            }
             ModelEffect::ListRemoveAt { index, .. } => (index, ParamKind::Count),
         };
         if let Arg::Param(name) = arg {

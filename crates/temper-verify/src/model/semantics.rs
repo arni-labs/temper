@@ -272,12 +272,16 @@ fn param_candidates(
     }
 }
 
-/// The literals a list `t` appends string parameter `name` to is compared
-/// against: the strings worth choosing for it.
+/// The literals a list `t` appends string parameter `name` to, or removes it
+/// from, is compared against: the strings worth choosing for it.
 fn string_literals(model: &TemperModel, t: &ResolvedTransition, name: &str) -> BTreeSet<String> {
     let mut values: BTreeSet<String> = BTreeSet::new();
     for effect in &t.effects {
         if let ModelEffect::ListAppend {
+            var,
+            value: Arg::Param(p),
+        }
+        | ModelEffect::ListRemove {
             var,
             value: Arg::Param(p),
         } = effect
@@ -379,8 +383,8 @@ fn outgrown<'a>(
 }
 
 /// Apply model effects to the provided state, reading `params.p` from
-/// `params`. Mirrors the runtime: `-=` stops at 0 and `remove_at` out of
-/// range is a no-op.
+/// `params`. Mirrors the runtime: `-=` stops at 0, `remove_at` out of
+/// range is a no-op and `remove` of an absent value is a no-op.
 ///
 /// `action_name` is used to generate deterministic fresh list elements.
 /// Third interpreter. Production apply is `temper-server` `entity_actor/effects.rs`.
@@ -447,6 +451,19 @@ pub fn apply_effects(
                     _ => placeholder(),
                 };
                 state.lists.entry(var.clone()).or_default().push(element);
+            }
+            ModelEffect::ListRemove { var, value } => {
+                let element = match value {
+                    Arg::Lit(Literal::Str(text)) => Some(text.clone().into()),
+                    Arg::Param(name) => match params.get(name) {
+                        Some(ParamValue::Str(value)) => Some(value.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let (Some(element), Some(entry)) = (element, state.lists.get_mut(var)) {
+                    entry.retain(|item| *item != element);
+                }
             }
             ModelEffect::ListRemoveAt { var, index } => {
                 let index = count(index, state);

@@ -98,7 +98,8 @@ fn walk<'a>(model: &TemperModel, t: &'a ResolvedTransition) -> Walked<'a> {
             }
             ModelEffect::SetBool { .. }
             | ModelEffect::SetString { .. }
-            | ModelEffect::ListAppend { .. } => {}
+            | ModelEffect::ListAppend { .. }
+            | ModelEffect::ListRemove { .. } => {}
         }
     }
     for (counter, value) in values {
