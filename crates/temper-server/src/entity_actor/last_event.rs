@@ -19,10 +19,16 @@ pub enum EventVia {
 
 /// Provenance persisted with an event. Older events have unknown provenance.
 ///
-/// `for` and `agent_type` are recorded only with `by`, and only when the
-/// subject carries them: an agent acting for a person names that person and
-/// its type. A person acting in person records `by` alone. They are left out
-/// of the event when absent, so events without them keep their old shape.
+/// `for`, `agent_type` and `role` are recorded only with `by`, and only when
+/// the subject carries them: an agent acting for a person names that person,
+/// its type and its role. A person acting in person records `by` and any role
+/// their token gave them. They are left out of the event when absent, so
+/// events without them keep their old shape.
+///
+/// They are what a record's journal says of who moved it by request, so a
+/// timer nothing else names a setter for can be set as that principal
+/// (`state_timer_setter`): an agent is set up again only with its role, which
+/// Cedar's role forbids depend on.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventOrigin {
     /// How the event came about; null for events written before provenance.
@@ -35,6 +41,9 @@ pub struct EventOrigin {
     /// The agent type of `by`, as its authenticated principal names it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<String>,
+    /// The role of `by`, as its authenticated principal names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 impl EventOrigin {
@@ -101,6 +110,7 @@ impl EventOrigin {
             by: Some(principal.id.clone()),
             acting_for: present(&principal.acting_for),
             agent_type: present(&principal.agent_type),
+            role: present(&principal.role),
         }
     }
 }
@@ -205,6 +215,7 @@ mod tests {
             EventOrigin {
                 via: Some(EventVia::Request),
                 by: Some("ann".into()),
+                role: Some("owner".into()),
                 ..EventOrigin::default()
             }
         );
@@ -233,23 +244,25 @@ mod tests {
                 by: Some("hub-client".into()),
                 acting_for: Some("ann".into()),
                 agent_type: Some("claude-code".into()),
+                role: Some("contributor".into()),
             }
         );
-        // The journaled event carries them at its top level, as `for` and
-        // `agent_type`, and reads them back.
+        // The journaled event carries them at its top level, as `for`,
+        // `agent_type` and `role`, and reads them back.
         let mut event = super::super::EntityEvent::bootstrap("Idle".into());
         event.origin = origin;
         let journaled = serde_json::to_value(&event).unwrap();
         assert_eq!(journaled["by"], "hub-client");
         assert_eq!(journaled["for"], "ann");
         assert_eq!(journaled["agent_type"], "claude-code");
+        assert_eq!(journaled["role"], "contributor");
         assert!(journaled.get("acting_for").is_none(), "{journaled}");
         let read: super::super::EntityEvent = serde_json::from_value(journaled).unwrap();
         assert_eq!(read.origin, event.origin);
     }
 
     #[test]
-    fn a_person_in_person_records_only_by() {
+    fn a_person_in_person_records_only_by_and_role() {
         let origin = EventOrigin::from_caller(Some(&caller()));
         assert_eq!(
             origin,
@@ -258,6 +271,7 @@ mod tests {
                 by: Some("ann".into()),
                 acting_for: None,
                 agent_type: None,
+                role: Some("owner".into()),
             }
         );
         let mut event = super::super::EntityEvent::bootstrap("Idle".into());

@@ -35,6 +35,7 @@ mod state_timer_fire;
 mod state_timer_follow;
 mod state_timer_reconcile;
 mod state_timer_rows;
+mod state_timer_setter;
 mod state_timer_settled;
 #[cfg(test)]
 #[path = "strict_support_test.rs"]

@@ -7,7 +7,9 @@
 //! for the rest of its budget,
 //! or at once if it fell due while the server was down. It fires once, as the
 //! identity that armed it; ticks missed while the server was down are not
-//! replayed.
+//! replayed. A row armed for no one (the state-timer service) is left to the
+//! walk that follows, which arms it as the principal the record's journal
+//! names, when it names one (`state_timer_setter`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -22,6 +24,7 @@ use tracing::instrument;
 
 use super::state_timeouts::{ArmedTimer, remaining_budget};
 use super::state_timer_follow::{BootCallers, BootTimers};
+use super::state_timer_setter::is_state_timer_service;
 use super::state_timer_settled::BootRows;
 use crate::entity_actor::EntityState;
 use crate::request_context::AgentContext;
@@ -269,6 +272,13 @@ impl ServerState {
                         continue;
                     }
                 };
+                if is_state_timer_service(&timer.agent_ctx) {
+                    // Armed for no one. The walk after this arms it, as the
+                    // principal the record's journal names when it names one
+                    // (`state_timer_setter`): reading a journal, page by page,
+                    // stays off the path the server serves after.
+                    continue;
+                }
                 timer.boot_gate = Some(gate.clone());
                 let delay = remaining_budget(timer.started_at, timer.after_seconds, now);
                 let label = if delay.is_zero() {
