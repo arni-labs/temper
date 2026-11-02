@@ -23,6 +23,16 @@ impl ServerState {
     }
 }
 
+/// The refusal of a move whose caller is no one a credential stands for.
+const NO_CONTEXT: &str = "Authenticated parameter requires a security context";
+const NO_CALLER: &str = "Authenticated subject requires a caller identity";
+
+/// Whether `error` refused a move because nothing names its caller, as opposed
+/// to something its caller did.
+pub(super) fn refused_for_no_caller(error: &DispatchError) -> bool {
+    matches!(error, DispatchError::AuthzDenied(reason) if reason == NO_CONTEXT || reason == NO_CALLER)
+}
+
 /// [`ServerState::resolve_authenticated_params`] under `table`: a version not
 /// yet installed binds a move's parameters as it will once it serves.
 pub(crate) fn bind_authenticated_params(
@@ -47,13 +57,12 @@ pub(crate) fn bind_authenticated_params(
                 "Parameter '{name}' is bound by the runtime and cannot be supplied"
             )));
         }
-        let context = agent.security_ctx.as_ref().ok_or_else(|| {
-            DispatchError::AuthzDenied("Authenticated parameter requires a security context".into())
-        })?;
+        let context = agent
+            .security_ctx
+            .as_ref()
+            .ok_or_else(|| DispatchError::AuthzDenied(NO_CONTEXT.into()))?;
         if !crate::request_context::names_a_caller(context) {
-            return Err(DispatchError::AuthzDenied(
-                "Authenticated subject requires a caller identity".into(),
-            ));
+            return Err(DispatchError::AuthzDenied(NO_CALLER.into()));
         }
         let principal = &context.principal;
         let value = match source {

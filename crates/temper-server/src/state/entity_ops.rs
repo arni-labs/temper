@@ -1,5 +1,7 @@
 //! Entity lifecycle methods for ServerState (spawn, query, delete, index).
 
+mod timer_needs_person;
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;

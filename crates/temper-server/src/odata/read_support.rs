@@ -55,12 +55,7 @@ fn catalog_row_to_entity_body(
             .or_insert(serde_json::json!({}));
         obj.entry("lists".to_string())
             .or_insert(serde_json::json!({}));
-        for property in [
-            "first_event_at",
-            "last_event_at",
-            "last_event_via",
-            "last_event_by",
-        ] {
+        for property in temper_spec::automaton::EVENT_METADATA_FIELDS {
             obj.entry(property.to_string())
                 .or_insert(serde_json::Value::Null);
         }
@@ -94,6 +89,7 @@ fn catalog_row_to_entity_body(
         "last_event_at": null,
         "last_event_via": null,
         "last_event_by": null,
+        "timer_needs_person": null,
         "@odata.id": format!("{entity_set_name}('{id}')"),
     })
 }
