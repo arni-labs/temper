@@ -17,6 +17,25 @@ use crate::{PostgresEventStore, PostgresSchema};
 const TENANT: &str = "t";
 const PID: &str = "t:Panel:p1";
 
+/// Assert the record's first move left a row in every table it writes
+/// besides the journal's own, so a later "nothing changed" compares real rows.
+/// On main the append wrote no catalog, field-index or timer rows.
+fn assert_first_move_rows(snapshot: &BTreeMap<&'static str, Vec<String>>) {
+    for table in [
+        "entity_key_index",
+        "entity_vector_index",
+        "scheduled_actions",
+        "entity_catalog",
+        "entity_field_index",
+        "state_timers",
+    ] {
+        assert!(
+            !snapshot[table].is_empty(),
+            "the first move wrote no {table} row"
+        );
+    }
+}
+
 /// Every table a move writes, in the order a snapshot reads them.
 const TABLES: [&str; 9] = [
     "events",
@@ -277,7 +296,7 @@ fn append_writes_every_row_the_projection_writer_would() {
 }
 
 /// A stale expected sequence writes nothing: the statement reports the head
-/// it found and every table is as it was. Hub condition 1, first path.
+/// it found and every table is as it was.
 #[test]
 fn stale_expected_sequence_writes_no_rows() {
     let Some(url) = temper_test_resource::env_var("DATABASE_URL") else {
@@ -296,6 +315,7 @@ fn stale_expected_sequence_writes_no_rows() {
             .await
             .unwrap();
         let before = snapshot(&pool, &schema).await;
+        assert_first_move_rows(&before);
 
         let stale = Rows::at(2, serde_json::json!({"Id": "p1", "app": "changed"}));
         let refused = store
@@ -324,7 +344,7 @@ fn stale_expected_sequence_writes_no_rows() {
 /// Two writers pass the sequence check together: the second meets the first
 /// on the journal's unique key, and its statement, every row with it, aborts.
 /// The rival here holds sequence 2 in an open transaction while the store's
-/// statement waits on it. Hub condition 1, second path.
+/// statement waits on it.
 #[test]
 fn racing_writer_aborts_with_none_of_its_rows() {
     let Some(url) = temper_test_resource::env_var("DATABASE_URL") else {
@@ -343,6 +363,7 @@ fn racing_writer_aborts_with_none_of_its_rows() {
             .await
             .unwrap();
         let before = snapshot(&pool, &schema).await;
+        assert_first_move_rows(&before);
 
         let mut rival = pool.begin().await.unwrap();
         sqlx::query(&store.schema().qualify_sql(
@@ -409,7 +430,6 @@ fn racing_writer_aborts_with_none_of_its_rows() {
 
 /// A move that drops one indexed field and changes another: the delete takes
 /// the dropped name, the upsert the changed one, in the same statement.
-/// Hub condition 2.
 #[test]
 fn move_that_drops_one_field_and_changes_another() {
     let Some(url) = temper_test_resource::env_var("DATABASE_URL") else {
