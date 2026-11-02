@@ -241,9 +241,19 @@ impl ServerState {
         if arming == Arming::FromRow && armed.is_none() && armed_by.is_none() && row.is_none() {
             return TimerFollow::WaitsForRow;
         }
-        let known = committed
+        // A live timer of this same row knows who the row may not say: a boot
+        // names the journal's setter in place of the row's service and keeps
+        // the row. A row with another arm is newer than the live timer.
+        let live_of_row = armed
             .as_ref()
-            .map(|timer| timer.agent_ctx.clone())
+            .filter(|armed| {
+                committed
+                    .as_ref()
+                    .is_some_and(|row| row.arm_id == armed.arm_id)
+            })
+            .map(|armed| armed.agent_ctx.clone());
+        let known = live_of_row
+            .or_else(|| committed.as_ref().map(|timer| timer.agent_ctx.clone()))
             .or_else(|| armed_by.cloned())
             .or_else(|| armed.as_ref().map(|armed| armed.agent_ctx.clone()))
             .or_else(|| row.as_ref().and_then(super::state_timer_rows::row_armed_by));
