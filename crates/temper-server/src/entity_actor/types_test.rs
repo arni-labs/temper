@@ -79,10 +79,18 @@ fn a_module_reads_the_record_without_what_its_past_moves_were_told() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|event| (event["action"].as_str().unwrap(), event["timestamp"].as_str().unwrap()))
+        .map(|event| {
+            (
+                event["action"].as_str().unwrap(),
+                event["timestamp"].as_str().unwrap(),
+            )
+        })
         .collect();
     let time = whole["events"][0]["timestamp"].as_str().unwrap();
-    assert_eq!(moves, [("Installed", time), ("Installed", time), ("Propose", time)]);
+    assert_eq!(
+        moves,
+        [("Installed", time), ("Installed", time), ("Propose", time)]
+    );
     // Everything else stays as the whole record says it, including a field added to the record later.
     let others = |value: &serde_json::Value| {
         let mut object = value.as_object().unwrap().clone();
