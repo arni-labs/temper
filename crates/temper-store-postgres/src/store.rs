@@ -527,12 +527,11 @@ impl EventStore for PostgresEventStore {
             let append = &appends[index];
             written[index] = self
                 .append_on(
-                    &mut tx,
+                    crate::append_commit::AppendOn::InBatch(&mut tx),
                     &append.persistence_id,
                     append.expected_sequence,
                     &append.events,
                     append.commit_rows(),
-                    crate::append_commit::AppendScope::InBatch,
                     &mut transaction_timer,
                 )
                 .await?;

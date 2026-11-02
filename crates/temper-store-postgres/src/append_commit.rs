@@ -505,12 +505,11 @@ impl PostgresEventStore {
         let mut conn = acquired.map_err(storage_error)?;
         let written = self
             .append_on(
-                &mut conn,
+                AppendOn::Alone(&mut conn),
                 persistence_id,
                 expected_sequence,
                 events,
                 rows,
-                AppendScope::Alone,
                 &mut timer,
             )
             .await?;
@@ -518,19 +517,22 @@ impl PostgresEventStore {
         Ok(written)
     }
 
-    /// Run the append statement for one record on `conn`: on its own it is
-    /// one transaction; inside a batch's transaction it is one of its
-    /// statements, and the batch commits them together.
+    /// Run the append statement for one record on `on`'s connection: on its
+    /// own it is one transaction; inside a batch's transaction it is one of
+    /// its statements, and the batch commits them together.
     pub(crate) async fn append_on(
         &self,
-        conn: &mut sqlx::PgConnection,
+        on: AppendOn<'_>,
         persistence_id: &str,
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
         rows: CommitRows<'_>,
-        scope: AppendScope,
         timer: &mut PostgresTransactionTimer,
     ) -> Result<u64, PersistenceError> {
+        let (conn, in_batch) = match on {
+            AppendOn::Alone(conn) => (conn, false),
+            AppendOn::InBatch(conn) => (conn, true),
+        };
         let (tenant, entity_type, entity_id) =
             parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
         let params = AppendParams::new(
@@ -558,39 +560,37 @@ impl PostgresEventStore {
                          held its lock"
                     ))
                 };
-                match scope {
-                    AppendScope::InBatch => self
-                        .run_append(conn, &params, expected_sequence, entity_type, timer)
+                if in_batch {
+                    self.run_append(conn, &params, expected_sequence, entity_type, timer)
                         .await?
-                        .ok_or_else(raced_again)?,
-                    AppendScope::Alone => {
-                        retry_seam::before_retry(self.schema.prefix()).await;
-                        let mut tx = sqlx::Connection::begin(&mut *conn)
-                            .await
-                            .map_err(storage_error)?;
-                        if retry_seam::takes_retry_lock(self.schema.prefix()) {
-                            let _held: Option<i32> = crate::dbm::postgres_query_scalar!(
-                                &self.schema,
-                                "SELECT 1 FROM {schema}entity_catalog \
+                        .ok_or_else(raced_again)?
+                } else {
+                    retry_seam::before_retry(self.schema.prefix()).await;
+                    let mut tx = sqlx::Connection::begin(&mut *conn)
+                        .await
+                        .map_err(storage_error)?;
+                    if retry_seam::takes_retry_lock(self.schema.prefix()) {
+                        let _held: Option<i32> = crate::dbm::postgres_query_scalar!(
+                            &self.schema,
+                            "SELECT 1 FROM {schema}entity_catalog \
                                  WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 \
                                  FOR UPDATE",
-                            )
-                            .bind(tenant)
-                            .bind(entity_type)
-                            .bind(entity_id)
-                            .fetch_optional(&mut *tx)
-                            .await
-                            .map_err(storage_error)?;
-                        }
-                        // A second race returns before the commit: the
-                        // transaction rolls back with nothing written.
-                        let written = self
-                            .run_append(&mut tx, &params, expected_sequence, entity_type, timer)
-                            .await?
-                            .ok_or_else(raced_again)?;
-                        tx.commit().await.map_err(storage_error)?;
-                        written
+                        )
+                        .bind(tenant)
+                        .bind(entity_type)
+                        .bind(entity_id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(storage_error)?;
                     }
+                    // A second race returns before the commit: the
+                    // transaction rolls back with nothing written.
+                    let written = self
+                        .run_append(&mut tx, &params, expected_sequence, entity_type, timer)
+                        .await?
+                        .ok_or_else(raced_again)?;
+                    tx.commit().await.map_err(storage_error)?;
+                    written
                 }
             }
         };
@@ -711,14 +711,14 @@ pub(crate) mod retry_seam {
     }
 }
 
-/// Whether the append statement commits on its own or as one statement of a
-/// batch's transaction, which decides how a raced run takes its lock again.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AppendScope {
+/// The connection an append runs on, and whether the statement commits on
+/// its own or as one statement of a batch's transaction, which decides how a
+/// raced run takes its lock again.
+pub(crate) enum AppendOn<'c> {
     /// The statement is its own transaction.
-    Alone,
+    Alone(&'c mut sqlx::PgConnection),
     /// The statement runs inside a batch's transaction.
-    InBatch,
+    InBatch(&'c mut sqlx::PgConnection),
 }
 
 impl AppendParams<'_> {
