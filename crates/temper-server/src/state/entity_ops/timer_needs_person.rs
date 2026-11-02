@@ -1,6 +1,9 @@
-//! Persist the reason a timer cannot name its caller.
+//! Recording a stopped state timer through the entity actor and read projection.
 
-use super::{EntityMsg, EntityResponse, ServerState, TenantId};
+use temper_runtime::tenant::TenantId;
+
+use super::ServerState;
+use crate::entity_actor::{EntityMsg, EntityResponse, TimerStop};
 
 impl ServerState {
     /// Record on a record that its state timer stopped because nothing names
@@ -12,7 +15,7 @@ impl ServerState {
         entity_id: &str,
         action: &str,
         checked: u64,
-    ) -> Result<crate::entity_actor::TimerStop, String> {
+    ) -> Result<TimerStop, String> {
         let actor_ref = self
             .get_or_spawn_tenant_actor(tenant, entity_type, entity_id)
             .ok_or_else(|| {
@@ -29,7 +32,7 @@ impl ServerState {
             .await
             .map_err(|e| format!("Actor update failed: {e}"))?;
         if response.refused && response.error.is_none() {
-            return Ok(crate::entity_actor::TimerStop::Moved);
+            return Ok(TimerStop::Moved);
         }
         if !response.success {
             return Err(response
@@ -44,6 +47,6 @@ impl ServerState {
             "timer_needs_person",
         )
         .await?;
-        Ok(crate::entity_actor::TimerStop::Said)
+        Ok(TimerStop::Said)
     }
 }
