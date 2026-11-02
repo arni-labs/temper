@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::task::AbortHandle;
 
 struct Running {
     turn: u64,
@@ -56,13 +56,7 @@ impl Drop for Leaving {
 impl ReviewsUnderWay {
     /// Run `review` for `version` of `app`, stopping the app's review before it: only the newest is kept, so the older
     /// one's paid calls would be for nothing.
-    pub(crate) fn start<F>(
-        self: &Arc<Self>,
-        tenant: &str,
-        app: &str,
-        version: &str,
-        review: F,
-    ) -> JoinHandle<()>
+    pub(crate) fn start<F>(self: &Arc<Self>, tenant: &str, app: &str, version: &str, review: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -89,7 +83,6 @@ impl ReviewsUnderWay {
         if let Some(older) = older {
             older.abort.abort();
         }
-        task
     }
 
     /// Whether a review of `version` of `app` is reading now.

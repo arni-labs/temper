@@ -344,6 +344,93 @@ async fn a_newer_review_stops_the_older_and_a_caller_waiting_on_the_older_is_tol
     );
 }
 
+/// A version whose checks pass and which the installer refuses after the review has started: it cannot parse the policy.
+fn refused_by_the_installer(commit: &str, version: u8) -> serde_json::Value {
+    let mut files = app_with_module(Some(commit), version);
+    files["policies/evolution.cedar"] =
+        "permit(principal, action, resource) when { this is not cedar };".into();
+    files
+}
+
+async fn push_is_refused(state: &PlatformState, tenant: &str, files: serde_json::Value) {
+    let (status, body) = send(state, push(tenant, serde_json::json!({ "files": files }))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let error = body["error"].as_str().expect("an error");
+    assert!(error.contains("Rolled back"), "{body}");
+}
+
+#[tokio::test]
+async fn a_failed_push_leaves_the_review_before_it_running() {
+    let tenant = unique_tenant("review-failed-running");
+    let server = server(&tenant);
+    let judge = HeldJudge::held();
+    server
+        .state
+        .set_module_reviewer(Arc::new(ModuleReviewer::new(judge.clone())));
+    install_over_http(&server.state, &tenant, app_with_module(Some("c1"), 1)).await;
+
+    push_is_refused(&server.state, &tenant, refused_by_the_installer("c2", 2)).await;
+
+    assert_eq!(
+        review_of(&server.state, &tenant, "c1").await["state"],
+        "reading"
+    );
+    assert_eq!(
+        review_of(&server.state, &tenant, "c2").await["state"],
+        "none"
+    );
+    judge.let_answer();
+    let done = finished_review(&server.state, &tenant, "c1").await;
+    assert_eq!(done["state"], "done", "{done}");
+    assert!(found_first_item(&done["warnings"]), "{done}");
+}
+
+#[tokio::test]
+async fn a_failed_push_leaves_what_the_review_before_it_kept() {
+    let tenant = unique_tenant("review-failed-kept");
+    let server = server(&tenant);
+    server
+        .state
+        .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::open())));
+    install_over_http(&server.state, &tenant, app_with_module(Some("c1"), 1)).await;
+    let kept = finished_review(&server.state, &tenant, "c1").await;
+    assert_eq!(kept["state"], "done", "{kept}");
+
+    push_is_refused(&server.state, &tenant, refused_by_the_installer("c2", 2)).await;
+
+    assert_eq!(finished_review(&server.state, &tenant, "c1").await, kept);
+    assert_eq!(
+        finished_review(&server.state, &tenant, "c2").await["state"],
+        "none"
+    );
+}
+
+#[tokio::test]
+async fn a_caller_that_waits_has_what_jev_said_before_it_is_saved() {
+    let tenant = unique_tenant("review-slow-save");
+    let server = server(&tenant);
+    let saves = server.ps.hold_module_review_saves();
+    server
+        .state
+        .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::open())));
+
+    let result = install_directly(&server.state, &tenant, app_with_module(Some("c1"), 1)).await;
+    let result = tokio::time::timeout(Duration::from_secs(5), result.with_reviews_read()) // determinism-ok: the save is held on another task
+        .await
+        .expect("what Jev said does not wait for the save");
+    assert_eq!(result.modules_reviewed, vec![MODULE.to_string()]);
+
+    // The route has no gap: still reading until it is kept.
+    assert_eq!(
+        review_of(&server.state, &tenant, "c1").await["state"],
+        "reading"
+    );
+    saves.add_permits(1);
+    let done = finished_review(&server.state, &tenant, "c1").await;
+    assert_eq!(done["state"], "done", "{done}");
+    assert!(found_first_item(&done["warnings"]), "{done}");
+}
+
 #[tokio::test]
 async fn a_caller_that_answers_with_all_of_it_can_wait_for_it() {
     let tenant = unique_tenant("review-read");

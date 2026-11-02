@@ -1,23 +1,26 @@
 //! The install's review of its app's modules ([`crate::module_review`]). It starts when the install starts, so Jev
 //! reads beside the install's own proofs and writes, and it goes on after the install answers, since Jev takes seconds
-//! and an app's change may not. Advisory: what it says is kept for the app (`PlatformStore::save_module_review`), and it
-//! never refuses or holds an install. A caller that answers with all of it waits (`InstallResult::with_reviews_read`).
+//! and an app's change may not. Advisory: it never refuses or holds an install. Only an install that succeeds lets it
+//! take the place of the app's review before it and keep what it says (`PlatformStore::save_module_review`), so a failed
+//! push costs neither. A caller that answers with all of it waits (`InstallResult::with_reviews_read`).
 //!
 //! A module is read again when its code changed or when a spec that runs it changed, since Jev reads a module against
 //! the specs that run it: a new guard or a split state can answer a finding, or make one.
 
 use std::path::{Component, Path};
+use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::json;
 use temper_runtime::tenant::TenantId;
+use temper_server::platform_store::PlatformStore;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 
 use super::reconcile;
 use super::types::{AppBundle, InstallWarning, WasmModuleManifest};
 use crate::module_review::{
-    BundleReview, Finding, ModuleSource, SPEC_BYTES, SpecSource, said_left_out,
+    BundleReview, Finding, ModuleSource, ReviewsUnderWay, SPEC_BYTES, SpecSource, said_left_out,
 };
 use crate::state::PlatformState;
 
@@ -59,37 +62,89 @@ impl ReviewAnswer {
         match self.said.wait_for(Option::is_some).await {
             Ok(said) => said.clone().unwrap_or_default(),
             Err(_) => ReviewOutcome {
-                warnings: vec![note(
-                    "Modules were not reviewed: the review stopped.".to_string(),
-                    json!({ "modules": self.asked }),
-                )],
+                warnings: vec![stopped_note(&self.asked)],
                 reviewed: Vec::new(),
             },
         }
     }
 }
 
-/// A review under way beside the install.
-#[derive(Default)]
-pub(super) struct PendingReview {
-    task: Option<JoinHandle<()>>,
-    left: Option<(ReviewAsked, ReviewAnswer)>,
-}
+/// Jev reading. An install that fails before it answers leaves him reading nothing, and paying for nothing, behind it.
+struct JevReading(JoinHandle<BundleReview>);
 
-/// An install that fails before it answers leaves no review running behind it.
-impl Drop for PendingReview {
+impl Drop for JevReading {
     fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
+        self.0.abort();
     }
 }
 
+/// A review under way beside the install. Nothing depends on it until the install has succeeded.
+#[derive(Default)]
+pub(super) struct PendingReview(Option<Reading>);
+
+struct Reading {
+    jev: Option<JevReading>,
+    said: Vec<InstallWarning>,
+    asked: Vec<String>,
+    changed: Vec<String>,
+    tenant: String,
+    app: String,
+    version: String,
+    store: Option<Arc<dyn PlatformStore>>,
+    under_way: Arc<ReviewsUnderWay>,
+}
+
 impl PendingReview {
-    /// The install answers now, and the review goes on without it.
-    pub(super) fn left_running(mut self) -> (Vec<ReviewAsked>, Vec<ReviewAnswer>) {
-        self.task = None;
-        self.left.take().into_iter().unzip()
+    /// The install succeeded and answers now. The review goes on without it, in place of the app's review before it.
+    pub(super) fn left_running(self) -> (Vec<ReviewAsked>, Vec<ReviewAnswer>) {
+        let Some(reading) = self.0 else {
+            return (Vec::new(), Vec::new());
+        };
+        let (tell, said) = watch::channel(None);
+        let asked = ReviewAsked {
+            app: reading.app.clone(),
+            version: reading.version.clone(),
+            modules: reading.changed.clone(),
+        };
+        let answer = ReviewAnswer {
+            said,
+            asked: reading.asked.clone(),
+        };
+        let under_way = Arc::clone(&reading.under_way);
+        let tenant = reading.tenant.clone();
+        under_way.start(&tenant, &asked.app, &asked.version, reading.finish(tell));
+        (vec![asked], vec![answer])
+    }
+}
+
+impl Reading {
+    async fn finish(mut self, tell: watch::Sender<Option<ReviewOutcome>>) {
+        let review: Result<BundleReview, JoinError> = match self.jev.as_mut() {
+            Some(jev) => (&mut jev.0).await,
+            None => Ok(BundleReview::default()),
+        };
+        let outcome = match review {
+            Ok(review) => outcome_of(review, self.said, &self.asked),
+            Err(error) => {
+                tracing::warn!(error = %error, "module review stopped");
+                self.said.push(stopped_note(&self.asked));
+                ReviewOutcome {
+                    warnings: self.said,
+                    reviewed: Vec::new(),
+                }
+            }
+        };
+        let kept = json!({ "warnings": outcome.warnings, "modules_reviewed": outcome.reviewed });
+        // Before the save: a write takes its turn behind every other, and a start or a Genesis install has what it
+        // waits for by now. The review stays on the list until the save is done, so the route misses nothing.
+        let _ = tell.send(Some(outcome));
+        if let Some(store) = self.store
+            && let Err(error) = store
+                .save_module_review(&self.tenant, &self.app, &self.version, &kept.to_string())
+                .await
+        {
+            tracing::warn!(error = %error, app = %self.app, "module review was not kept");
+        }
     }
 }
 
@@ -148,50 +203,22 @@ pub(super) async fn start(
         .storage_stack
         .as_ref()
         .and_then(|stack| stack.platform.clone());
-    let (tell, answer) = watch::channel(None);
-    let review = {
-        let (tenant, app_name, version, asked) = (
-            tenant.to_string(),
-            app_name.to_string(),
-            version.clone(),
-            asked.clone(),
-        );
-        async move {
-            let review = match reviewer {
-                Some(reviewer) if !modules.is_empty() => reviewer.review(&modules, &specs).await,
-                _ => BundleReview::default(),
-            };
-            let outcome = outcome_of(review, said, &asked);
-            let kept =
-                json!({ "warnings": outcome.warnings, "modules_reviewed": outcome.reviewed });
-            if let Some(store) = store
-                && let Err(error) = store
-                    .save_module_review(&tenant, &app_name, &version, &kept.to_string())
-                    .await
-            {
-                tracing::warn!(error = %error, app = %app_name, "module review was not kept");
-            }
-            // Nobody is listening when the caller went without it.
-            let _ = tell.send(Some(outcome));
-        }
-    };
-    let task = state
-        .module_reviews
-        .start(tenant, app_name, &version, review);
-    PendingReview {
-        task: Some(task),
-        left: Some((
-            ReviewAsked {
-                app: app_name.to_string(),
-                version,
-                modules: changed,
-            },
-            ReviewAnswer {
-                said: answer,
-                asked,
-            },
-        )),
-    }
+    let jev = reviewer.filter(|_| !modules.is_empty()).map(|reviewer| {
+        JevReading(tokio::spawn(async move {
+            reviewer.review(&modules, &specs).await
+        }))
+    });
+    PendingReview(Some(Reading {
+        jev,
+        said,
+        asked,
+        changed,
+        tenant: tenant.to_string(),
+        app: app_name.to_string(),
+        version,
+        store,
+        under_way: Arc::clone(&state.module_reviews),
+    }))
 }
 
 /// What names a version for its review: the commit its files say, else its bundle's digest.
@@ -356,6 +383,13 @@ fn outcome_of(review: BundleReview, said: Vec<InstallWarning>, asked: &[String])
         "module review"
     );
     outcome
+}
+
+fn stopped_note(asked: &[String]) -> InstallWarning {
+    note(
+        "Modules were not reviewed: the review stopped.".to_string(),
+        json!({ "modules": asked }),
+    )
 }
 
 fn note(message: String, detail: serde_json::Value) -> InstallWarning {

@@ -1008,6 +1008,8 @@ mod sim_platform_store {
         constraints: BTreeMap<String, String>,
         /// The newest module review, keyed by (tenant, app_name).
         module_reviews: BTreeMap<(String, String), ModuleReviewRow>,
+        /// Module review saves wait for a permit here, when a test holds them.
+        held_module_review_saves: Option<Arc<tokio::sync::Semaphore>>,
         /// Installed apps: (tenant, app_name).
         installed_apps: BTreeSet<(String, String)>,
         /// Installed app digest metadata keyed by (tenant, app_name).
@@ -1032,6 +1034,7 @@ mod sim_platform_store {
                     policy_entries: BTreeMap::new(),
                     constraints: BTreeMap::new(),
                     module_reviews: BTreeMap::new(),
+                    held_module_review_saves: None,
                     installed_apps: BTreeSet::new(),
                     installed_app_records: BTreeMap::new(),
                     pending_decisions: BTreeMap::new(),
@@ -1096,6 +1099,18 @@ mod sim_platform_store {
         }
     }
 
+    impl SimPlatformStore {
+        /// Hold every module review's save until the semaphore this returns is given a permit, as a slow write would.
+        pub fn hold_module_review_saves(&self) -> Arc<tokio::sync::Semaphore> {
+            let held = Arc::new(tokio::sync::Semaphore::new(0));
+            self.inner
+                .lock()
+                .expect("SimPlatformStore lock poisoned") // ci-ok: infallible lock
+                .held_module_review_saves = Some(Arc::clone(&held));
+            held
+        }
+    }
+
     #[async_trait::async_trait]
     impl PlatformStore for SimPlatformStore {
         async fn save_module_review(
@@ -1105,6 +1120,15 @@ mod sim_platform_store {
             version: &str,
             result: &str,
         ) -> Result<(), String> {
+            let held = self
+                .inner
+                .lock()
+                .expect("SimPlatformStore lock poisoned") // ci-ok: infallible lock
+                .held_module_review_saves
+                .clone();
+            if let Some(held) = held {
+                let _ = held.acquire().await;
+            }
             let mut inner = self.inner.lock().expect("SimPlatformStore lock poisoned"); // ci-ok: infallible lock
             inner.module_reviews.insert(
                 (tenant.to_string(), app_name.to_string()),
