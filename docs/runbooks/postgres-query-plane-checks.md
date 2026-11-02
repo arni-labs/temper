@@ -58,3 +58,13 @@ ORDER BY 3 DESC;
 A number is compared as Postgres prints it, which can differ from how the
 index wrote it for exponent forms such as `1e3`; check such a record by hand
 before counting it.
+
+## After each cutover
+
+A rolling deploy runs the old kernel beside this one for a while. The old
+kernel writes the catalog and field-index rows in a second transaction after
+the event commits, so an old process that stops between the two leaves a
+record whose catalog row is behind its journal. Run the catalog-behind check
+above on staging and production after each cutover, once the old process is
+gone. If it is not 0, restart the service once: boot repair replays those
+records before the new process serves. Do not write the rows by hand.

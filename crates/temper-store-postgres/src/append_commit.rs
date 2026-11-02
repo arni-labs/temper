@@ -25,10 +25,16 @@
 //! statement per record in persistence-id order. If the catalog row changed
 //! between the statement's snapshot and its lock (`raced`: a writer committed
 //! while it waited), the snapshot cannot see that writer's field-index rows,
-//! so the statement writes nothing and runs again on a new snapshot. A record
-//! with no catalog row yet has nothing to lock; its only writer while the
-//! server serves is its first move, and two first moves meet on the journal's
-//! unique key.
+//! so the statement writes nothing and runs once more, on a snapshot taken
+//! while its connection already holds the lock (`append_on`), which no writer
+//! can then change under it.
+//!
+//! A record with no catalog row yet has nothing to lock. While the server
+//! serves, only the record's own commit creates that row: boot repair creates
+//! the missing ones before serving, and the snapshot backfill that runs while
+//! serving rewrites existing rows only
+//! (`refresh_query_projection_with_state`). Two commits of one record meet on
+//! the journal's unique key.
 //!
 //! The sub-statements of one statement see one snapshot and must not change the
 //! same row twice, so each table's writes touch disjoint rows: the field-index
@@ -504,6 +510,7 @@ impl PostgresEventStore {
                 expected_sequence,
                 events,
                 rows,
+                AppendScope::Alone,
                 &mut timer,
             )
             .await?;
@@ -521,6 +528,7 @@ impl PostgresEventStore {
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
         rows: CommitRows<'_>,
+        scope: AppendScope,
         timer: &mut PostgresTransactionTimer,
     ) -> Result<u64, PersistenceError> {
         let (tenant, entity_type, entity_id) =
@@ -531,36 +539,52 @@ impl PostgresEventStore {
             events,
             rows,
         )?;
-        let mut written = None;
-        for _ in 0..RACED_ATTEMPTS {
-            let answer = params
-                .bind(crate::dbm::postgres_query_as!(
-                    &self.schema,
-                    APPEND_COMMIT_SQL
-                ))
-                .fetch_one(&mut *conn)
-                .await;
-            let answer: AppendAnswer = match answer {
-                Ok(answer) => answer,
-                Err(error) => {
-                    let error = append_error(error, expected_sequence, entity_type);
-                    if matches!(error, PersistenceError::ConcurrencyViolation { .. }) {
-                        timer.set_outcome("concurrency_violation");
-                    }
-                    return Err(error);
+        let written = match self
+            .run_append(conn, &params, expected_sequence, entity_type, timer)
+            .await?
+        {
+            Some(written) => written,
+            // Raced: run once more on a snapshot taken after this connection
+            // holds the record's catalog row lock, so no writer can change the
+            // row between that snapshot and the statement's own lock, and the
+            // second run cannot race. In a batch, the first run's `locked`
+            // took that lock and the batch's transaction still holds it. On
+            // its own, the first run committed and let it go, so the second
+            // takes it first, in a transaction of its own.
+            None => match scope {
+                AppendScope::InBatch => {
+                    self.run_append(conn, &params, expected_sequence, entity_type, timer)
+                        .await?
                 }
-            };
-            written = settle(answer, expected_sequence, entity_type, timer)?;
-            if written.is_some() {
-                break;
+                AppendScope::Alone => {
+                    let mut tx = sqlx::Connection::begin(&mut *conn)
+                        .await
+                        .map_err(storage_error)?;
+                    let _held: Option<i32> = crate::dbm::postgres_query_scalar!(
+                        &self.schema,
+                        "SELECT 1 FROM {schema}entity_catalog \
+                         WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 \
+                         FOR UPDATE",
+                    )
+                    .bind(tenant)
+                    .bind(entity_type)
+                    .bind(entity_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(storage_error)?;
+                    let written = self
+                        .run_append(&mut tx, &params, expected_sequence, entity_type, timer)
+                        .await?;
+                    tx.commit().await.map_err(storage_error)?;
+                    written
+                }
             }
-        }
-        let written = written.ok_or_else(|| {
-            PersistenceError::Storage(format!(
-                "the {entity_type} record's catalog row changed under each of \
-                 {RACED_ATTEMPTS} attempts to append to it"
-            ))
-        })?;
+            .ok_or_else(|| {
+                PersistenceError::Storage(format!(
+                    "the {entity_type} record's catalog row changed while this append held its lock"
+                ))
+            })?,
+        };
         if params.projection.op == Some("upsert") {
             record_postgres_projection_index_fields(
                 EVENT_APPEND_OPERATION,
@@ -573,6 +597,45 @@ impl PostgresEventStore {
         debug_assert_eq!(written, expected_sequence + events.len() as u64);
         Ok(written)
     }
+
+    /// Run the append statement once on `conn`. None when it raced another
+    /// writer of the record's rows and wrote nothing.
+    async fn run_append(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        params: &AppendParams<'_>,
+        expected_sequence: u64,
+        entity_type: &str,
+        timer: &mut PostgresTransactionTimer,
+    ) -> Result<Option<u64>, PersistenceError> {
+        let answer = params
+            .bind(crate::dbm::postgres_query_as!(
+                &self.schema,
+                APPEND_COMMIT_SQL
+            ))
+            .fetch_one(&mut *conn)
+            .await;
+        match answer {
+            Ok(answer) => settle(answer, expected_sequence, entity_type, timer),
+            Err(error) => {
+                let error = append_error(error, expected_sequence, entity_type);
+                if matches!(error, PersistenceError::ConcurrencyViolation { .. }) {
+                    timer.set_outcome("concurrency_violation");
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Whether the append statement commits on its own or as one statement of a
+/// batch's transaction, which decides how a raced run takes its lock again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AppendScope {
+    /// The statement is its own transaction.
+    Alone,
+    /// The statement runs inside a batch's transaction.
+    InBatch,
 }
 
 impl AppendParams<'_> {
@@ -621,11 +684,6 @@ impl AppendParams<'_> {
             .bind(timer.armed_by)
     }
 }
-
-/// How many times an append runs while another writer keeps changing the
-/// record's catalog row under it. Each run's snapshot includes the writer it
-/// waited for, so only a new commit in each wait makes it run again.
-const RACED_ATTEMPTS: usize = 3;
 
 /// The sequence the statement wrote at, None when it raced another writer
 /// of the record's rows and wrote nothing, or why it refused.

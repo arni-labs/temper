@@ -55,6 +55,30 @@ impl QueryPlaneStore for TenantStoreRouter {
             .await
     }
 
+    async fn refresh_projection(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        status: &str,
+        fields: &serde_json::Value,
+        state: &serde_json::Value,
+        sequence_nr: u64,
+    ) -> Result<(), PersistenceError> {
+        let store = self.store_for_tenant(tenant).await?;
+        store
+            .refresh_query_projection_with_state(
+                tenant,
+                entity_type,
+                entity_id,
+                status,
+                fields,
+                state,
+                sequence_nr,
+            )
+            .await
+    }
+
     async fn remove_projection(
         &self,
         tenant: &str,

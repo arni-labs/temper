@@ -39,6 +39,19 @@ impl QueryPlaneStore for RecordingQueryPlane {
         Ok(())
     }
 
+    async fn refresh_projection(
+        &self,
+        _tenant: &str,
+        _entity_type: &str,
+        _entity_id: &str,
+        _status: &str,
+        _fields: &serde_json::Value,
+        _state: &serde_json::Value,
+        _sequence_nr: u64,
+    ) -> Result<(), PersistenceError> {
+        unreachable!("this stack is never refreshed in the background")
+    }
+
     async fn remove_projection(
         &self,
         tenant: &str,

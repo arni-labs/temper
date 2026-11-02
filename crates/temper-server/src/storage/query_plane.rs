@@ -161,6 +161,23 @@ pub trait QueryPlaneStore: Send + Sync {
         sequence_nr: u64,
     ) -> Result<(), PersistenceError>;
 
+    /// Rewrite an existing catalog row and its field index, as
+    /// [`Self::upsert_projection`] does, and leave a record with no catalog row
+    /// alone. A background pass while the server serves uses this: only a
+    /// record's own commit creates its row then, and boot repair creates the
+    /// missing ones before serving.
+    #[expect(clippy::too_many_arguments, reason = "projection upsert boundary")]
+    async fn refresh_projection(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        status: &str,
+        fields: &serde_json::Value,
+        state: &serde_json::Value,
+        sequence_nr: u64,
+    ) -> Result<(), PersistenceError>;
+
     async fn remove_projection(
         &self,
         tenant: &str,

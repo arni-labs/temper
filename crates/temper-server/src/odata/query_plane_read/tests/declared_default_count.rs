@@ -42,6 +42,29 @@ impl QueryPlaneStore for WriteBeforeCount {
         .await
     }
 
+    async fn refresh_projection(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        status: &str,
+        fields: &serde_json::Value,
+        state: &serde_json::Value,
+        sequence_nr: u64,
+    ) -> Result<(), PersistenceError> {
+        QueryPlaneStore::refresh_projection(
+            self.store.as_ref(),
+            tenant,
+            entity_type,
+            entity_id,
+            status,
+            fields,
+            state,
+            sequence_nr,
+        )
+        .await
+    }
+
     async fn remove_projection(
         &self,
         tenant: &str,

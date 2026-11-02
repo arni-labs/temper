@@ -532,6 +532,7 @@ impl EventStore for PostgresEventStore {
                     append.expected_sequence,
                     &append.events,
                     append.commit_rows(),
+                    crate::append_commit::AppendScope::InBatch,
                     &mut transaction_timer,
                 )
                 .await?;
