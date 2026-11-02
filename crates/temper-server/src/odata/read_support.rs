@@ -89,6 +89,9 @@ fn catalog_row_to_entity_body(
         "last_event_at": null,
         "last_event_via": null,
         "last_event_by": null,
+        "last_event_for": null,
+        "last_event_agent_type": null,
+        "last_event_label": null,
         "timer_needs_person": null,
         "@odata.id": format!("{entity_set_name}('{id}')"),
     })
