@@ -333,9 +333,9 @@ async fn server_with(
     let mut specs = vec![("Job", job.as_str()), ("Child", CHILD_IOA)];
     specs.extend_from_slice(more);
     let mut state = PlatformState::new(None);
-    state
-        .server
-        .set_storage_stack(StorageStack::from_sim(store.clone(), None).with_entity_rows_in_journal());
+    state.server.set_storage_stack(
+        StorageStack::from_sim(store.clone(), None).with_entity_rows_in_journal(),
+    );
     state.server.state_timer_rows = Some(Arc::new(CommittedRows(store.clone())));
     let cache = BTreeMap::new();
     bootstrap_system_tenant(&state, &cache);
@@ -355,7 +355,7 @@ async fn server_with(
         for (entity_type, _) in &specs {
             registry.set_verification_status(
                 &tenant(),
-                *entity_type,
+                entity_type,
                 VerificationStatus::Completed(EntityVerificationResult {
                     all_passed: true,
                     levels: vec![EntityLevelSummary {
@@ -448,7 +448,10 @@ async fn history(state: &PlatformState, entity_type: &str, id: &str) -> Vec<Valu
         &agent(),
     )
     .await;
-    body["events"].as_array().expect("history has events").clone()
+    body["events"]
+        .as_array()
+        .expect("history has events")
+        .clone()
 }
 
 /// Wait until the record reaches `status`, or fail saying what it read.
@@ -563,7 +566,9 @@ async fn a_reaction_keeps_the_label_down_the_chain() {
         event_names_the_agent(event);
     }
 
-    let child_id = record["fields"]["child"].as_str().expect("the spawn names its child");
+    let child_id = record["fields"]["child"]
+        .as_str()
+        .expect("the spawn names its child");
     let child = until_status(&state, "Children", child_id, "Started").await;
     record_names_the_agent(&child);
     event_names_the_agent(history(&state, "Child", child_id).await.last().unwrap());
@@ -657,7 +662,11 @@ async fn a_persons_move_shows_no_agent_fields() {
     assert_eq!(record["last_event_by"], PERSON, "{record}");
     names_no_agent(
         &record,
-        ["last_event_for", "last_event_agent_type", "last_event_label"],
+        [
+            "last_event_for",
+            "last_event_agent_type",
+            "last_event_label",
+        ],
     );
     let moves = history(&state, "Job", "j").await;
     let event = moves.last().unwrap();
@@ -674,7 +683,11 @@ async fn an_empty_label_is_no_label() {
 
     let record = read(&state, "Jobs", "j").await;
     assert_eq!(record["last_event_by"], AGENT, "{record}");
-    assert_eq!(record.get("last_event_label"), Some(&Value::Null), "{record}");
+    assert_eq!(
+        record.get("last_event_label"),
+        Some(&Value::Null),
+        "{record}"
+    );
     let moves = history(&state, "Job", "j").await;
     assert_eq!(moves.last().unwrap().get("label"), Some(&Value::Null));
 }
@@ -759,7 +772,10 @@ async fn a_caller_cannot_supply_the_label() {
         let body = json!({ "author": supplied }).to_string();
         let (status, answer) = post_move(&state, id, "Publish", &agent(), &body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{id}: {answer}");
-        assert_eq!(answer["error"]["code"], "AuthenticatedParameter", "{answer}");
+        assert_eq!(
+            answer["error"]["code"], "AuthenticatedParameter",
+            "{answer}"
+        );
         let post = read(&state, "Posts", id).await;
         assert_eq!(post["status"], "Draft", "{post}");
         assert_eq!(post["fields"]["author"], "", "{post}");
