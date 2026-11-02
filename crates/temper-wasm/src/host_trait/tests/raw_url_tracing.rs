@@ -2,7 +2,9 @@
 //!
 //! This reads Rust tokens, not data flow: a URL copied into a variable whose
 //! name lacks "url" still escapes it. `url_for_log` is the engine's existing
-//! pre-redacted value. Neither exemption applies to other values in a call.
+//! pre-redacted value; `LocalTDataRequest::telemetry_path` exposes a parsed,
+//! query-free path. Safe values are recognized by their expression, never by
+//! the tracing field name. No exemption applies to other values in a call.
 
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
 
@@ -47,10 +49,36 @@ fn message_has_url(message: &str) -> bool {
     false
 }
 
+// Only a complete approved expression proves that a URL-labelled field is safe.
+// Finding one redacted value inside a tuple or block does not prove the rest safe.
+fn telemetry_value(tokens: &[TokenTree]) -> bool {
+    fn safe(expression: &syn::Expr) -> bool {
+        match expression {
+            syn::Expr::Path(path) => path.path.is_ident("url_for_log"),
+            syn::Expr::Call(call) => matches!(call.func.as_ref(), syn::Expr::Path(path)
+                if path.path.segments.last().is_some_and(|part| part.ident == "telemetry_url")),
+            syn::Expr::MethodCall(call) => call.method == "telemetry_path" && call.args.is_empty(),
+            syn::Expr::Reference(reference) => safe(&reference.expr),
+            syn::Expr::Paren(paren) => safe(&paren.expr),
+            syn::Expr::Group(group) => safe(&group.expr),
+            _ => false,
+        }
+    }
+    let value = match tokens {
+        [TokenTree::Punct(punct), rest @ ..] if matches!(punct.as_char(), '%' | '?') => rest,
+        _ => tokens,
+    };
+    syn::parse2::<syn::Expr>(value.iter().cloned().collect())
+        .is_ok_and(|expression| safe(&expression))
+}
+
 // Return (raw URL, redacted URL). Only the argument of telemetry_url is
 // exempt: `(telemetry_url(url), url)` still contains a raw URL.
 fn urls_in_value(tokens: &[TokenTree]) -> (bool, bool) {
-    let (mut raw, mut redacted) = (false, false);
+    if telemetry_value(tokens) {
+        return (false, true);
+    }
+    let mut raw = false;
     let mut index = 0;
     while index < tokens.len() {
         match &tokens[index] {
@@ -58,11 +86,10 @@ fn urls_in_value(tokens: &[TokenTree]) -> (bool, bool) {
                 if name == "telemetry_url"
                     && matches!(tokens.get(index + 1), Some(TokenTree::Group(_))) =>
             {
-                redacted = true;
                 index += 2;
                 continue;
             }
-            TokenTree::Ident(name) if name == "url_for_log" => redacted = true,
+            TokenTree::Ident(name) if name == "url_for_log" => {}
             TokenTree::Ident(name) => raw |= names_url(&name.to_string()),
             TokenTree::Literal(literal) => {
                 if let Ok(message) = syn::parse_str::<syn::LitStr>(&literal.to_string()) {
@@ -70,16 +97,15 @@ fn urls_in_value(tokens: &[TokenTree]) -> (bool, bool) {
                 }
             }
             TokenTree::Group(group) => {
-                let (nested_raw, nested_redacted) =
+                let (nested_raw, _) =
                     urls_in_value(&group.stream().into_iter().collect::<Vec<_>>());
                 raw |= nested_raw;
-                redacted |= nested_redacted;
             }
             _ => {}
         }
         index += 1;
     }
-    (raw, redacted)
+    (raw, false)
 }
 
 fn arguments_have_raw_url(tokens: &[TokenTree]) -> bool {
@@ -101,8 +127,7 @@ fn argument_has_raw_url(tokens: &[TokenTree]) -> bool {
     {
         let field: String = tokens[..equals].iter().map(ToString::to_string).collect();
         let (raw, redacted) = urls_in_value(&tokens[equals + 1..]);
-        // url.path is already parsed separately from the query by the local host.
-        raw || (names_url(&field) && field != "url.path" && !redacted)
+        raw || (names_url(&field) && !redacted)
     } else {
         urls_in_value(tokens).0
     }
@@ -229,6 +254,9 @@ fn redaction_is_checked_per_value() {
         assert_eq!(raw_urls_in_tracing(bad).len(), 1, "{bad}");
     }
     for good in [
+        r#"tracing::info_span!("x", http.url = %request.telemetry_path());"#,
+        r#"tracing::info_span!("x", url.path = %(request.telemetry_path()));"#,
+        r#"tracing::warn!(url.path = %telemetry_url(destination), "failed");"#,
         r#"tracing::warn!(url = %telemetry_url(url), "failed");"#,
         "tracing::warn!(url = %telemetry_url(\n &request.url\n), \"failed\");",
         r#"tracing::info_span!("x", http.url = %telemetry_url(&request.url));"#,
@@ -236,13 +264,34 @@ fn redaction_is_checked_per_value() {
         r#"tracing::warn!(status = status, "failed");"#,
         r#"tracing::event!(tracing::Level::WARN, { url = %telemetry_url(url) });"#,
         r#"tracing::warn!({ url = %telemetry_url(url) }, "failed");"#,
-        r#"tracing::info_span!("x", url.path = %path_for_span);"#,
+        r#"tracing::info_span!("x", url.path = %request.telemetry_path());"#,
         r#"tracing::warn!("failed {}", telemetry_url(url));"#,
         r#"tracing::warn!("literal {{url}}");"#,
         r#"let url = format!("{url}");"#,
         r#"// tracing::warn!(%url, "failed");"#,
     ] {
         assert!(raw_urls_in_tracing(good).is_empty(), "{good}");
+    }
+}
+
+#[test]
+fn a_url_field_name_is_not_proof_of_a_parsed_value() {
+    for bad in [
+        r#"let destination = "https://host.invalid/build?token=query-secret";
+            tracing::warn!(url.path = %destination, "failed");"#,
+        r#"tracing::warn!(url.path = ?destination, "failed");"#,
+        r#"tracing::warn!(url.path = %telemetry_path(destination), "failed");"#,
+        r#"tracing::warn!(url.path = %request.telemetry_path(destination), "failed");"#,
+        r#"tracing::warn!(url.path = ?(request.telemetry_path(), destination));"#,
+        r#"tracing::warn!(http.url = ?(telemetry_url(url), destination));"#,
+        r#"tracing::warn!(url.path = %destination, "{}", request.telemetry_path());"#,
+        r#"tracing::warn!(url.path = %request.telemetry_path(), raw_url = %destination);"#,
+        r#"tracing::warn!({ url.path = %destination }, "failed");"#,
+        r#"tracing::info_span!("x", url.path = %path_for_span);"#,
+        r#"tracing::warn!(url.path = %destination, safe_url = %telemetry_url(url));"#,
+        r#"tracing::warn!(safe_url = %telemetry_url(url), url.path = %destination);"#,
+    ] {
+        assert_eq!(raw_urls_in_tracing(bad).len(), 1, "{bad}");
     }
 }
 
