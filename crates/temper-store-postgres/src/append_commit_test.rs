@@ -648,5 +648,5 @@ fn a_batch_commits_each_records_rows_with_its_events() {
     });
 }
 
-#[path = "append_commit_test/race.rs"]
+#[path = "append_commit_test/race_test.rs"]
 mod race;

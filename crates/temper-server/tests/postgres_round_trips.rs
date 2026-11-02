@@ -10,8 +10,9 @@
 //! Gated on DATABASE_URL (skips without it, runs in CI); the store works in a
 //! schema of its own.
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -75,13 +76,19 @@ const POLICY: &str = r#"permit(principal, action, resource is Surface);"#;
 /// one kind.
 const LIST: &str = "/tdata/Surfaces?$filter=app%20eq%20'app-3'%20and%20status%20eq%20'Kept'%20and%20kind%20eq%20'react'&$top=1";
 
-/// Counts the client messages that wait for an answer from the server.
+/// Counts the client messages that wait for an answer from the server, and
+/// keeps each one's description: its type and the statements it runs.
 #[derive(Clone, Default)]
-struct RoundTrips(Arc<AtomicU64>);
+struct RoundTrips(Arc<AtomicU64>, Arc<Mutex<Vec<String>>>);
 
 impl RoundTrips {
     fn now(&self) -> u64 {
         self.0.load(Ordering::SeqCst)
+    }
+
+    /// The counted messages from `from` on, one line each.
+    fn since(&self, from: u64) -> Vec<String> {
+        self.1.lock().unwrap()[from as usize..].to_vec()
     }
 }
 
@@ -121,7 +128,11 @@ async fn relay(client: TcpStream, server: TcpStream, trips: RoundTrips) {
         };
         // Count before forwarding, so the answer cannot arrive first.
         let waits = frames.push(&chunk[..read]);
-        trips.0.fetch_add(waits, Ordering::SeqCst);
+        if !waits.is_empty() {
+            let mut log = trips.1.lock().unwrap();
+            trips.0.fetch_add(waits.len() as u64, Ordering::SeqCst);
+            log.extend(waits);
+        }
         if server_write.write_all(&chunk[..read]).await.is_err() {
             return;
         }
@@ -134,17 +145,39 @@ async fn relay(client: TcpStream, server: TcpStream, trips: RoundTrips) {
 struct Frames {
     pending: Vec<u8>,
     started: bool,
+    /// Each prepared statement's text, by name, as its Parse gave it.
+    prepared: HashMap<String, String>,
+    /// The statements of the extended-protocol batch a Sync will end.
+    batch: Vec<String>,
+}
+
+/// The first `limit` characters of `text` on one line.
+fn excerpt(text: &str, limit: usize) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(limit)
+        .collect()
+}
+
+/// The NUL-terminated strings at the start of `body`.
+fn cstrings(body: &[u8], count: usize) -> Vec<String> {
+    body.split(|byte| *byte == 0)
+        .take(count)
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect()
 }
 
 const SSL_REQUEST: u32 = 80_877_103;
 const GSS_REQUEST: u32 = 80_877_104;
 
 impl Frames {
-    /// Take in `bytes` and return how many complete messages among them wait
-    /// for an answer.
-    fn push(&mut self, bytes: &[u8]) -> u64 {
+    /// Take in `bytes` and describe each complete message among them that
+    /// waits for an answer.
+    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
         self.pending.extend_from_slice(bytes);
-        let mut waits = 0;
+        let mut waits = Vec::new();
         loop {
             let header = if self.started { 5 } else { 8 };
             if self.pending.len() < header {
@@ -157,8 +190,29 @@ impl Frames {
                 return waits;
             }
             if self.started {
-                if matches!(self.pending[0], b'Q' | b'S') {
-                    waits += 1;
+                let body = &self.pending[5..at + length];
+                match self.pending[0] {
+                    b'Q' => waits.push(format!("Q {}", excerpt(&cstrings(body, 1)[0], 120))),
+                    b'P' => {
+                        let parts = cstrings(body, 2);
+                        let text = excerpt(&parts[1], 120);
+                        self.prepared.insert(parts[0].clone(), text.clone());
+                        self.batch.push(format!("Parse {:?}: {text}", parts[0]));
+                    }
+                    b'B' => {
+                        let name = cstrings(body, 2).remove(1);
+                        let text = self.prepared.get(&name).cloned().unwrap_or_default();
+                        self.batch.push(format!("Bind {name:?}: {text}"));
+                    }
+                    b'S' => {
+                        let batch = std::mem::take(&mut self.batch);
+                        waits.push(if batch.is_empty() {
+                            "S (bare Sync: the pool's ping)".to_string()
+                        } else {
+                            format!("S [{}]", batch.join(" ; "))
+                        });
+                    }
+                    _ => {}
                 }
             } else {
                 let code = u32::from_be_bytes(self.pending[4..8].try_into().unwrap());
@@ -359,10 +413,14 @@ async fn a_move_and_a_filtered_page_cost_a_fixed_number_of_round_trips() {
         // Warm up: the first use of each statement prepares it.
         edit(&state, &trips, "s-003", "first").await;
         edit(&state, &trips, "s-003", "second").await;
+        quiet(&trips).await;
+        let from = trips.now();
         let move_cost = edit(&state, &trips, "s-003", "third").await;
+        let messages = trips.since(from);
+        eprintln!("warm move messages:\n  {}", messages.join("\n  "));
         assert!(
             move_cost <= 2,
-            "a warm move costs {move_cost} round trips, want at most 2"
+            "a warm move costs {move_cost} round trips, want at most 2: {messages:#?}"
         );
 
         list(&state, &trips).await;
