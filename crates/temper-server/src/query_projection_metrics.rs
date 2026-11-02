@@ -9,10 +9,6 @@ use opentelemetry::{
 };
 
 struct QueryProjectionMetrics {
-    update_started_total: Counter<u64>,
-    update_error_total: Counter<u64>,
-    update_duration_ms: Histogram<f64>,
-    update_end_to_end_duration_ms: Histogram<f64>,
     update_applied_sequence_nr: Gauge<u64>,
     backfill_entities_total: Counter<u64>,
     backfill_duration_ms: Histogram<f64>,
@@ -36,28 +32,6 @@ fn metrics() -> &'static QueryProjectionMetrics {
     METRICS.get_or_init(|| {
         let meter = global::meter("temper.runtime");
         QueryProjectionMetrics {
-            update_started_total: meter
-                .u64_counter("temper_query_projection_update_started_total")
-                .with_description("Durable query-plane projection updates that started running.")
-                .build(),
-            update_error_total: meter
-                .u64_counter("temper_query_projection_update_error_total")
-                .with_description("Durable query-plane projection updates that failed.")
-                .build(),
-            update_duration_ms: meter
-                .f64_histogram("temper_query_projection_update_duration_ms")
-                .with_unit("ms")
-                .with_description(
-                    "Wall time for durable query-plane projection maintenance after work starts.",
-                )
-                .build(),
-            update_end_to_end_duration_ms: meter
-                .f64_histogram("temper_query_projection_update_end_to_end_duration_ms")
-                .with_unit("ms")
-                .with_description(
-                    "End-to-end time from durable query-plane projection enqueue to completion.",
-                )
-                .build(),
             update_applied_sequence_nr: meter
                 .u64_gauge("temper_query_projection_applied_sequence_nr")
                 .with_description(
@@ -166,57 +140,6 @@ fn projection_attrs(
     ]
 }
 
-pub(crate) fn record_update_started(
-    tenant: &str,
-    entity_type: &str,
-    operation: &str,
-    source: &str,
-) {
-    metrics()
-        .update_started_total
-        .add(1, &projection_attrs(tenant, entity_type, operation, source));
-}
-
-pub(crate) fn record_update_duration(
-    tenant: &str,
-    entity_type: &str,
-    operation: &str,
-    source: &str,
-    result: &str,
-    duration: Duration,
-) {
-    let attrs = [
-        KeyValue::new("tenant", tenant.to_string()),
-        KeyValue::new("entity_type", entity_type.to_string()),
-        KeyValue::new("operation", operation.to_string()),
-        KeyValue::new("source", source.to_string()),
-        KeyValue::new("result", result.to_string()),
-    ];
-    metrics()
-        .update_duration_ms
-        .record(duration.as_secs_f64() * 1000.0, &attrs);
-}
-
-pub(crate) fn record_update_end_to_end_duration(
-    tenant: &str,
-    entity_type: &str,
-    operation: &str,
-    source: &str,
-    result: &str,
-    duration: Duration,
-) {
-    let attrs = [
-        KeyValue::new("tenant", tenant.to_string()),
-        KeyValue::new("entity_type", entity_type.to_string()),
-        KeyValue::new("operation", operation.to_string()),
-        KeyValue::new("source", source.to_string()),
-        KeyValue::new("result", result.to_string()),
-    ];
-    metrics()
-        .update_end_to_end_duration_ms
-        .record(duration.as_secs_f64() * 1000.0, &attrs);
-}
-
 pub(crate) fn record_update_applied_sequence(
     tenant: &str,
     entity_type: &str,
@@ -228,12 +151,6 @@ pub(crate) fn record_update_applied_sequence(
         sequence_nr,
         &projection_attrs(tenant, entity_type, operation, source),
     );
-}
-
-pub(crate) fn record_update_error(tenant: &str, entity_type: &str, operation: &str, source: &str) {
-    metrics()
-        .update_error_total
-        .add(1, &projection_attrs(tenant, entity_type, operation, source));
 }
 
 pub(crate) fn record_backfill_entities(

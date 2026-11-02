@@ -62,11 +62,13 @@ async fn append_batch_commits_multiple_journals_atomically() {
             persistence_id: "default:Order:ord-a".to_string(),
             expected_sequence: 0,
             events: vec![test_envelope(0, "Created")],
+            projection: None,
         },
         PersistenceAppend {
             persistence_id: "default:Order:ord-b".to_string(),
             expected_sequence: 0,
             events: vec![test_envelope(0, "Created"), test_envelope(0, "Submitted")],
+            projection: None,
         },
     ];
 
@@ -107,11 +109,13 @@ async fn append_batch_conflict_leaves_all_journals_untouched() {
                 persistence_id: "default:Order:ord-new".to_string(),
                 expected_sequence: 0,
                 events: vec![test_envelope(0, "Created")],
+                projection: None,
             },
             PersistenceAppend {
                 persistence_id: "default:Order:ord-existing".to_string(),
                 expected_sequence: 0,
                 events: vec![test_envelope(0, "Submitted")],
+                projection: None,
             },
         ])
         .await
@@ -354,6 +358,7 @@ async fn a_store_that_stops_after_a_write_refuses_every_write_until_it_takes_wri
         persistence_id: other.to_string(),
         expected_sequence: 1,
         events: vec![test_envelope(0, "Moved")],
+        projection: None,
     }];
     assert!(store.append_batch(&batch).await.is_err());
     assert_eq!(store.read_events(stopper, 0).await.unwrap().len(), 1);

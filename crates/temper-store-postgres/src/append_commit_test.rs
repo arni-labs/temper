@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 
 use sqlx::PgPool;
 use temper_runtime::persistence::{
-    CommitRows, EntityKeyRow, EntityVectorRow, EventMetadata, EventStore, PersistenceEnvelope,
-    PersistenceError, ProjectionRow, ScheduledActionRecord, StateTimerRecord, StateTimerRow,
+    AppendProjection, CommitRows, EntityKeyRow, EntityVectorRow, EventMetadata, EventStore,
+    PersistenceAppend, PersistenceEnvelope, PersistenceError, ProjectionRow, ScheduledActionRecord,
+    StateTimerRecord, StateTimerRow,
 };
 
 use crate::migration::run_migrations_in_schema;
@@ -115,7 +116,7 @@ async fn snapshot(pool: &PgPool, schema: &PostgresSchema) -> BTreeMap<&'static s
 async fn index_rows(store: &PostgresEventStore, pool: &PgPool) -> Vec<(String, String)> {
     sqlx::query_as(&store.schema().qualify_sql(
         "SELECT field_name, field_value FROM {schema}entity_field_index \
-         WHERE tenant = 't' AND entity_id = 'p1' ORDER BY field_name",
+         WHERE tenant = 't' AND entity_id = 'p1' ORDER BY field_name COLLATE \"C\"",
     ))
     .fetch_all(pool)
     .await
@@ -274,7 +275,7 @@ fn append_writes_every_row_the_projection_writer_would() {
             let pool = pool.clone();
             let sql = store.schema().qualify_sql(
                 "SELECT field_name, field_value, status FROM {schema}entity_field_index \
-                 WHERE tenant = 't' AND entity_id = $1 ORDER BY field_name",
+                 WHERE tenant = 't' AND entity_id = $1 ORDER BY field_name COLLATE \"C\"",
             );
             async move {
                 let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(&sql)
@@ -545,6 +546,102 @@ fn tombstone_removes_rows_and_leaves_a_terminal_mark() {
         .await
         .unwrap();
         assert_eq!(mark, (2, true));
+        drop_schema(&pool, &schema).await;
+    });
+}
+
+fn batched(
+    persistence_id: &str,
+    expected_sequence: u64,
+    projection: Option<AppendProjection>,
+) -> PersistenceAppend {
+    PersistenceAppend {
+        persistence_id: persistence_id.to_string(),
+        expected_sequence,
+        events: vec![envelope("Moved", serde_json::json!({}))],
+        projection,
+    }
+}
+
+fn kept(app: &str) -> Option<AppendProjection> {
+    Some(AppendProjection::Upsert {
+        status: "Kept".to_string(),
+        fields: serde_json::json!({ "app": app }),
+        state: serde_json::json!({}),
+    })
+}
+
+/// Each record's catalog and field-index rows, by record.
+async fn record_rows(
+    store: &PostgresEventStore,
+    pool: &PgPool,
+) -> Vec<(String, i64, Option<String>)> {
+    sqlx::query_as(&store.schema().qualify_sql(
+        "SELECT c.entity_id, c.sequence_nr, f.field_value FROM {schema}entity_catalog c \
+         LEFT JOIN {schema}entity_field_index f USING (tenant, entity_type, entity_id) \
+         WHERE c.tenant = 't' ORDER BY c.entity_id COLLATE \"C\"",
+    ))
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// A batch (a composite move, a batch delete) commits every record's rows
+/// with its events, as single appends do; a stale member writes nothing of
+/// the batch. On main a batch appended only the events and marked each record
+/// pending, and its rows were written after the commit.
+#[test]
+fn a_batch_commits_each_records_rows_with_its_events() {
+    let Some(url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
+    };
+    sqlx::test_block_on(async {
+        let (pool, schema, store) = isolated_store(&url).await;
+        store
+            .append_batch(&[
+                batched("t:Panel:p2", 0, kept("a2")),
+                batched("t:Panel:p1", 0, kept("a1")),
+            ])
+            .await
+            .unwrap();
+        let rows = record_rows(&store, &pool).await;
+        assert_eq!(
+            rows,
+            vec![
+                ("p1".to_string(), 1, Some("a1".to_string())),
+                ("p2".to_string(), 1, Some("a2".to_string())),
+            ]
+        );
+        assert_eq!(count(&store, &pool, "entity_projection_delta").await, 0);
+
+        // p1 is current, p2 is stale: nothing of the batch lands.
+        let before = snapshot(&pool, &schema).await;
+        let refused = store
+            .append_batch(&[
+                batched("t:Panel:p1", 1, kept("moved")),
+                batched("t:Panel:p2", 0, kept("moved")),
+            ])
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PersistenceError::ConcurrencyViolation {
+                    expected: 0,
+                    actual: 1
+                })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(snapshot(&pool, &schema).await, before);
+
+        // A batch delete removes each record's rows in its commit.
+        let mut deleted = batched("t:Panel:p1", 1, Some(AppendProjection::Remove));
+        deleted.events = vec![tombstone()];
+        store.append_batch(&[deleted]).await.unwrap();
+        assert_eq!(
+            record_rows(&store, &pool).await,
+            vec![("p2".to_string(), 1, Some("a2".to_string()))]
+        );
         drop_schema(&pool, &schema).await;
     });
 }

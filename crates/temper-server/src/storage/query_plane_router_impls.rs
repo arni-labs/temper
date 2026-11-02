@@ -3,10 +3,10 @@
 use temper_runtime::persistence::PersistenceError;
 use temper_store_turso::{TenantStoreRouter, TursoEventStore};
 
-use super::query_plane_impls::{catalog_freshness, storage_order_by, to_turso_projection};
+use super::query_plane_impls::{catalog_freshness, storage_order_by};
 use super::{
     CatalogGroup, CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexPage,
-    QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
+    QueryPlaneStore, QueryProjectionFieldsRow,
 };
 
 #[async_trait::async_trait]
@@ -52,21 +52,6 @@ impl QueryPlaneStore for TenantStoreRouter {
                 state,
                 sequence_nr,
             )
-            .await
-    }
-
-    async fn upsert_projections(
-        &self,
-        tenant: &str,
-        projections: &[QueryProjectionUpsert],
-    ) -> Result<(), PersistenceError> {
-        let store = self.store_for_tenant(tenant).await?;
-        let turso_projections = projections
-            .iter()
-            .map(to_turso_projection)
-            .collect::<Vec<_>>();
-        store
-            .upsert_query_projections(tenant, &turso_projections)
             .await
     }
 

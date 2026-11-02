@@ -21,7 +21,9 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use temper_runtime::ActorSystem;
 use temper_runtime::scheduler::sim_uuid;
 use temper_runtime::tenant::TenantId;
-use temper_server::registry::SpecRegistry;
+use temper_server::registry::{
+    EntityLevelSummary, EntityVerificationResult, SpecRegistry, VerificationStatus,
+};
 use temper_server::{ServerState, StorageStack, build_router};
 use temper_spec::csdl::parse_csdl;
 use temper_store_postgres::{PostgresEventStore, PostgresSchema};
@@ -196,9 +198,29 @@ async fn server(url: &str, schema: &PostgresSchema) -> (ServerState, RoundTrips)
         &[("Surface", SURFACE)],
     );
     let mut state = ServerState::from_registry(ActorSystem::new("pg-round-trips"), registry);
+    // Writes through the router wait for the spec to verify; this one is
+    // marked verified, as the other router tests do.
+    state.registry.write().unwrap().set_verification_status(
+        &TenantId::default(),
+        "Surface",
+        VerificationStatus::Completed(EntityVerificationResult {
+            all_passed: true,
+            levels: vec![EntityLevelSummary {
+                level: "L0 SMT".to_string(),
+                passed: true,
+                summary: "OK".to_string(),
+                details: None,
+            }],
+            verified_at: "2026-11-02T00:00:00Z".to_string(),
+        }),
+    );
     let mut stack = StorageStack::from_postgres(store);
-    // Trajectory entries are written in the background, off the request path;
-    // left on they would land in the middle of a measurement.
+    // No background writer shares the connection inside a counted window.
+    // Trajectory entries are written in the background, off the request path,
+    // so the sink is off. The snapshot queue writes a record only at its
+    // 100-event boundary (`TEMPER_SNAPSHOT_INTERVAL`), which no record here
+    // nears. The OTS outbox reads its queue once when the stack is attached;
+    // `quiet` waits that out before the first record is made.
     stack.trajectory = None;
     state.set_storage_stack(stack);
     state
@@ -233,6 +255,21 @@ fn authenticated(mut request: Request<Body>) -> Request<Body> {
     request
 }
 
+/// Wait until the connection has been idle for half a second, so no earlier
+/// statement is still in flight when a window opens.
+async fn quiet(trips: &RoundTrips) {
+    let mut last = trips.now();
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let now = trips.now();
+        if now == last {
+            return;
+        }
+        last = now;
+    }
+    panic!("the connection never went idle");
+}
+
 /// Send `request` and return its status and JSON body, and the round trips it
 /// cost.
 async fn send(
@@ -240,6 +277,7 @@ async fn send(
     trips: &RoundTrips,
     request: Request<Body>,
 ) -> (StatusCode, serde_json::Value, u64) {
+    quiet(trips).await;
     let before = trips.now();
     let response = build_router(state.clone())
         .oneshot(authenticated(request))
@@ -316,6 +354,7 @@ async fn a_move_and_a_filtered_page_cost_a_fixed_number_of_round_trips() {
     let schema = PostgresSchema::new(format!("round_trips_{}", sim_uuid().simple())).unwrap();
     let (state, trips) = server(&url, &schema).await;
     tokio::time::timeout(Duration::from_secs(300), async {
+        quiet(&trips).await;
         keep_surfaces(&state, 0, 40).await;
         // Warm up: the first use of each statement prepares it.
         edit(&state, &trips, "s-003", "first").await;

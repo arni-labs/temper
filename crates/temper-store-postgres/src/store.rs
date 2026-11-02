@@ -515,117 +515,35 @@ impl EventStore for PostgresEventStore {
             }
         };
 
-        let mut parsed = Vec::with_capacity(appends.len());
-        for append in appends {
-            let (tenant, entity_type, entity_id) =
-                parse_persistence_id_parts(&append.persistence_id)
-                    .map_err(PersistenceError::Storage)?;
-            let row: Option<(i64,)> = crate::dbm::postgres_query_as!(
-                &self.schema,
-                "SELECT COALESCE(MAX(sequence_nr), 0) FROM {schema}events \
-                 WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
-            )
-            .bind(tenant)
-            .bind(entity_type)
-            .bind(entity_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| PersistenceError::Storage(e.to_string()))?;
-
-            let current_seq = row.map(|r| r.0 as u64).unwrap_or(0);
-            if current_seq != append.expected_sequence {
-                transaction_timer.set_outcome("concurrency_violation");
-                return Err(PersistenceError::ConcurrencyViolation {
-                    expected: append.expected_sequence,
-                    actual: current_seq,
-                });
-            }
-            let segment_index = segments::open_segment_for_append(
-                &self.schema,
-                &mut tx,
-                tenant,
-                entity_type,
-                entity_id,
-                current_seq,
-            )
-            .await?;
-            parsed.push((
-                tenant.to_string(),
-                entity_type.to_string(),
-                entity_id.to_string(),
-                segment_index,
-            ));
-        }
-
-        let mut results = Vec::with_capacity(appends.len());
-        for (append, (tenant, entity_type, entity_id, segment_index)) in
-            appends.iter().zip(parsed.iter())
-        {
-            let mut new_seq = append.expected_sequence;
-            for event in &append.events {
-                new_seq += 1;
-                let metadata_json = serde_json::to_value(&event.metadata)
-                    .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
-
-                if let Err(e) = crate::dbm::postgres_query!(&self.schema,
-                    "INSERT INTO {schema}events (tenant, entity_type, entity_id, sequence_nr, segment_index, event_type, payload, metadata) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                )
-                .bind(tenant)
-                .bind(entity_type)
-                .bind(entity_id)
-                .bind(new_seq as i64)
-                .bind(*segment_index)
-                .bind(&event.event_type)
-                .bind(&event.payload)
-                .bind(metadata_json)
-                .execute(&mut *tx)
-                .await
-                {
-                    let msg = e.to_string();
-                    if msg.contains("unique") || msg.contains("duplicate key") {
-                        transaction_timer.set_outcome("concurrency_violation");
-                        return Err(PersistenceError::ConcurrencyViolation {
-                            expected: append.expected_sequence,
-                            actual: new_seq,
-                        });
-                    }
-                    return Err(PersistenceError::Storage(msg));
-                }
-            }
-            if new_seq > append.expected_sequence {
-                segments::update_segment_after_append(
-                    &self.schema,
+        // Each record's events and rows go in through the single-append
+        // statement, so a batch writes exactly what the same appends would
+        // one by one, and its transaction commits them together. The records
+        // are taken in persistence-id order, so two batches over the same
+        // records take their locks in the same order.
+        let mut order: Vec<usize> = (0..appends.len()).collect();
+        order.sort_by(|a, b| appends[*a].persistence_id.cmp(&appends[*b].persistence_id));
+        let mut written = vec![0_u64; appends.len()];
+        for index in order {
+            let append = &appends[index];
+            written[index] = self
+                .append_on(
                     &mut tx,
-                    tenant,
-                    entity_type,
-                    entity_id,
-                    *segment_index,
-                    new_seq,
+                    &append.persistence_id,
+                    append.expected_sequence,
+                    &append.events,
+                    append.commit_rows(),
+                    &mut transaction_timer,
                 )
                 .await?;
-            }
-            results.push(PersistenceAppendResult {
+        }
+        let results: Vec<PersistenceAppendResult> = appends
+            .iter()
+            .zip(written)
+            .map(|(append, sequence_nr)| PersistenceAppendResult {
                 persistence_id: append.persistence_id.clone(),
-                sequence_nr: new_seq,
-            });
-        }
-        // Every stream's events are in, so each mark follows its stream's
-        // concurrency check and unique key, as in a single append.
-        for ((append, (tenant, entity_type, entity_id, _)), result) in
-            appends.iter().zip(&parsed).zip(&results)
-        {
-            if !append.events.is_empty() {
-                crate::projection_delta::mark_pending(
-                    &self.schema,
-                    &mut tx,
-                    [tenant.as_str(), entity_type.as_str(), entity_id.as_str()],
-                    result.sequence_nr,
-                    append.events.iter().any(PersistenceEnvelope::is_tombstone),
-                )
-                .await?;
-            }
-        }
+                sequence_nr,
+            })
+            .collect();
 
         let commit_started = Instant::now();
         tx.commit().await.map_err(|e| {

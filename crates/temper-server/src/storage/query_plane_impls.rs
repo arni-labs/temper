@@ -1,11 +1,10 @@
 use temper_runtime::persistence::PersistenceError;
 use temper_store_postgres::PostgresEventStore;
-use temper_store_turso::{QueryProjectionUpsert as TursoQueryProjectionUpsert, TursoEventStore};
+use temper_store_turso::TursoEventStore;
 
 use super::{
     CatalogGroup, CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder,
     QueryFieldIndexOrderDirection, QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow,
-    QueryProjectionUpsert,
 };
 
 pub(super) fn catalog_freshness(
@@ -282,19 +281,6 @@ impl QueryPlaneStore for TursoEventStore {
         .await
     }
 
-    async fn upsert_projections(
-        &self,
-        tenant: &str,
-        projections: &[QueryProjectionUpsert],
-    ) -> Result<(), PersistenceError> {
-        let turso_projections = projections
-            .iter()
-            .map(to_turso_projection)
-            .collect::<Vec<_>>();
-        self.upsert_query_projections(tenant, &turso_projections)
-            .await
-    }
-
     async fn remove_projection(
         &self,
         tenant: &str,
@@ -442,20 +428,5 @@ impl QueryPlaneStore for TursoEventStore {
         let rows =
             TursoEventStore::catalog_groups(self, tenant, entity_type, fields, statuses).await?;
         Ok(Some(CatalogGroup::from_rows(rows, fields)))
-    }
-}
-
-pub(super) fn to_turso_projection(
-    projection: &QueryProjectionUpsert,
-) -> TursoQueryProjectionUpsert {
-    TursoQueryProjectionUpsert {
-        entity_type: projection.entity_type.clone(),
-        entity_id: projection.entity_id.clone(),
-        status: projection.status.clone(),
-        fields: projection.fields.clone(),
-        state: projection.state.clone(),
-        indexed_fields: projection.indexed_fields.clone(),
-        sequence_nr: projection.sequence_nr,
-        known_new: projection.known_new,
     }
 }

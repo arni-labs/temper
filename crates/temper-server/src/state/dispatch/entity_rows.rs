@@ -18,7 +18,7 @@
 //! that timer after the commit, and the boot walk arms a record left without
 //! one.
 
-use temper_runtime::persistence::StateTimerRecord;
+use temper_runtime::persistence::{AppendProjection, StateTimerRecord};
 use temper_runtime::tenant::TenantId;
 
 use super::state_timeouts::{rearm_clock_start, timer_agent};
@@ -45,6 +45,24 @@ impl ServerState {
         std::sync::Arc::new(move |input: &RowsInput<'_>| {
             server.entity_rows(&tenant, &entity_type, input)
         })
+    }
+
+    /// The query-plane row a record's append in a batch commits with its
+    /// events, as [`Self::entity_rows`] gives a single append's.
+    pub(crate) fn append_projection(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        after: &crate::entity_actor::EntityState,
+    ) -> AppendProjection {
+        if after.is_tombstoned() {
+            return AppendProjection::Remove;
+        }
+        AppendProjection::Upsert {
+            status: after.status.clone(),
+            fields: self.query_projection_fields(tenant, entity_type, &after.fields),
+            state: self.query_projection_state(after),
+        }
     }
 
     fn entity_rows(

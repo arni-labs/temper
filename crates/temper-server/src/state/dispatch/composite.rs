@@ -382,15 +382,7 @@ impl crate::state::ServerState {
         }
         let stage_ms = stage_started_at.map(|started| started.elapsed().as_millis() as u64);
 
-        let appends = streams
-            .iter()
-            .filter(|(_, stream)| !stream.events.is_empty())
-            .map(|(persistence_id, stream)| PersistenceAppend {
-                persistence_id: persistence_id.clone(),
-                expected_sequence: stream.expected_sequence,
-                events: stream.events.clone(),
-            })
-            .collect::<Vec<_>>();
+        let appends = self.composite_appends(tenant, store.commits_entity_rows(), &streams);
         if appends.is_empty() {
             return Ok(true);
         }
@@ -437,8 +429,7 @@ impl crate::state::ServerState {
         self.invalidate_batch_state_timeouts(tenant, &timed);
 
         let projection_collect_started_at = timing_enabled.then(std::time::Instant::now);
-        self.update_composite_query_projections(tenant, &streams)
-            .await?;
+        self.index_composite_streams(tenant, &streams)?;
         let projection_collect_ms =
             projection_collect_started_at.map(|started| started.elapsed().as_millis() as u64);
 

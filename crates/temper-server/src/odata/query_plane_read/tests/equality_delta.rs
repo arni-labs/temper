@@ -71,6 +71,7 @@ async fn measure_equality_delta_3000_rows() {
                         actor_id: "measure".into(),
                     },
                 }],
+                projection: None,
             })
             .collect();
         store.append_batch(&appends).await.unwrap();

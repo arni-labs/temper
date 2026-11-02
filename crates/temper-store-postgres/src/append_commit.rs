@@ -15,6 +15,21 @@
 //! so the events are inserted before any other row, and a racing writer of the
 //! same record fails on the journal rather than on one of its other rows.
 //!
+//! Every writer of a record's rows takes the record's catalog row first: this
+//! statement in `locked` (which every write depends on, through `chk`), the
+//! repair writer (`upsert_query_projection_with_state`) by `FOR UPDATE` before
+//! its index and mark. After the catalog, this statement writes the events and
+//! the record's other rows, then the catalog row, and only then the field
+//! index and the gap mark (`cat`, which they join), the order the repair
+//! writer takes them in, so the two cannot deadlock. A batch runs this
+//! statement per record in persistence-id order. If the catalog row changed
+//! between the statement's snapshot and its lock (`raced`: a writer committed
+//! while it waited), the snapshot cannot see that writer's field-index rows,
+//! so the statement writes nothing and runs again on a new snapshot. A record
+//! with no catalog row yet has nothing to lock; its only writer while the
+//! server serves is its first move, and two first moves meet on the journal's
+//! unique key.
+//!
 //! The sub-statements of one statement see one snapshot and must not change the
 //! same row twice, so each table's writes touch disjoint rows: the field-index
 //! delete takes the names the record no longer indexes and the upsert the names
@@ -56,7 +71,11 @@ const UNIQUE_VIOLATION: &str = "23505";
 /// the events hold the tombstone; `$28` the timer (`arm`, `end` or NULL) with
 /// `$29..$34` its row.
 pub(crate) const APPEND_COMMIT_SQL: &str = concat!(
-    "WITH head AS (
+    "WITH locked AS (
+    SELECT c.sequence_nr, c.projection_hash FROM {schema}entity_catalog c
+    WHERE c.tenant = $1 AND c.entity_type = $2 AND c.entity_id = $3
+    FOR UPDATE),
+head AS (
     SELECT COALESCE(MAX(sequence_nr), 0)::bigint AS seq FROM {schema}events
     WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3),
 clash AS (
@@ -65,10 +84,18 @@ clash AS (
       ON k.key_name = nk.key_name AND k.key_hash = nk.key_hash
     WHERE k.tenant = $1 AND k.entity_type = $2 AND k.entity_id <> $3
     ORDER BY k.key_name LIMIT 1),
+prev AS (
+    SELECT c.sequence_nr, c.projection_hash FROM {schema}entity_catalog c
+    WHERE c.tenant = $1 AND c.entity_type = $2 AND c.entity_id = $3),
+raced AS (
+    SELECT NOT ((NOT EXISTS (SELECT 1 FROM locked) AND NOT EXISTS (SELECT 1 FROM prev))
+        OR EXISTS (SELECT 1 FROM locked l JOIN prev p
+            ON l.sequence_nr = p.sequence_nr AND l.projection_hash = p.projection_hash))
+        AS raced),
 chk AS (
-    SELECT head.seq AS head,
-        head.seq = $4::bigint AND NOT EXISTS (SELECT 1 FROM clash) AS ok
-    FROM head),
+    SELECT head.seq AS head, raced.raced,
+        head.seq = $4::bigint AND NOT EXISTS (SELECT 1 FROM clash) AND NOT raced.raced AS ok
+    FROM head, raced),
 open_seg AS (
     SELECT segment_index FROM {schema}event_segments
     WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 AND sealed_at IS NULL
@@ -150,9 +177,6 @@ sched_fire AS (
     DELETE FROM {schema}scheduled_actions s USING w
     WHERE s.tenant = $1 AND s.entity_type = $2 AND s.entity_id = $3
       AND s.arm_id = $18::text),
-prev AS (
-    SELECT c.sequence_nr, c.projection_hash FROM {schema}entity_catalog c
-    WHERE c.tenant = $1 AND c.entity_type = $2 AND c.entity_id = $3),
 go AS (
     SELECT w.seq,
         NOT EXISTS (SELECT 1 FROM prev WHERE prev.projection_hash = $23::text) AS reindex
@@ -176,13 +200,17 @@ cat_put AS (
         first_event_at = COALESCE(c.first_event_at, EXCLUDED.first_event_at),
         state = EXCLUDED.state,
         updated_at = now()
-    WHERE c.sequence_nr <= EXCLUDED.sequence_nr),
+    WHERE c.sequence_nr <= EXCLUDED.sequence_nr
+    RETURNING 1),
 cat_drop AS (
     DELETE FROM {schema}entity_catalog c USING w
     WHERE $19::text = 'remove'
-      AND c.tenant = $1 AND c.entity_type = $2 AND c.entity_id = $3),
+      AND c.tenant = $1 AND c.entity_type = $2 AND c.entity_id = $3
+    RETURNING 1),
+cat AS (
+    SELECT (SELECT count(*) FROM cat_put) + (SELECT count(*) FROM cat_drop) AS written),
 fi_drop AS (
-    DELETE FROM {schema}entity_field_index f USING w
+    DELETE FROM {schema}entity_field_index f USING w, cat
     WHERE f.tenant = $1 AND f.entity_type = $2 AND f.entity_id = $3
       AND ($19::text = 'remove' OR EXISTS (SELECT 1 FROM go
           WHERE go.reindex AND f.field_name <> ALL($24::text[])))),
@@ -190,7 +218,7 @@ fi_put AS (
     INSERT INTO {schema}entity_field_index AS f
         (tenant, entity_type, entity_id, field_name, field_value)
     SELECT $1, $2, $3, i.field_name, i.field_value
-    FROM unnest($24::text[], $25::text[]) AS i(field_name, field_value), go
+    FROM unnest($24::text[], $25::text[]) AS i(field_name, field_value), go, cat
     WHERE go.reindex
     ON CONFLICT (tenant, entity_type, entity_id, field_name) DO UPDATE SET
         field_value = EXCLUDED.field_value, status = NULL
@@ -207,7 +235,7 @@ mark AS (
             WHERE d.tenant = $1 AND d.entity_type = $2 AND d.entity_id = $3 AND ",
     tombstone_sql!(),
     "))
-    FROM w
+    FROM w, cat
     WHERE CASE $19::text
         WHEN 'remove' THEN true
         WHEN 'upsert' THEN $26::boolean OR NOT EXISTS (SELECT 1 FROM go)
@@ -216,7 +244,7 @@ mark AS (
         sequence_nr = GREATEST(m.sequence_nr, EXCLUDED.sequence_nr),
         terminal = m.terminal OR EXCLUDED.terminal),
 retire AS (
-    DELETE FROM {schema}entity_projection_delta m USING go
+    DELETE FROM {schema}entity_projection_delta m USING go, cat
     WHERE NOT $26::boolean
       AND m.tenant = $1 AND m.entity_type = $2 AND m.entity_id = $3
       AND m.sequence_nr <= go.seq AND NOT m.terminal
@@ -241,13 +269,13 @@ timer_end AS (
     WHERE $28::text = 'end'
       AND t.tenant = $1 AND t.entity_type = $2 AND t.entity_id = $3)
 SELECT chk.ok, chk.head, (SELECT seq FROM w),
-    (SELECT key_name FROM clash), (SELECT entity_id FROM clash)
+    (SELECT key_name FROM clash), (SELECT entity_id FROM clash), chk.raced
 FROM chk"
 );
 
 /// What the statement answers: whether the checks held, the journal head it
 /// found, the sequence it wrote at, and the key another record holds.
-type AppendAnswer = (bool, i64, Option<i64>, Option<String>, Option<String>);
+type AppendAnswer = (bool, i64, Option<i64>, Option<String>, Option<String>, bool);
 
 /// One append's parameters, owned and laid out as the statement's arrays.
 struct AppendParams<'a> {
@@ -460,14 +488,6 @@ impl PostgresEventStore {
         events: &[PersistenceEnvelope],
         rows: CommitRows<'_>,
     ) -> Result<u64, PersistenceError> {
-        let (tenant, entity_type, entity_id) =
-            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
-        let params = AppendParams::new(
-            [tenant, entity_type, entity_id],
-            expected_sequence,
-            events,
-            rows,
-        )?;
         let mut timer = PostgresTransactionTimer::start(EVENT_APPEND_OPERATION);
         let acquire_started = Instant::now();
         let acquired = self.pool().acquire().await;
@@ -477,24 +497,70 @@ impl PostgresEventStore {
             if acquired.is_ok() { "ok" } else { "error" },
         );
         let mut conn = acquired.map_err(storage_error)?;
-        let answer = params
-            .bind(crate::dbm::postgres_query_as!(
-                &self.schema,
-                APPEND_COMMIT_SQL
-            ))
-            .fetch_one(&mut *conn)
-            .await;
-        let answer: AppendAnswer = match answer {
-            Ok(answer) => answer,
-            Err(error) => {
-                let error = append_error(error, expected_sequence, entity_type);
-                if matches!(error, PersistenceError::ConcurrencyViolation { .. }) {
-                    timer.set_outcome("concurrency_violation");
+        let written = self
+            .append_on(
+                &mut conn,
+                persistence_id,
+                expected_sequence,
+                events,
+                rows,
+                &mut timer,
+            )
+            .await?;
+        timer.set_outcome("ok");
+        Ok(written)
+    }
+
+    /// Run the append statement for one record on `conn`: on its own it is
+    /// one transaction; inside a batch's transaction it is one of its
+    /// statements, and the batch commits them together.
+    pub(crate) async fn append_on(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        persistence_id: &str,
+        expected_sequence: u64,
+        events: &[PersistenceEnvelope],
+        rows: CommitRows<'_>,
+        timer: &mut PostgresTransactionTimer,
+    ) -> Result<u64, PersistenceError> {
+        let (tenant, entity_type, entity_id) =
+            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
+        let params = AppendParams::new(
+            [tenant, entity_type, entity_id],
+            expected_sequence,
+            events,
+            rows,
+        )?;
+        let mut written = None;
+        for _ in 0..RACED_ATTEMPTS {
+            let answer = params
+                .bind(crate::dbm::postgres_query_as!(
+                    &self.schema,
+                    APPEND_COMMIT_SQL
+                ))
+                .fetch_one(&mut *conn)
+                .await;
+            let answer: AppendAnswer = match answer {
+                Ok(answer) => answer,
+                Err(error) => {
+                    let error = append_error(error, expected_sequence, entity_type);
+                    if matches!(error, PersistenceError::ConcurrencyViolation { .. }) {
+                        timer.set_outcome("concurrency_violation");
+                    }
+                    return Err(error);
                 }
-                return Err(error);
+            };
+            written = settle(answer, expected_sequence, entity_type, timer)?;
+            if written.is_some() {
+                break;
             }
-        };
-        let written = settle(answer, expected_sequence, entity_type, &mut timer)?;
+        }
+        let written = written.ok_or_else(|| {
+            PersistenceError::Storage(format!(
+                "the {entity_type} record's catalog row changed under each of \
+                 {RACED_ATTEMPTS} attempts to append to it"
+            ))
+        })?;
         if params.projection.op == Some("upsert") {
             record_postgres_projection_index_fields(
                 EVENT_APPEND_OPERATION,
@@ -503,7 +569,6 @@ impl PostgresEventStore {
                 params.projection.skipped_fields,
             );
         }
-        timer.set_outcome("ok");
         debug_assert!(written >= expected_sequence);
         debug_assert_eq!(written, expected_sequence + events.len() as u64);
         Ok(written)
@@ -557,13 +622,19 @@ impl AppendParams<'_> {
     }
 }
 
-/// The sequence the statement wrote at, or why it wrote nothing.
+/// How many times an append runs while another writer keeps changing the
+/// record's catalog row under it. Each run's snapshot includes the writer it
+/// waited for, so only a new commit in each wait makes it run again.
+const RACED_ATTEMPTS: usize = 3;
+
+/// The sequence the statement wrote at, None when it raced another writer
+/// of the record's rows and wrote nothing, or why it refused.
 fn settle(
-    (ok, head, written, clash_key, clash_holder): AppendAnswer,
+    (ok, head, written, clash_key, clash_holder, raced): AppendAnswer,
     expected_sequence: u64,
     entity_type: &str,
     timer: &mut PostgresTransactionTimer,
-) -> Result<u64, PersistenceError> {
+) -> Result<Option<u64>, PersistenceError> {
     let head = u64::try_from(head).unwrap_or_default();
     if head != expected_sequence {
         debug_assert!(!ok, "a stale expected sequence never writes");
@@ -579,11 +650,15 @@ fn settle(
             "duplicate declared key '{key_name}' for {entity_type}: held by {holder}"
         )));
     }
+    if raced {
+        debug_assert!(!ok, "a raced append writes nothing");
+        return Ok(None);
+    }
     assert!(ok, "an append whose checks held writes its rows");
     let written = written.ok_or_else(|| {
         PersistenceError::Storage("append wrote no sequence although its checks held".into())
     })?;
-    Ok(u64::try_from(written).unwrap_or_default())
+    Ok(Some(u64::try_from(written).unwrap_or_default()))
 }
 
 /// What a failed statement means. Only a unique violation has a meaning of its

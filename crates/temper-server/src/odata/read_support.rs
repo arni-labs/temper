@@ -271,15 +271,20 @@ pub(super) async fn materialize_entity_set_entities(
                 if let Some(row) = catalog_row {
                     let entity = match selected_catalog_fields.as_deref() {
                         Some(select) => {
-                            let fields = defaults.field_values(row.state.as_ref().unwrap_or(&row.fields));
+                            let fields =
+                                defaults.field_values(row.state.as_ref().unwrap_or(&row.fields));
                             let mut entity = catalog_row_to_selected_entity_body(
-                                &entity_type, &entity_set_name, row, select,
+                                &entity_type,
+                                &entity_set_name,
+                                row,
+                                select,
                             );
                             defaults.apply_selected(&mut entity, select, &fields);
                             entity
                         }
                         None => {
-                            let mut entity = catalog_row_to_entity_body(&entity_type, &entity_set_name, row);
+                            let mut entity =
+                                catalog_row_to_entity_body(&entity_type, &entity_set_name, row);
                             defaults.apply(&mut entity);
                             entity
                         }
@@ -291,36 +296,9 @@ pub(super) async fn materialize_entity_set_entities(
                     .await
                 {
                     Ok(response) => {
-                        if !response.state.is_tombstoned()
-                            && let Some(query_plane) = state.query_plane_store()
-                        {
-                            let fields = state.query_projection_fields(
-                                &tenant,
-                                &entity_type,
-                                &response.state.fields,
-                            );
-                            let projected_state = state.query_projection_state(&response.state);
-                            if let Err(error) = query_plane
-                                .upsert_projection(
-                                    tenant.as_str(),
-                                    &entity_type,
-                                    &id,
-                                    &response.state.status,
-                                    &fields,
-                                    &projected_state,
-                                    response.state.sequence_nr,
-                                )
-                                .await
-                            {
-                                tracing::debug!(
-                                    error = %error,
-                                    tenant = %tenant,
-                                    entity_type = %entity_type,
-                                    entity_id = %id,
-                                    "failed to repair query projection after actor materialization fallback"
-                                );
-                            }
-                        }
+                        // Nothing is written back: a record's catalog row
+                        // commits with its events, so a row missing here is
+                        // a commit still in flight or a delete, not a lag.
                         let mut entity = serde_json::to_value(&response.state).unwrap_or_default();
                         defaults.apply(&mut entity);
                         if let Some(obj) = entity.as_object_mut() {

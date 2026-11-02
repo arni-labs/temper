@@ -116,6 +116,7 @@ async fn projection_delta_covers_batch_snapshot_wrapped_and_removed_rows() {
             persistence_id: "t:Payment:batch".into(),
             expected_sequence: 0,
             events: vec![test_envelope("Create", serde_json::json!({}))],
+            projection: None,
         }])
         .await
         .unwrap();
@@ -259,4 +260,43 @@ async fn projection_delta_never_resurrects_a_tombstone_or_scans_deleted_rows() {
     project(&store, "gone", "needle", 1).await;
     assert!(candidates(&store, "t").await.0.is_empty());
     assert!(candidates(&store, "t").await.1.is_empty());
+}
+
+/// A batch that carries a record's projection commits its catalog and index
+/// rows with its events and leaves no gap, as a single append does; a batch
+/// delete removes them. On main a batch appended only the events.
+#[tokio::test]
+async fn a_batch_commits_each_records_projection_with_its_events() {
+    let store = make_store("projection-delta-batch-rows").await;
+    let upsert = |id: &str| PersistenceAppend {
+        persistence_id: format!("t:Payment:{id}"),
+        expected_sequence: 0,
+        events: vec![test_envelope("Create", serde_json::json!({}))],
+        projection: Some(temper_runtime::persistence::AppendProjection::Upsert {
+            status: "Draft".into(),
+            fields: serde_json::json!({"Id": id, "app": "needle"}),
+            state: serde_json::json!({}),
+        }),
+    };
+    store
+        .append_batch(&[upsert("one"), upsert("two")])
+        .await
+        .unwrap();
+    assert_eq!(
+        candidates(&store, "t").await,
+        (vec!["one".to_string(), "two".to_string()], Vec::new())
+    );
+    store
+        .append_batch(&[PersistenceAppend {
+            persistence_id: "t:Payment:one".into(),
+            expected_sequence: 1,
+            events: vec![test_envelope(
+                "Deleted",
+                serde_json::json!({"kind": "tombstone"}),
+            )],
+            projection: Some(temper_runtime::persistence::AppendProjection::Remove),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(candidates(&store, "t").await.0, vec!["two".to_string()]);
 }
