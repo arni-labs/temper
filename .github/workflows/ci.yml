@@ -1,12 +1,6 @@
 name: CI
 
 on:
-  pull_request:
-    branches: [main, staging]
-  # The merge queue tests each group (the queued pull requests on top of main) before it
-  # lands. Every required check comes from this workflow, so without this trigger the
-  # queue would wait for checks that never start.
-  merge_group:
   push:
     branches: [main, staging]
   schedule:
@@ -14,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       changed:
-        description: "Paths to treat as changed (space-separated). Set: the pull-request lane for those paths. Empty: every check, as on main."
+        description: "Paths to treat as changed (space-separated). Set: the affected lane for those paths. Empty: every check, as on main."
         required: false
         default: ""
       tests:
@@ -31,12 +25,10 @@ on:
         required: false
         default: false
 
-# A new push to a pull request cancels its older run. Every merge group, push to main,
-# schedule and dispatch runs to the end in its own group, so each commit on main gets a
-# full verdict.
+# Every run goes to the end in its own group, so each push to main gets a full verdict.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -50,7 +42,7 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
   # Every cargo build here resolves features across the whole workspace, as main's
-  # --workspace run does, whichever packages it selects with -p. The pr lane builds only
+  # --workspace run does, whichever packages it selects with -p. The affected lane builds only
   # the packages a change reaches, and cargo's default resolves features for those alone,
   # so a dependency could build without a feature another package turns on: #147 gave
   # temper-server's dev-dependency opentelemetry-otlp the http-json feature, the shards
@@ -60,23 +52,17 @@ env:
   # cargo metadata uses, ignores it with a warning.
   CARGO_UNSTABLE_FEATURE_UNIFICATION: "true"
   CARGO_RESOLVER_FEATURE_UNIFICATION: workspace
-  # The Actions cache holds 10 GB per repository. When every pull request saved its own
-  # 0.3 to 1.4 GB per job, main's caches were evicted within minutes and pull requests,
-  # which can only restore their own ref's caches or main's, compiled from scratch.
-  # Only main (push, schedule, dispatch) saves; everything restores from main.
-  SAVE_RUST_CACHE: ${{ (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') || inputs.save_cache == true }}
+  # The Actions cache holds 10 GB per repository. Only main (push, schedule, dispatch) saves
+  # its Rust caches, so a branch run by hand restores main's and does not evict them.
+  SAVE_RUST_CACHE: ${{ github.ref == 'refs/heads/main' || inputs.save_cache == true }}
 
 jobs:
   # ─────────────────────────────────────────────────────
-  # What this run tests. Schedule and a plain dispatch: everything (lane "full"). A push, a pull
-  # request or a merge group: only the packages its changes can reach (lane "pr"), see
-  # scripts/ci/affected.py. A merge group's changes are those of every pull request in it; a push's
-  # are what it moved main by. A push whose tree already passed in a merge group: nothing to test.
-  # Every test runs once, in the merge group (Rita, 31 Oct 2026: "CI 2 times is insane"): a pull
-  # request only compiles and lints (Compile & Lint, Integrity, Instrumentation Hygiene, the
-  # SDK's type check), so its author sees a broken build in about four minutes, and every job
-  # that runs tests is skipped on it (output tests=false). To run on a branch, before queueing
-  # it, exactly what its merge group will:
+  # What this run tests. Schedule and a plain dispatch: everything (lane "full"). A push to
+  # main: only the packages its changes can reach (lane "affected"), see scripts/ci/affected.py;
+  # the changes are what the push moved main by. The nightly schedule runs the full lane and
+  # catches what that selection misses. To run a branch by hand with the same selection as
+  # a push:
   #   gh workflow run ci.yml -R arni-labs/temper --ref <branch> -f changed="$(git diff --name-only origin/main...)"
   # Jobs with nothing to do are skipped here rather than started; a skipped job satisfies
   # a required check. The DST cells always start, because a matrix job skipped before it
@@ -96,7 +82,6 @@ jobs:
       rust: ${{ steps.affected.outputs.rust }}
       sdk_ts: ${{ steps.affected.outputs.sdk_ts }}
       shards: ${{ steps.affected.outputs.shards }}
-      tests: ${{ steps.affected.outputs.tests }}
       specs: ${{ steps.affected.outputs.specs }}
       dst_matrix: ${{ steps.dst.outputs.matrix }}
     steps:
@@ -104,32 +89,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      # The queue moves main to the commit its group tested, so the push that follows
-      # would test the same files again. Matched by tree, not commit: same files, same result.
-      - id: verified
-        if: github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tree=$(git rev-parse 'HEAD^{tree}')
-          run=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100" \
-            --jq ".workflow_runs[] | select(.head_commit.tree_id == \"$tree\") | .html_url" | head -n 1)
-          echo "tree $tree: ${run:-no merge group run passed it}"
-          echo "run=$run" >> "$GITHUB_OUTPUT"
-
       - id: affected
         env:
           EVENT: ${{ github.event_name }}
-          VERIFIED_RUN: ${{ steps.verified.outputs.run }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+          BASE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
           CHANGED_PATHS: ${{ inputs.changed }}
           # cargo metadata --no-deps needs no particular toolchain; skip installing the pinned one.
           RUSTUP_TOOLCHAIN: stable
         run: python3 scripts/ci/affected.py
 
       # Every suite always has a cell (each is a required check). platform-random: one smoke
-      # cell on the pr lane, four full-mode seed shards on the full lane.
+      # cell on the affected lane, four full-mode seed shards on the full lane.
       - id: dst
         env:
           LANE: ${{ steps.affected.outputs.lane }}
@@ -140,7 +111,7 @@ jobs:
             {"suite":"platform-consistency","filter":"test(dst_) and binary(/^dst_platform_/) and not binary(=dst_platform_boot) and not binary(=dst_platform_random)"}
           ]'
           RANDOM_FILTER="test(dst_) and binary(=dst_platform_random)"
-          if [ "$LANE" = "pr" ]; then
+          if [ "$LANE" = "affected" ]; then
             RANDOM_CELLS=$(jq -cn --arg f "$RANDOM_FILTER" '[{suite:"platform-random",filter:$f}]')
           else
             RANDOM_CELLS=$(jq -cn --arg f "$RANDOM_FILTER" '[range(0;4) | {suite:"platform-random",shard_index:(.|tostring),shard_count:"4",filter:$f}]')
@@ -163,7 +134,7 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libz3-dev
 
-      # About 2 minutes of deletes; check and clippy fit without it on pull requests.
+      # About 2 minutes of deletes; check and clippy fit without it.
       - name: Free disk space for full workspace tests
         if: needs.changes.outputs.lane == 'full'
         run: |
@@ -219,11 +190,10 @@ jobs:
       - name: Type check
         run: npx tsc --noEmit
       - name: Tests
-        if: needs.changes.outputs.tests == 'true'
         run: npx vitest run
 
   # ─────────────────────────────────────────────────────
-  # Gate 1b: Bench compile (non-PR events only)
+  # Gate 1b: Bench compile (full lane only)
   # ─────────────────────────────────────────────────────
   bench-build:
     name: Bench Build
@@ -373,7 +343,7 @@ jobs:
           echo "Dependency isolation: OK"
 
   # ─────────────────────────────────────────────────────
-  # Gate 3a: pull-request tests, split across machines
+  # Gate 3a: affected-lane tests, split across machines
   # Only the packages a change can reach (scripts/ci/affected.py), by test-name hash.
   # temper-server runs with observe and sim on, the features the workspace run gives it,
   # so its observe-gated tests (spec_validate_endpoint, observe::, api::repl::) run here.
@@ -381,7 +351,7 @@ jobs:
   test-shards:
     name: Tests (${{ matrix.name }})
     needs: changes
-    if: needs.changes.outputs.lane == 'pr' && needs.changes.outputs.mode != 'none' && needs.changes.outputs.tests == 'true'
+    if: needs.changes.outputs.lane == 'affected' && needs.changes.outputs.mode != 'none'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
@@ -493,7 +463,7 @@ jobs:
   workspaces:
     name: Other workspaces
     needs: changes
-    if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.mode != 'none' && needs.changes.outputs.tests == 'true'
+    if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.mode != 'none'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -512,9 +482,8 @@ jobs:
   # ─────────────────────────────────────────────────────
   # Gate 3: Full test suite (minutes)
   # The required "Tests" check. Full lane (schedule, plain dispatch): the
-  # whole workspace on one machine, exactly as before. Pull-request lane (also a push): passes
-  # when every test shard above passed, or nothing needed testing, or on a pull
-  # request, which runs no tests (its merge group runs them). Either lane also
+  # whole workspace on one machine. Affected lane (a push): passes when every test shard
+  # above passed or nothing needed testing. Either lane also
   # needs Other workspaces to have passed, or to have had nothing to test.
   # ─────────────────────────────────────────────────────
   test:
@@ -542,18 +511,14 @@ jobs:
           --health-cmd "redis-cli ping"
           --health-interval 2s --health-timeout 5s --health-retries 30
     steps:
-      - name: Pull-request lane result
+      - name: Affected lane result
         if: needs.changes.outputs.lane != 'full'
         env:
           CHANGES: ${{ needs.changes.result }}
           SHARDS: ${{ needs.test-shards.result }}
           PACKAGES: ${{ needs.changes.outputs.packages }}
         run: |
-          if [ "${{ needs.changes.outputs.tests }}" != true ]; then
-            echo "A pull request only compiles and lints; its merge group runs the tests of: ${PACKAGES:-none}"
-          else
-            echo "Packages tested: ${PACKAGES:-none}"
-          fi
+          echo "Packages tested: ${PACKAGES:-none}"
           echo "changes: $CHANGES; test shards: $SHARDS"
           [ "$CHANGES" = success ] || exit 1
           case "$SHARDS" in success|skipped) ;; *) exit 1 ;; esac
@@ -677,7 +642,7 @@ jobs:
   postgres-migrations:
     name: Postgres rollback migrations
     needs: changes
-    if: needs.changes.outputs.packages != '' && needs.changes.outputs.tests == 'true'
+    if: needs.changes.outputs.packages != ''
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:
@@ -751,7 +716,7 @@ jobs:
   # them every test of those packages runs. The cells split that one set by test
   # binary; a dst_ test outside the dst_platform_* binaries lands in core.
   #
-  # ARN-439: platform-random full mode is the main-branch tail. Off-PR it is sharded
+  # ARN-439: platform-random full mode is the main-branch tail. On the full lane it is sharded
   # by SEED across 4 jobs (TEMPER_DST_SHARD_INDEX/COUNT) — not nextest --partition —
   # because each of its 5 test functions loops its seeds internally, so only
   # seed-level splitting balances the work. The union of the 4 shards is the full
@@ -768,15 +733,13 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.dst_matrix) }}
     # The cells always run so each required check reports; when no change reaches a
-    # package, or the tree already passed in its merge group, their steps are skipped.
-    # A pull request runs none: the merge queue runs every suite on the same change
-    # before it lands, and main takes nothing that has not passed there.
+    # package, their steps are skipped.
     env:
-      DST_NEEDED: ${{ needs.changes.outputs.test_args != '' && needs.changes.outputs.tests == 'true' }}
+      DST_NEEDED: ${{ needs.changes.outputs.test_args != '' }}
     steps:
       - name: Not affected
         if: env.DST_NEEDED != 'true'
-        run: echo "No dst_ tests run here. Nothing new to test, or a pull request, whose merge group runs this suite."
+        run: echo "No dst_ tests run here. No changed package reaches a dst_ test."
 
       - uses: actions/checkout@v4
         if: env.DST_NEEDED == 'true'
@@ -825,7 +788,7 @@ jobs:
         env:
           TEST_ARGS: ${{ needs.changes.outputs.test_args }}
           FILTER: ${{ matrix.filter }}
-          TEMPER_DST_RANDOM_MODE: ${{ matrix.suite == 'platform-random' && needs.changes.outputs.lane == 'pr' && 'smoke' || 'full' }}
+          TEMPER_DST_RANDOM_MODE: ${{ matrix.suite == 'platform-random' && needs.changes.outputs.lane == 'affected' && 'smoke' || 'full' }}
           TEMPER_DST_SHARD_INDEX: ${{ matrix.shard_index }}
           TEMPER_DST_SHARD_COUNT: ${{ matrix.shard_count }}
         run: cargo nextest run --locked $TEST_ARGS --no-tests=warn -E "$FILTER"
@@ -837,11 +800,11 @@ jobs:
     name: Spec Verification (L0-L3)
     needs: changes
     # These are temper-cli's verify:: tests, which read every spec collection in the
-    # repository. The pr lane runs them here when a spec file
+    # repository. The affected lane runs them here when a spec file
     # changed (scripts/ci/affected.py, SPEC_FILES). A run that tests temper-cli runs them
     # in Tests already, so this job only runs when it does not.
     if: >-
-      needs.changes.outputs.specs == 'true' && needs.changes.outputs.tests == 'true'
+      needs.changes.outputs.specs == 'true'
       && !contains(format(' {0} ', needs.changes.outputs.packages), ' temper-cli ')
     runs-on: ubuntu-latest
     timeout-minutes: 30
