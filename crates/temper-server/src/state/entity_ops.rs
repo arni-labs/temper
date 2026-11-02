@@ -2152,7 +2152,8 @@ impl ServerState {
         entity_type: &str,
         entity_id: &str,
         action: &str,
-    ) -> Result<(), String> {
+        checked: u64,
+    ) -> Result<crate::entity_actor::TimerStop, String> {
         let actor_ref = self
             .get_or_spawn_tenant_actor(tenant, entity_type, entity_id)
             .ok_or_else(|| {
@@ -2162,11 +2163,15 @@ impl ServerState {
             .ask(
                 EntityMsg::RecordTimerNeedsPerson {
                     action: action.to_owned(),
+                    checked,
                 },
                 self.action_dispatch_timeout,
             )
             .await
             .map_err(|e| format!("Actor update failed: {e}"))?;
+        if response.refused && response.error.is_none() {
+            return Ok(crate::entity_actor::TimerStop::Moved);
+        }
         if !response.success {
             return Err(response
                 .error
@@ -2179,7 +2184,8 @@ impl ServerState {
             &response,
             "timer_needs_person",
         )
-        .await
+        .await?;
+        Ok(crate::entity_actor::TimerStop::Said)
     }
 
     /// Delete an entity.

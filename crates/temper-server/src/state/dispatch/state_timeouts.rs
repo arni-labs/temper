@@ -781,6 +781,8 @@ impl ArmedTimer {
             Some(temper_authz::TimerRecord {
                 entity_type: self.entity_type.clone(),
                 entity_id: self.entity_id.clone(),
+                state: self.state.clone(),
+                action: self.action.clone(),
             }),
         );
         agent.event_origin = None;
@@ -788,6 +790,7 @@ impl ArmedTimer {
             tenant: self.tenant.to_string(),
             entity_type: self.entity_type.clone(),
             entity_id: self.entity_id.clone(),
+            state: self.state.clone(),
             action: self.action.clone(),
             armed_seq: self.sequence_nr,
         });

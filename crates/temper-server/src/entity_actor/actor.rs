@@ -2396,10 +2396,13 @@ impl EntityActor {
                 });
             }
 
-            EntityMsg::RecordTimerNeedsPerson { action } => {
-                let outcome = super::timer_needs_person::commit(self, state, &action).await;
+            EntityMsg::RecordTimerNeedsPerson { action, checked } => {
+                let outcome =
+                    super::timer_needs_person::commit(self, state, &action, checked).await;
+                // A record that moved since is refused, with nothing written.
+                let moved = outcome == Ok(super::timer_needs_person::Stop::Moved);
                 ctx.reply(EntityResponse {
-                    success: outcome.is_ok(),
+                    success: outcome.is_ok() && !moved,
                     refusal: None,
                     state: state.clone(),
                     error: outcome.err(),
@@ -2407,7 +2410,7 @@ impl EntityActor {
                     scheduled_actions: vec![],
                     spawn_requests: vec![],
                     spec_governed: true,
-                    refused: false,
+                    refused: moved,
                     answered_action: None,
                     trigger_failures: Vec::new(),
                     store_unavailable: false,

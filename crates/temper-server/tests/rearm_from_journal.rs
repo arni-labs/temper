@@ -10,15 +10,19 @@
 //!
 //! Each test sets a record polling as someone, takes away or spoils what its
 //! row says, restarts the server over the same store, and reads who the
-//! reaction after the next polls ran as (`Merge` binds its caller).
+//! reaction after the next polls ran as (`Merge` binds its caller). Each
+//! scenario runs across 16 seeds on a single-threaded paused clock, with
+//! seeded request/crash times, poll counts and downtime. The clock and
+//! journal survive each process; dropping its runtime stops every task.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use temper_authz::{PrincipalKind, SecurityContext};
 use temper_runtime::ActorSystem;
 use temper_runtime::persistence::{PersistenceError, StateTimerRecord};
+use temper_runtime::scheduler::{DeterministicIdGen, DeterministicRng, install_sim_context};
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::SpecRegistry;
 use temper_server::request_context::AgentContext;
@@ -26,6 +30,12 @@ use temper_server::storage::StateTimerStore;
 use temper_server::{ServerState, StorageStack};
 use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
+
+#[path = "dst_state_timers_follow_state/process_clock.rs"]
+mod process_clock;
+use process_clock::ProcessClock;
+
+const SEEDS: u64 = 16;
 
 /// `Start` enters Checking, whose timer fires `Look` every second and resets
 /// itself. Once `looks` reaches LOOKS, a reaction to `Look` makes `Merge`,
@@ -133,16 +143,11 @@ impl StateTimerStore for CommittedRows {
     }
 }
 
-/// A started server over `store`, merging after `looks` looks.
 /// Watch's spec, merging at `looks` looks a look every `every` seconds.
 fn watch_ioa(looks: u32, every: u32) -> String {
     WATCH_IOA
         .replace("LOOKS", &looks.to_string())
         .replace("after_seconds = 1", &format!("after_seconds = {every}"))
-}
-
-async fn server(name: &str, store: &SimEventStore, looks: u32) -> ServerState {
-    server_looking_every(name, store, looks, 1).await
 }
 
 async fn server_looking_every(
@@ -169,7 +174,12 @@ async fn server_looking_every(
         .reload_tenant_policies(TENANT, "permit(principal, action, resource);")
         .expect("policy should load");
     state.rebuild_reaction_dispatcher();
-    state.start_runtime().await;
+    state
+        .start_runtime()
+        .await
+        .expect("server starts")
+        .await
+        .expect("boot walk completes");
     state
 }
 
@@ -235,180 +245,204 @@ async fn watch(state: &ServerState, id: &str) -> (String, serde_json::Map<String
     (record.status, fields)
 }
 
-/// Wait until watch `id` is `status`, or fail saying where it stood.
+/// One simulated process. Dropping its single-threaded runtime stops all
+/// tasks; the journal and clock outlive it, as in the timer restart harness.
+struct Process {
+    runtime: tokio::runtime::Runtime,
+    state: ServerState,
+}
+
+impl Process {
+    fn start(clock: &ProcessClock, store: &SimEventStore, looks: u32, every: u32) -> Self {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let state = runtime.block_on(async {
+            clock.begin();
+            server_looking_every("journal-recovery", store, looks, every).await
+        });
+        Self { runtime, state }
+    }
+
+    fn kill(self, clock: &ProcessClock, downtime: Duration) {
+        self.runtime.block_on(async { clock.end(downtime) });
+        let Self { runtime, state } = self;
+        drop(state);
+        drop(runtime);
+    }
+}
+
+/// Let all work at this simulated instant finish before inspecting it.
+async fn settle() {
+    for _ in 0..600 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Wait on the runtime's paused clock, including every self-resetting poll.
 async fn reaches(
     state: &ServerState,
     id: &str,
     status: &str,
     within: Duration,
 ) -> Result<serde_json::Map<String, Value>, String> {
-    let deadline = Instant::now() + within; // determinism-ok: real-time test
+    let deadline = tokio::time::Instant::now() + within;
     loop {
+        settle().await;
         let (now, fields) = watch(state, id).await;
         if now == status {
             return Ok(fields);
         }
-        if Instant::now() >= deadline {
-            // determinism-ok: real-time test
+        if tokio::time::Instant::now() >= deadline {
             return Err(format!("watch {id} stayed {now} with {fields:?}"));
         }
-        tokio::time::sleep(Duration::from_millis(50)).await; // determinism-ok: real-time test
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-}
-
-/// Start watch `id` polling as `by`, spoil its row as `spoil` while the
-/// server is down, and return the server started after, which merges at the
-/// next look.
-async fn poll_then_restart(id: &str, by: &AgentContext, spoil: Spoil) -> ServerState {
-    let store = poll_and_stop(id, by, spoil);
-    server(&format!("{id}-after"), &store, 1).await
-}
-
-/// Start watch `id` polling as `by` on a server that stops, and spoil its row
-/// as `spoil` while the server is down.
-fn poll_and_stop(id: &str, by: &AgentContext, spoil: Spoil) -> SimEventStore {
-    let store = SimEventStore::no_faults(7);
-    let (first_store, first_id, by) = (store.clone(), id.to_string(), by.clone());
-    std::thread::spawn(move || {
-        // Its own runtime: dropping it stops the server as a process exit
-        // would, timers and all.
-        let first = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        first.block_on(async {
-            let state = server("watch-before", &first_store, 1000).await;
-            let tenant = TenantId::new(TENANT);
-            state
-                .get_or_create_tenant_entity(&tenant, "Watch", &first_id, json!({}))
-                .await
-                .expect("the watch is created");
-            let started = state
-                .dispatch_tenant_action(&tenant, "Watch", &first_id, "Start", json!({}), &by)
-                .await
-                .expect("started");
-            assert!(started.success, "{:?}", started.error);
-            // The row the process leaves was armed by a look, not by Start.
-            reaches_looks(&state, &first_id, 2).await;
-        });
-        drop(first);
-    })
-    .join()
-    .expect("the first server ran");
-
-    let rows = store.list_state_timers(TENANT);
-    let row = rows
-        .iter()
-        .find(|row| row.entity_id == id)
-        .expect("the poll left a timer row")
-        .clone();
-    match spoil {
-        Spoil::Lost => store.delete_state_timer(TENANT, "Watch", id, &row.arm_id),
-        Spoil::Service => store.upsert_state_timer(&StateTimerRecord {
-            armed_by: service_armed_by(),
-            ..row
-        }),
-    }
-    store
 }
 
 async fn reaches_looks(state: &ServerState, id: &str, looks: i64) {
-    let deadline = Instant::now() + Duration::from_secs(20); // determinism-ok: real-time test
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
+        settle().await;
         let (_, fields) = watch(state, id).await;
         if fields.get("looks").and_then(Value::as_i64).unwrap_or(0) >= looks {
             return;
         }
         assert!(
-            Instant::now() < deadline,
-            "watch {id} never looked {looks} times"
-        ); // determinism-ok: real-time test
-        tokio::time::sleep(Duration::from_millis(50)).await; // determinism-ok: real-time test
+            tokio::time::Instant::now() < deadline,
+            "watch {id} never looked {looks} times: {fields:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
-async fn merged_by(id: &str, by: &AgentContext, spoil: Spoil) -> String {
-    let state = poll_then_restart(id, by, spoil).await;
-    let fields = reaches(&state, id, "Merged", Duration::from_secs(20))
-        .await
-        .unwrap_or_else(|error| panic!("{spoil:?}: the reaction after a look never ran: {error}"));
-    fields
-        .get("merged_by")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_lost_rows_poll_runs_as_the_person_who_started_it() {
-    assert_eq!(
-        merged_by("w-lost", &person("person-1"), Spoil::Lost).await,
-        "person-1"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_service_armed_poll_runs_as_the_person_who_started_it() {
-    assert_eq!(
-        merged_by("w-service", &person("person-2"), Spoil::Service).await,
-        "person-2"
-    );
-}
-
-/// A boot names the person in place of the row's service and keeps the row. An
-/// install that then changes the timer's budget replaces the live timer, and
-/// the replacement still runs as that person.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_install_keeps_the_person_a_boot_found_in_the_journal() {
-    let store = poll_and_stop("w-install", &person("person-3"), Spoil::Service);
-    let state = server_looking_every("w-install-after", &store, 1, 3600).await;
-    // The boot arms the record's timer, as the journal's person, an hour out.
-    tokio::time::sleep(Duration::from_secs(2)).await; // determinism-ok: real-time test
-    let (status, _) = watch(&state, "w-install").await;
-    assert_eq!(status, "Checking", "the look an hour out has not run");
-
-    let ioa = watch_ioa(1, 1);
-    state
-        .registry
-        .write()
-        .expect("registry lock") // ci-ok: infallible lock
-        .register_tenant(
-            TENANT,
-            parse_csdl(CSDL).expect("CSDL should parse"),
-            CSDL.to_string(),
-            &[("Watch", ioa.as_str())],
+/// Each seed varies the request time, polls before the crash, crash time and
+/// downtime (including overdue timers). The invariant is that the reaction
+/// binds the journal's caller after recovery, also after timer replacement;
+/// a journal with no caller must never bind anyone.
+fn check_recovery(by: &AgentContext, spoil: Spoil, install: bool, expected: Option<&str>) {
+    for seed in 0..SEEDS {
+        let clock = Arc::new(ProcessClock::new());
+        let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+        let mut rng = DeterministicRng::new(seed ^ 0x7e57_a127);
+        let store = SimEventStore::no_faults(seed);
+        let id = format!("watch-{seed}");
+        let tenant = TenantId::new(TENANT);
+        let request_at = rng.next_bound(500) as u64;
+        let polls = 2 + rng.next_bound(4) as i64;
+        let crash_after = rng.next_bound(500) as u64;
+        let downtime = rng.next_bound(3000) as u64;
+        let trace = format!(
+            "seed {seed}, {spoil:?}, request at {request_at}ms, crash {crash_after}ms \
+             after {polls} polls, down {downtime}ms, install {install}"
         );
-    state.rebuild_reaction_dispatcher();
-    state.follow_spec_changes().await;
 
-    let fields = reaches(&state, "w-install", "Merged", Duration::from_secs(20))
-        .await
-        .unwrap_or_else(|error| panic!("the reaction after a look never ran: {error}"));
-    assert_eq!(fields["merged_by"], "person-3");
+        let first = Process::start(&clock, &store, 1000, 1);
+        first.runtime.block_on(async {
+            tokio::time::sleep(Duration::from_millis(request_at)).await;
+            first
+                .state
+                .get_or_create_tenant_entity(&tenant, "Watch", &id, json!({}))
+                .await
+                .expect("the watch is created");
+            let started = first
+                .state
+                .dispatch_tenant_action(&tenant, "Watch", &id, "Start", json!({}), by)
+                .await
+                .expect("started");
+            assert!(started.success, "{trace}: {:?}", started.error);
+            // The last row was armed by a timer, not the request itself.
+            reaches_looks(&first.state, &id, polls).await;
+            tokio::time::sleep(Duration::from_millis(crash_after)).await;
+            settle().await;
+        });
+        first.kill(&clock, Duration::from_millis(downtime));
+
+        let row = store
+            .list_state_timers(TENANT)
+            .into_iter()
+            .find(|row| row.entity_id == id)
+            .unwrap_or_else(|| panic!("{trace}: the poll left no row"));
+        match spoil {
+            Spoil::Lost => store.delete_state_timer(TENANT, "Watch", &id, &row.arm_id),
+            Spoil::Service => store.upsert_state_timer(&StateTimerRecord {
+                armed_by: service_armed_by(),
+                ..row
+            }),
+        }
+
+        // An install replaces a recovered live timer before it fires. Its
+        // initial budget is an hour so the boot cannot fire it first.
+        let second = Process::start(&clock, &store, 1, if install { 3600 } else { 1 });
+        second.runtime.block_on(async {
+            if install {
+                settle().await;
+                assert_eq!(watch(&second.state, &id).await.0, "Checking", "{trace}");
+                let ioa = watch_ioa(1, 1);
+                second
+                    .state
+                    .registry
+                    .write()
+                    .expect("registry lock") // ci-ok: infallible lock
+                    .register_tenant(
+                        TENANT,
+                        parse_csdl(CSDL).expect("CSDL should parse"),
+                        CSDL.to_string(),
+                        &[("Watch", ioa.as_str())],
+                    );
+                second.state.rebuild_reaction_dispatcher();
+                second.state.follow_spec_changes().await;
+            }
+            let result = reaches(&second.state, &id, "Merged", Duration::from_secs(20)).await;
+            if let Some(expected) = expected {
+                let fields = result.unwrap_or_else(|error| panic!("{trace}: {error}"));
+                assert_eq!(fields["merged_by"], expected, "{trace}");
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{trace}: a journal with no caller bound someone"
+                );
+                let (status, fields) = watch(&second.state, &id).await;
+                assert_eq!(status, "Checking", "{trace}");
+                assert!(
+                    fields["looks"].as_i64().unwrap_or(0) > polls,
+                    "{trace}: timer never fired"
+                );
+                assert_eq!(fields["merged_by"], "", "{trace}");
+            }
+        });
+        second.kill(&clock, Duration::ZERO);
+    }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_lost_rows_poll_runs_as_the_agent_that_started_it() {
-    assert_eq!(
-        merged_by(
-            "w-agent",
-            &agent_for("person-3", "contributor"),
-            Spoil::Lost
-        )
-        .await,
-        "person-3"
+#[test]
+fn a_lost_rows_poll_runs_as_the_person_who_started_it() {
+    check_recovery(&person("person-1"), Spoil::Lost, false, Some("person-1"));
+}
+
+#[test]
+fn a_service_armed_poll_runs_as_the_person_who_started_it() {
+    check_recovery(&person("person-2"), Spoil::Service, false, Some("person-2"));
+}
+
+#[test]
+fn an_install_keeps_the_person_a_boot_found_in_the_journal() {
+    check_recovery(&person("person-3"), Spoil::Service, true, Some("person-3"));
+}
+
+#[test]
+fn a_lost_rows_poll_runs_as_the_agent_that_started_it() {
+    check_recovery(
+        &agent_for("person-3", "contributor"),
+        Spoil::Lost,
+        false,
+        Some("person-3"),
     );
 }
 
-/// A record nobody moved by request keeps its timer for no one: the journal
-/// names no one, so its reaction, which needs a caller, is refused.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_poll_nobody_requested_still_runs_for_no_one() {
-    let state = poll_then_restart("w-system", &AgentContext::system(), Spoil::Lost).await;
-    assert!(
-        reaches(&state, "w-system", "Merged", Duration::from_secs(4))
-            .await
-            .is_err(),
-        "a timer whose journal names no one must not act for anyone"
-    );
+#[test]
+fn a_poll_nobody_requested_still_runs_for_no_one() {
+    check_recovery(&AgentContext::system(), Spoil::Lost, false, None);
 }

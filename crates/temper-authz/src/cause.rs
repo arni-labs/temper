@@ -64,13 +64,21 @@ pub struct TimerArm {
     pub state_timer_of: Option<TimerRecord>,
 }
 
-/// The record a state timer belongs to.
+/// The record a state timer belongs to, and which of its declared timers it
+/// is: a refusal late in its chain stops only that timer, not one the record
+/// moved on to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimerRecord {
     /// The record's entity type.
     pub entity_type: String,
     /// The record's entity id.
     pub entity_id: String,
+    /// The timed state the timer was declared for.
+    #[serde(default)]
+    pub state: String,
+    /// The timer's `on_timeout` action.
+    #[serde(default)]
+    pub action: String,
 }
 
 impl MoveCause {

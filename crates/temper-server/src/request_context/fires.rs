@@ -31,6 +31,8 @@ pub struct StateTimerFire {
     pub entity_type: String,
     /// The record's id.
     pub entity_id: String,
+    /// The timed state the timer was declared for.
+    pub state: String,
     /// The timer's `on_timeout` action.
     pub action: String,
     /// The record's journal sequence when the timer was armed.
