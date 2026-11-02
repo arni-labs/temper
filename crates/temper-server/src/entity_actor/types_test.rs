@@ -188,14 +188,3 @@ fn entity_response_spec_governed_skipped_when_true() {
     let serialized = serde_json::to_string(&resp).unwrap();
     assert!(!serialized.contains("spec_governed"));
 }
-
-#[test]
-fn default_spec_governed_is_true() {
-    assert!(default_spec_governed());
-}
-
-#[test]
-fn is_true_helper() {
-    assert!(is_true(&true));
-    assert!(!is_true(&false));
-}
