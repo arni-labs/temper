@@ -31,6 +31,6 @@ pub use models::{
 mod ci_audit_defect {
     #[test]
     fn deliberate_defect_must_fail() {
-        assert_eq!(1 + 1, 3, "deliberate defect");
+        let _: u8 = "not a number";
     }
 }
