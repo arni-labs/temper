@@ -222,4 +222,3 @@ async fn a_chain_a_person_started_is_not_stopped() {
     assert_eq!(record["fields"]["fired_by"], "eve");
     assert_eq!(record["timer_needs_person"], Value::Null, "{record}");
 }
-

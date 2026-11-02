@@ -167,7 +167,13 @@ pub(super) fn agent_for(person: &str) -> AgentContext {
 }
 
 /// Make `action` on `entity_type` `id` as `by`, creating the record first.
-pub(super) async fn act(state: &ServerState, entity_type: &str, id: &str, action: &str, by: &AgentContext) {
+pub(super) async fn act(
+    state: &ServerState,
+    entity_type: &str,
+    id: &str,
+    action: &str,
+    by: &AgentContext,
+) {
     let tenant = TenantId::default();
     state
         .get_or_create_tenant_entity(&tenant, entity_type, id, json!({}))
@@ -254,4 +260,3 @@ where
     .join()
     .expect("the first server ran")
 }
-

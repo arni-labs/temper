@@ -317,4 +317,3 @@ pub(super) const CSDL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
     </Schema>
   </edmx:DataServices>
 </edmx:Edmx>"#;
-

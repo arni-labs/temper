@@ -128,7 +128,13 @@ async fn a_persons_move_during_a_stop_runs_the_timer_as_them() {
         reached: Arc::new(Notify::new()),
         go: Arc::new(Notify::new()),
     };
-    let state = server_over("race", &store, 1, Some(BoxedEventStore::new(journal.clone()))).await;
+    let state = server_over(
+        "race",
+        &store,
+        1,
+        Some(BoxedEventStore::new(journal.clone())),
+    )
+    .await;
     act(&state, "Check", "c-race", "Begin", &AgentContext::system()).await;
     // Begin's own follow has read what it reads; the next read of this record's
     // newest events is the stop's, after the timer's fire is refused.

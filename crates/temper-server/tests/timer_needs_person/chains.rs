@@ -76,4 +76,3 @@ async fn a_chain_a_non_owner_started_names_them_not_the_owner() {
     assert_eq!(shipped.moved_by, "guest");
     assert_eq!(shipped.fired_by, "guest");
 }
-

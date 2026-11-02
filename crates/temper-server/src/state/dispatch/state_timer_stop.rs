@@ -26,12 +26,26 @@ use temper_runtime::tenant::TenantId;
 
 use super::DispatchError;
 use super::authenticated_params::refused_for_no_caller;
+use super::state_timer_follow::{FOLLOW_RETRY_FIRST, FOLLOW_RETRY_MAX};
 use crate::entity_actor::TimerStop;
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
 
 /// The log line a monitor or the line can open an incident from.
 const STOPPED: &str = "state timer stopped: nothing names its caller";
+
+/// How a [`ServerState::decide_stop`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pass {
+    /// The timer runs as someone, or the record says it needs a person, or a
+    /// write that failed left only the log line.
+    Decided,
+    /// The record could not be read, and its timer was left as it was.
+    RecordUnread,
+    /// The timer stopped, but its record's journal could not be read, so who
+    /// it runs for is not known yet.
+    JournalUnread,
+}
 
 /// The record whose state timer `agent`'s move belongs to, when the move runs
 /// as that timer's own identity.
@@ -69,62 +83,112 @@ impl ServerState {
         else {
             return;
         };
-        // Decided against the record as read, and again whenever a move lands
-        // before the stop is written: that move may name someone. Each pass
-        // follows a newer event, so this ends once the record stops moving.
+        match self
+            .decide_stop(tenant, &entity_type, &entity_id, action)
+            .await
+        {
+            Pass::Decided => {}
+            Pass::RecordUnread => {
+                // The timer is armed as it was: its next refusal stops it.
+            }
+            Pass::JournalUnread => {
+                self.decide_stop_later(tenant, entity_type, entity_id, action);
+            }
+        }
+    }
+
+    /// Stop the record's timer and decide who it runs for, against the record
+    /// as read, and again whenever a move lands before the stop is written:
+    /// that move may name someone. Each pass follows a newer event, so this
+    /// ends once the record stops moving.
+    async fn decide_stop(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        action: &str,
+    ) -> Pass {
         loop {
-            let armed = self.armed_state_timer(tenant, &entity_type, &entity_id);
+            let armed = self.armed_state_timer(tenant, entity_type, entity_id);
             if armed.is_some_and(|armed| armed.agent_ctx.caller().is_some()) {
                 // Its next arming already names someone.
-                return;
+                return Pass::Decided;
             }
             let current = match self
-                .get_tenant_entity_state(tenant, &entity_type, &entity_id)
+                .get_tenant_entity_state(tenant, entity_type, entity_id)
                 .await
             {
                 Ok(current) => current.state,
                 Err(error) => {
                     tracing::warn!(tenant = %tenant, entity_type, entity_id, %error,
-                        "record of a timer no one can run not readable; its next refusal stops it");
-                    return;
+                        "record of a timer no one can run not readable");
+                    return Pass::RecordUnread;
                 }
             };
-            let setter = match self.journal_setter(tenant, &entity_type, &entity_id).await {
+            let setter = self.journal_setter(tenant, entity_type, entity_id).await;
+            // A timer that fires for no one only repeats its refusal, so it
+            // stops whatever the journal says.
+            self.cancel_state_timer(tenant, entity_type, entity_id, current.sequence_nr)
+                .await;
+            let setter = match setter {
                 Ok(setter) => setter,
                 Err(error) => {
+                    // An unread journal is not proof that no one moved the
+                    // record: the record is left unmarked until it is read.
                     tracing::warn!(tenant = %tenant, entity_type, entity_id, %error,
                         "record journal not readable; its timer's setter is not known yet");
-                    None
+                    return Pass::JournalUnread;
                 }
             };
-            self.cancel_state_timer(tenant, &entity_type, &entity_id, current.sequence_nr)
-                .await;
             if let Some(setter) = setter {
                 // Armed for no one before a move named someone, which kept that
                 // timer: it runs as them from here.
                 self.reconcile_state_timers(
                     tenant,
-                    &entity_type,
-                    &entity_id,
+                    entity_type,
+                    entity_id,
                     &current,
                     Some(&setter),
                 )
                 .await;
-                return;
+                return Pass::Decided;
             }
             let said = self
-                .say_timer_needs_person(
-                    tenant,
-                    &entity_type,
-                    &entity_id,
-                    action,
-                    current.sequence_nr,
-                )
+                .say_timer_needs_person(tenant, entity_type, entity_id, action, current.sequence_nr)
                 .await;
             if said != Some(TimerStop::Moved) {
-                return;
+                return Pass::Decided;
             }
         }
+    }
+
+    /// [`Self::decide_stop`] again in the background, after a wait that
+    /// doubles from [`FOLLOW_RETRY_FIRST`] to [`FOLLOW_RETRY_MAX`], until the
+    /// record and its journal are read. The timer is stopped, so nothing else
+    /// would come back to the record before its next move or the next boot. A
+    /// read can fail for a passing store error, so this does not give up.
+    fn decide_stop_later(
+        &self,
+        tenant: &TenantId,
+        entity_type: String,
+        entity_id: String,
+        action: &str,
+    ) {
+        let (server, tenant, action) = (self.clone(), tenant.clone(), action.to_owned());
+        let retry = async move {
+            let mut wait = FOLLOW_RETRY_FIRST;
+            loop {
+                tokio::time::sleep(wait).await; // determinism-ok: retry wait on the runtime clock
+                let pass = server
+                    .decide_stop(&tenant, &entity_type, &entity_id, &action)
+                    .await;
+                if pass == Pass::Decided {
+                    return;
+                }
+                wait = (wait * 2).min(FOLLOW_RETRY_MAX);
+            }
+        };
+        tokio::spawn(retry); // determinism-ok: a stop's read retries run in the background
     }
 
     /// Leave `action` on the record as what its timer stopped for, decided
