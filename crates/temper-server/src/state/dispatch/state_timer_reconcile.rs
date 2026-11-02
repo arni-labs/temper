@@ -52,6 +52,7 @@ use super::state_timeouts::{
 };
 use super::state_timer_follow::{FOLLOW_RETRY_FIRST, FOLLOW_RETRY_MAX};
 use crate::entity_actor::{EntityState, RehydrateHook};
+use crate::odata::read_defaults::ReadDefaults;
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
 
@@ -260,6 +261,7 @@ impl ServerState {
             entity_id,
             &st,
             current,
+            &ReadDefaults::for_entity(self, tenant, entity_type),
             &identity,
             started_at,
         );

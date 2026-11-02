@@ -357,7 +357,9 @@ async fn dst_a_refused_trigger_move_is_on_the_source_records_observe_stream() {
         assert_eq!(data["refusal"]["code"], "ParameterConstraint");
         assert_eq!(data["refusal"]["parameter"], "installs");
         assert!(
-            data["reason"].as_str().is_some_and(|r| r.contains("installs")),
+            data["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("installs")),
             "seed {seed}: {data}"
         );
     }

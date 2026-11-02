@@ -144,10 +144,12 @@ impl ReactionDispatcher {
         let mut repeat_stopped_count = 0usize;
         let mut success_count = 0usize;
         let mut results = Vec::new();
-        // Guards read the source record as every guard does: a variable it
-        // stores no value for reads as its declared initial value.
-        let guarded = rules.iter().any(|rule| rule.when.guard.is_some());
-        let read = guarded
+        // Guards and args read the source record as every guard does: a
+        // variable it stores no value for reads as its declared initial value.
+        let reads_record = rules
+            .iter()
+            .any(|rule| rule.when.guard.is_some() || !rule.then.args.is_empty());
+        let read = reads_record
             .then(|| ReadDefaults::for_entity(state, tenant, entity_type).fields_as_read(fields));
 
         for rule in rules {
@@ -233,8 +235,12 @@ impl ReactionDispatcher {
                 "Dispatching reaction"
             );
 
-            let effective_params =
-                super::params::build_effective_params(&rule.then, entity_id, fields, &rule.name);
+            let effective_params = super::params::build_effective_params(
+                &rule.then,
+                entity_id,
+                read.as_ref().unwrap_or(fields),
+                &rule.name,
+            );
 
             // ADR-0046: resolve the dispatch principal. If the rule declares
             // an explicit `principal`, build a synthetic service identity;
