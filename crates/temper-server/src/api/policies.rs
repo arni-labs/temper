@@ -15,10 +15,10 @@ use crate::authz::persist_and_activate_policy;
 use crate::state::ServerState;
 
 mod replacement;
-mod support;
+pub(super) mod support;
 pub(crate) use replacement::handle_replace_policy;
 use support::{
-    build_prospective_enabled_text, build_prospective_enabled_text_with_override, persist_new_rule,
+    build_prospective_enabled_text_with_override, live_text_with_entry, persist_new_rule,
     policy_row_to_json, reload_tenant_from_store,
 };
 
@@ -312,9 +312,12 @@ pub(crate) async fn handle_create_policy(
         }
     };
 
-    // Validate: build prospective enabled policy text with the new entry added.
-    let prospective =
-        build_prospective_enabled_text(&state, &tenant, Some((&policy_id, &cedar_text))).await;
+    // The live text with this entry set: its old statements leave, so a
+    // repeated or replacing create never stacks copies.
+    let prospective = match live_text_with_entry(&state, &tenant, &policy_id, &cedar_text).await {
+        Ok(text) => text,
+        Err(refused) => return refused.into_response(),
+    };
     if let Err(resp) = super::validate_and_reload_policies(&state, &tenant, &prospective) {
         return resp;
     }

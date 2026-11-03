@@ -1,6 +1,9 @@
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use std::collections::BTreeSet;
+
 use sha2::{Digest, Sha256};
+use temper_authz::statements::{remove_statements, statement_keys};
 
 use crate::authz::{load_and_activate_tenant_policies, persist_and_activate_policy};
 use crate::state::ServerState;
@@ -51,7 +54,10 @@ pub(super) async fn persist_new_rule(
     let policy_id = add_rule_policy_id(rule);
     debug_assert_ne!(policy_id, "primary");
     debug_assert!(!policy_id.is_empty());
-    let prospective = build_prospective_enabled_text(state, tenant, Some((&policy_id, rule))).await;
+    let prospective = match live_text_with_entry(state, tenant, &policy_id, rule).await {
+        Ok(text) => text,
+        Err(refused) => return refused.into_response(),
+    };
     if let Err(resp) = crate::api::validate_and_reload_policies(state, tenant, &prospective) {
         return resp;
     }
@@ -95,22 +101,82 @@ pub(super) async fn reload_tenant_from_store(state: &ServerState, tenant: &str) 
     load_and_activate_tenant_policies(state, tenant).await;
 }
 
-pub(super) async fn build_prospective_enabled_text(
+/// The tenant's live Cedar once the row `policy_id` holds `cedar_text`.
+///
+/// What the row held before leaves the live text, except a statement another
+/// enabled row also holds, and so does every live copy of the posted
+/// statements; then the posted text is added once. Posting the same entry
+/// again leaves the live text as it was, and posting new text under an id
+/// leaves none of its old statements live. The rows already end that way, so
+/// the live text now agrees with what a restart loads from them.
+///
+/// # Errors
+///
+/// The status and reason to answer with when the posted text or the live
+/// text is not Cedar (400), or the tenant's rows cannot be read (500).
+pub(in crate::api) async fn live_text_with_entry(
     state: &ServerState,
     tenant: &str,
-    additional: Option<(&str, &str)>,
-) -> String {
-    let mut text = {
+    policy_id: &str,
+    cedar_text: &str,
+) -> Result<String, (StatusCode, String)> {
+    let refuse = |status: StatusCode, why: String| Err((status, why));
+    let posted = match statement_keys(cedar_text) {
+        Ok(keys) => keys,
+        Err(error) => {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                format!("Policy validation failed: {error}"),
+            );
+        }
+    };
+    let mut leaving = posted;
+    if let Some(store) = state.policy_store() {
+        let rows = match store.load_policies_for_tenant(tenant).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                return refuse(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to read the tenant's policy rows: {error}"),
+                );
+            }
+        };
+        let mut previous = BTreeSet::new();
+        let mut held_by_others = BTreeSet::new();
+        for row in rows.iter().filter(|row| row.enabled) {
+            // A row that does not parse holds no live statement: boot cannot load it.
+            let Ok(keys) = statement_keys(&row.cedar_text) else {
+                continue;
+            };
+            if row.policy_id == policy_id {
+                previous.extend(keys);
+            } else {
+                held_by_others.extend(keys);
+            }
+        }
+        leaving.extend(previous.difference(&held_by_others).cloned());
+    }
+    let live = {
         let policies = state.tenant_policies.read().unwrap(); // ci-ok: infallible lock
         policies.get(tenant).cloned().unwrap_or_default()
     };
-    if let Some((_id, cedar_text)) = additional {
-        if !text.is_empty() {
-            text.push('\n');
+    let kept = match remove_statements(&live, &leaving) {
+        Ok(kept) => kept,
+        Err(error) => {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Policy validation failed: the tenant's live Cedar does not parse: {error}"
+                ),
+            );
         }
-        text.push_str(cedar_text);
-    }
-    text
+    };
+    let kept = kept.trim_end();
+    Ok(if kept.is_empty() {
+        cedar_text.to_string()
+    } else {
+        format!("{kept}\n{cedar_text}")
+    })
 }
 
 pub(super) async fn build_prospective_enabled_text_with_override(
