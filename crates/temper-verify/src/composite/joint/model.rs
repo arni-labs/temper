@@ -252,14 +252,17 @@ impl JointModel {
             .filter(|(_, specs)| specs.iter().any(|spec| spec.on_success.is_empty()))
             .map(|((entity, _), _)| entity)
             .collect();
-        // A module whose trigger names no `on_success` may answer with any
-        // action of its record, with parameters of its own choosing.
-        let answered = |entity: &str, action: &str| {
-            chosen(entity, action)
-                || kernel.calls_on.iter().any(|((e, _), specs)| {
-                    e == entity && specs.iter().any(|s| s.on_success.is_empty())
-                })
+        // A module whose trigger names no `on_success` may answer with an
+        // action of its record nothing else sends, choosing its parameters.
+        let only_a_module = |entity: &str, action: &str| {
+            open.contains(&entity.to_string())
+                && !chosen(entity, action)
+                && !reactions
+                    .iter()
+                    .any(|r| r.to == entity && r.target_action == action)
         };
+        let answered =
+            |entity: &str, action: &str| chosen(entity, action) || only_a_module(entity, action);
         let order = Order::read(&Specs {
             by_name,
             models: &models,
@@ -287,12 +290,7 @@ impl JointModel {
                     .transitions
                     .iter()
                     .enumerate()
-                    .filter(|(_, t)| {
-                        !chosen(entity, &t.name)
-                            && !reactions
-                                .iter()
-                                .any(|r| &r.to == entity && r.target_action == t.name)
-                    })
+                    .filter(|(_, t)| only_a_module(entity, &t.name))
                     .map(|(i, _)| i)
                     .collect();
                 (!ways.is_empty()).then(|| (entity.clone(), ways))
