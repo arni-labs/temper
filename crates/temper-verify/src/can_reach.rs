@@ -177,6 +177,148 @@ pub(crate) fn broken_rules(
         .collect()
 }
 
+/// Each `can_reach` rule no state breaks, but whose route from some state
+/// in its `from` places needs a gated move: a step no move surely open
+/// from the record alone takes, such as one gated on another record. The
+/// gate may never open, so the route is not proved. Each comes with why,
+/// naming the gated moves on the nearest such route. A state with a step
+/// past a bound on a surely open way ahead is not named: what lies past
+/// the bound was not walked, and the walk's result says it is bounded.
+pub(crate) fn gated_routes(
+    model: &TemperModel,
+    graph: &Graph,
+    reach: &Reach,
+    found: &HashMap<TemperModelState, u32>,
+) -> Vec<(String, String)> {
+    let rules: Vec<(&str, &[String], &[String])> = model
+        .liveness
+        .iter()
+        .filter_map(|live| match &live.kind {
+            LivenessKind::CanReach { from, targets } => {
+                Some((live.name.as_str(), from.as_slice(), targets.as_slice()))
+            }
+            _ => None,
+        })
+        .collect();
+    if rules.is_empty() {
+        return Vec::new();
+    }
+    let n = graph.len();
+    let mut into_surely: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for at in 0..n {
+        for (&to, &certain) in graph.steps(at).iter().zip(graph.certain(at)) {
+            if certain {
+                into_surely[to as usize].push(at as u32);
+            }
+        }
+    }
+    let mut number: Vec<Option<&TemperModelState>> = vec![None; n];
+    for (state, &at) in found {
+        number[at as usize] = Some(state);
+    }
+    let in_places = |names: &[String], at: usize| {
+        let place = graph.place[at];
+        place != NO_PLACE && names.contains(&model.states[place as usize])
+    };
+
+    let mut unproved = Vec::new();
+    for (name, from, targets) in rules {
+        // Every state that a chain of surely open steps takes to a target,
+        // or to a step past a bound.
+        let mut surely = vec![false; n];
+        let mut queue: Vec<usize> = (0..n)
+            .filter(|&at| in_places(targets, at) || graph.cut[at])
+            .collect();
+        for &at in &queue {
+            surely[at] = true;
+        }
+        while let Some(at) = queue.pop() {
+            for &before in &into_surely[at] {
+                if !surely[before as usize] {
+                    surely[before as usize] = true;
+                    queue.push(before as usize);
+                }
+            }
+        }
+        let wanted = reach.bits.of(model, targets);
+        let reaches_one = |at: usize| {
+            reach
+                .places(at)
+                .iter()
+                .zip(&wanted)
+                .any(|(r, t)| r & t != 0)
+        };
+        let starts =
+            |at: usize| graph.place[at] != NO_PLACE && (from.is_empty() || in_places(from, at));
+        // A state that cannot reach a target at all breaks the rule, and is
+        // named by `broken_rules`.
+        if (0..n).any(|at| starts(at) && !reach.past_bound(at) && !reaches_one(at)) {
+            continue;
+        }
+        let Some(at) = (0..n).find(|&at| starts(at) && !surely[at]) else {
+            continue;
+        };
+        let gates = gates_on_nearest_route(model, graph, &number, |to| in_places(targets, to), at);
+        let place = number[at].map_or("?", |state| state.status.as_str());
+        unproved.push((
+            name.to_string(),
+            format!(
+                "rule '{name}' not proved: a record in {place} reaches {} only through {}, \
+                 which may never open: it needs another record or a value the check does \
+                 not track",
+                crate::lost_places::either(targets),
+                gates.join(", "),
+            ),
+        ));
+    }
+    unproved
+}
+
+/// The gated moves, each with its guard, on the shortest route from `at` to
+/// a state `arrived` holds.
+fn gates_on_nearest_route(
+    model: &TemperModel,
+    graph: &Graph,
+    number: &[Option<&TemperModelState>],
+    arrived: impl Fn(usize) -> bool,
+    at: usize,
+) -> Vec<String> {
+    let mut came_from: HashMap<usize, (usize, bool)> = HashMap::new();
+    let mut queue = std::collections::VecDeque::from([at]);
+    let mut end = None;
+    while let Some(here) = queue.pop_front() {
+        if arrived(here) {
+            end = Some(here);
+            break;
+        }
+        for (&to, &certain) in graph.steps(here).iter().zip(graph.certain(here)) {
+            let to = to as usize;
+            if to != at && !came_from.contains_key(&to) {
+                came_from.insert(to, (here, certain));
+                queue.push_back(to);
+            }
+        }
+    }
+    let mut gates = BTreeSet::new();
+    let mut here = end.expect("the record can reach a target");
+    while let Some(&(before, certain)) = came_from.get(&here) {
+        if !certain && let (Some(from), Some(to)) = (number[before], number[here]) {
+            for transition in &model.transitions {
+                if model.transition_enabled(transition, from)
+                    && !model.surely_open(transition, from)
+                    && successors(model, transition, from)
+                        .iter()
+                        .any(|(_, next)| next == to)
+                {
+                    gates.insert(format!("{} ({})", transition.name, transition.guard));
+                }
+            }
+        }
+        here = before;
+    }
+    gates.into_iter().collect()
+}
+
 /// The states on `path` with the action taken from each: the transition's
 /// name and the parameter values that step to the next state.
 pub(crate) fn trace(

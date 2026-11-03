@@ -109,9 +109,20 @@ impl TemperModel {
     /// as one that may fire, but it may never be open, so a record with no
     /// other may wait where it is.
     pub(crate) fn surely_moves(&self, state: &TemperModelState) -> bool {
-        self.transitions.iter().any(|t| {
-            self.transition_enabled(t, state) && locally_enabled(self, t, state) == Some(true)
-        })
+        self.transitions
+            .iter()
+            .any(|t| self.transition_enabled(t, state) && self.surely_open(t, state))
+    }
+
+    /// Whether `transition`'s guard holds in `state` from the record alone:
+    /// not gated on another record, an untracked value or an input the
+    /// search could not settle.
+    pub(crate) fn surely_open(
+        &self,
+        transition: &ResolvedTransition,
+        state: &TemperModelState,
+    ) -> bool {
+        locally_enabled(self, transition, state) == Some(true)
     }
 
     /// Whether `action` may fire in `state`.

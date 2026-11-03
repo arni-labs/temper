@@ -20,6 +20,9 @@ pub(crate) struct Graph {
     pub(crate) depth: Vec<u32>,
     offsets: Vec<u32>,
     steps: Vec<u32>,
+    /// For each step, whether some move taking it is surely open from the
+    /// record alone, not gated on another record or an untracked value.
+    certain: Vec<bool>,
 }
 
 /// A state's place when its status is not a declared place.
@@ -45,9 +48,10 @@ impl Graph {
         at
     }
 
-    /// The steps from state `at`, the next state the walk takes, and whether
-    /// one was left out past a bound.
-    pub(crate) fn steps_from(&mut self, at: u32, cut: bool, mut to: Vec<u32>) {
+    /// The steps from state `at`, the next state the walk takes, each with
+    /// whether a move taking it is surely open, and whether one was left out
+    /// past a bound.
+    pub(crate) fn steps_from(&mut self, at: u32, cut: bool, mut to: Vec<(u32, bool)>) {
         if self.offsets.is_empty() {
             self.offsets.push(0);
         }
@@ -56,10 +60,17 @@ impl Graph {
             self.offsets.len() - 1,
             "the walk takes states in the order it found them"
         );
+        // Sorted with the surely open copy of a step last, so it is the one
+        // kept.
         to.sort_unstable();
-        to.dedup();
+        to.reverse();
+        to.dedup_by_key(|(next, _)| *next);
+        to.reverse();
         self.cut[at as usize] = cut;
-        self.steps.extend(to);
+        for (next, certain) in to {
+            self.steps.push(next);
+            self.certain.push(certain);
+        }
         self.offsets
             .push(u32::try_from(self.steps.len()).expect("a walk has fewer than 2^32 steps"));
     }
@@ -70,6 +81,11 @@ impl Graph {
 
     pub(crate) fn steps(&self, at: usize) -> &[u32] {
         &self.steps[self.offsets[at] as usize..self.offsets[at + 1] as usize]
+    }
+
+    /// For each of [`Graph::steps`] from `at`, whether it is surely open.
+    pub(crate) fn certain(&self, at: usize) -> &[bool] {
+        &self.certain[self.offsets[at] as usize..self.offsets[at + 1] as usize]
     }
 
     /// The states and transitions from a start state to `at`: each state's
