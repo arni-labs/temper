@@ -124,7 +124,8 @@ async fn a_time_range_pages_in_the_catalog() {
 async fn a_count_alone_reads_no_records() {
     let (state, records, _dir) = turso_state("list-cost-count-alone").await;
     let ctx = SecurityContext::system();
-    let cases: [(&str, fn(&Record) -> bool); 3] = [
+    type Keep = fn(&Record) -> bool;
+    let cases: [(&str, Keep); 3] = [
         ("Status eq 'Draft'", |record| record.status == "Draft"),
         ("Place eq 'place-2'", |record| record.place == "place-2"),
         ("Status ne 'Unmade' and Place eq 'place-3'", |record| {
@@ -166,4 +167,50 @@ async fn oldest_first_records_page_by_their_first_event() {
     }
     let all = walk(&state, &ctx, query, PAGE, PAGE + 1).await;
     assert_eq!(all, want);
+}
+
+/// An app's runs list: a filter on a field every record shares, newest first
+/// by an app time field, a few fields selected, ten rows. Read by an operator
+/// every row is allowed to, then by a reader a row policy hides some from.
+#[tokio::test]
+async fn a_field_ordered_page_reads_its_rows_whatever_the_filter_keeps() {
+    let (state, records, _dir) = turso_state("list-cost-field-order").await;
+    let query = format!(
+        "$filter=CustomerId eq '{CUSTOMER}'&$orderby=CreatedAt desc\
+         &$select=entity_id,status,CreatedAt,f001&$top={TOP}"
+    );
+    let newest = |hide_secret: bool| {
+        let mut kept: Vec<&Record> = records
+            .iter()
+            .filter(|record| !(hide_secret && record.secret))
+            .collect();
+        kept.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        kept.into_iter()
+            .take(TOP)
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let page = read(&state, &SecurityContext::system(), &query).await;
+    assert_eq!(ids(&page), newest(false));
+    assert_projected(&page, &["entity_id", "status", "CreatedAt", "f001"]);
+    assert_work(&page, TOP + 1, &query);
+
+    state
+        .authz
+        .reload_tenant_policies(
+            TenantId::default().as_str(),
+            r#"
+            permit(principal, action == Action::"list", resource is Order);
+            permit(principal, action == Action::"read", resource is Order);
+            forbid(principal, action == Action::"read", resource is Order)
+                when { resource.Secret == "yes" };
+            "#,
+        )
+        .expect("install row policy");
+    let page = read(&state, &reader(), &query).await;
+    assert_eq!(ids(&page), newest(true));
+    // A third of the rows are hidden, so the page reads a few more records
+    // than it returns, never the type.
+    assert_work(&page, 4 * (TOP + 1), &query);
 }

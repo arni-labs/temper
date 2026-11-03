@@ -18,12 +18,16 @@ mod shapes;
 const RECORDS: usize = 600;
 const FIELDS: usize = 200;
 const TOP: usize = 10;
+/// The one customer every record belongs to: a filter on it narrows nothing.
+const CUSTOMER: &str = "6f1c0a52-8d1e-4c3b-9a57-2f0e4b1d7c90";
 
 /// One stored record, as the oracle sees it.
 struct Record {
     id: String,
     status: &'static str,
     place: String,
+    /// An app time field (`CreatedAt`), distinct per record and out of id order.
+    created_at: String,
     last_event_at: Option<DateTime<Utc>>,
     /// The record's state has no `last_event_at` key at all, as a row written
     /// before the kernel kept one; otherwise an unknown time is a JSON null.
@@ -58,6 +62,11 @@ fn record(index: usize) -> Record {
         id: format!("rec-{index:03}"),
         status,
         place: format!("place-{}", index % 5),
+        created_at: format!(
+            "2026-02-01T{:02}:{:02}:00Z",
+            (index * 7919) % 600 / 60,
+            (index * 7919) % 60
+        ),
         last_event_at,
         time_key_absent: index % 100 == 51,
         secret: index.is_multiple_of(3),
@@ -70,6 +79,11 @@ async fn seed(store: &TursoEventStore, tenant: &TenantId) -> Vec<Record> {
         let mut fields = serde_json::Map::new();
         fields.insert("Id".to_string(), serde_json::json!(record.id));
         fields.insert("Place".to_string(), serde_json::json!(record.place));
+        fields.insert("CustomerId".to_string(), serde_json::json!(CUSTOMER));
+        fields.insert(
+            "CreatedAt".to_string(),
+            serde_json::json!(record.created_at),
+        );
         fields.insert(
             "Secret".to_string(),
             serde_json::json!(if record.secret { "yes" } else { "no" }),
