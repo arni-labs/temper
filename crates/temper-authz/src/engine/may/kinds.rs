@@ -21,6 +21,10 @@ use super::request::{Request, Results, TRUE};
 use super::{Asker, Cause, May, SendAnalysis, decide};
 use crate::platform_keys;
 
+mod memory;
+mod split;
+use memory::Memory;
+
 /// A question a walk asks of each outside sender: whether it may send
 /// `action` to a `resource_type` record, for a move with `cause`, whatever
 /// the record holds.
@@ -98,8 +102,15 @@ struct Tests {
 impl SendAnalysis {
     /// The kinds of outside sender these policies tell apart on
     /// `questions`: together they are every outside principal, and every
-    /// question has one answer for all of a kind's.
-    pub fn outside_kinds(&self, questions: &[Question<'_>]) -> Vec<Kind> {
+    /// question has one answer for all of a kind's. `reserve` accounts for
+    /// the live construction's bytes before growth; denial aborts the
+    /// partition rather than returning an incomplete set of senders.
+    pub fn outside_kinds(
+        &self,
+        questions: &[Question<'_>],
+        reserve: &dyn Fn(usize) -> Result<(), String>,
+    ) -> Result<Vec<Kind>, String> {
+        reserve(memory::tests_room(&self.policies, questions.len()))?;
         let tests = Tests::read(&self.policies);
         let none = BTreeMap::new();
         let anyone = Asker::Outside;
@@ -114,6 +125,8 @@ impl SendAnalysis {
                     .collect()
             })
             .collect();
+        let memory = Memory::new(&tests, &self.policies, &candidates, reserve);
+        memory.reserve(4)?;
         let read = |profile: Profile| {
             let mut answers = Vec::with_capacity(questions.len());
             let mut undecided = BTreeSet::new();
@@ -170,6 +183,9 @@ impl SendAnalysis {
         let mut leaves: Vec<Node> = Vec::new();
         let mut open = vec![read(Profile::default())];
         while let Some(node) = open.pop() {
+            // Include vector spare capacity, reallocation overlap, children,
+            // signatures, and the result being assembled before allocating.
+            memory.reserve(4 * (open.len() + leaves.len() + memory.branches + 1))?;
             let split = node.undecided.first().map(|test| {
                 let children: Vec<Node> = tests
                     .split(&node.profile, test)
@@ -216,10 +232,10 @@ impl SendAnalysis {
                 None => kinds.push((answers, vec![profile])),
             }
         }
-        kinds
+        Ok(kinds
             .into_iter()
             .map(|(_, profiles)| Kind(profiles))
-            .collect()
+            .collect())
     }
 }
 
@@ -400,95 +416,11 @@ impl Tests {
             ),
         }
     }
-
-    /// The profiles that tell `profile` apart on `test`: between them,
-    /// every value it may have.
-    fn split(&self, profile: &Profile, test: &Test) -> Vec<Profile> {
-        let with = |set: &dyn Fn(&mut Profile)| {
-            let mut next = profile.clone();
-            set(&mut next);
-            next
-        };
-        match test {
-            Test::Kind => {
-                let unlike: Vec<Json> = self
-                    .kinds
-                    .iter()
-                    .map(|kind| Json::from(kind.as_str()))
-                    .collect();
-                let mut facts: Vec<Fact> = unlike.iter().cloned().map(Fact::Is).collect();
-                facts.push(Fact::Other {
-                    unlike,
-                    like: BTreeMap::new(),
-                    string: None,
-                });
-                facts
-                    .into_iter()
-                    .map(|fact| with(&|p: &mut Profile| p.kind = Some(fact.clone())))
-                    .collect()
-            }
-            Test::Named(place, name) => {
-                let of = (*place, name.clone());
-                let literals = self.literals.get(&of).cloned().unwrap_or_default();
-                // A principal always has its id; the engine sets both names.
-                let always =
-                    *place == Place::Principal && matches!(name.as_str(), "id" | "accountId");
-                let mut facts: Vec<Fact> = Vec::new();
-                if !always {
-                    facts.push(Fact::Absent);
-                }
-                facts.extend(literals.iter().cloned().map(Fact::Is));
-                facts.push(Fact::Other {
-                    unlike: literals,
-                    like: BTreeMap::new(),
-                    string: None,
-                });
-                facts
-                    .into_iter()
-                    .map(|fact| {
-                        with(&|p: &mut Profile| {
-                            facts_mut(p, *place).insert(name.clone(), fact.clone());
-                        })
-                    })
-                    .collect()
-            }
-            Test::Like(place, name, pattern) => [Some(true), Some(false), None]
-                .into_iter()
-                .filter(|matches| {
-                    matches.is_some()
-                        || matches!(
-                            facts(profile, *place).get(name),
-                            Some(Fact::Other { string: None, .. })
-                        )
-                })
-                .map(|matches| {
-                    with(&|p: &mut Profile| {
-                        if let Some(Fact::Other { like, string, .. }) =
-                            facts_mut(p, *place).get_mut(name)
-                        {
-                            // Non-strings error for every pattern, including under !.
-                            *string = Some(matches.is_some());
-                            if let Some(matches) = matches {
-                                like.insert(pattern.clone(), matches);
-                            }
-                        }
-                    })
-                })
-                .collect(),
-        }
-    }
 }
 
 fn facts(profile: &Profile, place: Place) -> &BTreeMap<String, Fact> {
     match place {
         Place::Principal => &profile.attrs,
         Place::Context => &profile.context,
-    }
-}
-
-fn facts_mut(profile: &mut Profile, place: Place) -> &mut BTreeMap<String, Fact> {
-    match place {
-        Place::Principal => &mut profile.attrs,
-        Place::Context => &mut profile.context,
     }
 }

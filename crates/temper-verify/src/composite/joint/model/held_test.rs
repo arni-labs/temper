@@ -70,6 +70,7 @@ fn calling_model(calls: usize) -> JointModel {
         &[],
         Sending {
             policies: None,
+            reserve: None,
             kernel_moves: true,
             relies_on: BTreeSet::new(),
         },

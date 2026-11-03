@@ -163,3 +163,68 @@ when { principal has role && principal.role == "visitor" && context.rule == "Not
         "{result}"
     );
 }
+
+#[test]
+fn sender_construction_stops_incomplete_when_its_room_is_full() {
+    // With no construction accounting this parity expression enumerates
+    // 2^24 profiles before the walk even starts.
+    let condition = (1..24).fold("(principal has flag0)".to_string(), |left, at| {
+        format!("({left} == (principal has flag{at}))")
+    });
+    let policies = SendAnalysis::new(&format!(
+        r#"
+permit(principal, action == Action::"Add", resource is Note) when {{ {condition} }};
+permit(principal, action == Action::"Address", resource is Note)
+when {{ {condition} && context.via != "request" }};
+"#
+    ))
+    .unwrap();
+    let note = parse_automaton(NOTE).unwrap();
+    let room = Bytes::new(1 << 20);
+    let progress = Progress::default();
+    let results = verify_joint_liveness(
+        &[&note],
+        Some(&policies),
+        Bound {
+            room: &room,
+            progress: &progress,
+        },
+    );
+    assert_eq!(results.len(), 1);
+    assert!(
+        matches!(&results[0].outcome, LivenessOutcome::Incomplete { reason } if reason.contains("sender-kind construction")),
+        "{}",
+        results[0]
+    );
+    assert_eq!(results[0].states, 0);
+    assert_eq!(
+        room.held(),
+        0,
+        "a failed construction releases every reservation"
+    );
+}
+
+#[test]
+fn a_proof_keeps_its_senders_charged_until_the_proof_is_dropped() {
+    let note = parse_automaton(NOTE).unwrap();
+    let policies = SendAnalysis::new(MEMBERS_ADD).unwrap();
+    let room = Bytes::new(64 << 20);
+    let proofs = liveness_proofs(&[&note], Some(&policies), &room);
+    let retained = room.held();
+    assert!(
+        retained > 0,
+        "sender profiles remain charged between construction and walking"
+    );
+    let progress = Progress::default();
+    assert!(
+        proofs[0]
+            .check(Bound {
+                room: &room,
+                progress: &progress
+            })
+            .holds()
+    );
+    assert_eq!(room.held(), retained, "the walk releases its own room");
+    drop(proofs);
+    assert_eq!(room.held(), 0);
+}

@@ -115,7 +115,7 @@ when { principal has role && principal.role like "guest*" };
             cause: Cause::reaction(false, Hop::unknown()),
         },
     ];
-    let kinds = analysis.outside_kinds(&questions);
+    let kinds = analysis.outside_kinds(&questions, &|_| Ok(())).unwrap();
     let answers = |kind: &Kind| -> Vec<May> {
         let asker = Asker::OutsideAs(kind.clone());
         questions
@@ -195,7 +195,7 @@ when { principal.flag like "y*" };
             cause: Cause::request(),
         })
         .collect();
-    let kinds = analysis.outside_kinds(&questions);
+    let kinds = analysis.outside_kinds(&questions, &|_| Ok(())).unwrap();
     let answers: Vec<Vec<May>> = kinds
         .iter()
         .map(|kind| {
@@ -279,7 +279,8 @@ when { (principal has role) == (principal has agent_type) && context.via != "req
         },
     ];
     let answers: Vec<Vec<_>> = analysis
-        .outside_kinds(&questions)
+        .outside_kinds(&questions, &|_| Ok(()))
+        .unwrap()
         .into_iter()
         .map(|kind| {
             questions
@@ -302,4 +303,37 @@ when { (principal has role) == (principal has agent_type) && context.via != "req
         answers.iter().all(|answers| !answers.contains(&May::Maybe)),
         "{answers:?}"
     );
+}
+
+#[test]
+fn a_denied_partition_reservation_never_returns_a_partial_cover() {
+    let condition = (1..8).fold("(principal has flag0)".to_string(), |left, at| {
+        format!("({left} == (principal has flag{at}))")
+    });
+    let analysis = SendAnalysis::new(&format!(
+        "permit(principal, action, resource) when {{ {condition} }};"
+    ))
+    .unwrap();
+    let calls = std::cell::Cell::new(0);
+    let result = analysis.outside_kinds(
+        &[Question {
+            action: "Add",
+            resource_type: "Note",
+            cause: Cause::request(),
+        }],
+        &|bytes| {
+            assert!(bytes > 0);
+            calls.set(calls.get() + 1);
+            if calls.get() == 3 {
+                Err("test room is full".into())
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert_eq!(
+        result.expect_err("denial must return no sender cover"),
+        "test room is full"
+    );
+    assert_eq!(calls.get(), 3, "construction must stop at the first denial");
 }

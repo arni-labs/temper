@@ -68,6 +68,8 @@ pub(super) struct Sending<'s> {
     /// The policies that decide each move as its sender; `None` lets every
     /// sender send everything.
     pub(super) policies: Option<&'s SendAnalysis>,
+    /// Reserve construction bytes before growing the sender partition.
+    pub(super) reserve: Option<&'s dyn Fn(usize) -> Result<(), String>>,
     /// Whether the model makes the kernel's own moves: state timers, module
     /// answers and failures, and module calls lost to a restart. Without
     /// them anyone may send any action, which covers what they do.
@@ -84,6 +86,7 @@ impl Sending<'_> {
     pub(super) fn anyone() -> Self {
         Self {
             policies: None,
+            reserve: None,
             kernel_moves: false,
             relies_on: BTreeSet::new(),
         }
@@ -267,6 +270,7 @@ impl JointModel {
             sending.policies,
             &sender_matters,
             &inheriting,
+            sending.reserve,
         );
         let chosen = |entity: &str, action: &str| {
             sending
@@ -339,6 +343,16 @@ impl JointModel {
             sender_matters,
             unsent,
         }
+    }
+
+    /// Retain only the finished partition, or propagate construction failure.
+    pub(super) fn built(self, memory: &super::room::Construction<'_>) -> Result<Self, String> {
+        if let Some(reason) = &self.senders.problem {
+            memory.set(0)?;
+            return Err(reason.clone());
+        }
+        memory.set(self.senders.kind_bytes())?;
+        Ok(self)
     }
 
     /// Note each move the runtime could make in `state` that the walk never

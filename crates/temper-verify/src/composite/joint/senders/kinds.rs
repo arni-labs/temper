@@ -15,7 +15,8 @@ pub(super) fn outside(
     policies: &SendAnalysis,
     roots: &BTreeSet<String>,
     inheriting: &BTreeSet<(String, String)>,
-) -> Option<Vec<Kind>> {
+    reserve: &dyn Fn(usize) -> Result<(), String>,
+) -> Result<Option<Vec<Kind>>, String> {
     let mut requests = Vec::new();
     for entity in roots {
         for action in &by_name[entity.as_str()].actions {
@@ -42,7 +43,7 @@ pub(super) fn outside(
         }
     }
     if requests.is_empty() {
-        return None;
+        return Ok(None);
     }
     let none = BTreeMap::new();
     let answers = |asker: &Asker, questions: &[Question<'_>]| -> Vec<May> {
@@ -56,7 +57,7 @@ pub(super) fn outside(
     // whichever of them sent it, so they are one sender.
     let reactions = &questions[requests.len()..];
     let mut kinds: Vec<(Vec<May>, Kind)> = Vec::new();
-    for kind in policies.outside_kinds(&questions) {
+    for kind in policies.outside_kinds(&questions, reserve)? {
         let asker = Asker::OutsideAs(kind.clone());
         if answers(&asker, &requests).iter().all(|may| *may == May::No) {
             continue;
@@ -78,7 +79,7 @@ pub(super) fn outside(
         && !chain.contains(&May::Maybe)
         && *chain == anyone
     {
-        return None;
+        return Ok(None);
     }
-    Some(kinds.into_iter().map(|(_, kind)| kind).collect())
+    Ok(Some(kinds.into_iter().map(|(_, kind)| kind).collect()))
 }

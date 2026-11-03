@@ -210,7 +210,7 @@ pub fn verify_joint_invariants(
     policies: Option<&SendAnalysis>,
     bound: Bound<'_>,
 ) -> Vec<JointInvariantResult> {
-    invariant_proofs(automatons, policies)
+    invariant_proofs(automatons, policies, bound.room)
         .iter()
         .flat_map(|proof| proof.check(bound))
         .collect()

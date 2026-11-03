@@ -76,6 +76,8 @@ pub(super) struct Senders {
     /// sender, or someone outside of no known kind when the policies tell
     /// none apart.
     outside: Vec<u32>,
+    /// A failed partition cannot be walked as an unrestricted sender.
+    pub(super) problem: Option<String>,
     /// Each asker's place with resource-relative IDs forgotten after a
     /// different-ID hop.
     detached: Vec<u32>,
@@ -143,9 +145,27 @@ impl Senders {
         policies: Option<&SendAnalysis>,
         roots: &BTreeSet<String>,
         inheriting: &BTreeSet<(String, String)>,
+        reserve: Option<&dyn Fn(usize) -> Result<(), String>>,
     ) -> Self {
-        let kinds =
-            policies.and_then(|policies| kinds::outside(by_name, policies, roots, inheriting));
+        let unlimited = |_: usize| Ok(());
+        let kinds = policies
+            .map(|policies| {
+                kinds::outside(
+                    by_name,
+                    policies,
+                    roots,
+                    inheriting,
+                    reserve.unwrap_or(&unlimited),
+                )
+            })
+            .transpose();
+        let (kinds, problem) = match kinds {
+            Ok(kinds) => (kinds.flatten(), None),
+            Err(reason) => (
+                None,
+                Some(format!("sender-kind construction does not fit: {reason}")),
+            ),
+        };
         let outside: Vec<u32> = match &kinds {
             None => vec![OUTSIDE],
             Some(kinds) => (1..=kinds.len()).map(|at| at as u32 * 2).collect(),
@@ -222,6 +242,7 @@ impl Senders {
             askers,
             names,
             outside,
+            problem,
             detached,
             timer_chains,
             requests,
@@ -249,6 +270,17 @@ impl Senders {
             }
         }
         self.reread = reread(self.policies.as_ref(), &self.askers, self.may.as_ref());
+    }
+
+    /// Bytes retained by the partition after its temporary work is dropped.
+    pub(super) fn kind_bytes(&self) -> usize {
+        self.askers
+            .iter()
+            .map(|asker| match asker {
+                Asker::OutsideAs(kind) => kind.bytes(),
+                _ => 0,
+            })
+            .sum()
     }
 
     /// Whether Cedar lets someone outside, of no known kind, request
