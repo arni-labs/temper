@@ -339,6 +339,7 @@ pub struct ContextEntityDecl {
 /// after `after_seconds`. If the entity leaves `state` before the timer
 /// fires, the timer is cancelled. If any action listed in `reset_on`
 /// fires while the entity is in `state`, the timer is re-armed from now.
+/// If any action listed in `due_on` fires there, the armed timer is due now.
 ///
 /// Authors write the declaration once; the spec compiler (see
 /// `metadata::validate_state_timeouts` and the durable scheduler) generates
@@ -364,6 +365,14 @@ pub struct StateTimeout {
     /// the current moment. Progress signals such as `Heartbeat` go here.
     #[serde(default)]
     pub reset_on: Vec<String>,
+    /// Actions that, when fired while in `state`, make the timer the record
+    /// has armed due now: it fires at once, as whoever armed it, exactly as
+    /// it would have at its deadline. Only a timer already armed on the same
+    /// record is brought forward; nothing is armed, no deadline moves later
+    /// and the timer's identity never changes. An outside event (a webhook)
+    /// goes here, so the owner's timer acts on it without waiting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub due_on: Vec<String>,
     /// Parameters passed to the `on_timeout` action, read when the timer is
     /// armed. Each value is a literal (`'text'`, an integer, `true`, `false`,
     /// `null`) or a declared state variable (`Id` is the entity's id).

@@ -117,6 +117,7 @@ pub(super) fn validate(automaton: &Automaton) -> Result<(), AutomatonParseError>
     //    - `state` must be a declared state.
     //    - `on_timeout` must be a declared action.
     //    - each `reset_on` entry must be a declared action.
+    //    - each `due_on` entry must be a declared action not in `reset_on`.
     //    - `after_seconds` must be > 0 (a zero delay is almost certainly a typo).
     //    - the same state must not be declared twice (ambiguous timer contract).
     let mut seen_states: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
@@ -149,6 +150,24 @@ pub(super) fn validate(automaton: &Automaton) -> Result<(), AutomatonParseError>
             if !action_names.contains(&reset.as_str()) {
                 return Err(AutomatonParseError::Validation(format!(
                     "state_timeout for '{}' references unknown reset_on action '{reset}'",
+                    st.state
+                )));
+            }
+        }
+        for due in &st.due_on {
+            if !action_names.contains(&due.as_str()) {
+                return Err(AutomatonParseError::Validation(format!(
+                    "state_timeout for '{}' references unknown due_on action '{due}'",
+                    st.state
+                )));
+            }
+            // A reset arms a new timer as the move's caller; a due_on move
+            // fires the armed one as its armer. One move cannot do both.
+            if st.reset_on.contains(due) {
+                return Err(AutomatonParseError::Validation(format!(
+                    "state_timeout for '{}' lists '{due}' in both reset_on and due_on: \
+                     a reset starts a new timer as the move's caller, a due_on move \
+                     fires the armed one as whoever armed it",
                     st.state
                 )));
             }

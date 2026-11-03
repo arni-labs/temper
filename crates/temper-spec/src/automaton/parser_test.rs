@@ -110,6 +110,27 @@ from = []
     }
 
     #[test]
+    fn due_on_parses_and_rejects_unknown_or_reset_actions() {
+        let timeout = "\n[[state_timeout]]\nstate = \"B\"\nafter_seconds = 30\non_timeout = \"TimeoutFail\"\n";
+        let auto = parse_automaton(&format!("{BASE_SPEC}{timeout}due_on = [\"Heartbeat\"]\n"))
+            .expect("a declared action may bring the timer forward");
+        assert_eq!(auto.state_timeouts[0].due_on, vec!["Heartbeat".to_string()]);
+
+        let err =
+            parse_automaton(&format!("{BASE_SPEC}{timeout}due_on = [\"Mystery\"]\n")).unwrap_err();
+        assert!(err.to_string().contains("due_on action 'Mystery'"), "{err}");
+
+        let err = parse_automaton(&format!(
+            "{BASE_SPEC}{timeout}reset_on = [\"Heartbeat\"]\ndue_on = [\"Heartbeat\"]\n"
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("both reset_on and due_on"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn rejects_zero_after_seconds() {
         let spec = format!(
             "{BASE_SPEC}\n[[state_timeout]]\nstate = \"B\"\nafter_seconds = 0\non_timeout = \"TimeoutFail\"\n"
