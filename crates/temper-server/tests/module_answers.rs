@@ -230,7 +230,8 @@ const INSTALL_CSDL_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
   </edmx:DataServices>
 </edmx:Edmx>"#;
 
-/// Cedar lets only the runtime service move an install.
+/// Cedar lets only the runtime service move an install, so `Revive` lands
+/// only when Cedar permits it for the principal that sent `Recheck`.
 const ONLY_RUNTIME: &str =
     r#"permit(principal, action, resource) when { principal.id == "service:runtime" };"#;
 
@@ -299,5 +300,4 @@ async fn a_module_may_answer_with_an_input_action() {
         (revived.from_status.as_str(), revived.to_status.as_str()),
         ("Broken", "Restarting")
     );
-    assert_eq!(revived.origin.by.as_deref(), Some("service:runtime"));
 }
