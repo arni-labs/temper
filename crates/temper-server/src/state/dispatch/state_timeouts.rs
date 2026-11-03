@@ -160,6 +160,9 @@ pub(super) enum Reservation {
     Missing,
     /// Follow a committed arm: keep only that arm with the same declaration.
     Committed,
+    /// Bring the armed timer forward (`state_timer_due`): replace only the
+    /// same arming, never another timer or none.
+    Sooner,
 }
 
 /// In-memory cancellation counter keyed by entity instance.
@@ -218,10 +221,17 @@ impl StateTimeoutTracker {
         if journal < entry.journal {
             return None;
         }
+        let same_arming = entry
+            .armed
+            .as_ref()
+            .is_some_and(|armed| armed.is_declared_as(timer) && armed.arm_id == timer.arm_id);
+        if reservation == Reservation::Sooner && !same_arming {
+            return None;
+        }
         let keep_armed = entry.armed.as_ref().is_some_and(|armed| {
             armed.is_declared_as(timer)
                 && match reservation {
-                    Reservation::Fresh => false,
+                    Reservation::Fresh | Reservation::Sooner => false,
                     Reservation::Missing => true,
                     Reservation::Committed => armed.arm_id == timer.arm_id,
                 }
@@ -422,9 +432,18 @@ impl crate::state::ServerState {
             .map(|e| e.from_status.as_str())
             .unwrap_or_default();
         let state_changed = pre_state != response.state.status;
+        let due_now = !state_changed
+            && declared
+                .as_ref()
+                .is_some_and(|st| st.due_on.iter().any(|action| action == ctx.action));
         let fresh = declared
             .filter(|st| state_changed || st.reset_on.iter().any(|action| action == ctx.action));
         let Some(st) = fresh else {
+            // The timer the record had armed before this move, if any: only
+            // that one is brought forward, never one this move's reconcile arms.
+            let before = due_now
+                .then(|| self.armed_state_timer(ctx.tenant, ctx.entity_type, ctx.entity_id))
+                .flatten();
             self.reconcile_state_timers(
                 ctx.tenant,
                 ctx.entity_type,
@@ -433,6 +452,10 @@ impl crate::state::ServerState {
                 Some(ctx.agent_ctx),
             )
             .await;
+            if let Some(before) = before {
+                self.bring_state_timer_forward(&before, response.state.sequence_nr, sim_now())
+                    .await;
+            }
             return;
         };
         if !state_changed {
@@ -664,7 +687,7 @@ impl crate::state::ServerState {
         let follow = super::state_timer_reconcile::Follow {
             armed_by: Some(&timer.agent_ctx),
             gate: timer.boot_gate.clone(),
-            woke_for: Some(deadline(timer.started_at, timer.after_seconds)),
+            woke_for: Some(timer.due_at()),
             ..Default::default()
         };
         self.follow_owned_state_timer(
@@ -675,6 +698,12 @@ impl crate::state::ServerState {
             follow,
         )
         .await;
+        // A `due_on` move brought this arming forward: the same arming,
+        // followed to the record's newer sequence, stays due then.
+        if let Some(due_by) = timer.due_by {
+            self.bring_state_timer_forward(timer, current.sequence_nr, due_by)
+                .await;
+        }
         debug_assert!(
             self.state_timeout_tracker
                 .armed(&key)
@@ -745,6 +774,10 @@ pub(super) struct ArmedTimer {
     /// The entity's journal sequence when the timer was armed.
     pub(super) sequence_nr: u64,
     pub(super) started_at: DateTime<Utc>,
+    /// When a `due_on` move brought the timer forward, the time it is due
+    /// instead of its deadline (`state_timer_due`). Kept in this process
+    /// only: a restart arms the timer from its row, due at its deadline.
+    pub(super) due_by: Option<DateTime<Utc>>,
     /// Shared dispatch gate inherited by replacements of boot timers.
     pub(super) boot_gate: Option<Arc<Semaphore>>,
 }
@@ -756,6 +789,13 @@ impl ArmedTimer {
         self.state == other.state
             && self.action == other.action
             && self.after_seconds == other.after_seconds
+    }
+
+    /// When it fires: its deadline, or sooner when a `due_on` move brought
+    /// it forward. Never later than its deadline.
+    pub(super) fn due_at(&self) -> DateTime<Utc> {
+        let deadline = deadline(self.started_at, self.after_seconds);
+        self.due_by.map_or(deadline, |due_by| due_by.min(deadline))
     }
 
     /// A key for the fires of one task of this arming: a fire tried again
@@ -865,6 +905,7 @@ pub(super) fn declared_timer(
         arm_id: sim_uuid().to_string(),
         sequence_nr: state.sequence_nr,
         started_at,
+        due_by: None,
     }
 }
 
@@ -1066,6 +1107,7 @@ mod tests {
             arm_id: format!("{state}-{journal}"),
             sequence_nr: journal,
             started_at: DateTime::<Utc>::from_timestamp_millis(0).unwrap(),
+            due_by: None,
         }
     }
 

@@ -397,5 +397,6 @@ pub(super) fn armed_timer(
         arm_id: row.arm_id.clone(),
         sequence_nr: row.sequence_nr,
         started_at,
+        due_by: None,
     })
 }
