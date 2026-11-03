@@ -193,3 +193,77 @@ fn a_row_evaluates_only_the_policies_it_can_change() {
         &row("b", Some("other"), "Open")
     ));
 }
+
+/// Policies a list read can meet: permits and forbids that read the row and
+/// that do not, ones that error on rows missing a field, an id scope, a
+/// forbid naming `resource.id`, and a nested read the classifier cannot
+/// project.
+const POOL: &[&str] = &[
+    r#"permit(principal, action == Action::"read", resource is Order);"#,
+    r#"permit(principal, action == Action::"read", resource is Order) when { resource.owner == principal.id };"#,
+    r#"permit(principal, action == Action::"read", resource is Order) when { resource.status == "Open" };"#,
+    r#"permit(principal, action, resource) when { principal has role && principal.role == "helper" };"#,
+    r#"permit(principal, action == Action::"read", resource == Order::"o1");"#,
+    r#"permit(principal, action == Action::"read", resource is Order) when { resource has owner && resource.owner.name == "x" };"#,
+    r#"forbid(principal, action == Action::"read", resource is Order) when { context has owner && context.owner != principal.id };"#,
+    r#"forbid(principal, action, resource is Order) when { principal has role && principal.role like "guest*" };"#,
+    r#"forbid(principal, action, resource) when { principal has role && principal.role == "file-upload" } unless { resource has id && resource.id == principal.id };"#,
+    r#"forbid(principal, action == Action::"read", resource is Order) when { resource.status == "Closed" };"#,
+    r#"forbid(principal, action == Action::"read", resource is Order) when { resource.owner like "ot*" };"#,
+    r#"forbid(principal, action, resource) unless { principal has role || principal is Customer };"#,
+];
+
+fn reader_as(id: &str, kind: PrincipalKind, role: Option<&str>) -> SecurityContext {
+    let mut who = reader(kind, role);
+    who.principal.id = id.to_string();
+    who
+}
+
+/// Every set of one to three policies from [`POOL`], for principals with and
+/// without roles, over rows with and without each field: the split's
+/// decision for every row equals the whole set's. A split that dropped a
+/// row-reading forbid, or let a list-wide permit pass a row's own forbid,
+/// gives some row here a different answer.
+#[test]
+fn split_and_whole_set_agree_on_every_row() {
+    let readers = [
+        reader_as("reader", PrincipalKind::Customer, None),
+        reader_as("reader", PrincipalKind::Customer, Some("guest:link")),
+        reader_as("o1", PrincipalKind::Agent, Some("file-upload")),
+        reader_as("reader", PrincipalKind::Agent, Some("helper")),
+        reader_as("reader", PrincipalKind::Agent, None),
+    ];
+    let mut sets = Vec::new();
+    for a in 0..POOL.len() {
+        sets.push(vec![a]);
+        for b in a + 1..POOL.len() {
+            sets.push(vec![a, b]);
+            for c in b + 1..POOL.len() {
+                sets.push(vec![a, b, c]);
+            }
+        }
+    }
+    let mut compared = 0usize;
+    let mut per_row = 0usize;
+    for set in &sets {
+        let policy = set
+            .iter()
+            .map(|index| POOL[*index])
+            .collect::<Vec<_>>()
+            .join("\n");
+        for who in &readers {
+            let (split, whole, mode) = decisions(&policy, who);
+            assert_eq!(
+                split, whole,
+                "{mode} differs for {:?} under:\n{policy}",
+                who.principal
+            );
+            compared += split.len();
+            per_row += usize::from(mode == "per_row");
+        }
+    }
+    // 298 sets x 5 principals x 7 rows, and enough of them decided per row
+    // that the per-row part is what is being compared.
+    assert_eq!(compared, sets.len() * readers.len() * rows().len());
+    assert!(per_row > sets.len(), "only {per_row} reads were per row");
+}
