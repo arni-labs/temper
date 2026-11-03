@@ -413,3 +413,7 @@ mod chain_test;
 #[cfg(test)]
 #[path = "outside_test.rs"]
 mod outside_tests;
+
+#[cfg(test)]
+#[path = "trigger_guard_test.rs"]
+mod trigger_guard_tests;
