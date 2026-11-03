@@ -270,10 +270,15 @@ fn split_and_whole_set_agree_on_every_row() {
 
 /// Exercise the row projection too: an indirect read must keep the fields
 /// that the full request would put on the row's Cedar entity.
-fn assert_indirect_read_matches_whole_set(resource_type: &str, forbid: &str, field: &str) {
-    let who = reader(PrincipalKind::Customer, None);
+fn assert_indirect_read_matches_whole_set(
+    resource_type: &str,
+    forbid: &str,
+    field: &str,
+    blocked_id: &str,
+    who: &SecurityContext,
+) {
     let blocked = HashMap::from([
-        ("id".to_string(), json!("reader")),
+        ("id".to_string(), json!(blocked_id)),
         ("status".to_string(), json!("Open")),
         (field.to_string(), json!(true)),
     ]);
@@ -292,14 +297,14 @@ fn assert_indirect_read_matches_whole_set(resource_type: &str, forbid: &str, fie
         engine.reload_tenant_policies("tenant", &policy).unwrap();
         let list = engine.list_read_for_tenant(
             "tenant",
-            &who,
+            who,
             "read",
             resource_type,
             &row("_list", None, ""),
         );
         for (attrs, expected) in [(&blocked, false), (&clear, true)] {
             let whole = engine
-                .authorize_row_for_tenant("tenant", &who, "read", resource_type, attrs)
+                .authorize_row_for_tenant("tenant", who, "read", resource_type, attrs)
                 .is_allowed();
             assert_eq!(whole, expected, "full request: {policy}");
             let split = match &list {
@@ -317,14 +322,14 @@ fn assert_indirect_read_matches_whole_set(resource_type: &str, forbid: &str, fie
                         })
                         .map(|(key, value)| (key.clone(), value.clone()))
                         .collect();
-                    engine.list_row_allowed("tenant", &who, "read", resource_type, rule, &projected)
+                    engine.list_row_allowed("tenant", who, "read", resource_type, rule, &projected)
                 }
             };
             assert_eq!(split, whole, "projected split: {policy}, row: {attrs:?}");
         }
         // The rule and any list-wide permit remain tenant-local.
         assert!(matches!(
-            engine.list_read_for_tenant("other-tenant", &who, "read", resource_type, &blocked,),
+            engine.list_read_for_tenant("other-tenant", who, "read", resource_type, &blocked,),
             ListRead::DenyAll
         ));
     }
@@ -337,6 +342,8 @@ fn literal_entity_reads_stay_with_the_row_and_keep_its_fields() {
         r#"forbid(principal, action == Action::"read", resource is Order)
            when { Order::"reader" has blocked && Order::"reader".blocked };"#,
         "blocked",
+        "reader",
+        &reader(PrincipalKind::Customer, None),
     );
 }
 
@@ -347,5 +354,77 @@ fn self_row_principal_reads_stay_with_the_row_and_keep_its_fields() {
         r#"forbid(principal, action == Action::"read", resource is Customer)
            when { principal has blocked && principal.blocked };"#,
         "blocked",
+        "reader",
+        &reader(PrincipalKind::Customer, None),
     );
+}
+
+#[test]
+fn action_entity_reads_stay_with_the_row_and_keep_its_fields() {
+    assert_indirect_read_matches_whole_set(
+        "Action",
+        r#"forbid(principal, action == Action::"read", resource is Action)
+           when { action has blocked && action.blocked };"#,
+        "blocked",
+        "read",
+        &reader(PrincipalKind::Customer, None),
+    );
+}
+
+/// Even the normally type-wide has_spec field can be overwritten by the
+/// principal's attributes when resource and principal share a Cedar UID.
+#[test]
+fn self_row_resource_reads_observe_the_merged_entity() {
+    let engine = AuthzEngine::empty();
+    engine
+        .reload_tenant_policies(
+            "tenant",
+            r#"
+        permit(principal, action == Action::"read", resource is Customer);
+        forbid(principal, action == Action::"read", resource is Customer)
+        when { resource.has_spec == false };
+    "#,
+        )
+        .unwrap();
+    let mut who = reader(PrincipalKind::Customer, None);
+    who.principal
+        .attributes
+        .insert("has_spec".into(), json!(false));
+    let probe = HashMap::from([
+        ("id".to_string(), json!("_list")),
+        ("has_spec".to_string(), json!(true)),
+    ]);
+    let list = engine.list_read_for_tenant("tenant", &who, "read", "Customer", &probe);
+    for (id, expected) in [("reader", false), ("other", true)] {
+        let mut attrs = probe.clone();
+        attrs.insert("id".to_string(), json!(id));
+        let whole = engine
+            .authorize_row_for_tenant("tenant", &who, "read", "Customer", &attrs)
+            .is_allowed();
+        assert_eq!(whole, expected);
+        let split = match &list {
+            ListRead::AllowAll => true,
+            ListRead::DenyAll => false,
+            ListRead::PerRow(rule) => {
+                engine.list_row_allowed("tenant", &who, "read", "Customer", rule, &attrs)
+            }
+        };
+        assert_eq!(split, whole, "self-row has_spec differs for {id}");
+    }
+}
+
+#[test]
+fn context_values_cedar_omits_do_not_hide_row_fields() {
+    for value in [json!(null), json!(1.5), json!({"nested": true})] {
+        let mut who = reader(PrincipalKind::Customer, None);
+        who.context_attrs.insert("blocked".into(), value);
+        assert_indirect_read_matches_whole_set(
+            "Order",
+            r#"forbid(principal, action == Action::"read", resource is Order)
+               when { context has blocked && context.blocked };"#,
+            "blocked",
+            "reader",
+            &who,
+        );
+    }
 }

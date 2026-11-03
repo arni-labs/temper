@@ -75,11 +75,16 @@ pub(super) fn split(
     let action_uid = EntityUid::from_str(&format!("Action::\"{action}\"")).ok()?;
     let resource_type_name = EntityTypeName::from_str(resource_type).ok()?;
 
-    // Keys a row's fields cannot fill: authority keys, and those the request
-    // sets itself, which the engine puts in the context before the row's.
-    let request_fills = |key: &str| {
-        is_cedar_authority_context_key(key) || security_ctx.context_attrs.contains_key(key)
-    };
+    // Use the engine's conversion: null, objects, and non-integer numbers
+    // are omitted, so their keys can still be filled by a row's fields.
+    let mut request_context = std::collections::HashMap::new();
+    for (key, value) in &security_ctx.context_attrs {
+        super::insert_json_as_cedar(&mut request_context, key.clone(), value);
+    }
+    // Authority keys never come from rows; actual request values take
+    // precedence over row values in evaluate_request.
+    let request_fills =
+        |key: &str| is_cedar_authority_context_key(key) || request_context.contains_key(key);
     let mut varies = false;
     let mut keys = Some(BTreeSet::new());
     let mut list = Vec::new();
@@ -183,9 +188,12 @@ fn row_variance(
             let body = condition.get("body").unwrap_or(condition);
             // A self-row shares the principal's Cedar UID. evaluate_request
             // merges its fields into that entity, filling attributes the
-            // identity did not supply. Even a principal-only condition can
-            // therefore change on this row; keep its full fields.
-            if principal_can_be_row && json_contains_var(body, "principal") {
+            // identity did not supply, while identity attributes override
+            // resource fields (even has_spec). Keep the full merged entity
+            // for conditions reading either alias of it.
+            if principal_can_be_row
+                && (json_contains_var(body, "principal") || json_contains_var(body, "resource"))
+            {
                 return RowVariance::Unknown;
             }
             scan.merge(collect_resource_attrs(body));
@@ -329,12 +337,12 @@ fn classify_getattr(attr: &str, target: Option<&serde_json::Value>, scan: &mut A
         scan.nested_context_keys.insert(key.to_string());
         return;
     }
-    if json_var_is(target, "principal") || json_var_is(target, "action") {
+    if json_var_is(target, "principal") {
         // Principal reads on a type that can be the principal's own row
         // were kept per-row above. Other direct request reads are fixed.
         return;
     }
-    // An entity literal (or an expression returning an entity) can name
+    // An action, entity literal, or expression returning an entity can name
     // the current row too: Order::"secret".blocked sees that field only
     // while checking the secret row. Nested reads also need the full row.
     // Do not infer independence from the absence of a `resource` variable.
