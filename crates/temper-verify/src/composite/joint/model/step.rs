@@ -155,37 +155,9 @@ impl JointModel {
                 };
             }
             Move::Reaction(entity, action, by) => {
-                // Nothing the model holds decides whether it is sent or
-                // what Cedar says of it, so it may also not happen.
-                let from =
-                    self.outside_from(entity, &action.name)
-                        .map_or_else(String::new, |from| {
-                            from.iter()
-                                .map(String::as_str)
-                                .collect::<Vec<_>>()
-                                .join(" or ")
-                        });
-                let text = format!("{entity}.{action} (a reaction from {from})");
-                let chain = self.outside_chain(entity, &action.name);
-                if self.action_reads_related(entity, &action.name) {
-                    let mut next = state.clone();
-                    let mut dispatch = sent(entity, action, *by);
-                    dispatch.chain = chain;
-                    add(&mut next, dispatch);
-                    if !self
-                        .expansion
-                        .push(&mut outcomes, (next, format!("{text} sent"), Unsure))
-                    {
+                for outcome in self.outside_reaction(state, entity, action, *by) {
+                    if !self.expansion.push(&mut outcomes, outcome) {
                         return (Vec::new(), false);
-                    };
-                } else {
-                    for (outcome, then) in self.commit(state.clone(), entity, action, &chain, *by) {
-                        if !self
-                            .expansion
-                            .push(&mut outcomes, (outcome, text.clone(), Unsure.then(then)))
-                        {
-                            return (Vec::new(), false);
-                        };
                     }
                 }
             }
@@ -468,7 +440,7 @@ impl JointModel {
 
 /// The dispatch an outside sender, or a module's answer, makes after the
 /// dispatch path read the related records and they allowed it.
-fn sent(entity: &str, action: &TemperModelAction, by: u32) -> Dispatch {
+pub(super) fn sent(entity: &str, action: &TemperModelAction, by: u32) -> Dispatch {
     Dispatch {
         to: entity.to_string(),
         action: action.name.clone(),
