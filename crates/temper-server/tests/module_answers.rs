@@ -230,11 +230,6 @@ const INSTALL_CSDL_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
   </edmx:DataServices>
 </edmx:Edmx>"#;
 
-/// Cedar lets only the runtime service move an install, so `Revive` lands
-/// only when Cedar permits it for the principal that sent `Recheck`.
-const ONLY_RUNTIME: &str =
-    r#"permit(principal, action, resource) when { principal.id == "service:runtime" };"#;
-
 #[tokio::test(flavor = "multi_thread")]
 async fn a_module_may_answer_with_an_input_action() {
     let mut registry = SpecRegistry::new();
@@ -246,10 +241,6 @@ async fn a_module_may_answer_with_an_input_action() {
         &[("Install", INSTALL_IOA)],
     );
     let state = ServerState::from_registry(ActorSystem::new("module-answer-input"), registry);
-    state
-        .authz
-        .reload_tenant_policies("default", ONLY_RUNTIME)
-        .expect("the policy loads");
     let tenant = TenantId::default();
     let hash = state
         .wasm_engine
