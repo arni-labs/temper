@@ -16,12 +16,18 @@ use tower::ServiceExt;
 
 const TENANT: &str = "default";
 
+/// agent-1's request, in its session `session-1`.
 fn request(path: &str, body: serde_json::Value) -> Request<Body> {
-    let mut request = Request::post(path)
-        .header("content-type", "application/json")
-        .header("x-session-id", "session-1")
-        .body(Body::from(body.to_string()))
-        .unwrap();
+    request_in(path, body, Some("session-1"))
+}
+
+/// agent-1's request, in `session` or, with none, as a plain key's.
+fn request_in(path: &str, body: serde_json::Value, session: Option<&str>) -> Request<Body> {
+    let mut builder = Request::post(path).header("content-type", "application/json");
+    if let Some(session) = session {
+        builder = builder.header("x-session-id", session);
+    }
+    let mut request = builder.body(Body::from(body.to_string())).unwrap();
     request.extensions_mut().insert(
         AuthenticatedRequestContext::new(
             TenantId::new(TENANT),
@@ -41,7 +47,7 @@ fn request(path: &str, body: serde_json::Value) -> Request<Body> {
                 credential: None,
             },
         )
-        .with_session_id(Some("session-1".to_string())),
+        .with_session_id(session.map(str::to_string)),
     );
     request
 }
@@ -234,6 +240,28 @@ async fn factory_sized_checks_enqueue_nothing_but_a_refused_move_records_one_att
     );
     assert_eq!(filed(&state, &store).await, (0, 0, 0));
     assert!(state.load_trajectory_entries(TENANT, 200).await.is_empty());
+
+    // The same refused move from a plain key, with no session to wait for an
+    // answer: a decision would never resolve, so it is a plain 403 and
+    // nothing is stored (`authz::denial_can_be_answered`).
+    let response = app
+        .clone()
+        .oneshot(request_in(
+            "/tdata/Orders('order-1')/Temper.AddItem",
+            serde_json::json!({"ProductId": "p1", "Quantity": 1}),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let plain = json_body(response).await;
+    assert!(plain.get("decision_id").is_none(), "{plain}");
+    assert_eq!(
+        enqueued(&provider, &exporter),
+        0,
+        "a plain key's refusal stores no trajectory row"
+    );
+    assert_eq!(filed(&state, &store).await, (0, 0, 0), "nor any decision");
 
     let response = app
         .oneshot(request(

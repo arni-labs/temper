@@ -231,11 +231,7 @@ pub(crate) async fn require_governed_mutation_auth(
             .get("sessionId")
             .and_then(|value| value.as_str())
     });
-    if matches!(
-        security_ctx.principal.kind,
-        temper_authz::PrincipalKind::Agent
-    ) && session_id.is_some()
-    {
+    if denial_can_be_answered(security_ctx, session_id) {
         let resource_attrs_json =
             serde_json::to_value(&input.resource_attrs).unwrap_or_else(|_| serde_json::json!({}));
         let pd = record_authz_denial(
@@ -279,6 +275,32 @@ pub(crate) async fn require_governed_mutation_auth(
         "unauthorized non-resumable governed mutation"
     );
     Some((StatusCode::FORBIDDEN, reason))
+}
+
+/// Whether a refused request can become a decision that someone answers: an
+/// agent's, in a session that waits for the answer. `declared_session` is the
+/// session the request named; a session a server-side path minted itself is
+/// read from `context_attrs` (the WASM and agent dispatch contexts carry one
+/// there, not in a header). A decision with no one to answer it never
+/// resolves, so anyone else's refusal is a plain 403 and nothing is stored.
+pub(crate) fn denial_can_be_answered(
+    security_ctx: &SecurityContext,
+    declared_session: Option<&str>,
+) -> bool {
+    security_ctx.principal.kind == temper_authz::PrincipalKind::Agent
+        && (declared_session.is_some() || security_ctx.context_attrs.contains_key("sessionId"))
+}
+
+/// [`record_authz_denial`] for a refusal someone can answer
+/// ([`denial_can_be_answered`]); `None`, with nothing stored, for any other.
+pub(crate) async fn record_answerable_denial(
+    state: &crate::state::ServerState,
+    input: DenialInput<'_>,
+) -> Option<PendingDecision> {
+    if !denial_can_be_answered(input.security_ctx, input.session_id.as_deref()) {
+        return None;
+    }
+    Some(record_authz_denial(state, input).await)
 }
 
 /// Record result of an authorization denial.
