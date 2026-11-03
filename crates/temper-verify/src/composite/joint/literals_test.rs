@@ -264,3 +264,59 @@ fn cedar_may_take_a_made_up_value_for_a_literal_its_field_never_meets() {
         "{result}"
     );
 }
+
+/// Cedar lets the ping finish a box only when its tag equals its holder
+/// and is not empty: a comparison of two of the record's fields.
+const FINISH_WHEN_TAG_IS_HOLDER: &str = r#"
+permit(principal, action in [Action::"Send", Action::"Ping", Action::"Tag", Action::"Label"], resource);
+permit(principal, action == Action::"Hold", resource is Box) when { context.via == "reaction" };
+permit(principal, action == Action::"Finish", resource is Box) when {
+    context.via == "reaction" && resource.tag == resource.holder && resource.tag != ""
+};
+"#;
+
+/// The ping note, handing its box as holder its own `label`, which anyone
+/// may write while the note is open, instead of `'main'`.
+fn labelled_note() -> String {
+    PING_NOTE
+        .replace("holder = \"'main'\"", "holder = \"label\"")
+        .replace(
+            "[[action]]\nname = \"Send\"",
+            "[[state]]\nname = \"label\"\ntype = \"string\"\ninitial = \"\"\n\n\
+             [[action]]\nname = \"Label\"\nkind = \"input\"\nfrom = [\"Open\"]\nto = \"Open\"\n\
+             params = [{ name = \"label\", type = \"string\" }]\n\n\
+             [[action]]\nname = \"Send\"",
+        )
+}
+
+#[test]
+fn cedar_comparing_two_fields_keeps_a_literal_one_holds_possible_for_the_other() {
+    // The tag, set while the note is open, is a made-up value; the holder
+    // is 'main'. The runtime may have tagged the box 'main' too, so the
+    // policy's tag == holder may hold.
+    let sources = [PING_NOTE.to_string(), TAGGED_BOX.to_string()];
+    let result = check(&sources, Some(FINISH_WHEN_TAG_IS_HOLDER));
+    assert!(
+        matches!(result.outcome, JointOutcome::Broken { .. }),
+        "{result}"
+    );
+}
+
+#[test]
+fn cedar_comparing_two_made_up_values_from_different_classes_may_find_them_equal() {
+    // The tag and the note's label are both made up, and nothing in the
+    // specs compares them: one may still be written as the other, and the
+    // walk must reach the box finished.
+    let sources = [labelled_note(), TAGGED_BOX.to_string()];
+    let result = check(&sources, Some(FINISH_WHEN_TAG_IS_HOLDER));
+    let JointOutcome::Broken { path } = &result.outcome else {
+        panic!("expected broken, got {result}");
+    };
+    assert!(
+        path.iter().any(|step| step
+            .action
+            .as_deref()
+            .is_some_and(|a| a.contains("Note.Label"))),
+        "{result}"
+    );
+}
