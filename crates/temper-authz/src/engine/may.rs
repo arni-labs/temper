@@ -23,6 +23,8 @@ mod request;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_kinds;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
