@@ -22,6 +22,7 @@ use super::common::{
     resolve_value_parent, tenant_csdl_xml, tenant_entity_sets,
 };
 use super::filter_sql;
+use super::property_read::{handle_property_read, is_navigation_property};
 use super::query_plane_read::{
     QueryPlaneReadBudget, QueryPlaneReadRequest, read_entity_set_from_query_plane,
 };
@@ -995,7 +996,8 @@ async fn handle_entity(
     }
 }
 
-/// Handle `NavigationProperty` path: resolve parent and expand nav property.
+/// Handle `NavigationProperty` path: resolve the parent, then read the property
+/// on its own when it is a structural one, or expand it when it is a navigation one.
 async fn handle_navigation_property(
     state: &ServerState,
     tenant: &TenantId,
@@ -1012,6 +1014,18 @@ async fn handle_navigation_property(
                 return odata_error(status, "InvalidPath", &msg).into_response();
             }
         };
+    if !is_navigation_property(state, tenant, &parent_type, property) {
+        return handle_property_read(
+            state,
+            tenant,
+            security_ctx,
+            &parent_type,
+            &parent_set,
+            &parent_key,
+            property,
+        )
+        .await;
+    }
 
     let parent_body = match load_authorized_entity_body(
         state,
