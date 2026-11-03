@@ -135,6 +135,17 @@ impl Request<'_> {
         })
     }
 
+    /// Whether `policy`'s action and resource scopes fit this request; they
+    /// read neither the sender nor the cause.
+    pub(super) fn scope_fits(&self, policy: &Json) -> bool {
+        let Some(object) = policy.as_object() else {
+            return true;
+        };
+        self.action_scope(&object["action"])
+            .and_then(|| self.resource_scope(&object["resource"]))
+            .can(TRUE)
+    }
+
     fn principal_scope(&self, scope: &Json) -> Results {
         match (scope["op"].as_str(), scope.get("in")) {
             (Some("All"), _) => TRUE,

@@ -90,8 +90,8 @@ impl JointModel {
                         .map(|(field, value)| (field.clone(), value.clone()))
                         .collect(),
                 };
-                let at = outcome.calls.partition_point(|c| c < &call);
-                outcome.calls.insert(at, call);
+                let at = outcome.calls.partition_point(|c| **c < call);
+                outcome.calls.insert(at, call.into());
             }
         }
         outcomes
