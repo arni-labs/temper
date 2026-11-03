@@ -267,3 +267,85 @@ fn split_and_whole_set_agree_on_every_row() {
     assert_eq!(compared, sets.len() * readers.len() * rows().len());
     assert!(per_row > sets.len(), "only {per_row} reads were per row");
 }
+
+/// Exercise the row projection too: an indirect read must keep the fields
+/// that the full request would put on the row's Cedar entity.
+fn assert_indirect_read_matches_whole_set(resource_type: &str, forbid: &str, field: &str) {
+    let who = reader(PrincipalKind::Customer, None);
+    let blocked = HashMap::from([
+        ("id".to_string(), json!("reader")),
+        ("status".to_string(), json!("Open")),
+        (field.to_string(), json!(true)),
+    ]);
+    let clear = HashMap::from([
+        ("id".to_string(), json!("other")),
+        ("status".to_string(), json!("Open")),
+        (field.to_string(), json!(false)),
+    ]);
+    // A row-dependent permit reproduces the reported split bypass. A
+    // list-wide permit also verifies that uniformity cannot allow all rows.
+    for condition in [r#"when { resource.status == "Open" }"#, ""] {
+        let engine = AuthzEngine::empty();
+        let policy = format!(
+            "permit(principal, action == Action::\"read\", resource is {resource_type}) {condition};\n{forbid}"
+        );
+        engine.reload_tenant_policies("tenant", &policy).unwrap();
+        let list = engine.list_read_for_tenant(
+            "tenant",
+            &who,
+            "read",
+            resource_type,
+            &row("_list", None, ""),
+        );
+        for (attrs, expected) in [(&blocked, false), (&clear, true)] {
+            let whole = engine
+                .authorize_row_for_tenant("tenant", &who, "read", resource_type, attrs)
+                .is_allowed();
+            assert_eq!(whole, expected, "full request: {policy}");
+            let split = match &list {
+                ListRead::AllowAll => true,
+                ListRead::DenyAll => false,
+                ListRead::PerRow(rule) => {
+                    let projected = attrs
+                        .iter()
+                        .filter(|(key, _)| {
+                            key.as_str() == "id"
+                                || rule
+                                    .attribute_keys
+                                    .as_ref()
+                                    .is_none_or(|keys| keys.contains(*key))
+                        })
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect();
+                    engine.list_row_allowed("tenant", &who, "read", resource_type, rule, &projected)
+                }
+            };
+            assert_eq!(split, whole, "projected split: {policy}, row: {attrs:?}");
+        }
+        // The rule and any list-wide permit remain tenant-local.
+        assert!(matches!(
+            engine.list_read_for_tenant("other-tenant", &who, "read", resource_type, &blocked,),
+            ListRead::DenyAll
+        ));
+    }
+}
+
+#[test]
+fn literal_entity_reads_stay_with_the_row_and_keep_its_fields() {
+    assert_indirect_read_matches_whole_set(
+        "Order",
+        r#"forbid(principal, action == Action::"read", resource is Order)
+           when { Order::"reader" has blocked && Order::"reader".blocked };"#,
+        "blocked",
+    );
+}
+
+#[test]
+fn self_row_principal_reads_stay_with_the_row_and_keep_its_fields() {
+    assert_indirect_read_matches_whole_set(
+        "Customer",
+        r#"forbid(principal, action == Action::"read", resource is Customer)
+           when { principal has blocked && principal.blocked };"#,
+        "blocked",
+    );
+}

@@ -89,7 +89,12 @@ pub(super) fn split(
             continue;
         }
         let variance = if policy.is_static() {
-            row_variance(policy, &resource_type_name, &request_fills)
+            row_variance(
+                policy,
+                &resource_type_name,
+                principal_uid.type_name() == &resource_type_name,
+                &request_fills,
+            )
         } else {
             RowVariance::Unknown
         };
@@ -142,6 +147,7 @@ enum RowVariance {
 fn row_variance(
     policy: &Policy,
     resource_type: &EntityTypeName,
+    principal_can_be_row: bool,
     request_fills: &dyn Fn(&str) -> bool,
 ) -> RowVariance {
     let scope_varies = match policy.resource_constraint() {
@@ -175,6 +181,13 @@ fn row_variance(
     if let Some(conditions) = json.get("conditions").and_then(|value| value.as_array()) {
         for condition in conditions {
             let body = condition.get("body").unwrap_or(condition);
+            // A self-row shares the principal's Cedar UID. evaluate_request
+            // merges its fields into that entity, filling attributes the
+            // identity did not supply. Even a principal-only condition can
+            // therefore change on this row; keep its full fields.
+            if principal_can_be_row && json_contains_var(body, "principal") {
+                return RowVariance::Unknown;
+            }
             scan.merge(collect_resource_attrs(body));
         }
     } else if json.get("conditions").is_some() {
@@ -316,11 +329,16 @@ fn classify_getattr(attr: &str, target: Option<&serde_json::Value>, scan: &mut A
         scan.nested_context_keys.insert(key.to_string());
         return;
     }
-    if json_contains_var(target, "resource") {
-        // `resource.owner.name` and other nested reads are not a field list
-        // this walker can project safely.
-        scan.unknown = true;
+    if json_var_is(target, "principal") || json_var_is(target, "action") {
+        // Principal reads on a type that can be the principal's own row
+        // were kept per-row above. Other direct request reads are fixed.
+        return;
     }
+    // An entity literal (or an expression returning an entity) can name
+    // the current row too: Order::"secret".blocked sees that field only
+    // while checking the secret row. Nested reads also need the full row.
+    // Do not infer independence from the absence of a `resource` variable.
+    scan.unknown = true;
 }
 
 /// The context key a chain of attribute reads starts from: `owner` for
