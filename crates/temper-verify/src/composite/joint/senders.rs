@@ -92,12 +92,14 @@ impl fmt::Debug for Senders {
 }
 
 /// A move decided again: its sender, record type and action, the rule that
-/// made it, its source's id, and the record's tracked strings and booleans.
+/// made it, the cause's and inherited service's source IDs, and the record's
+/// tracked strings and booleans.
 type Question = (
     u32,
     String,
     String,
     String,
+    Option<ModelString>,
     Option<ModelString>,
     BTreeMap<String, ModelString>,
     BTreeMap<String, bool>,
@@ -251,12 +253,22 @@ impl Senders {
         ) else {
             return may;
         };
-        // The kernel names the record whose move set the reaction off, and
-        // a declared reaction's source.
+        // The current cause names the record whose move set this reaction off.
+        // The service keeps the source recorded when it was declared.
         let source_id = state
             .records
             .get(rule.from)
             .and_then(|record| record.strings.get(ID));
+        let service_source_id = match asker {
+            Asker::Service { context, .. } => match context.get("triggerSourceEntityType") {
+                Some(Attr::Value(Value::String(source))) => state
+                    .records
+                    .get(source)
+                    .and_then(|record| record.strings.get(ID)),
+                _ => None,
+            },
+            Asker::Outside => None,
+        };
         let name = rule.to_string();
         let question = (
             by,
@@ -264,6 +276,7 @@ impl Senders {
             action.to_string(),
             name.clone(),
             source_id.cloned(),
+            service_source_id.cloned(),
             target.strings.clone(),
             target.booleans.clone(),
         );
@@ -273,13 +286,14 @@ impl Senders {
         // A value the model made up is none of the literals it holds.
         let literals: BTreeSet<String> = source_id
             .into_iter()
+            .chain(service_source_id)
             .chain(target.strings.values())
             .filter_map(|value| match value {
                 ModelString::Literal(text) if !text.is_empty() => Some(text.clone()),
                 _ => None,
             })
             .collect();
-        let asker = match (asker, source_id) {
+        let asker = match (asker, service_source_id) {
             (Asker::Service { name, context }, Some(id)) => {
                 let mut context = context.clone();
                 context.insert("triggerSourceEntityId".to_string(), symbol(id, &literals));
@@ -345,7 +359,7 @@ impl Senders {
     /// Someone outside, in `by`'s chain: who stands for every sender of a
     /// move whose reactions all declare theirs.
     pub(super) fn anyone(by: u32) -> u32 {
-        OUTSIDE | by % 2
+        OUTSIDE | (by % 2)
     }
 
     /// Who sender `by` is, in words.
