@@ -10,6 +10,7 @@ use temper_spec::automaton::Integration;
 use temper_wasm::WasmResourceLimits;
 
 use super::WasmDispatchMode;
+use super::owed_writes::{FIRST_RETRY_WAIT, LAST_RETRY_WAIT};
 use crate::entity_actor::EntityState;
 use crate::request_context::calls::{call_arm_id, called_integration};
 use crate::request_context::{AgentContext, BackgroundCall, ScheduledFire};
@@ -62,6 +63,7 @@ impl ServerState {
             }
             if let Some(on_failure) = &integration.on_failure {
                 calls.push(BackgroundCall {
+                    process_id: self.call_process_id,
                     trigger: integration.trigger.clone(),
                     integration: integration.name.clone(),
                     on_failure: on_failure.clone(),
@@ -114,15 +116,52 @@ impl ServerState {
     }
 
     /// Remove the deadline row of a call whose answer did not land and will
-    /// not be sent again.
+    /// not be sent again. Cancellation is durable before deletion; each
+    /// failed write remains pending until it lands.
     pub(super) async fn end_call_row(&self, call: &ScheduledFire) {
-        self.forget_scheduled_action(
-            &TenantId::new(&call.tenant),
-            &call.entity_type,
-            &call.entity_id,
-            &call.arm_id,
-        )
-        .await;
+        let Some((store, _)) = self.event_journal() else {
+            return;
+        };
+        let mut wait = FIRST_RETRY_WAIT;
+        // First persist finality. A crash after this point, even with failed
+        // deletion, leaves a cancelled row that recovery cannot fire.
+        loop {
+            match store
+                .cancel_scheduled_action(
+                    &call.tenant,
+                    &call.entity_type,
+                    &call.entity_id,
+                    &call.arm_id,
+                )
+                .await
+            {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(?call, %error, "call cancellation pending; retrying");
+                    tokio::time::sleep(wait).await; // determinism-ok: retry backoff
+                    wait = (wait * 2).min(LAST_RETRY_WAIT);
+                }
+            }
+        }
+        wait = FIRST_RETRY_WAIT;
+        loop {
+            match store
+                .delete_scheduled_action(
+                    &call.tenant,
+                    &call.entity_type,
+                    &call.entity_id,
+                    &call.arm_id,
+                )
+                .await
+            {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::warn!(?call, %error, "cancelled call row cleanup pending; retrying");
+                    tokio::time::sleep(wait).await; // determinism-ok: retry backoff
+                    wait = (wait * 2).min(LAST_RETRY_WAIT);
+                }
+            }
+        }
     }
 
     /// The parameters the fire of the row `arm_id` sends as `action` on an

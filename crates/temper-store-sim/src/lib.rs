@@ -290,13 +290,17 @@ impl SimEventStore {
 
     /// Fail the next `count` scheduled-row deletions without changing any row.
     pub fn fail_next_scheduled_deletes(&self, count: usize) {
-        self.inner.lock().expect("SimEventStore lock poisoned") // ci-ok: infallible lock
+        self.inner
+            .lock()
+            .expect("SimEventStore lock poisoned") // ci-ok: infallible lock
             .pending_scheduled_delete_failures = count;
     }
 
     /// The number of injected deletion failures not yet observed.
     pub fn scheduled_delete_failures_pending(&self) -> usize {
-        self.inner.lock().expect("SimEventStore lock poisoned") // ci-ok: infallible lock
+        self.inner
+            .lock()
+            .expect("SimEventStore lock poisoned") // ci-ok: infallible lock
             .pending_scheduled_delete_failures
     }
 
@@ -919,6 +923,25 @@ impl EventStore for SimEventStore {
             .collect())
     }
 
+    async fn cancel_scheduled_action(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        arm_id: &str,
+    ) -> Result<(), PersistenceError> {
+        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        if let Some(row) = inner.scheduled_actions.get_mut(&(
+            tenant.to_string(),
+            entity_type.to_string(),
+            entity_id.to_string(),
+            arm_id.to_string(),
+        )) {
+            row.action.clear();
+        }
+        Ok(())
+    }
+
     async fn delete_scheduled_action(
         &self,
         tenant: &str,
@@ -937,7 +960,9 @@ impl EventStore for SimEventStore {
         let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
         if inner.pending_scheduled_delete_failures > 0 {
             inner.pending_scheduled_delete_failures -= 1;
-            return Err(PersistenceError::Storage("simulated scheduled-action delete failure".into()));
+            return Err(PersistenceError::Storage(
+                "simulated scheduled-action delete failure".into(),
+            ));
         }
         inner.scheduled_actions.remove(&(
             tenant.to_string(),

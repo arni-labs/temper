@@ -29,7 +29,7 @@ use super::actor::EntityActor;
 use super::effects::ScheduledAction;
 use super::types::{EntityEvent, EntityState};
 use crate::request_context::AgentContext;
-use crate::request_context::armed_by::encode_scheduled_armed_by;
+use crate::request_context::armed_by::{encode_call_armed_by, encode_scheduled_armed_by};
 use crate::request_context::calls::{call_arm_id, called_integration};
 
 /// The scheduled-action rows an event changes in its commit.
@@ -161,7 +161,7 @@ impl EntityActor {
                 .and_then(|deadline| event.timestamp.checked_add_signed(deadline))
                 .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
             let answer = caller.for_call_answer(&call.integration);
-            let armed_by = encode_scheduled_armed_by(&answer).unwrap_or_else(|error| {
+            let armed_by = encode_call_armed_by(&answer, call.process_id).unwrap_or_else(|error| {
                 tracing::error!(entity_type = %state.entity_type, entity_id = %state.entity_id,
                     %error, "call deadline caller not encodable; it fires with no identity");
                 "{}".to_string()

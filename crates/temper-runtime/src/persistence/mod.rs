@@ -210,7 +210,8 @@ pub struct ScheduledActionRecord {
     /// called integration for a call's deadline (`<seq>.call:<integration>`),
     /// so a repeated write of the same arm lands on the same row.
     pub arm_id: String,
-    /// The action to dispatch.
+    /// The action to dispatch. Empty means durably cancelled: recovery only
+    /// removes the row and must never dispatch it.
     pub action: String,
     /// When it is due, RFC 3339.
     pub due_at: String,
@@ -376,6 +377,20 @@ pub trait EventStore: Send + Sync + 'static {
                 .filter(|row| row.entity_type == entity_type && row.entity_id == entity_id)
                 .collect())
         }
+    }
+
+    /// Durably cancel a scheduled action without deleting its row, by clearing
+    /// its action. Idempotent, including when the row is already absent.
+    /// Recovery must only delete cancelled rows, never dispatch them. Stores
+    /// that keep rows override this; stores without rows can simply delete.
+    fn cancel_scheduled_action(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        arm_id: &str,
+    ) -> impl std::future::Future<Output = Result<(), PersistenceError>> + Send {
+        self.delete_scheduled_action(tenant, entity_type, entity_id, arm_id)
     }
 
     /// Remove one scheduled action's row once it has fired. Idempotent.

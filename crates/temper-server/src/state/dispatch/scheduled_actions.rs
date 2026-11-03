@@ -39,11 +39,12 @@
 
 mod recovery;
 
+use recovery::scheduled_timer;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use temper_runtime::persistence::ScheduledActionRecord;
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
 use tokio::sync::Semaphore;
@@ -55,7 +56,6 @@ use super::state_timer_follow::BootTimers;
 use super::timer_standing::{Standing, TimerFire};
 use super::{DispatchError, DispatchExtOptions};
 use crate::entity_actor::EntityResponse;
-use crate::request_context::armed_by::decode_armed_by;
 use crate::request_context::{AgentContext, ScheduledFire};
 use crate::state::ServerState;
 use crate::wake::{Armed, TimerRef};
@@ -195,6 +195,9 @@ impl ServerState {
             .await
             .map_err(|error| error.to_string())?;
         for row in rows {
+            if self.skip_call_recovery(tenant, &row) {
+                continue;
+            }
             let timer = match scheduled_timer(tenant, &row) {
                 Ok(armed) => armed,
                 Err(reason) => {
@@ -476,25 +479,4 @@ pub(crate) fn scheduled_fire_lapsed(
             response.refusal,
             Some(temper_jit::table::Refusal::InvalidState { .. })
         )
-}
-
-/// The timer a row arms.
-fn scheduled_timer(
-    tenant: &TenantId,
-    row: &ScheduledActionRecord,
-) -> Result<ScheduledTimer, String> {
-    let due_at = DateTime::parse_from_rfc3339(&row.due_at)
-        .map_err(|error| format!("due_at: {error}"))?
-        .with_timezone(&Utc);
-    let agent_ctx = decode_armed_by(&row.armed_by).map_err(|error| format!("armed_by: {error}"))?;
-    let timer = ScheduledTimer {
-        tenant: tenant.clone(),
-        entity_type: row.entity_type.clone(),
-        entity_id: row.entity_id.clone(),
-        arm_id: row.arm_id.clone(),
-        action: row.action.clone(),
-        due_at,
-        agent_ctx,
-    };
-    Ok(timer)
 }

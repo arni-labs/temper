@@ -6,18 +6,21 @@
 //! deadline passes. The call's answer removes the row in the answer's commit
 //! ([`AgentContext::ends_call`]); a call that ends any other way the kernel
 //! sees (a refused answer, a silent exit, a module that cannot run) has its
-//! row removed right after. An answer whose write the store failed is owed
-//! and keeps the row until it lands. So a row is left only for a call the
-//! process lost: it stopped while the call ran or while its answer was being
-//! written.
+//! row durably cancelled and then removed, with failed writes retried. A
+//! cancelled row only needs cleanup after restart; it never answers a call.
+//! An answer whose write the store failed is owed and keeps its live row
+//! until it lands. A live row left by a previous process belongs to a call
+//! that process lost: it stopped while the call ran or while its answer was
+//! being written.
 //!
-//! At boot the row is armed again like any scheduled action, and when it is
-//! due it answers the call with its `on_failure`, as whoever made the move,
-//! under the key the call's own answer would carry. A record that has moved
-//! on refuses it like any late fire, and whichever of the two answers
-//! commits first answers the other as its duplicate. A running process
-//! never arms these rows: there the engine stops the call at its deadline
-//! and the call answers through its own path.
+//! At boot a live row from a previous process is armed again like any
+//! scheduled action. When due, it answers the call with its `on_failure`, as
+//! whoever made the move, under the key the call's own answer would carry.
+//! A record that has moved on refuses it like any late fire, and whichever
+//! of the two answers commits first answers the other as its duplicate.
+//! A running process never arms its own rows, even during boot listing
+//! retries: there the engine stops the call at its deadline and the call
+//! answers through its own path.
 
 use std::time::Duration;
 
@@ -30,6 +33,8 @@ const CALL_ARM: &str = ".call:";
 /// A background call a move may start, by the custom effect that starts it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackgroundCall {
+    /// The server process that owns the live call, so boot retries skip it.
+    pub process_id: uuid::Uuid,
     /// The custom effect (trigger) that starts the call.
     pub trigger: String,
     /// The integration's name: the call's answer is made under it.
