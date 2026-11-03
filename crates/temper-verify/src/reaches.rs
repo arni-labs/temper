@@ -208,8 +208,8 @@ fn gets_there(
 
 /// The walk's path to `at`, then on through states that need not get
 /// there (each has such a step unless it has none at all) until one has no
-/// step or the next is already on the path. Each state's number with the
-/// transition taken from it, the last with none.
+/// step or the next is already on the failing suffix. Each state's number
+/// with the transition taken from it, the last with none.
 fn path_that_never_arrives(
     model: &TemperModel,
     graph: &Graph,
@@ -218,7 +218,9 @@ fn path_that_never_arrives(
     at: usize,
 ) -> Vec<(usize, Option<usize>)> {
     let mut path = graph.path_to(at);
-    let mut on_path: BTreeSet<usize> = path.iter().map(|(at, _)| *at).collect();
+    // The prefix can contain a target. Only revisiting a state since the
+    // failing `from` state closes a loop that avoids the rule's targets.
+    let mut on_path = BTreeSet::from([at]);
     loop {
         let here = path.last().expect("a path has a state").0;
         let onward: Vec<usize> = graph
@@ -227,7 +229,7 @@ fn path_that_never_arrives(
             .map(|&to| to as usize)
             .filter(|&to| !arrives[to])
             .collect();
-        // A step back onto the path closes the loop soonest.
+        // A step back onto the failing suffix closes the loop soonest.
         let Some(next) = onward
             .iter()
             .copied()

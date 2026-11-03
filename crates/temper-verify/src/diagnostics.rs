@@ -100,7 +100,7 @@ pub fn model_check_diagnostics(result: &VerificationResult) -> Vec<String> {
             let back = counterexample
                 .trace
                 .split_last()
-                .and_then(|((last, _), rest)| rest.iter().position(|(state, _)| state == last));
+                .and_then(|((last, _), rest)| rest.iter().rposition(|(state, _)| state == last));
             lines.push(match back {
                 Some(back) => format!(
                     "rule '{rule}' broken: this path comes back to step {back} without \
@@ -108,7 +108,7 @@ pub fn model_check_diagnostics(result: &VerificationResult) -> Vec<String> {
                 ),
                 None => format!(
                     "rule '{rule}' broken: this path stops without reaching {targets} \
-                     ({steps} step(s)):"
+                     after the rule starts ({steps} step(s)):"
                 ),
             });
         } else if counterexample.never_reaches.is_empty() {
