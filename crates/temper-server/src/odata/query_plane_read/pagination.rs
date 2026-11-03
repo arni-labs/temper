@@ -316,17 +316,13 @@ pub(in crate::odata) async fn read_entity_set_from_query_plane(
         None => None,
     };
 
-    // `$select` is applied again after the cursor is taken. A select-only read
-    // (no filter, sort, or continuation) is also projected in the catalog
-    // query so the page does not transfer full `fields` and `state` documents.
-    // The page keeps `entity_id` for the cursor; this layer strips it when the
-    // caller did not ask for it.
+    // `$select` is projected in the catalog read, so the page does not load
+    // whole `fields` and `state` documents. The projection also loads what
+    // the filter, the sort and the cursor read (`entity_id` and the
+    // `$orderby` properties); `$select` is applied again after the cursor is
+    // taken, which strips them when the caller did not ask for them.
     let select = query_options.select.clone();
-    let project_select_in_catalog = query_options.filter.is_none()
-        && query_options.orderby.is_none()
-        && query_options.expand.is_none()
-        && resume_predicate.is_none()
-        && select.as_ref().is_some_and(|fields| !fields.is_empty());
+    let page_select = crate::odata::read_support::catalog_select_projection_fields(query_options);
     let count_separately = query_options.count == Some(true) && resume_predicate.is_some();
     let base_filter = match resume_predicate {
         Some(keyset) => Some(and_filter(query_options.filter.clone(), keyset)),
@@ -370,11 +366,7 @@ pub(in crate::odata) async fn read_entity_set_from_query_plane(
 
     let page_options = QueryOptions {
         filter: base_filter,
-        select: if project_select_in_catalog {
-            select.clone()
-        } else {
-            None
-        },
+        select: page_select,
         expand: None,
         orderby: effective_orderby,
         top: Some(fetch_top),

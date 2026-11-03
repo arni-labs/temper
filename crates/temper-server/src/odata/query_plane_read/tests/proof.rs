@@ -362,7 +362,7 @@ async fn upsert_order_projection_with_status(
 }
 
 #[test]
-fn native_plan_pushes_file_lookup_equalities_with_status_ne_recheck() {
+fn native_plan_pushes_file_lookup_equalities_and_status_ne() {
     let state = build_order_state("query-plane-native-file-status-ne");
     let tenant = TenantId::default();
     let security_ctx = SecurityContext::system();
@@ -412,10 +412,16 @@ fn native_plan_pushes_file_lookup_equalities_with_status_ne_recheck() {
 
     assert!(plan.filter_pushdown);
     assert!(plan.where_clause.contains("AND"));
-    assert!(!plan.where_clause.contains("status !="));
+    assert!(plan.where_clause.contains("status != ?7"));
     assert_eq!(
         plan.params,
-        vec!["Path", "/proofs/live.txt", "WorkspaceId", "ws-1"]
+        vec![
+            "Path",
+            "/proofs/live.txt",
+            "WorkspaceId",
+            "ws-1",
+            "Archived"
+        ]
     );
     assert!(should_try_native_page_first(&request, &plan));
 }
@@ -796,13 +802,9 @@ async fn file_point_lookup_with_status_ne_uses_lossless_equality_candidates() {
         )
         .await
         .expect("native candidate query should execute");
-    assert_eq!(
-        candidate_ids,
-        vec![
-            "zz-target-archived".to_string(),
-            "zz-target-ready".to_string()
-        ]
-    );
+    // The status column narrows the page in SQL too: the archived row is
+    // never read.
+    assert_eq!(candidate_ids, vec!["zz-target-ready".to_string()]);
 
     let result = match read_entity_set_page(request).await {
         Ok(result) => result,
@@ -836,9 +838,9 @@ async fn file_point_lookup_with_status_ne_uses_lossless_equality_candidates() {
         QueryPlaneReadStrategy::NativePagePushdown
     );
     assert!(result.telemetry.filter_pushdown);
-    assert_eq!(result.telemetry.candidate_count, 2);
-    assert_eq!(result.telemetry.materialized_count, 2);
-    assert_eq!(result.telemetry.pushdown_page_count, 2);
+    assert_eq!(result.telemetry.candidate_count, 1);
+    assert_eq!(result.telemetry.materialized_count, 1);
+    assert_eq!(result.telemetry.pushdown_page_count, 1);
     assert_eq!(result.telemetry.returned_count, 1);
 
     let _ = std::fs::remove_file(db_path);

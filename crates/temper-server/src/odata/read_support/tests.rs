@@ -172,32 +172,51 @@ fn selected_catalog_body_resolves_fields_and_omits_unselected_payload() {
 }
 
 #[test]
-fn selected_catalog_projection_only_applies_to_safe_select_only_reads() {
+fn selected_catalog_projection_loads_what_the_read_reads() {
     let selected = QueryOptions {
         select: Some(vec!["Id".to_string(), "Status".to_string()]),
         ..QueryOptions::default()
     };
     assert_eq!(
-        catalog_select_projection_fields(&selected).map(|fields| fields.len()),
-        Some(2)
+        catalog_select_projection_fields(&selected),
+        Some(vec![
+            "Id".to_string(),
+            "Status".to_string(),
+            "entity_id".to_string()
+        ])
     );
 
+    // A filter or sort reads its properties after the projection; `Status`
+    // reads the catalog `status`.
     let filtered = QueryOptions {
         select: Some(vec!["Id".to_string()]),
-        filter: Some(FilterExpr::Literal(ODataValue::Boolean(true))),
-        ..QueryOptions::default()
-    };
-    assert!(catalog_select_projection_fields(&filtered).is_none());
-
-    let ordered = QueryOptions {
-        select: Some(vec!["Id".to_string()]),
+        filter: Some(FilterExpr::BinaryOp {
+            left: Box::new(FilterExpr::Property("Status".to_string())),
+            op: temper_odata::query::types::BinaryOperator::Eq,
+            right: Box::new(FilterExpr::Literal(ODataValue::String("Open".into()))),
+        }),
         orderby: Some(vec![OrderByClause {
-            property: "Name".to_string(),
-            direction: OrderDirection::Asc,
+            property: "last_event_at".to_string(),
+            direction: OrderDirection::Desc,
         }]),
         ..QueryOptions::default()
     };
-    assert!(catalog_select_projection_fields(&ordered).is_none());
+    assert_eq!(
+        catalog_select_projection_fields(&filtered),
+        Some(
+            ["Id", "status", "last_event_at", "entity_id"]
+                .map(String::from)
+                .to_vec()
+        )
+    );
+
+    let expanded = QueryOptions {
+        select: Some(vec!["Id".to_string()]),
+        expand: Some(Vec::new()),
+        ..QueryOptions::default()
+    };
+    assert!(catalog_select_projection_fields(&expanded).is_none());
+    assert!(catalog_select_projection_fields(&QueryOptions::default()).is_none());
 }
 
 #[test]
@@ -305,10 +324,9 @@ fn legacy_catalog_metadata_is_null_and_never_taken_from_app_fields() {
         select: Some(properties.clone()),
         ..QueryOptions::default()
     };
-    assert!(
-        catalog_select_projection_fields(&options).is_none(),
-        "metadata selects need the authoritative state, not a sparse app-field projection"
-    );
+    // Metadata selects project; their values come from the state alone,
+    // never from an app field of the same name.
+    assert!(catalog_select_projection_fields(&options).is_some());
     for state in [
         None,
         Some(serde_json::json!({"fields": {"last_event_by":"forged"}})),

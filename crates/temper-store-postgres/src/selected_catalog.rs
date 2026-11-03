@@ -6,7 +6,9 @@
 
 use std::collections::BTreeSet;
 
-use temper_runtime::persistence::{PersistenceError, catalog_state_from_storage};
+use temper_runtime::persistence::{
+    PersistenceError, catalog_state_from_storage, catalog_state_metadata_key,
+};
 
 use crate::PostgresEventStore;
 use crate::platform::{PostgresEntityCatalogRow, storage_error};
@@ -113,10 +115,13 @@ impl PostgresEventStore {
     ///
     /// This keeps safe OData `$select` list reads from pulling the full
     /// `entity_catalog.state` and `entity_catalog.fields` JSONB payloads over
-    /// the database boundary. The selected values are returned in the row's
-    /// `fields` object and `state` is intentionally omitted. Selecting `fields`
-    /// restores the complete stored object with the same state-over-column
-    /// precedence as [`catalog_state_from_storage`].
+    /// the database boundary. Selected kernel event metadata
+    /// ([`catalog_state_metadata_key`]) is returned in the row's `state`, read
+    /// from the stored state alone and `first_event_at` from its column; every
+    /// other selected value is returned in the row's `fields` object. `state`
+    /// is `None` when no metadata was selected. Selecting `fields` restores the
+    /// complete stored object with the same state-over-column precedence as
+    /// [`catalog_state_from_storage`].
     pub async fn load_selected_entity_catalog_rows_pg(
         &self,
         tenant: &str,
@@ -128,12 +133,12 @@ impl PostgresEventStore {
             return Ok(Vec::new());
         }
 
-        let selected_fields = selected_fields
+        let (metadata_fields, selected_fields): (Vec<String>, Vec<String>) = selected_fields
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .collect::<Vec<_>>();
+            .partition(|field| catalog_state_metadata_key(field));
         let mut rows = Vec::new();
         for chunk in entity_ids.chunks(CATALOG_READ_BATCH) {
             rows.extend(
@@ -142,6 +147,7 @@ impl PostgresEventStore {
                     entity_type,
                     chunk,
                     &selected_fields,
+                    &metadata_fields,
                 )
                 .await?,
             );
@@ -156,8 +162,16 @@ impl PostgresEventStore {
         entity_type: &str,
         entity_ids: &[String],
         selected_fields: &[String],
+        metadata_fields: &[String],
     ) -> Result<Vec<PostgresEntityCatalogRow>, PersistenceError> {
-        let rows: Vec<(String, String, serde_json::Value, i64)> = crate::dbm::postgres_query_as!(
+        type SelectedRow = (
+            String,
+            String,
+            serde_json::Value,
+            Option<serde_json::Value>,
+            i64,
+        );
+        let rows: Vec<SelectedRow> = crate::dbm::postgres_query_as!(
             &self.schema,
             "SELECT c.entity_id, \
                     c.status, \
@@ -181,6 +195,19 @@ impl PostgresEventStore {
                         ), \
                         '{}'::jsonb \
                     ) AS fields, \
+                    CASE WHEN cardinality($5::text[]) = 0 THEN NULL ELSE COALESCE( \
+                        ( \
+                            SELECT jsonb_object_agg(m.field_name, picked.value) \
+                            FROM unnest($5::text[]) AS m(field_name) \
+                            CROSS JOIN LATERAL ( \
+                                SELECT CASE WHEN m.field_name = 'first_event_at' \
+                                            THEN to_jsonb(c.first_event_at) \
+                                            ELSE c.state -> m.field_name END AS value \
+                            ) picked \
+                            WHERE picked.value IS NOT NULL \
+                        ), \
+                        '{}'::jsonb \
+                    ) END AS state, \
                     c.sequence_nr \
              FROM {schema}entity_catalog c \
              WHERE c.tenant = $1 AND c.entity_type = $2 AND c.entity_id = ANY($3) \
@@ -190,6 +217,7 @@ impl PostgresEventStore {
         .bind(entity_type)
         .bind(entity_ids)
         .bind(selected_fields)
+        .bind(metadata_fields)
         .fetch_all(self.pool())
         .await
         .map_err(storage_error)?;
@@ -197,11 +225,11 @@ impl PostgresEventStore {
         Ok(rows
             .into_iter()
             .map(
-                |(entity_id, status, fields, seq)| PostgresEntityCatalogRow {
+                |(entity_id, status, fields, state, seq)| PostgresEntityCatalogRow {
                     entity_id,
                     status,
                     fields,
-                    state: None,
+                    state,
                     sequence_nr: seq.max(0) as u64,
                 },
             )

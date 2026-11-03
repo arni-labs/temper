@@ -267,10 +267,7 @@ fn retain_authorized(
     }
 }
 
-fn projection_fields<'a>(
-    request: &'a QueryPlaneReadRequest<'_>,
-    authz: &RowAuthz,
-) -> Option<&'a [String]> {
+fn projection_fields(request: &QueryPlaneReadRequest<'_>, authz: &RowAuthz) -> Option<Vec<String>> {
     let select = catalog_select_projection_fields(request.query_options)?;
     match authz {
         RowAuthz::AllowAll | RowAuthz::DenyAll => Some(select),
@@ -336,7 +333,7 @@ pub(super) async fn materialize_and_authorize_ids(
         request.entity_set_name,
         entity_ids,
         prefer_catalog,
-        projection,
+        projection.as_deref(),
     )
     .await;
     counters.materialized_count += materialized.entities.len();
@@ -365,7 +362,7 @@ pub(super) async fn materialize_filter_and_authorize_ids(
         request.entity_set_name,
         entity_ids,
         prefer_catalog,
-        projection,
+        projection.as_deref(),
     )
     .await;
     counters.materialized_count += materialized.entities.len();

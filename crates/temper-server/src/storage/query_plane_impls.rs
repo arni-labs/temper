@@ -7,6 +7,20 @@ use super::{
     QueryFieldIndexOrderDirection, QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow,
 };
 
+pub(super) fn turso_catalog_rows(
+    rows: Vec<temper_store_turso::store::field_index::EntityCatalogRow>,
+) -> Vec<EntityCatalogRow> {
+    rows.into_iter()
+        .map(|row| EntityCatalogRow {
+            entity_id: row.entity_id,
+            status: row.status,
+            fields: row.fields,
+            state: row.state,
+            sequence_nr: row.sequence_nr,
+        })
+        .collect()
+}
+
 pub(super) fn catalog_freshness(
     rows: Vec<(String, bool, Option<serde_json::Value>)>,
 ) -> Vec<CatalogRowFreshness> {
@@ -407,19 +421,25 @@ impl QueryPlaneStore for TursoEventStore {
     ) -> Result<Option<Vec<EntityCatalogRow>>, PersistenceError> {
         TursoEventStore::load_entity_catalog_rows(self, tenant, entity_type, entity_ids)
             .await
-            .map(|rows| {
-                Some(
-                    rows.into_iter()
-                        .map(|row| EntityCatalogRow {
-                            entity_id: row.entity_id,
-                            status: row.status,
-                            fields: row.fields,
-                            state: row.state,
-                            sequence_nr: row.sequence_nr,
-                        })
-                        .collect(),
-                )
-            })
+            .map(|rows| Some(turso_catalog_rows(rows)))
+    }
+
+    async fn load_selected_entity_catalog_rows(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_ids: &[String],
+        selected_fields: &[String],
+    ) -> Result<Option<Vec<EntityCatalogRow>>, PersistenceError> {
+        TursoEventStore::load_selected_entity_catalog_rows(
+            self,
+            tenant,
+            entity_type,
+            entity_ids,
+            selected_fields,
+        )
+        .await
+        .map(|rows| rows.map(turso_catalog_rows))
     }
 
     async fn projected_entity_counts_by_tenant(

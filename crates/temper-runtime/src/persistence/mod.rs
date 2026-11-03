@@ -8,7 +8,10 @@ mod catalog_state;
 mod secret;
 mod tombstone;
 pub use catalog_group::CatalogGroupRow;
-pub use catalog_state::{catalog_state_for_storage, catalog_state_from_storage};
+pub use catalog_state::{
+    catalog_state_for_storage, catalog_state_from_storage, catalog_state_metadata_key,
+    catalog_state_time_sql,
+};
 pub use secret::{SecretPrecondition, SecretWrite};
 pub use tombstone::{EVENT_KIND_KEY, EventKind, TOMBSTONE_EVENT_TYPE, journal_is_deleted};
 

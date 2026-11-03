@@ -35,8 +35,9 @@ fn native_order_by(request: &QueryPlaneReadRequest<'_>) -> Option<Vec<QueryField
 
 fn native_order_property_is_lossless(request: &QueryPlaneReadRequest<'_>, property: &str) -> bool {
     // Kernel event metadata is in the catalog state, never the app field index.
+    // Its record times sort there as the server sorts them; the rest do not.
     if temper_spec::automaton::is_event_metadata_field(property) {
-        return false;
+        return temper_runtime::persistence::catalog_state_time_sql(property).is_some();
     }
     if matches!(property, "entity_id" | "Id" | "id" | "Status" | "status") {
         return true;
@@ -329,10 +330,14 @@ async fn try_uniform_native_page(
     }))
 }
 
+/// Read the page from the catalog. With `uniform_only`, answer only when one
+/// SQL page holds it (every row allowed, the filter whole in SQL) and never
+/// fall back to scanning candidate pages.
 pub(in crate::odata::query_plane_read) async fn try_native_page_read(
     request: &QueryPlaneReadRequest<'_>,
     plan: NativeCandidatePagePlan,
     coverage: QueryPlaneCoverageReport,
+    uniform_only: bool,
 ) -> Option<Result<CandidateScanResult, QueryPlaneReadError>> {
     let requested_top = request.budget.requested_top(request.query_options);
     let skip = request.query_options.skip.unwrap_or(0);
@@ -389,6 +394,9 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
     {
         return Some(result);
     }
+    if uniform_only {
+        return None;
+    }
 
     let scan_budget = request.budget.scan_candidate_budget();
     let page_size = request.budget.scan_page_size(request.query_options);
@@ -396,6 +404,15 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
     let mut authorized_seen = 0usize;
     let mut returned_before_select = Vec::new();
     let mut counters = ScanCounters::empty();
+    // A count authorizes every match, so it reads whole scan pages. A page
+    // first reads the rows it owes (skip plus top), then twice as many after
+    // each read that came up short (rows a policy hides or the filter recheck
+    // drops), so it costs about its own rows plus the hidden ones before them.
+    let mut storage_want = if include_count {
+        page_size
+    } else {
+        skip.saturating_add(requested_top).clamp(1, page_size)
+    };
 
     loop {
         let remaining_budget = scan_budget.saturating_sub(counters.candidate_count);
@@ -409,7 +426,7 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
                 counters,
             )));
         }
-        let storage_top = page_size.min(remaining_budget);
+        let storage_top = storage_want.min(remaining_budget);
         let page =
             match try_query_native_page(request, &plan, storage_offset, storage_top, include_count)
                 .await
@@ -449,6 +466,7 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
         if page_len < storage_top {
             break;
         }
+        storage_want = storage_want.saturating_mul(2).min(page_size);
     }
 
     let count = include_count.then_some(authorized_seen);

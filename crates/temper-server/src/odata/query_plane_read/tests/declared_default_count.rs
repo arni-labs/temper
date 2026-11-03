@@ -275,10 +275,11 @@ async fn assert_count_during_write(stack: StorageStack, seed: u64) {
             },
         };
         let plan = native_candidate_page_plan(&request).unwrap();
-        let result = try_native_page_read(&request, plan, QueryPlaneCoverageReport::default())
-            .await
-            .expect("native candidate read")
-            .unwrap_or_else(|_| panic!("seed {seed}: count must fit budget"));
+        let result =
+            try_native_page_read(&request, plan, QueryPlaneCoverageReport::default(), false)
+                .await
+                .expect("native candidate read")
+                .unwrap_or_else(|_| panic!("seed {seed}: count must fit budget"));
         assert!(!qp.write_pending.load(Ordering::SeqCst));
         assert_eq!(result.count, Some(1), "seed {seed}, skip {skip}");
         assert_eq!(result.entities.len(), 1 - skip, "seed {seed}");

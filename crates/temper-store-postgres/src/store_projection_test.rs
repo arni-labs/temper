@@ -334,12 +334,14 @@ fn load_selected_entity_catalog_rows_pg_returns_sparse_json_values() {
             "Status": "Published",
             "JsonField": { "kind": "nested", "score": 9 },
             "Large": "x".repeat(4096),
+            "last_event_by": "forged",
         });
         let state = serde_json::json!({
             "entity_type": entity_type,
             "entity_id": entity_id,
             "status": "Published",
             "Title": "State title",
+            "last_event_at": "2026-01-01T00:00:00.5Z",
             "fields": {
                 "Id": entity_id,
                 "Name": "State name wins",
@@ -405,6 +407,27 @@ fn load_selected_entity_catalog_rows_pg_returns_sparse_json_values() {
             .unwrap();
         assert_eq!(selected_fields[0].fields["fields"], state["fields"]);
         assert!(selected_fields[0].state.is_none());
+
+        // Kernel metadata comes from the state alone: an app field of the
+        // same name never supplies it.
+        let metadata = store
+            .load_selected_entity_catalog_rows_pg(
+                &tenant,
+                entity_type,
+                &[entity_id.to_string()],
+                &[
+                    "Id".to_string(),
+                    "last_event_at".to_string(),
+                    "last_event_by".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata[0].state,
+            Some(serde_json::json!({"last_event_at": "2026-01-01T00:00:00.5Z"}))
+        );
+        assert_eq!(metadata[0].fields, serde_json::json!({"Id": entity_id}));
 
         crate::dbm::postgres_query!("DELETE FROM entity_field_index WHERE tenant = $1")
             .bind(&tenant)

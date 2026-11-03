@@ -259,7 +259,7 @@ pub(in crate::odata) async fn read_entity_set_page(
             .state
             .list_entity_ids(request.tenant, request.entity_type);
         if let Some(result) =
-            try_native_page_read(&request, plan, QueryPlaneCoverageReport::default()).await
+            try_native_page_read(&request, plan, QueryPlaneCoverageReport::default(), false).await
         {
             let result = result?;
             if should_reconcile_empty_exact_match_against_authoritative(
@@ -334,9 +334,13 @@ pub(in crate::odata) async fn read_entity_set_page(
             };
             if let Some(gap_ids) = gap_ids
                 && let Some(plan) = native_plan.clone()
-                && let Some(page) =
-                    try_native_page_read(&rescue_request, plan, QueryPlaneCoverageReport::default())
-                        .await
+                && let Some(page) = try_native_page_read(
+                    &rescue_request,
+                    plan,
+                    QueryPlaneCoverageReport::default(),
+                    false,
+                )
+                .await
             {
                 let page = page?;
                 let gap_len = gap_ids.len();
@@ -390,7 +394,7 @@ pub(in crate::odata) async fn read_entity_set_page(
     if !reconciling_exact_match_lag
         && !keyed_authoritative_absent
         && let Some(plan) = native_plan.clone()
-        && let Some(result) = try_native_page_read(&request, plan, coverage).await
+        && let Some(result) = try_native_page_read(&request, plan, coverage, false).await
     {
         return result.map(|result| QueryPlaneReadResult {
             entities: result.entities,

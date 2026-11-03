@@ -158,6 +158,8 @@ fn postgres_query_field_order_sql(order_by: &[(String, bool)]) -> String {
             clauses.push(format!("entity_id {direction}"));
         } else if field_name == "status" || field_name == "Status" {
             clauses.push(format!("status {direction} {nulls}"));
+        } else if let Some(time) = temper_runtime::persistence::catalog_state_time_sql(field_name) {
+            clauses.push(format!("{time} {direction} {nulls}"));
         } else {
             let field = postgres_string_literal(field_name);
             clauses.push(format!(

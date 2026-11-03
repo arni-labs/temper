@@ -271,13 +271,20 @@ pub(super) async fn materialize_entity_set_entities(
             let entity_type = entity_type.to_string();
             let entity_set_name = entity_set_name.to_string();
             let selected_catalog_fields = selected_catalog_fields_owned.clone();
+            let sparse = catalog_select_projection;
             let defaults = &defaults;
             async move {
                 if let Some(row) = catalog_row {
                     let entity = match selected_catalog_fields.as_deref() {
                         Some(select) => {
-                            let fields =
-                                defaults.field_values(row.state.as_ref().unwrap_or(&row.fields));
+                            // A sparse row holds its selected values in
+                            // `fields`; its `state` holds only selected
+                            // kernel metadata.
+                            let stored = match &row.state {
+                                Some(state) if !sparse => state,
+                                _ => &row.fields,
+                            };
+                            let fields = defaults.field_values(stored);
                             let mut entity = catalog_row_to_selected_entity_body(
                                 &entity_type,
                                 &entity_set_name,

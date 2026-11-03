@@ -24,7 +24,8 @@ pub enum QueryFieldIndexOrderDirection {
 /// One storage-pushed query-field page order clause.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryFieldIndexOrder {
-    /// Projection field, `status`, or `entity_id` to order by.
+    /// Projection field, `status`, `entity_id`, or a record time the catalog
+    /// state holds (`catalog_state_time_sql`) to order by.
     pub field_name: String,
     /// Sort direction.
     pub direction: QueryFieldIndexOrderDirection,
@@ -235,11 +236,14 @@ pub trait QueryPlaneStore: Send + Sync {
     }
 
     /// Batch-fetch catalog rows with only the JSON properties required by a
-    /// safe `$select` collection read.
+    /// `$select` collection read.
     ///
-    /// The returned rows preserve `entity_id`, `status`, and `sequence_nr`,
-    /// but may set `state` to `None` and store the selected properties in
-    /// `fields`. Backends that cannot perform a sparse catalog load return
+    /// The returned rows preserve `entity_id`, `status`, and `sequence_nr`
+    /// and store the selected properties in `fields`, except selected kernel
+    /// event metadata, which comes back in `state`, read from the stored
+    /// state alone (`first_event_at` from its column) so an app field of the
+    /// same name never supplies it. `state` is `None` when no metadata was
+    /// selected. Backends that cannot perform a sparse catalog load return
     /// `None`, allowing callers to use [`QueryPlaneStore::load_entity_catalog_rows`].
     async fn load_selected_entity_catalog_rows(
         &self,

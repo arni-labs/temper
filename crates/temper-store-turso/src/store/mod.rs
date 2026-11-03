@@ -61,6 +61,7 @@ mod published_artifacts;
 mod query_page;
 mod scheduled_actions;
 mod secrets;
+mod selected_catalog;
 mod spec_originals;
 mod spec_versions;
 mod specs;

@@ -3,7 +3,7 @@
 use temper_runtime::persistence::PersistenceError;
 use temper_store_turso::{TenantStoreRouter, TursoEventStore};
 
-use super::query_plane_impls::{catalog_freshness, storage_order_by};
+use super::query_plane_impls::{catalog_freshness, storage_order_by, turso_catalog_rows};
 use super::{
     CatalogGroup, CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexPage,
     QueryPlaneStore, QueryProjectionFieldsRow,
@@ -168,19 +168,26 @@ impl QueryPlaneStore for TenantStoreRouter {
         let store = self.store_for_tenant(tenant).await?;
         TursoEventStore::load_entity_catalog_rows(&store, tenant, entity_type, entity_ids)
             .await
-            .map(|rows| {
-                Some(
-                    rows.into_iter()
-                        .map(|row| EntityCatalogRow {
-                            entity_id: row.entity_id,
-                            status: row.status,
-                            fields: row.fields,
-                            state: row.state,
-                            sequence_nr: row.sequence_nr,
-                        })
-                        .collect(),
-                )
-            })
+            .map(|rows| Some(turso_catalog_rows(rows)))
+    }
+
+    async fn load_selected_entity_catalog_rows(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_ids: &[String],
+        selected_fields: &[String],
+    ) -> Result<Option<Vec<EntityCatalogRow>>, PersistenceError> {
+        let store = self.store_for_tenant(tenant).await?;
+        TursoEventStore::load_selected_entity_catalog_rows(
+            &store,
+            tenant,
+            entity_type,
+            entity_ids,
+            selected_fields,
+        )
+        .await
+        .map(|rows| rows.map(turso_catalog_rows))
     }
 
     async fn projected_entity_counts_by_tenant(

@@ -239,3 +239,41 @@ fn metadata_continuation_partitions_every_null_and_known_boundary_both_direction
         }
     }
 }
+
+/// A cursor over the id or a record time is an SQL range: every term of its
+/// keyset is a lossless catalog predicate, so a continuation page reads from
+/// the cursor on rather than from the first row. A cursor over an app field
+/// is rechecked after materialization.
+#[test]
+fn record_time_and_id_cursors_push_down_whole() {
+    let boundary = row(
+        "en-05",
+        serde_json::json!({ "last_event_at": "2026-01-01T00:00:00.5Z", "Name": "Civic" }),
+    );
+    let unknown = row("en-06", serde_json::json!({ "last_event_at": null }));
+    for (property, pushed) in [
+        (None, true),
+        (Some("last_event_at"), true),
+        (Some("first_event_at"), true),
+        (Some("Name"), false),
+    ] {
+        for direction in [OrderDirection::Asc, OrderDirection::Desc] {
+            let clauses = property.map(|property| {
+                vec![OrderByClause {
+                    property: property.into(),
+                    direction,
+                }]
+            });
+            let order = canonical_pagination_order(clauses.as_deref());
+            for row in [&boundary, &unknown] {
+                let cursor = cursor_for_row(row, &order);
+                let keyset = keyset_after_predicate(&cursor, &order).expect("keyset predicate");
+                assert_eq!(
+                    crate::odata::filter_sql::candidate_filter_is_lossless(&keyset),
+                    pushed,
+                    "{property:?} {direction:?} {row}"
+                );
+            }
+        }
+    }
+}

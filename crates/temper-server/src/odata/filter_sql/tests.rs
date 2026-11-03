@@ -89,7 +89,7 @@ fn candidate_and_equality_filter_is_lossless_for_string_fields() {
 }
 
 #[test]
-fn candidate_and_filter_keeps_lossless_equalities_when_status_ne_is_present() {
+fn candidate_and_filter_keeps_lossless_equalities_when_a_field_ne_is_present() {
     let filter = FilterExpr::BinaryOp {
         left: Box::new(FilterExpr::BinaryOp {
             left: Box::new(FilterExpr::BinaryOp {
@@ -108,9 +108,9 @@ fn candidate_and_filter_keeps_lossless_equalities_when_status_ne_is_present() {
         }),
         op: BinaryOperator::And,
         right: Box::new(FilterExpr::BinaryOp {
-            left: Box::new(FilterExpr::Property("Status".into())),
+            left: Box::new(FilterExpr::Property("Priority".into())),
             op: BinaryOperator::Ne,
-            right: Box::new(FilterExpr::Literal(ODataValue::String("Archived".into()))),
+            right: Box::new(FilterExpr::Literal(ODataValue::String("Low".into()))),
         }),
     };
 
@@ -120,7 +120,7 @@ fn candidate_and_filter_keeps_lossless_equalities_when_status_ne_is_present() {
     assert!(result.where_clause.contains("field_value = ?4"));
     assert!(result.where_clause.contains("field_name = ?5"));
     assert!(result.where_clause.contains("field_value = ?6"));
-    assert!(!result.where_clause.contains("status !="));
+    assert!(!result.where_clause.contains("!="));
     assert_eq!(
         result.params,
         vec!["Path", "/proofs/live.txt", "WorkspaceId", "ws-1"]
@@ -139,9 +139,9 @@ fn candidate_or_filter_does_not_drop_non_lossless_branch() {
         }),
         op: BinaryOperator::Or,
         right: Box::new(FilterExpr::BinaryOp {
-            left: Box::new(FilterExpr::Property("Status".into())),
+            left: Box::new(FilterExpr::Property("Priority".into())),
             op: BinaryOperator::Ne,
-            right: Box::new(FilterExpr::Literal(ODataValue::String("Archived".into()))),
+            right: Box::new(FilterExpr::Literal(ODataValue::String("Low".into()))),
         }),
     };
 
@@ -226,7 +226,9 @@ fn status_null_filter_uses_catalog_status_column() {
     let result = try_translate_filter(&filter).unwrap();
     assert_eq!(result.where_clause, "status IS NOT NULL");
     assert!(result.params.is_empty());
-    assert!(try_translate_candidate_filter(&filter).is_none());
+    // The column always holds the status a read returns.
+    let candidate = try_translate_candidate_filter(&filter).unwrap();
+    assert_eq!(candidate.where_clause, "status IS NOT NULL");
 }
 
 #[test]

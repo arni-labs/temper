@@ -137,6 +137,7 @@ async fn indexed_sort_with_declared_defaults_stays_bounded_when_values_are_prese
         &native_request,
         native_plan,
         QueryPlaneCoverageReport::default(),
+        false,
     )
     .await
     .unwrap()
@@ -163,6 +164,7 @@ async fn indexed_sort_with_declared_defaults_stays_bounded_when_values_are_prese
             &empty_request,
             native_candidate_page_plan(&empty_request).unwrap(),
             QueryPlaneCoverageReport::default(),
+            false,
         )
         .await
         .unwrap()

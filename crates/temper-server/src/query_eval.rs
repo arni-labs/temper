@@ -338,7 +338,7 @@ fn evaluate_function(entity: &serde_json::Value, name: &str, args: &[FilterExpr]
 
 // Fixed UTC precision orders instants correctly, including a whole second
 // before a fractional second. This applies only to the kernel's typed clock.
-fn normalize_event_time(value: serde_json::Value) -> serde_json::Value {
+pub(crate) fn normalize_event_time(value: serde_json::Value) -> serde_json::Value {
     value
         .as_str()
         .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())

@@ -7,7 +7,8 @@
 //!
 //! Ordinary fields are matched through the `entity_field_index` EAV table.
 //! `Status` is the canonical entity lifecycle column, so status predicates bind
-//! directly to the projection row's `status` column.
+//! directly to the projection row's `status` column; `entity_id` and the record
+//! times in the row's state bind to the row the same way (`catalog_columns`).
 //!
 //! The translator returns `None` for expressions it cannot handle, signalling
 //! the caller to fall back to the existing in-memory filter path.
@@ -16,8 +17,13 @@ use std::collections::BTreeSet;
 
 use temper_odata::query::types::{BinaryOperator, FilterExpr, ODataValue, UnaryOperator};
 
+mod catalog_columns;
 mod equality;
 
+use catalog_columns::{
+    catalog_column, catalog_comparison_is_lossless, catalog_ordering_is_lossless,
+    translate_catalog_comparison,
+};
 pub(super) use equality::equality_field_predicates;
 
 const MAX_INDEXABLE_FIELD_VALUE_BYTES: usize = 2000;
@@ -139,7 +145,9 @@ fn translate_expr(expr: &FilterExpr, ctx: &mut TranslateCtx) -> Option<String> {
 
         FilterExpr::FunctionCall { name, args } => translate_function(name, args, ctx),
 
-        // Bare property or literal at top level — not a valid boolean filter
+        FilterExpr::Literal(ODataValue::Boolean(true)) => Some("(1 = 1)".to_string()),
+        FilterExpr::Literal(ODataValue::Boolean(false)) => Some("(1 = 0)".to_string()),
+        // Bare property or other literal at top level — not a valid boolean filter
         FilterExpr::Property(_) | FilterExpr::Literal(_) => None,
     }
 }
@@ -222,9 +230,6 @@ fn translate_comparison(
         _ => return None, // cross-field or complex expressions
     };
 
-    if temper_spec::automaton::is_event_metadata_field(field_name.as_str()) {
-        return None;
-    }
     let sql_op = match op {
         BinaryOperator::Eq => "=",
         BinaryOperator::Ne => "!=",
@@ -235,8 +240,11 @@ fn translate_comparison(
         _ => return None,
     };
 
-    if is_status_property(&field_name) {
-        return translate_status_comparison(sql_op, op, value, ctx);
+    // Values the catalog row holds itself rather than the field index.
+    if temper_spec::automaton::is_event_metadata_field(field_name.as_str())
+        || catalog_column(&field_name).is_some()
+    {
+        return translate_catalog_comparison(&field_name, sql_op, op, value, ctx);
     }
 
     // Handle null comparison specially
@@ -290,10 +298,6 @@ fn translate_comparison(
     }
 }
 
-fn is_status_property(field_name: &str) -> bool {
-    field_name == "Status" || field_name == "status"
-}
-
 pub(super) fn candidate_filter_is_lossless(expr: &FilterExpr) -> bool {
     match expr {
         FilterExpr::BinaryOp { left, op, right } => match op {
@@ -301,12 +305,22 @@ pub(super) fn candidate_filter_is_lossless(expr: &FilterExpr) -> bool {
                 candidate_filter_is_lossless(left) && candidate_filter_is_lossless(right)
             }
             BinaryOperator::Eq => lossless_eq_comparison(left, right),
-            BinaryOperator::Gt | BinaryOperator::Ge | BinaryOperator::Lt | BinaryOperator::Le => {
-                status_literal_comparison(left, right)
+            BinaryOperator::Ne => {
+                property_literal_pair(left, right).is_some_and(|(field_name, value)| {
+                    catalog_comparison_is_lossless(field_name, value)
+                })
             }
-            BinaryOperator::Ne | BinaryOperator::Has => false,
+            BinaryOperator::Gt | BinaryOperator::Ge | BinaryOperator::Lt | BinaryOperator::Le => {
+                catalog_ordering_is_lossless(left, right)
+            }
+            BinaryOperator::Has => false,
         },
-        FilterExpr::UnaryOp { .. } | FilterExpr::FunctionCall { .. } => false,
+        // A constant, such as the `not true` a paging cursor ends with.
+        FilterExpr::UnaryOp { operand, .. } => {
+            matches!(**operand, FilterExpr::Literal(ODataValue::Boolean(_)))
+        }
+        FilterExpr::Literal(ODataValue::Boolean(_)) => true,
+        FilterExpr::FunctionCall { .. } => false,
         FilterExpr::Property(_) | FilterExpr::Literal(_) => false,
     }
 }
@@ -315,11 +329,10 @@ fn lossless_eq_comparison(left: &FilterExpr, right: &FilterExpr) -> bool {
     let Some((field_name, value)) = property_literal_pair(left, right) else {
         return false;
     };
-    if temper_spec::automaton::is_event_metadata_field(field_name) {
-        return false;
-    }
-    if is_status_property(field_name) {
-        return matches!(value, ODataValue::Null | ODataValue::String(_));
+    if temper_spec::automaton::is_event_metadata_field(field_name)
+        || catalog_column(field_name).is_some()
+    {
+        return catalog_comparison_is_lossless(field_name, value);
     }
     match value {
         // Ordinary JSON nulls are not a lossless candidate predicate today:
@@ -335,14 +348,6 @@ fn lossless_eq_comparison(left: &FilterExpr, right: &FilterExpr) -> bool {
     }
 }
 
-fn status_literal_comparison(left: &FilterExpr, right: &FilterExpr) -> bool {
-    matches!(
-        (left, right),
-        (FilterExpr::Property(field_name), FilterExpr::Literal(ODataValue::String(_)))
-            if is_status_property(field_name)
-    )
-}
-
 fn property_literal_pair<'a>(
     left: &'a FilterExpr,
     right: &'a FilterExpr,
@@ -352,25 +357,6 @@ fn property_literal_pair<'a>(
         | (FilterExpr::Literal(value), FilterExpr::Property(name)) => Some((name.as_str(), value)),
         _ => None,
     }
-}
-
-fn translate_status_comparison(
-    sql_op: &str,
-    op: BinaryOperator,
-    value: &ODataValue,
-    ctx: &mut TranslateCtx,
-) -> Option<String> {
-    if matches!(value, ODataValue::Null) {
-        return match op {
-            BinaryOperator::Eq => Some("status IS NULL".to_string()),
-            BinaryOperator::Ne => Some("status IS NOT NULL".to_string()),
-            _ => None,
-        };
-    }
-
-    let text_value = odata_value_to_text(value)?;
-    let value_param = ctx.add_param(text_value);
-    Some(format!("status {sql_op} {value_param}"))
 }
 
 /// Translate OData string functions to SQL LIKE patterns.

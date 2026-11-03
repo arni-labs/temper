@@ -68,6 +68,47 @@ pub fn catalog_state_from_storage(fields: &Value, mut stored: Value) -> Value {
     stored
 }
 
+/// Whether `key` is kernel event metadata (when and by whom the record last
+/// moved, and similar). A catalog read takes it from the row's state alone,
+/// and `first_event_at` from the row's own column, never from an app field of
+/// the same name.
+pub fn catalog_state_metadata_key(key: &str) -> bool {
+    temper_spec::automaton::is_event_metadata_field(key)
+}
+
+/// SQL text for a catalog row's record time `key` as UTC with nine
+/// fractional digits, or `None` for a key that is not one. NULL when the row
+/// has no such time.
+///
+/// A read serves each time from where the row keeps it, and so does this:
+/// `first_event_at` from its own column (written once, from the first
+/// event), `last_event_at` from the top of the row's state, which every
+/// event rewrites.
+///
+/// The kernel's clock serializes as RFC 3339 UTC with 0, 3, 6 or 9 fractional
+/// digits (`2026-01-01T00:00:00Z`, `...00.500Z`), and that text does not sort
+/// as time: a whole second sorts after its own fractions. Padding the fraction
+/// to nine digits gives text of one shape, `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`,
+/// which sorts and compares as the instant does, under byte order and under
+/// any collation that orders digits. It is the text a server read compares
+/// these times by (`to_rfc3339_opts(Nanos, true)`), so a store can order and
+/// filter by it and agree with the server.
+///
+/// The expression is the same on every catalog store: `->>` reads a JSON text
+/// value on SQLite, Turso and Postgres (`state` is JSON text or `jsonb`), and
+/// `substr`, `rtrim` and `||` mean the same on each.
+pub fn catalog_state_time_sql(key: &str) -> Option<String> {
+    let text = match key {
+        "first_event_at" => "first_event_at",
+        "last_event_at" => "(state ->> 'last_event_at')",
+        _ => return None,
+    };
+    Some(format!(
+        "(substr({text}, 1, 19) || '.' || \
+         substr(rtrim(substr({text}, 21), 'Z') || '000000000', 1, 9) || 'Z')"
+    ))
+}
+
 #[cfg(test)]
 #[path = "catalog_state_test.rs"]
 mod tests;

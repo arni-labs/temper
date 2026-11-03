@@ -148,6 +148,27 @@ pub(super) async fn try_reconciled_equality_read(
         }
         break candidates;
     };
+    // With no lag, the catalog alone answers a counted read: one SQL page
+    // gives the rows and the window count gives every match, so no other
+    // match is read. When one page cannot answer, keep the complete proof.
+    if needs_complete_count
+        && pending.is_empty()
+        && let Some(plan) = super::scan::native_candidate_page_plan(request)
+        && let Some(result) = super::scan::try_native_page_read(
+            request,
+            plan,
+            QueryPlaneCoverageReport::default(),
+            true,
+        )
+        .await
+    {
+        return Some(result.map(|result| QueryPlaneReadResult {
+            entities: result.entities,
+            count: result.count,
+            telemetry: result.telemetry,
+            next_skiptoken: None,
+        }));
+    }
     let prefix = request
         .query_options
         .skip
