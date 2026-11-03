@@ -405,3 +405,7 @@ mod vacuous_tests;
 
 #[cfg(test)]
 mod chain_test;
+
+#[cfg(test)]
+#[path = "outside_test.rs"]
+mod outside_tests;
