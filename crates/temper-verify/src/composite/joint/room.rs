@@ -251,6 +251,10 @@ impl Heap for super::Dispatch {
             + self.target_state.heap()
             + self.params.heap()
             + self.chain.heap()
+            + self
+                .unread_guard
+                .as_ref()
+                .map_or(0, |c| c.status.heap() + c.fields.heap())
     }
 }
 
