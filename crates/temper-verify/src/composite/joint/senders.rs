@@ -44,7 +44,7 @@ use super::env::ID;
 use super::model::Classes;
 use super::room::Heap;
 use super::state::JointState;
-use crate::model::{ModelString, TemperModel};
+use crate::model::ModelString;
 
 /// Someone outside the kernel, in a request's chain.
 pub(super) const OUTSIDE: u32 = 0;
@@ -198,14 +198,20 @@ impl Senders {
         }
     }
 
-    /// Learn which literals each id and tracked field of `models` can meet.
-    pub(super) fn meet(&mut self, classes: &Classes, models: &BTreeMap<String, TemperModel>) {
+    /// These senders, knowing which literals each id and tracked field of
+    /// `models` can meet.
+    pub(super) fn meeting(
+        mut self,
+        classes: &Classes,
+        models: &BTreeMap<String, crate::model::TemperModel>,
+    ) -> Self {
         for (entity, model) in models {
             for field in model.tracked_strings.iter().map(String::as_str).chain([ID]) {
                 let key = (entity.clone(), field.to_string());
                 self.meets.insert(key, classes.literals(entity, field));
             }
         }
+        self
     }
 
     /// Forget what Cedar lets each sender send of `moves` (entity, action),

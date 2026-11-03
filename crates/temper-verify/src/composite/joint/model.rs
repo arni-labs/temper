@@ -233,8 +233,7 @@ impl JointModel {
         } else {
             Kernel::default()
         };
-        let mut senders = Senders::new(by_name, scope, sending.policies);
-        senders.meet(&classes, &models);
+        let senders = Senders::new(by_name, scope, sending.policies);
         let chosen = |entity: &str, action: &str| {
             sending
                 .relies_on
@@ -294,6 +293,8 @@ impl JointModel {
                 (!ways.is_empty()).then(|| (entity.clone(), ways))
             })
             .collect();
+        // Cedar is told which literals a made-up value may not be.
+        let senders = senders.meeting(&classes, &models);
         Self {
             expansion: Expansion::default(),
             id_literals,
