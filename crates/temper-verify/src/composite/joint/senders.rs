@@ -69,6 +69,9 @@ pub(super) const OUTSIDE: u32 = 0;
 /// outside sender, then the services.
 pub(super) struct Senders {
     askers: Vec<Asker>,
+    /// Each asker in a move's words, by place: a walk names a sender in
+    /// every move's label, and a kind takes far longer to name than a step.
+    names: Vec<String>,
     /// The senders an outside request is sent as: each kind of outside
     /// sender, or someone outside of no known kind when the policies tell
     /// none apart.
@@ -214,8 +217,10 @@ impl Senders {
             })
         });
         let reread = reread(policies, &askers, may.as_ref());
+        let names = askers.iter().map(asker_name).collect();
         Self {
             askers,
+            names,
             outside,
             detached,
             timer_chains,
@@ -427,12 +432,19 @@ impl Senders {
 
     /// Who sender `by` is, in words.
     pub(super) fn name(&self, by: u32) -> String {
-        match self.askers.get(by as usize / 2) {
-            Some(Asker::Outside) => "an outside caller".to_string(),
-            Some(Asker::OutsideAs(kind)) => format!("an outside caller {kind}"),
-            Some(Asker::Service { name, .. }) => format!("service:{name}"),
+        match self.names.get(by as usize / 2) {
+            Some(name) => name.clone(),
             None => format!("sender {by}"),
         }
+    }
+}
+
+/// An asker in a move's words.
+fn asker_name(asker: &Asker) -> String {
+    match asker {
+        Asker::Outside => "an outside caller".to_string(),
+        Asker::OutsideAs(kind) => format!("an outside caller {kind}"),
+        Asker::Service { name, .. } => format!("service:{name}"),
     }
 }
 
