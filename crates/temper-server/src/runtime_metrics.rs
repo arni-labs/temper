@@ -41,6 +41,8 @@ struct RuntimeMetrics {
     timer_fire_withheld_total: Counter<u64>,
     // A machine's move that left its record unchanged and wrote nothing.
     unrecorded_moves_total: Counter<u64>,
+    // Events written to a journal, the moves that were recorded.
+    events_written_total: Counter<u64>,
     // A scheduled action that came due when its record could not take it.
     scheduled_fires_lapsed_total: Counter<u64>,
     scheduler_overdue_on_replay_total: Counter<u64>,
@@ -212,6 +214,13 @@ fn metrics() -> &'static RuntimeMetrics {
                 .with_description(
                     "Moves a timer, reaction or callback made that left their record unchanged, \
                      so no event, row or trajectory entry was written for them.",
+                )
+                .build(),
+            events_written_total: meter
+                .u64_counter("temper_events_written_total")
+                .with_description(
+                    "Events written to a record's journal, by tenant and entity type: what grows \
+                     the journal. Beside temper_unrecorded_moves_total, the moves left out of it.",
                 )
                 .build(),
             scheduled_fires_lapsed_total: meter
@@ -755,6 +764,17 @@ pub fn record_unrecorded_move(tenant: &str, entity_type: &str, action: &str) {
             KeyValue::new("tenant", tenant.to_string()),
             KeyValue::new("entity_type", entity_type.to_string()),
             KeyValue::new("action", action.to_string()),
+        ],
+    );
+}
+
+/// Record `count` events written to a journal of `entity_type` in `tenant`.
+pub fn record_events_written(tenant: &str, entity_type: &str, count: u64) {
+    metrics().events_written_total.add(
+        count,
+        &[
+            KeyValue::new("tenant", tenant.to_string()),
+            KeyValue::new("entity_type", entity_type.to_string()),
         ],
     );
 }
