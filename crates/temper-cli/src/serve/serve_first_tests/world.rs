@@ -98,11 +98,11 @@ struct ProcessClock {
 
 impl ProcessClock {
     fn begin(&self) {
-        self.base.lock().unwrap().0 = Some(tokio::time::Instant::now());
+        self.base.lock().expect("clock lock").0 = Some(tokio::time::Instant::now());
     }
 
     fn end(&self) {
-        let mut base = self.base.lock().unwrap();
+        let mut base = self.base.lock().expect("clock lock");
         let ran = base
             .0
             .take()
@@ -114,9 +114,10 @@ impl ProcessClock {
 
 impl SimClock for ProcessClock {
     fn now(&self) -> DateTime<Utc> {
-        let base = self.base.lock().unwrap();
+        let base = self.base.lock().expect("clock lock");
         let ran = base.0.map(|origin| origin.elapsed()).unwrap_or_default();
-        self.epoch + chrono::Duration::from_std(base.1 + ran).unwrap()
+        self.epoch
+            + chrono::Duration::from_std(base.1 + ran).expect("virtual time fits a chrono duration")
     }
 
     fn tick(&self) -> u64 {
@@ -136,12 +137,15 @@ impl World {
     /// An empty store, with ids drawn from `seed`.
     pub(super) fn new(seed: u64) -> Self {
         let clock = Arc::new(ProcessClock {
-            epoch: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            epoch: Utc
+                .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+                .single()
+                .expect("a valid date"),
             base: Mutex::new((None, Duration::ZERO)),
         });
         let sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
         Self {
-            dir: tempfile::tempdir().unwrap(),
+            dir: tempfile::tempdir().expect("temporary directory"),
             clock,
             _sim: sim,
         }
@@ -157,7 +161,7 @@ impl World {
             .enable_all()
             .start_paused(true)
             .build()
-            .unwrap();
+            .expect("test runtime");
         runtime.block_on(async { self.clock.begin() });
         runtime
     }
@@ -174,7 +178,9 @@ impl World {
     pub(super) fn store_tenants(&self, tenants: &[String], armed: &[String]) {
         let runtime = self.process();
         runtime.block_on(async {
-            let store = TursoEventStore::new(&self.url(), None).await.unwrap();
+            let store = TursoEventStore::new(&self.url(), None)
+                .await
+                .expect("open the test store");
             let hash = temper_store_turso::spec_content_hash(PROBE_IOA);
             for tenant in tenants {
                 store
@@ -185,10 +191,10 @@ impl World {
                         "probe",
                     )
                     .await
-                    .unwrap();
+                    .expect("store the tenant specs");
                 PolicyStore::save_policy(&store, tenant, "probe:permit", PERMIT_ALL, "fixture")
                     .await
-                    .unwrap();
+                    .expect("store the tenant policy");
             }
             if !armed.is_empty() {
                 arm_probes(store, armed).await;
@@ -200,8 +206,11 @@ impl World {
     /// Boot a server on this world's store the way `temper serve` does,
     /// its policy reads going through `gate`. Returns once it would answer.
     pub(super) async fn boot(&self, gate: Arc<Gate>) -> PlatformState {
-        let mut stack =
-            StorageStack::from_turso(TursoEventStore::new(&self.url(), None).await.unwrap());
+        let mut stack = StorageStack::from_turso(
+            TursoEventStore::new(&self.url(), None)
+                .await
+                .expect("open the test store"),
+        );
         let inner = stack
             .policies
             .take()
@@ -214,13 +223,15 @@ impl World {
             registry,
             policy_seed,
             mut later,
-        } = boot::read_stored(None, Some(&stack), &[]).await.unwrap();
+        } = boot::read_stored(None, Some(&stack), &[])
+            .await
+            .expect("read the stored tenants");
         let mut state = PlatformState::with_registry(registry, None);
         state.server.data_dir = self.dir.path().to_path_buf();
         state.server.set_storage_stack(stack);
         boot::restore_own(&state, policy_seed, &[], &[], &mut later)
             .await
-            .unwrap();
+            .expect("restore the own tenants");
         boot::start_serving(&state, later).await;
         gate.serving();
         state
@@ -234,7 +245,7 @@ async fn arm_probes(store: TursoEventStore, tenants: &[String]) {
     for tenant in tenants {
         registry.register_tenant(
             tenant.as_str(),
-            temper_spec::csdl::parse_csdl(CSDL).unwrap(),
+            temper_spec::csdl::parse_csdl(CSDL).expect("probe CSDL parses"),
             CSDL.to_string(),
             &[("Probe", PROBE_IOA)],
         );
@@ -248,7 +259,7 @@ async fn arm_probes(store: TursoEventStore, tenants: &[String]) {
         state
             .authz
             .reload_tenant_policies(tenant, PERMIT_ALL)
-            .unwrap();
+            .expect("probe policy parses");
     }
     state.rebuild_reaction_dispatcher();
     let _boot = state.start_runtime().await;
@@ -268,11 +279,11 @@ async fn arm_probes(store: TursoEventStore, tenants: &[String]) {
         state
             .get_or_create_tenant_entity(&tenant, "Probe", "p1", json!({}))
             .await
-            .unwrap();
+            .expect("create p1");
         let armed = state
             .dispatch_tenant_action(&tenant, "Probe", "p1", "Arm", json!({}), &who)
             .await
-            .unwrap();
+            .expect("arm p1");
         assert!(armed.success, "arm p1 in {tenant}: {:?}", armed.error);
     }
 }
@@ -280,12 +291,16 @@ async fn arm_probes(store: TursoEventStore, tenants: &[String]) {
 /// The actions `p1`'s journal in `tenant` holds, oldest first, read from
 /// the store, not through the server.
 pub(super) async fn journal(state: &PlatformState, tenant: &str) -> Vec<String> {
-    let stack = state.server.storage_stack.as_ref().unwrap();
+    let stack = state
+        .server
+        .storage_stack
+        .as_ref()
+        .expect("the server has a store");
     stack
         .events
         .read_events(&format!("{tenant}:Probe:p1"), 0)
         .await
-        .unwrap()
+        .expect("read the journal")
         .into_iter()
         .map(|event| event.event_type)
         .collect()
@@ -334,7 +349,7 @@ fn with_credential(
             method.as_str(),
             &format!("http://127.0.0.1:3000{uri}"),
         )
-        .unwrap();
+        .expect("issue a call credential");
     let body = if method == Method::POST {
         Body::from("{}")
     } else {
@@ -347,7 +362,7 @@ fn with_credential(
         .header("x-tenant-id", tenant)
         .header("content-type", "application/json")
         .body(body)
-        .unwrap()
+        .expect("build the request")
 }
 
 /// A request to `tenant` at `uri` with no credential.
@@ -356,7 +371,7 @@ pub(super) fn public_request(tenant: &str, uri: &str) -> Request<Body> {
         .uri(uri)
         .header("x-tenant-id", tenant)
         .body(Body::empty())
-        .unwrap()
+        .expect("build the request")
 }
 
 /// What a client sees of a response.
@@ -370,12 +385,12 @@ pub(super) struct Answer {
 /// Send `request` through `router` and read the whole answer.
 pub(super) async fn answer(router: axum::Router, request: Request<Body>) -> Answer {
     use tower::ServiceExt;
-    let response = router.oneshot(request).await.unwrap();
+    let response = router.oneshot(request).await.expect("the router answers");
     let status = response.status();
     let retry_after = header(response.headers(), "retry-after");
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
+        .expect("read the answer body");
     Answer {
         status,
         body: String::from_utf8_lossy(&bytes).into_owned(),

@@ -53,12 +53,12 @@ impl Gate {
 
     /// The server serves from now on.
     pub(super) fn serving(&self) {
-        self.inner.lock().unwrap().serving = true;
+        self.inner.lock().expect("gate lock").serving = true;
     }
 
     /// The tenants read before the server served.
     pub(super) fn read_before_serving(&self) -> BTreeSet<String> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().expect("gate lock");
         inner
             .reads
             .iter()
@@ -71,7 +71,7 @@ impl Gate {
     pub(super) fn release(&self, tenant: &str) {
         self.inner
             .lock()
-            .unwrap()
+            .expect("gate lock")
             .released
             .insert(tenant.to_string());
         self.changed.notify_waiters();
@@ -81,7 +81,7 @@ impl Gate {
     /// tenant's reads fail.
     async fn pass(&self, tenant: &str) -> Result<(), String> {
         let held = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().expect("gate lock");
             let serving = inner.serving;
             inner.reads.push((tenant.to_string(), serving));
             if inner.failing.contains(tenant) {
@@ -95,7 +95,13 @@ impl Gate {
         let _ = self.waiting.send(tenant.to_string());
         loop {
             let changed = self.changed.notified();
-            if self.inner.lock().unwrap().released.contains(tenant) {
+            if self
+                .inner
+                .lock()
+                .expect("gate lock")
+                .released
+                .contains(tenant)
+            {
                 return Ok(());
             }
             changed.await;
