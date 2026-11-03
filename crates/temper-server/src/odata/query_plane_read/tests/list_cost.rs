@@ -1,16 +1,19 @@
 //! A list read costs in proportion to the rows it returns, not to the type.
 //!
 //! The shape is an app's first screen: many records with many fields, read
-//! newest move first with a status filter and a small `$top`, then followed
-//! by `$skiptoken`. Work is measured by the read's own telemetry
+//! newest move first, with or without a filter, with a small `$top`, then
+//! followed by `$skiptoken`. Work is measured by the read's own telemetry
 //! (`materialized_count`, `candidate_count`), which production reports on
 //! every `odata.entity_set_read` span. The answer is checked against an
 //! oracle built from the records themselves: same rows, same order, the same
-//! continuation, and no row a per-row policy hides.
+//! continuation and count, no unselected field, and no row a per-row policy
+//! hides.
 
 use super::*;
 use chrono::{DateTime, TimeZone, Utc};
 use temper_odata::query::types::parse_query_options;
+
+mod shapes;
 
 const RECORDS: usize = 600;
 const FIELDS: usize = 200;
@@ -20,14 +23,18 @@ const TOP: usize = 10;
 struct Record {
     id: String,
     status: &'static str,
+    place: String,
     last_event_at: Option<DateTime<Utc>>,
+    /// The record's state has no `last_event_at` key at all, as a row written
+    /// before the kernel kept one; otherwise an unknown time is a JSON null.
+    time_key_absent: bool,
     secret: bool,
 }
 
 fn record(index: usize) -> Record {
-    let status = if index % 7 == 0 {
+    let status = if index.is_multiple_of(7) {
         "Unmade"
-    } else if index % 2 == 0 {
+    } else if index.is_multiple_of(2) {
         "Draft"
     } else {
         "Created"
@@ -50,8 +57,10 @@ fn record(index: usize) -> Record {
     Record {
         id: format!("rec-{index:03}"),
         status,
+        place: format!("place-{}", index % 5),
         last_event_at,
-        secret: index % 3 == 0,
+        time_key_absent: index % 100 == 51,
+        secret: index.is_multiple_of(3),
     }
 }
 
@@ -60,6 +69,7 @@ async fn seed(store: &TursoEventStore, tenant: &TenantId) -> Vec<Record> {
     for (index, record) in records.iter().enumerate() {
         let mut fields = serde_json::Map::new();
         fields.insert("Id".to_string(), serde_json::json!(record.id));
+        fields.insert("Place".to_string(), serde_json::json!(record.place));
         fields.insert(
             "Secret".to_string(),
             serde_json::json!(if record.secret { "yes" } else { "no" }),
@@ -76,12 +86,17 @@ async fn seed(store: &TursoEventStore, tenant: &TenantId) -> Vec<Record> {
             .last_event_at
             .map(|at| serde_json::to_value(at).unwrap())
             .unwrap_or(serde_json::Value::Null);
-        let state = serde_json::json!({
+        let mut state = serde_json::json!({
             "status": record.status,
             "fields": fields,
             "first_event_at": at,
             "last_event_at": at,
         });
+        if record.time_key_absent {
+            let object = state.as_object_mut().unwrap();
+            object.remove("first_event_at");
+            object.remove("last_event_at");
+        }
         store
             .upsert_query_projection_with_state(
                 tenant.as_str(),
@@ -98,22 +113,28 @@ async fn seed(store: &TursoEventStore, tenant: &TenantId) -> Vec<Record> {
     records
 }
 
-/// Ids a reader may see, newest move first (unknown times first), ties by id.
-fn expected(records: &[Record], hide_secret: bool) -> Vec<String> {
-    let mut visible: Vec<&Record> = records
-        .iter()
-        .filter(|record| record.status != "Unmade" && !(hide_secret && record.secret))
-        .collect();
-    visible.sort_by(|a, b| match (a.last_event_at, b.last_event_at) {
+/// Ids of the records `keep` admits, newest move first (unknown times
+/// first), ties by id: the order `$orderby=last_event_at desc` pages in.
+fn newest_first(records: &[Record], keep: impl Fn(&Record) -> bool) -> Vec<String> {
+    let mut kept: Vec<&Record> = records.iter().filter(|record| keep(record)).collect();
+    kept.sort_by(|a, b| match (a.last_event_at, b.last_event_at) {
         (None, None) => a.id.cmp(&b.id),
         (None, Some(_)) => std::cmp::Ordering::Less,
         (Some(_), None) => std::cmp::Ordering::Greater,
         (Some(x), Some(y)) => y.cmp(&x).then_with(|| a.id.cmp(&b.id)),
     });
-    visible
-        .into_iter()
-        .map(|record| record.id.clone())
-        .collect()
+    kept.into_iter().map(|record| record.id.clone()).collect()
+}
+
+/// Ids a reader may see under [`NEWEST_FIRST`].
+fn expected(records: &[Record], hide_secret: bool) -> Vec<String> {
+    newest_first(records, |record| {
+        record.status != "Unmade" && !(hide_secret && record.secret)
+    })
+}
+
+fn ids(page: &QueryPlaneReadResult) -> Vec<String> {
+    page.entities.iter().map(listed_entity_id).collect()
 }
 
 fn reader() -> SecurityContext {
@@ -170,7 +191,7 @@ async fn walk(
     top: usize,
     work_per_page: usize,
 ) -> Vec<String> {
-    let mut ids = Vec::new();
+    let mut listed = Vec::new();
     let mut token: Option<String> = None;
     for _ in 0..=RECORDS {
         let page_query = match &token {
@@ -179,11 +200,11 @@ async fn walk(
         };
         let page = read(state, security_ctx, &page_query).await;
         assert!(page.entities.len() <= top, "{page_query}");
-        ids.extend(page.entities.iter().map(listed_entity_id));
+        listed.extend(ids(&page));
         assert_work(&page, work_per_page, &page_query);
         match page.next_skiptoken {
             Some(next) => token = Some(next),
-            None => return ids,
+            None => return listed,
         }
     }
     panic!("continuations never ended: {query}");
@@ -201,6 +222,25 @@ fn assert_work(page: &QueryPlaneReadResult, rows: usize, query: &str) {
         "a page of {} rows considered {} candidates (bound {rows}): {query}",
         page.entities.len(),
         page.telemetry.candidate_count,
+    );
+}
+
+/// Every row carries only the properties `selected` names (and OData
+/// annotations), and the catalog read itself was projected: the page did not
+/// load whole records to drop their fields afterwards.
+fn assert_projected(page: &QueryPlaneReadResult, selected: &[&str]) {
+    for row in &page.entities {
+        let object = row.as_object().expect("a listed row is an object");
+        for key in object.keys() {
+            assert!(
+                key.starts_with('@') || selected.contains(&key.as_str()),
+                "unselected property {key} listed: {row}"
+            );
+        }
+    }
+    assert!(
+        page.telemetry.catalog_select_projection,
+        "the page loaded whole records for a $select of {selected:?}"
     );
 }
 
@@ -228,8 +268,7 @@ async fn newest_first_page_reads_only_its_rows() {
     // First page and its continuation: the rows and order of the oracle,
     // each paid for with about one page of records.
     let first = read(&state, &security_ctx, &format!("{NEWEST_FIRST}&$top={TOP}")).await;
-    let first_ids: Vec<String> = first.entities.iter().map(listed_entity_id).collect();
-    assert_eq!(first_ids, want[..TOP].to_vec());
+    assert_eq!(ids(&first), want[..TOP].to_vec());
     let token = first
         .next_skiptoken
         .clone()
@@ -240,8 +279,7 @@ async fn newest_first_page_reads_only_its_rows() {
         &format!("{NEWEST_FIRST}&$top={TOP}&$skiptoken={token}"),
     )
     .await;
-    let second_ids: Vec<String> = second.entities.iter().map(listed_entity_id).collect();
-    assert_eq!(second_ids, want[TOP..2 * TOP].to_vec());
+    assert_eq!(ids(&second), want[TOP..2 * TOP].to_vec());
 
     // `$count` names the whole filtered set, still from one page of work.
     let counted = read(
@@ -263,13 +301,7 @@ async fn newest_first_page_reads_only_its_rows() {
         &format!("{NEWEST_FIRST}&$top={TOP}&$select=entity_id,f001"),
     )
     .await;
-    for row in &projected.entities {
-        assert!(row.get("f002").is_none(), "unselected field leaked: {row}");
-        assert!(
-            row.get("fields").is_none(),
-            "unselected fields leaked: {row}"
-        );
-    }
+    assert_projected(&projected, &["entity_id", "f001"]);
 
     // The cost: one page of records per page, not the type.
     let page_work = 2 * (TOP + 1);
@@ -299,8 +331,7 @@ async fn row_policy_pages_stay_bounded_and_hide_their_rows() {
     let want = expected(&records, true);
 
     let first = read(&state, &security_ctx, &format!("{NEWEST_FIRST}&$top={TOP}")).await;
-    let first_ids: Vec<String> = first.entities.iter().map(listed_entity_id).collect();
-    assert_eq!(first_ids, want[..TOP].to_vec());
+    assert_eq!(ids(&first), want[..TOP].to_vec());
     let all = walk(&state, &security_ctx, NEWEST_FIRST, 50, RECORDS).await;
     assert_eq!(all, want, "a hidden row was listed, or a visible one lost");
 
