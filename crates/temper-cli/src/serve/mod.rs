@@ -11,12 +11,15 @@ mod actor_runtime;
 mod boot;
 mod bootstrap;
 mod data_dir;
+mod installed_apps;
+mod later;
 mod loader;
 mod local_sandbox;
 mod observe_ui;
 pub(crate) mod options;
 #[cfg(test)]
 mod pushed_boot_tests;
+mod restore;
 #[cfg(test)]
 mod serve_first_tests;
 mod storage;
@@ -95,7 +98,7 @@ pub async fn run(
     let boot::Stored {
         registry,
         policy_seed: tenant_policy_seed,
-        later,
+        mut later,
     } = boot::read_stored(pg_pool.as_ref(), storage_stack.as_ref(), &apps).await?;
     // build_registry already said which disk apps it skipped; the later phases
     // (webhooks, hydration, tenant bootstrap, verification) skip them as well.
@@ -242,7 +245,14 @@ pub async fn run(
 
     // Phases 6-8b: the server's own tenants: entities, Cedar, WASM, secrets,
     // system and agent specs, installed apps and CLI `--app` requests.
-    boot::restore_own(&state, tenant_policy_seed, &apps, &os_app_installs).await?;
+    boot::restore_own(
+        &state,
+        tenant_policy_seed,
+        &apps,
+        &os_app_installs,
+        &mut later,
+    )
+    .await?;
     if actor_runtime == ActorRuntimeBackend::Postgres {
         pg_actor_runtime_cancel = Some(
             actor_runtime::install_postgres_actor_runtime(

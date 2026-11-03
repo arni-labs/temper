@@ -213,12 +213,12 @@ impl World {
         let boot::Stored {
             registry,
             policy_seed,
-            later,
+            mut later,
         } = boot::read_stored(None, Some(&stack), &[]).await.unwrap();
         let mut state = PlatformState::with_registry(registry, None);
         state.server.data_dir = self.dir.path().to_path_buf();
         state.server.set_storage_stack(stack);
-        boot::restore_own(&state, policy_seed, &[], &[])
+        boot::restore_own(&state, policy_seed, &[], &[], &mut later)
             .await
             .unwrap();
         boot::start_serving(&state, later).await;
