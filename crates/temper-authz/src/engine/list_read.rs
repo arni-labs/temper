@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use cedar_policy::{Policy, PolicySet};
+use cedar_policy::{Effect, Policy, PolicySet};
 
 use super::{AuthzDecision, AuthzEngine, CompiledPolicies, ListReadUniformity, list_uniformity};
 use crate::context::SecurityContext;
@@ -99,6 +99,16 @@ impl AuthzEngine {
             } else {
                 ListRead::DenyAll
             };
+        }
+        // Only a satisfied permit allows a row. With none from the list and
+        // none among the row's policies, no row can be allowed.
+        if !list_permits
+            && split
+                .row
+                .iter()
+                .all(|policy| policy.effect() == Effect::Forbid)
+        {
+            return ListRead::DenyAll;
         }
         let row_policy_count = split.row.len();
         let Some(row_policies) = compile(split.row) else {
