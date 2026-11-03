@@ -25,6 +25,16 @@
 //! apart ([`SendAnalysis::tells_timer_chains`]); otherwise every chain is
 //! taken as a request's, and states that differ only in it are one.
 //!
+//! Someone outside is one principal along all of a chain: its reactions,
+//! module answers and timer fires run as it, with the same security context
+//! (`resolve_trigger_principal` clones it, a timer keeps the arming one).
+//! When some policy tells two outside principals apart on a move such a
+//! chain makes, the model keeps one sender per kind of outside principal
+//! the policies tell apart ([`SendAnalysis::outside_kinds`]): a request is
+//! sent as each kind that may send it, and everything after it is decided
+//! for that kind, so a chain is never let through for one principal and
+//! refused for another. Together the kinds cover every outside principal.
+//!
 //! What each sender may send is read from the policies once. A reaction
 //! whose answer depends on the request is decided again when it arrives,
 //! with what the joint state knows of it: its source's id, and its record's
@@ -44,23 +54,33 @@ use super::env::ID;
 use super::room::Heap;
 use super::state::JointState;
 use crate::model::ModelString;
+use table::{each, reread};
 
-/// Someone outside the kernel, in a request's chain.
+mod kinds;
+mod table;
+
+/// Someone outside the kernel, of no known kind, in a request's chain.
 pub(super) const OUTSIDE: u32 = 0;
 
 /// The senders a model knows, by number, and what Cedar lets each send.
 ///
 /// A sender's number is its asker's place, doubled, plus one in a timer's
-/// chain.
+/// chain. Someone outside of no known kind is first, then each kind of
+/// outside sender, then the services.
 pub(super) struct Senders {
     askers: Vec<Asker>,
+    /// The senders an outside request is sent as: each kind of outside
+    /// sender, or someone outside of no known kind when the policies tell
+    /// none apart.
+    outside: Vec<u32>,
     /// Each asker's place with resource-relative IDs forgotten after a
     /// different-ID hop.
     detached: Vec<u32>,
     /// Whether some policy tells a timer's chain from a request's.
     timer_chains: bool,
-    /// Entity, then action: what Cedar lets someone outside request.
-    requests: Option<BTreeMap<String, BTreeMap<String, May>>>,
+    /// Entity, then action, then each outside asker's answer (of no known
+    /// kind first): what Cedar lets them request.
+    requests: Option<BTreeMap<String, BTreeMap<String, Vec<May>>>>,
     /// Entity, then action, then each sender's answer as a reaction's.
     may: Option<BTreeMap<String, BTreeMap<String, Vec<May>>>>,
     /// The policies, to decide again a move whose answer depends on the
@@ -85,6 +105,7 @@ impl fmt::Debug for Senders {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Senders")
             .field("askers", &self.askers)
+            .field("outside", &self.outside)
             .field("detached", &self.detached)
             .field("timer_chains", &self.timer_chains)
             .field("requests", &self.requests)
@@ -110,13 +131,25 @@ type Question = (
 
 impl Senders {
     /// The senders of the moves among `entities`, and what `policies` lets
-    /// each send.
+    /// each send. A request to one of `roots` starts a chain that runs as
+    /// its sender through the `inheriting` moves (entity, action): those
+    /// are what the kinds of outside sender are told apart on.
     pub(super) fn new<'a>(
         by_name: &BTreeMap<&str, &Automaton>,
         entities: impl IntoIterator<Item = &'a String> + Clone,
         policies: Option<&SendAnalysis>,
+        roots: &BTreeSet<String>,
+        inheriting: &BTreeSet<(String, String)>,
     ) -> Self {
+        let kinds =
+            policies.and_then(|policies| kinds::outside(by_name, policies, roots, inheriting));
+        let outside: Vec<u32> = match &kinds {
+            None => vec![OUTSIDE],
+            Some(kinds) => (1..=kinds.len()).map(|at| at as u32 * 2).collect(),
+        };
+        let kinds = kinds.unwrap_or_default();
         let mut askers = vec![Asker::Outside];
+        askers.extend(kinds.iter().cloned().map(Asker::OutsideAs));
         for entity in entities.clone() {
             for action in &by_name[entity.as_str()].actions {
                 for trigger in &action.triggers {
@@ -152,7 +185,10 @@ impl Senders {
         let requests = policies.map(|policies| {
             each(by_name, entities.clone(), &|entity, action| {
                 let request = Cause::request();
-                policies.may(&Asker::Outside, action, entity, &none, Some(&request))
+                askers[..=kinds.len()]
+                    .iter()
+                    .map(|asker| policies.may(asker, action, entity, &none, Some(&request)))
+                    .collect()
             })
         });
         let may = policies.map(|policies| {
@@ -180,6 +216,7 @@ impl Senders {
         let reread = reread(policies, &askers, may.as_ref());
         Self {
             askers,
+            outside,
             detached,
             timer_chains,
             requests,
@@ -209,17 +246,29 @@ impl Senders {
         self.reread = reread(self.policies.as_ref(), &self.askers, self.may.as_ref());
     }
 
-    /// Whether Cedar lets someone outside request `action` on an `entity`
-    /// record.
+    /// Whether Cedar lets someone outside, of no known kind, request
+    /// `action` on an `entity` record.
     pub(super) fn request(&self, entity: &str, action: &str) -> May {
+        self.request_as(OUTSIDE, entity, action)
+    }
+
+    /// Whether Cedar lets the outside sender `by` request `action` on an
+    /// `entity` record.
+    pub(super) fn request_as(&self, by: u32, entity: &str, action: &str) -> May {
         let Some(requests) = &self.requests else {
             return May::Yes;
         };
         requests
             .get(entity)
             .and_then(|actions| actions.get(action))
+            .and_then(|answers| answers.get(by as usize / 2))
             .copied()
             .unwrap_or(May::No)
+    }
+
+    /// The senders an outside request is sent as.
+    pub(super) fn outside(&self) -> &[u32] {
+        &self.outside
     }
 
     /// Whether Cedar lets sender `by` send `action` to an `entity` record as
@@ -271,7 +320,7 @@ impl Senders {
                     .and_then(|record| record.strings.get(ID)),
                 _ => None,
             },
-            Asker::Outside => None,
+            Asker::Outside | Asker::OutsideAs(_) => None,
         };
         let name = rule.to_string();
         let question = (
@@ -380,51 +429,11 @@ impl Senders {
     pub(super) fn name(&self, by: u32) -> String {
         match self.askers.get(by as usize / 2) {
             Some(Asker::Outside) => "an outside caller".to_string(),
+            Some(Asker::OutsideAs(kind)) => format!("an outside caller {kind}"),
             Some(Asker::Service { name, .. }) => format!("service:{name}"),
             None => format!("sender {by}"),
         }
     }
-}
-
-/// `answer` for each action of each of `entities`, by entity, then action.
-fn each<'a, T>(
-    by_name: &BTreeMap<&str, &Automaton>,
-    entities: impl IntoIterator<Item = &'a String>,
-    answer: &dyn Fn(&str, &str) -> T,
-) -> BTreeMap<String, BTreeMap<String, T>> {
-    entities
-        .into_iter()
-        .map(|entity| {
-            let actions = by_name[entity.as_str()]
-                .actions
-                .iter()
-                .map(|action| (action.name.clone(), answer(entity, &action.name)))
-                .collect();
-            (entity.clone(), actions)
-        })
-        .collect()
-}
-
-/// The policies that may apply to a move whose answer `may` leaves to the
-/// request: all a walk reads of `policies` when it decides one again.
-fn reread(
-    policies: Option<&SendAnalysis>,
-    askers: &[Asker],
-    may: Option<&BTreeMap<String, BTreeMap<String, Vec<May>>>>,
-) -> BTreeSet<String> {
-    let mut reread = BTreeSet::new();
-    if let (Some(policies), Some(may)) = (policies, may) {
-        for (entity, actions) in may {
-            for (action, answers) in actions {
-                for (by, answer) in answers.iter().enumerate() {
-                    if *answer == May::Maybe {
-                        reread.extend(policies.applicable(&askers[by / 2], action, entity));
-                    }
-                }
-            }
-        }
-    }
-    reread
 }
 
 /// The sender a reaction declares, as the trigger dispatcher builds it.

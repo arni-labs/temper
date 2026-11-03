@@ -37,7 +37,14 @@ context.triggerSourceEntityId == resource.id
     )
     .unwrap();
     let entities = vec!["A".to_string()];
-    let senders = Senders::new(&BTreeMap::from([("A", &a)]), &entities, Some(&policy));
+    let none = BTreeSet::new();
+    let senders = Senders::new(
+        &BTreeMap::from([("A", &a)]),
+        &entities,
+        Some(&policy),
+        &BTreeSet::new(),
+        &none,
+    );
     let principal = declared(&a.actions[0].triggers[0], "A", "Start").unwrap();
     let b = senders.reaction(Some(&principal), OUTSIDE, true);
     assert_eq!(senders.may(b, "A", "Start"), May::Yes);

@@ -8,6 +8,7 @@ mod initial;
 mod labels;
 mod moves;
 mod order;
+mod outside;
 mod react;
 mod read;
 mod silent;
@@ -253,7 +254,20 @@ impl JointModel {
         } else {
             Kernel::default()
         };
-        let senders = Senders::new(by_name, scope, sending.policies);
+        // A reaction that declares no principal runs as whoever sent its
+        // source action.
+        let inherits = reactions.iter().filter(|r| r.principal.is_none());
+        let sender_matters: BTreeSet<String> = inherits.clone().map(|r| r.from.clone()).collect();
+        let inheriting = inherits
+            .map(|r| (r.to.clone(), r.target_action.clone()))
+            .collect();
+        let senders = Senders::new(
+            by_name,
+            scope,
+            sending.policies,
+            &sender_matters,
+            &inheriting,
+        );
         let chosen = |entity: &str, action: &str| {
             sending
                 .relies_on
@@ -280,11 +294,6 @@ impl JointModel {
             })
             .collect();
         let unchecked = unchecked_constraints(by_name, &models, &order);
-        let sender_matters = reactions
-            .iter()
-            .filter(|r| r.principal.is_none())
-            .map(|r| r.from.clone())
-            .collect();
         let into = reactions_into(by_name, scope);
         let open: BTreeSet<&String> = kernel
             .calls_on
