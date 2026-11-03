@@ -242,8 +242,9 @@ async fn factory_sized_checks_enqueue_nothing_but_a_refused_move_records_one_att
     assert!(state.load_trajectory_entries(TENANT, 200).await.is_empty());
 
     // The same refused move from a plain key, with no session to wait for an
-    // answer: a decision would never resolve, so it is a plain 403 and
-    // nothing is stored (`authz::denial_can_be_answered`).
+    // answer: a decision would never resolve, so it is a plain 403 and no
+    // decision or denial pattern is filed (`authz::denial_can_be_answered`).
+    // Its trajectory row is still written: a direct request is recorded.
     let response = app
         .clone()
         .oneshot(request_in(
@@ -258,10 +259,13 @@ async fn factory_sized_checks_enqueue_nothing_but_a_refused_move_records_one_att
     assert!(plain.get("decision_id").is_none(), "{plain}");
     assert_eq!(
         enqueued(&provider, &exporter),
-        0,
-        "a plain key's refusal stores no trajectory row"
+        1,
+        "a plain key's refusal writes its trajectory row"
     );
-    assert_eq!(filed(&state, &store).await, (0, 0, 0), "nor any decision");
+    assert_eq!(filed(&state, &store).await, (0, 0, 0), "and files nothing");
+    let rows = persisted_trajectory(&state, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_refusal_row(&rows[0], None);
 
     let response = app
         .oneshot(request(
@@ -272,7 +276,11 @@ async fn factory_sized_checks_enqueue_nothing_but_a_refused_move_records_one_att
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let refusal = json_body(response).await;
-    assert_eq!(enqueued(&provider, &exporter), 1, "one real refused move");
+    assert_eq!(
+        enqueued(&provider, &exporter),
+        2,
+        "one more real refused move"
+    );
     assert_eq!(filed(&state, &store).await, (1, 1, 1));
     let decisions = store.query_all_decisions(None).await.unwrap();
     let decision: serde_json::Value = serde_json::from_str(&decisions[0]).unwrap();
@@ -281,25 +289,42 @@ async fn factory_sized_checks_enqueue_nothing_but_a_refused_move_records_one_att
         state.list_entity_ids(&TenantId::new("temper-system"), "GovernanceDecision");
     assert_eq!(decision["governance_decision_id"], governance_ids[0]);
 
-    let rows = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let rows = persisted_trajectory(&state, 2).await;
+    assert_eq!(rows.len(), 2);
+    let in_session = rows
+        .iter()
+        .find(|row| row.session_id.is_some())
+        .expect("the session's refusal has its row");
+    assert_refusal_row(in_session, Some("session-1"));
+}
+
+/// The tenant's persisted trajectory rows, once there are `count` of them.
+async fn persisted_trajectory(
+    state: &ServerState,
+    count: usize,
+) -> Vec<temper_server::state::TrajectoryEntry> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let rows = state.load_trajectory_entries(TENANT, 200).await;
-            if !rows.is_empty() {
+            if rows.len() >= count {
                 break rows;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("the refused move's trajectory must persist");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].entity_type, "Order");
-    assert_eq!(rows[0].entity_id, "order-1");
-    assert_eq!(rows[0].action, "AddItem");
-    assert_eq!(rows[0].agent_id.as_deref(), Some("agent-1"));
-    assert_eq!(rows[0].session_id.as_deref(), Some("session-1"));
-    assert_eq!(rows[0].authz_denied, Some(true));
+    .expect("the refused move's trajectory must persist")
+}
+
+/// agent-1's refused AddItem on order-1, made in `session`.
+fn assert_refusal_row(row: &temper_server::state::TrajectoryEntry, session: Option<&str>) {
+    assert_eq!(row.entity_type, "Order");
+    assert_eq!(row.entity_id, "order-1");
+    assert_eq!(row.action, "AddItem");
+    assert_eq!(row.agent_id.as_deref(), Some("agent-1"));
+    assert_eq!(row.session_id.as_deref(), session);
+    assert_eq!(row.authz_denied, Some(true));
     // OData's denial guard leaves this unset; conformance walks these rows.
-    assert_eq!(rows[0].spec_governed, None);
-    assert!(!rows[0].success);
+    assert_eq!(row.spec_governed, None);
+    assert!(!row.success);
 }
