@@ -70,6 +70,7 @@ impl Visit for FieldVisitor {
 #[test]
 fn public_storage_key_is_generic_and_content_addressed() {
     let key = public_storage_key(
+        &TenantId::new("tenant-a"),
         "public-demo-artifacts",
         "Report",
         "quarterly-2026",
@@ -81,7 +82,10 @@ fn public_storage_key_is_generic_and_content_addressed() {
 
     assert_eq!(
         key,
-        "public-demo-artifacts/Report/quarterly-2026/preview-image-abc123.png"
+        format!(
+            "public-demo-artifacts/tenants/{}/Report/quarterly-2026/preview-image-abc123.png",
+            sha256_hex(b"tenant-a")
+        )
     );
 }
 
@@ -411,5 +415,13 @@ async fn tenants_publishing_the_same_owner_label_and_hash_get_different_keys() {
 
     assert_ne!(first.public_storage_key, second.public_storage_key);
     assert_ne!(first.public_url, second.public_url);
+    for (artifact, tenant) in [(&first, &tenant_a), (&second, &tenant_b)] {
+        let tenant_segment = format!("/tenants/{}/", sha256_hex(tenant.as_str().as_bytes()));
+        assert!(
+            artifact.public_storage_key.contains(&tenant_segment),
+            "{} carries {tenant}",
+            artifact.public_storage_key
+        );
+    }
     endpoint.verify().await;
 }

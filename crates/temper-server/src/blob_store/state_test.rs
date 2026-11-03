@@ -151,6 +151,32 @@ async fn tenant_blob_keys_are_disjoint() {
     assert!(written.is_err(), "the write is refused: {written:?}");
 }
 
+/// An object store's address is a URL, which folds `..` and its percent-encoded forms and reads `\\` as `/`, so a key
+/// is refused before any request rather than climbing out of the tenant's prefix.
+#[tokio::test]
+async fn an_object_store_key_stays_under_its_tenant_prefix() {
+    let store = BlobStore::s3(
+        "http://127.0.0.1:9",
+        "bucket",
+        None,
+        None,
+        "/tmp",
+        object_key_prefix(Some("app"), &TenantId::new("acme")),
+    );
+    for key in [
+        "../../x",
+        "a/%2e%2e/%2e%2e/x",
+        "a\\..\\..\\x",
+        "Tenants/abc/x",
+    ] {
+        let refused = store.get(key).await.expect_err("refused");
+        assert!(
+            refused.contains(&format!("blob key '{key}'")),
+            "{key}: {refused}"
+        );
+    }
+}
+
 /// A Katagami app whose vault key was lost (Run probe, 21 Oct 2026) restored its data with no readable
 /// `blob_endpoint`, and a File put then answered 204 while its bytes went to this disk and the app's database.
 #[tokio::test]
