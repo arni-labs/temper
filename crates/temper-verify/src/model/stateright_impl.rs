@@ -103,6 +103,17 @@ impl TemperModel {
         taken && guard_may_hold(&transition.guard, &self.var_kinds, state)
     }
 
+    /// Whether a record in `state` surely has a move open: one the walk
+    /// takes whose guard holds from the record alone. A move gated on
+    /// another record, or on a value the model does not track, is explored
+    /// as one that may fire, but it may never be open, so a record with no
+    /// other may wait where it is.
+    pub(crate) fn surely_moves(&self, state: &TemperModelState) -> bool {
+        self.transitions.iter().any(|t| {
+            self.transition_enabled(t, state) && locally_enabled(self, t, state) == Some(true)
+        })
+    }
+
     /// Whether `action` may fire in `state`.
     ///
     /// [`Model::next_state`] cannot answer this: it resolves the transition

@@ -12,6 +12,12 @@
 //! A state with a step past a counter's bound is not taken for a stop: what
 //! lies past the bound was not walked, and the walk's result says it is
 //! bounded. A walk cut short by its time or state limit checks nothing here.
+//!
+//! The walk takes a move whose guard reads another record, or a value it
+//! does not track, as one that may fire. That is right for safety, but a
+//! record whose every move is like that may wait forever. A rule that holds
+//! only if such a record moves on is not proved: it fails the check without
+//! a path, since none is known to break it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -25,16 +31,26 @@ use crate::reach::{Graph, NO_PLACE};
 /// is what is false.
 pub const REACHES: &str = "Reaches";
 
-/// One counterexample for each `reaches` rule some path in `graph` breaks:
-/// the path to the nearest state in the rule's `from` places that need not
-/// get there, then on through states that need not either, until it stops
-/// or comes back to a state already on it. `found` maps each state to its
+/// What the `reaches` rules came to on a whole walk.
+#[derive(Default)]
+pub(crate) struct Verdicts {
+    /// One counterexample for each rule some path breaks: the path to the
+    /// nearest state in the rule's `from` places that need not get there,
+    /// then on through states that need not either, until it stops or comes
+    /// back to a state already on it.
+    pub(crate) broken: Vec<Counterexample>,
+    /// Each rule that holds only if a record that may wait moves on, with
+    /// why it is not proved.
+    pub(crate) unproved: Vec<(String, String)>,
+}
+
+/// Check every `reaches` rule on `graph`. `found` maps each state to its
 /// number in `graph`.
-pub(crate) fn broken_rules(
+pub(crate) fn check(
     model: &TemperModel,
     graph: &Graph,
     found: &HashMap<TemperModelState, u32>,
-) -> Vec<Counterexample> {
+) -> Verdicts {
     let rules: Vec<(&str, &[String], &[String])> = model
         .liveness
         .iter()
@@ -46,7 +62,7 @@ pub(crate) fn broken_rules(
         })
         .collect();
     if rules.is_empty() {
-        return Vec::new();
+        return Verdicts::default();
     }
     // The whole walk is complete. Replaying its evidence must neither spend
     // its remaining search budget nor stop when its deadline passes.
@@ -62,6 +78,18 @@ pub(crate) fn broken_rules(
             into[to as usize].push(at as u32);
         }
     }
+    let mut number: Vec<Option<&TemperModelState>> = vec![None; n];
+    for (state, &at) in found {
+        number[at as usize] = Some(state);
+    }
+    let number: Vec<&TemperModelState> = number
+        .into_iter()
+        .map(|state| state.expect("the walk numbered every state it found"))
+        .collect();
+    // A state with steps but no move sure to be open may wait there.
+    let may_wait: Vec<bool> = (0..n)
+        .map(|at| !graph.steps(at).is_empty() && !replay.surely_moves(number[at]))
+        .collect();
     let in_places = |names: &[String]| -> Vec<bool> {
         let places: Vec<bool> = model.states.iter().map(|s| names.contains(s)).collect();
         (0..n)
@@ -69,27 +97,46 @@ pub(crate) fn broken_rules(
             .collect()
     };
 
-    let broken: Vec<Broken> = rules
-        .into_iter()
-        .filter_map(|(name, from, targets)| {
-            let arrives = gets_there(graph, &into, in_places(targets));
-            let starts = if from.is_empty() {
-                (0..n).map(|at| graph.parent[at].is_none()).collect()
-            } else {
-                in_places(from)
-            };
-            // The walk numbers states in the order it finds them, so the
-            // first that breaks the rule is one of the nearest.
-            let at = (0..n).find(|&at| starts[at] && !arrives[at])?;
-            Some(Broken {
+    let mut unproved = Vec::new();
+    let mut broken = Vec::new();
+    for (name, from, targets) in rules {
+        let arrived = in_places(targets);
+        let arrives = gets_there(graph, &into, arrived.clone(), &[]);
+        let starts: Vec<bool> = if from.is_empty() {
+            (0..n).map(|at| graph.parent[at].is_none()).collect()
+        } else {
+            in_places(from)
+        };
+        // The walk numbers states in the order it finds them, so the first
+        // that breaks the rule is one of the nearest.
+        if let Some(at) = (0..n).find(|&at| starts[at] && !arrives[at]) {
+            broken.push(Broken {
                 name: name.to_string(),
                 targets: targets.to_vec(),
-                path: path_that_never_arrives(&replay, graph, found, &arrives, at),
-            })
-        })
-        .collect();
+                path: path_that_never_arrives(&replay, graph, &number, &arrives, at),
+            });
+            continue;
+        }
+        let surely = gets_there(graph, &into, arrived, &may_wait);
+        if let Some(at) = (0..n).find(|&at| starts[at] && !surely[at]) {
+            let waits = waiting_state(graph, &surely, &may_wait, at);
+            unproved.push((
+                name.to_string(),
+                format!(
+                    "rule '{name}' not proved: a record in {} may wait there forever, since \
+                     every move it has there ({}) needs another record or a value the check \
+                     does not track",
+                    number[waits].status,
+                    open_moves(&replay, number[waits]).join(", "),
+                ),
+            ));
+        }
+    }
     if broken.is_empty() {
-        return Vec::new();
+        return Verdicts {
+            broken: Vec::new(),
+            unproved,
+        };
     }
 
     let wanted: BTreeSet<u32> = broken
@@ -101,7 +148,7 @@ pub(crate) fn broken_rules(
         .filter(|(_, at)| wanted.contains(at))
         .map(|(state, at)| (*at as usize, state))
         .collect();
-    broken
+    let broken = broken
         .into_iter()
         .map(|broken| Counterexample {
             property: REACHES.to_string(),
@@ -109,7 +156,8 @@ pub(crate) fn broken_rules(
             trace: trace(&replay, &states, &broken.path),
             never_reaches: broken.targets,
         })
-        .collect()
+        .collect();
+    Verdicts { broken, unproved }
 }
 
 /// A broken rule: its name, its places, and the path that never gets
@@ -121,10 +169,16 @@ struct Broken {
 }
 
 /// Which states every path from gets to a state in `arrived`: the least
-/// fixpoint of "in `arrived`, or has a step and every step leads to one
-/// that gets there", where a state with a step past a bound and no other
-/// counts as getting there (what lies past the bound was not walked).
-fn gets_there(graph: &Graph, into: &[Vec<u32>], mut arrived: Vec<bool>) -> Vec<bool> {
+/// fixpoint of "in `arrived`, or has a step, may not wait (when `may_wait`
+/// says so) and every step leads to one that gets there", where a state
+/// with a step past a bound and no other counts as getting there (what lies
+/// past the bound was not walked). An empty `may_wait` lets every state on.
+fn gets_there(
+    graph: &Graph,
+    into: &[Vec<u32>],
+    mut arrived: Vec<bool>,
+    may_wait: &[bool],
+) -> Vec<bool> {
     let n = graph.len();
     let mut left: Vec<usize> = (0..n).map(|at| graph.steps(at).len()).collect();
     let mut queue: Vec<usize> = Vec::new();
@@ -143,7 +197,7 @@ fn gets_there(graph: &Graph, into: &[Vec<u32>], mut arrived: Vec<bool>) -> Vec<b
                 continue;
             }
             left[from] -= 1;
-            if left[from] == 0 {
+            if left[from] == 0 && !may_wait.get(from).copied().unwrap_or(false) {
                 arrived[from] = true;
                 queue.push(from);
             }
@@ -159,13 +213,12 @@ fn gets_there(graph: &Graph, into: &[Vec<u32>], mut arrived: Vec<bool>) -> Vec<b
 fn path_that_never_arrives(
     model: &TemperModel,
     graph: &Graph,
-    found: &HashMap<TemperModelState, u32>,
+    number: &[&TemperModelState],
     arrives: &[bool],
     at: usize,
 ) -> Vec<(usize, Option<usize>)> {
     let mut path = graph.path_to(at);
     let mut on_path: BTreeSet<usize> = path.iter().map(|(at, _)| *at).collect();
-    let number: HashMap<u32, &TemperModelState> = found.iter().map(|(s, at)| (*at, s)).collect();
     loop {
         let here = path.last().expect("a path has a state").0;
         let onward: Vec<usize> = graph
@@ -183,7 +236,7 @@ fn path_that_never_arrives(
         else {
             return path;
         };
-        let transition = transition_between(model, number[&(here as u32)], number[&(next as u32)]);
+        let transition = transition_between(model, number[here], number[next]);
         path.last_mut().expect("a path has a state").1 = Some(transition);
         path.push((next, None));
         if !on_path.insert(next) {
@@ -208,4 +261,35 @@ fn transition_between(
                     .any(|(_, next)| next == to)
         })
         .expect("the walk took this step")
+}
+
+/// A state from `at` on that may wait, reached through states that do not
+/// surely get there. Every such state that does get there on every path
+/// has a step to one of them or may wait itself, so the walk ends.
+fn waiting_state(graph: &Graph, surely: &[bool], may_wait: &[bool], mut at: usize) -> usize {
+    let mut seen = BTreeSet::new();
+    while !may_wait[at] && seen.insert(at) {
+        match graph
+            .steps(at)
+            .iter()
+            .map(|&to| to as usize)
+            .find(|&to| !surely[to])
+        {
+            Some(next) => at = next,
+            None => break,
+        }
+    }
+    at
+}
+
+/// The names of the moves the walk takes from `state`.
+fn open_moves(model: &TemperModel, state: &TemperModelState) -> Vec<String> {
+    let mut names: Vec<String> = model
+        .transitions
+        .iter()
+        .filter(|transition| model.transition_enabled(transition, state))
+        .map(|transition| transition.name.clone())
+        .collect();
+    names.dedup();
+    names
 }
