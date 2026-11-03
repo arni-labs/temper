@@ -318,3 +318,51 @@ fn a_rule_that_rests_on_a_gate_another_record_holds_is_not_proved() {
     assert!(verification.is_complete, "the walk completed");
     assert!(verification.counterexamples.is_empty());
 }
+
+/// A record steps through more places than a simulated run has moves for
+/// before it gets to Done. Every path gets there, but no run does.
+fn long_way_round() -> String {
+    let places: Vec<String> = (0..30).map(|i| format!("Step{i}")).collect();
+    let mut spec = format!(
+        "[automaton]\nname = \"LongWay\"\nstates = [{}, \"Done\"]\ninitial = \"Step0\"\n",
+        places
+            .iter()
+            .map(|p| format!("\"{p}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for (i, place) in places.iter().enumerate() {
+        let next = places.get(i + 1).map_or("Done", String::as_str);
+        spec.push_str(&format!(
+            "\n[[action]]\nname = \"Leave{i}\"\nfrom = [\"{place}\"]\nto = \"{next}\"\n"
+        ));
+    }
+    spec.push_str("\n[[liveness]]\nname = \"GetsDone\"\nreaches = [\"Done\"]\n");
+    spec
+}
+
+/// A run cut off by its action or tick budget proves nothing about a
+/// `reaches` rule: it is counted as not reached within the budget, and the
+/// verdict says so.
+#[test]
+fn a_run_cut_off_by_its_budget_does_not_break_the_rule() {
+    let spec = long_way_round();
+    let result = VerificationCascade::from_ioa(&spec)
+        .with_sim_seeds(3)
+        .with_prop_test_cases(20)
+        .run();
+    let l1 = result
+        .level_result(CascadeLevel::ModelCheck)
+        .expect("L1 ran");
+    assert!(l1.passed, "{}", l1.summary);
+    let l2 = result
+        .level_result(CascadeLevel::Simulation)
+        .expect("L2 ran");
+    assert!(l2.passed, "{}: {:?}", l2.summary, l2.diagnostics);
+    assert!(
+        l2.summary.contains("GetsDone") && l2.summary.contains("within"),
+        "the verdict says the runs were cut off: {}",
+        l2.summary
+    );
+    assert!(result.all_passed, "{:?}", result.levels);
+}
