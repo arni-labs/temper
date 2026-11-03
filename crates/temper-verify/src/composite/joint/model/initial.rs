@@ -128,8 +128,8 @@ fn partitions(allowed: Vec<Vec<usize>>, fixed: usize) -> impl Iterator<Item = Ve
                 .or_else(|| (next[i] < newest).then(|| (next[i] + 1).max(fixed)));
             if let Some(b) = bigger {
                 next[i] = b;
-                for j in i + 1..allowed.len() {
-                    next[j] = least(j, &allowed);
+                for (j, block) in next.iter_mut().enumerate().skip(i + 1) {
+                    *block = least(j, &allowed);
                 }
                 blocks = Some(next);
                 break;
