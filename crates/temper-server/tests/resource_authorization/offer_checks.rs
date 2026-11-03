@@ -85,6 +85,10 @@ async fn order_only_a_person_may_add_to(state: &ServerState) {
 
 /// `request` as agent-1 inside an interactive session, the case that files decisions.
 fn as_agent_in_session(mut request: Request<Body>) -> Request<Body> {
+    request.headers_mut().insert(
+        "x-session-id",
+        axum::http::HeaderValue::from_static("session-1"),
+    );
     let mut security = customer_security_context("agent-1");
     security.principal.kind = PrincipalKind::Agent;
     request.extensions_mut().insert(
