@@ -50,9 +50,7 @@ use chrono::{DateTime, Utc};
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
 
-use super::state_timeouts::{
-    Reservation, deadline, declared_timer, rearm_clock_start, remaining_budget,
-};
+use super::state_timeouts::{Reservation, declared_timer, rearm_clock_start};
 use super::state_timer_follow::{FOLLOW_RETRY_FIRST, FOLLOW_RETRY_MAX};
 use super::state_timer_setter::{STATE_TIMER_SERVICE, is_state_timer_service};
 use crate::entity_actor::{EntityState, RehydrateHook};
@@ -257,8 +255,22 @@ impl ServerState {
                     .is_some_and(|row| row.arm_id == armed.arm_id)
             })
             .map(|armed| armed.agent_ctx.clone());
+        // A live timer of this same declaration is the record's timer: a
+        // dispatch's caller arms only a timer the record lacks. It matters
+        // when a move brings that timer forward (`fire_now_on`) and no row
+        // names who armed it: the replacement fires as the live timer's
+        // setter, never as the move that brought it forward.
+        let live_declared = armed
+            .as_ref()
+            .filter(|armed| {
+                armed.state == st.state
+                    && armed.action == st.on_timeout
+                    && armed.after_seconds == st.after_seconds
+            })
+            .map(|armed| armed.agent_ctx.clone());
         let known = live_of_row
             .or_else(|| committed.as_ref().map(|timer| timer.agent_ctx.clone()))
+            .or(live_declared)
             .or_else(|| armed_by.cloned())
             .or_else(|| armed.as_ref().map(|armed| armed.agent_ctx.clone()))
             .or_else(|| row.as_ref().and_then(super::state_timer_rows::row_armed_by));
@@ -319,17 +331,15 @@ impl ServerState {
             // but fence its replacement at the record we just reconciled.
             // Non-resetting actions advance the journal without a new arm.
             timer.sequence_nr = current.sequence_nr;
+            timer.brought_forward_at =
+                super::state_timeouts::brought_forward_at(&st, current, timer.started_at);
             Reservation::Committed
         } else {
             Reservation::Missing
         };
         timer.boot_gate = gate.or_else(|| armed.and_then(|armed| armed.boot_gate));
-        let delay = remaining_budget(timer.started_at, st.after_seconds, now);
-        let bucket = elapsed_bucket(
-            delay,
-            deadline(timer.started_at, st.after_seconds),
-            woke_for,
-        );
+        let delay = (timer.due_at() - now).to_std().unwrap_or(Duration::ZERO);
+        let bucket = elapsed_bucket(delay, timer.due_at(), woke_for);
         if self.start_armed_timer(timer, reservation).await {
             crate::runtime_metrics::record_state_timeout_armed_on_hydration(
                 tenant.as_str(),
