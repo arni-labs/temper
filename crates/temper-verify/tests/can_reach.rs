@@ -445,3 +445,6 @@ mod review_constraints;
 
 #[path = "can_reach/entry_rules.rs"]
 mod entry_rules;
+
+#[path = "can_reach/gates.rs"]
+mod gates;
