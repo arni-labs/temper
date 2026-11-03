@@ -133,9 +133,11 @@ impl JointModel {
                 }
             }
             Move::Send(entity, action, by) => {
-                // Its record's guard is read on the dispatch path and in its
-                // actor, which decide it later.
-                let known = self.outside_may(*by, entity, &action.name) == May::Yes;
+                // Its record's guard is read on the dispatch path now, which
+                // may refuse it when the model cannot decide the guard, and
+                // in its actor later.
+                let known = self.outside_may(*by, entity, &action.name) == May::Yes
+                    && self.truth(entity, action, state) == Truth::True;
                 let mut next = state.clone();
                 add(&mut next, sent(entity, action, *by));
                 let text = format!("{entity}.{action} sent{}", self.as_sender(*by));
@@ -172,11 +174,18 @@ impl JointModel {
                     self.senders.name(call.by)
                 );
                 if self.action_reads_related(&call.to, &action.name) {
+                    // The dispatch path reads its guard now, and may refuse
+                    // it when the model cannot decide the guard.
+                    let known = self.truth(&call.to, action, state) == Truth::True;
                     add(&mut next, sent(&call.to, action, call.by));
-                    if !self
-                        .expansion
-                        .push(&mut outcomes, (next, format!("{text} sent"), Sure))
-                    {
+                    if !self.expansion.push(
+                        &mut outcomes,
+                        (
+                            next,
+                            format!("{text} sent"),
+                            Certainty::unless(known, Unsure),
+                        ),
+                    ) {
                         return (Vec::new(), false);
                     };
                 } else if self.stale(call, &action.name, state) {
