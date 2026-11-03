@@ -405,7 +405,9 @@ fn load_selected_entity_catalog_rows_pg_returns_sparse_json_values() {
             )
             .await
             .unwrap();
-        assert_eq!(selected_fields[0].fields["fields"], state["fields"]);
+        let mut whole_fields = state["fields"].clone();
+        whole_fields["last_event_by"] = serde_json::json!("forged");
+        assert_eq!(selected_fields[0].fields["fields"], whole_fields);
         assert!(selected_fields[0].state.is_none());
 
         // Kernel metadata comes from the state alone: an app field of the

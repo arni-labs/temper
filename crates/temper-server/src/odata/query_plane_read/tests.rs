@@ -508,7 +508,8 @@ async fn turso_native_pages_order_and_count_inside_query_plane() {
         QueryPlaneReadStrategy::NativePagePushdown
     );
     assert!(result.telemetry.pushdown_sparse_page);
-    assert!(!result.telemetry.catalog_select_projection);
+    // A sorted `$select` projects in the catalog read too.
+    assert!(result.telemetry.catalog_select_projection);
     assert!(result.telemetry.select_requested);
 
     let _ = std::fs::remove_file(db_path);
