@@ -229,9 +229,10 @@ impl JointModel {
         // Taken or refused, and nothing else, unless another transition
         // might be the one taken, the model chose a value it was not sent, or
         // a count behind its family's newest moves up by an unknown amount.
-        // With one transition, the parts of its guard that read only related
-        // records were read on the dispatch path, which let it through.
-        let guard = if self.transitions_for(dispatch).nth(1).is_none() {
+        // With one transition whose related records are read by the model,
+        // the dispatch path let those parts of its guard through. A guard
+        // reading only types outside scope skips Read, so it stays unknown.
+        let guard = if self.reads_related(t) && self.transitions_for(dispatch).nth(1).is_none() {
             self.actor_holds(&dispatch.to, t, state)
         } else {
             eval(&t.guard, &self.env(&dispatch.to, state)) == Truth::True

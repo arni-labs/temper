@@ -87,13 +87,16 @@ permit(principal, action == Action::"Finish", resource is Child) when {
 "#;
 
 fn check(way: &[(&str, &str)]) -> JointInvariantResult {
-    let sources = [parent(way), CHILD.to_string()];
+    check_under(&[parent(way), CHILD.to_string()], FINISH_WHEN_FINE)
+}
+
+fn check_under(sources: &[String], policies: &str) -> JointInvariantResult {
     let automatons: Vec<Automaton> = sources
         .iter()
         .map(|source| parse_automaton(source).expect("fixture parses"))
         .collect();
     let refs: Vec<&Automaton> = automatons.iter().collect();
-    let analysis = SendAnalysis::new(FINISH_WHEN_FINE).expect("fixture policies parse");
+    let analysis = SendAnalysis::new(policies).expect("fixture policies parse");
     let (room, progress) = (Bytes::new(1 << 30), Progress::default());
     let bound = Bound {
         room: &room,
@@ -157,4 +160,38 @@ fn a_break_reached_first_by_an_unsure_move_is_broken_by_the_sure_way() {
             .is_some_and(|a| a.contains("Parent.Drop"))),
         "{result}"
     );
+}
+
+#[test]
+fn a_reaction_guard_outside_the_proof_does_not_make_a_break_sure() {
+    // The invariant scopes the proof to Parent and Child. Gate is declared
+    // and permanently closed, but outside that scope, so no Read runs for
+    // Finish. Its arrival must stay undecided, rather than assume Gate was
+    // read and allowed it. The runtime can never reach the reported break.
+    let child = CHILD
+        .replace(
+            "to = \"Done\"",
+            "to = \"Done\"\nguard = \"Gate[Id].status == 'Open'\"",
+        )
+        .replace(
+            "Parent[Id].status != 'Gone' || status == 'Done'",
+            "status != 'Done' || Parent[Id].status != 'Closed'",
+        );
+    let gate = r#"
+[automaton]
+name = "Gate"
+states = ["Closed"]
+initial = "Closed"
+"#;
+    let policies = r#"
+permit(principal, action, resource is Parent);
+permit(principal, action == Action::"Finish", resource is Child) when {
+    context.via == "reaction"
+};
+"#;
+    let result = check_under(&[parent(&[]), child, gate.to_string()], policies);
+    let JointOutcome::Incomplete { reason } = &result.outcome else {
+        panic!("expected not checked, got {result}");
+    };
+    assert!(reason.contains("Child.Finish arrives"), "{result}");
 }
