@@ -55,19 +55,8 @@ pub struct BlobObjectStream {
 }
 
 impl BlobObjectStream {
-    /// Wrap bytes already in memory as a bounded stream.
-    ///
-    /// Used by the legacy DB blob fallback, whose store returns whole objects
-    /// rather than a stream. Keeping the same `BlobObjectStream` shape means
-    /// callers cannot tell which store answered, which is the point: the
-    /// streaming and non-streaming reads must agree about what exists.
-    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
-        let content_length = bytes.len() as u64;
-        let source: BlobByteStream = Box::pin(async_stream::try_stream! {
-            if !bytes.is_empty() {
-                yield Bytes::from(bytes);
-            }
-        });
+    /// Wrap a source with the same length and time checks as object storage.
+    pub(crate) fn from_stream(content_length: u64, source: BlobByteStream) -> Self {
         Self {
             content_length,
             stream: enforce_stream_bounds(source, content_length),

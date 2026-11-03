@@ -18,7 +18,7 @@ use temper_authz::SecurityContext;
 use temper_runtime::tenant::TenantId;
 
 use super::authz::{READ_ACTION, authorize_read};
-use super::read::load_existing_entity_descriptor_body;
+use super::read::{load_existing_entity_descriptor_body, load_pg_entity_descriptor_body};
 use crate::blob_store::BlobStreamRead;
 use crate::blobs::{
     BlobHydrationBudget, field_overflow_descriptor, hydrate_blob_refs_for_tenant_with_budget,
@@ -58,9 +58,13 @@ pub(super) async fn handle_property_read(
     property: &str,
 ) -> Response {
     // Authorization precedes any blob-store read, as for a whole record.
-    let body = match load_existing_entity_descriptor_body(state, tenant, entity_type, set_name, key)
-        .await
+    let loaded = if state.is_pg_actor_backed(tenant, entity_type) && state.pg_actor_system.is_some()
     {
+        load_pg_entity_descriptor_body(state, tenant, entity_type, set_name, key).await
+    } else {
+        load_existing_entity_descriptor_body(state, tenant, entity_type, set_name, key).await
+    };
+    let body = match loaded {
         Ok(body) => body,
         Err(response) => return response,
     };

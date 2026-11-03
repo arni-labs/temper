@@ -62,6 +62,7 @@ const LARGE_ITEMS_BYTES: usize = 3 * 512 * 1024;
 
 struct Fixture {
     state: ServerState,
+    store: TursoEventStore,
     _temp: tempfile::TempDir,
 }
 
@@ -99,8 +100,12 @@ async fn fixture() -> Fixture {
         .reload_tenant_policies("default", PERMIT_ALL)
         .expect("fixture policy should parse");
     state.data_dir = temp.path().join("data");
-    state.set_storage_stack(StorageStack::from_turso(store));
-    Fixture { state, _temp: temp }
+    state.set_storage_stack(StorageStack::from_turso(store.clone()));
+    Fixture {
+        state,
+        store,
+        _temp: temp,
+    }
 }
 
 async fn send(state: &ServerState, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
@@ -236,4 +241,127 @@ async fn a_reader_refused_the_record_is_refused_its_fields() {
         assert_eq!(status, StatusCode::FORBIDDEN, "{field}: {}", short(&body));
         assert!(body.get("value").is_none(), "{field}: {}", short(&body));
     }
+}
+
+async fn property_response(state: &ServerState, uri: &str) -> axum::response::Response {
+    let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    request
+        .extensions_mut()
+        .insert(temper_authz::AuthenticatedRequestContext::new(
+            TenantId::default(),
+            temper_authz::SecurityContext::from_resolved_identity(
+                "property-read",
+                "test-agent",
+                None,
+            ),
+        ));
+    build_router(state.clone()).oneshot(request).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_legacy_field_streams_in_bounded_chunks_with_its_content_length() {
+    use futures_util::StreamExt as _;
+    let fixture = fixture().await;
+    let state = &fixture.state;
+    let items = large_items();
+    filled_batch(state, "legacy", &items).await;
+    let (status, record) = get(state, "/tdata/Batches('legacy')").await;
+    assert_eq!(status, StatusCode::OK);
+    let key = record["fields"]["Items"]["__temper_blob_ref"]
+        .as_str()
+        .unwrap();
+    // Today's overflow writes go only to object storage. Seed the legacy row
+    // explicitly, then remove the object, as on pre-migration deployments.
+    fixture
+        .store
+        .put_blob(key, &serde_json::to_vec(&items).unwrap())
+        .await
+        .unwrap();
+    // Only the old database copy remains, as on pre-migration deployments.
+    tokio::fs::remove_dir_all(state.data_dir.join("blobs"))
+        .await
+        .unwrap();
+    let response = property_response(state, "/tdata/Batches('legacy')/Items").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let length = response.headers()["Content-Length"]
+        .to_str()
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    let mut stream = response.into_body().into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.unwrap();
+        assert!(
+            chunk.len() <= 64 * 1024,
+            "legacy read buffered {} bytes",
+            chunk.len()
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    assert_eq!(length, bytes.len());
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(body["value"] == items);
+}
+
+#[tokio::test]
+async fn postgres_actor_fields_share_the_whole_record_loader_and_authorization() {
+    use std::sync::Arc;
+    use temper_actor_runtime::{ActorSystem as PgActors, SchedulerConfig, SpecDrivenActor};
+    let (pool, _container) = temper_actor_runtime::test_utils::setup_test_pg().await;
+    let actors = Arc::new(PgActors::new(pool, SchedulerConfig::default()));
+    actors
+        .register(Arc::new(SpecDrivenActor::from_ioa(BATCH_IOA).unwrap()))
+        .await
+        .unwrap();
+    let mut registry = SpecRegistry::new();
+    registry.register_tenant(
+        "default",
+        parse_csdl(CSDL).unwrap(),
+        CSDL.into(),
+        &[("Batch", BATCH_IOA)],
+    );
+    registry.set_verification_status(
+        &TenantId::default(),
+        "Batch",
+        VerificationStatus::Completed(EntityVerificationResult {
+            all_passed: true,
+            levels: vec![],
+            verified_at: "2026-11-03T00:00:00Z".into(),
+        }),
+    );
+    let mut state = ServerState::from_pg_registry(actors, registry);
+    state.actor_backed_types.insert("Batch".into());
+    state
+        .authz
+        .reload_tenant_policies("default", PERMIT_ALL)
+        .unwrap();
+    let id = temper_runtime::scheduler::sim_uuid().to_string();
+    let (status, body) = send(
+        &state,
+        Method::POST,
+        "/tdata/Batches",
+        json!({"Id": id, "Label": "postgres"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let path = format!("/tdata/Batches('{id}')");
+    let (status, whole) = get(&state, &path).await;
+    assert_eq!(status, StatusCode::OK, "{whole}");
+    let (status, property) = get(&state, &format!("{path}/Label")).await;
+    assert_eq!(status, StatusCode::OK, "{property}");
+    assert_eq!(property["value"], "postgres");
+    assert_eq!(property["value"], whole["fields"]["Label"]);
+    state
+        .authz
+        .reload_tenant_policies(
+            "default",
+            &format!("{PERMIT_ALL}\nforbid(principal, action == Action::\"read\", resource);"),
+        )
+        .unwrap();
+    let (status, body) = get(&state, &format!("{path}/Label")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.get("value").is_none());
+    let (status, _) = get(&state, "/tdata/Batches('absent')/Label").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

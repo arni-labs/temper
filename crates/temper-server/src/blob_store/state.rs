@@ -218,11 +218,8 @@ impl ServerState {
 
     /// Open a tenant-scoped object-store blob as a bounded stream.
     ///
-    /// Objects within the caller's ceiling fall back to the legacy database
-    /// store when the object store does not have them, so this agrees with
-    /// [`Self::get_blob_with_legacy_fallback`] about what exists. Anything above
-    /// the ceiling is still refused there rather than buffered, which is why
-    /// the fallback asks the store to bound the read instead of reading first.
+    /// The legacy database fallback reads fixed-size chunks too, so the
+    /// caller's ceiling is a content boundary, never an allocation budget.
     pub async fn stream_blob_object(
         &self,
         tenant: &TenantId,
@@ -265,40 +262,55 @@ impl ServerState {
         let Some(store) = self.metadata_store_for_tenant(tenant.as_str()).await else {
             return Ok(super::BlobStreamRead::Missing);
         };
-        // Bound before materializing. The legacy interface is buffered, which is
-        // why streaming reads skipped it originally; asking the store to refuse
-        // anything over the caller's ceiling keeps that intent — the fallback
-        // never pulls a large object into memory, it just stops pretending
-        // small ones do not exist.
-        let ceiling = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-        // Hold the same blob I/O permit the object-store path takes. The read is
-        // bounded per caller but still buffered, so without the permit a burst
-        // of legacy reads is unbounded in aggregate — the ceiling limits one
-        // read, the semaphore limits how many happen at once.
-        let _permit = tokio::time::timeout(
+        const CHUNK_BYTES: usize = 64 * 1024;
+        // A permit lives with the stream; dropping a response also drops the
+        // permit. Each database operation has a deadline and reads one chunk.
+        let permit = tokio::time::timeout(
             super::BLOB_IO_QUEUE_TIMEOUT,
             super::blob_io_semaphore().acquire_owned(),
         )
         .await
         .map_err(|_| format!("legacy DB blob read for '{key}' timed out queueing for blob I/O"))?
         .map_err(|error| format!("legacy DB blob I/O semaphore closed for '{key}': {error}"))?;
-        // Bounded in time as well as size, like every other buffered blob
-        // operation. This is an external database read holding a blob I/O
-        // permit: without a deadline a hung store would keep the permit and
-        // starve the readers queued behind it.
-        let Some(bytes) = tokio::time::timeout(
+        // Open with a zero-byte read: this obtains the actual length without
+        // fetching content, including for a caller whose ceiling is too small.
+        let Some((length, _)) = tokio::time::timeout(
             super::BLOB_BUFFERED_OPERATION_TIMEOUT,
-            store.get_blob_if_size_at_most(key, ceiling),
+            store.get_blob_chunk(key, 0, 0),
         )
         .await
-        .map_err(|_| format!("legacy DB blob read for '{key}' timed out"))?
-        .map_err(|error| format!("legacy DB blob read failed for '{key}': {error}"))?
+        .map_err(|_| format!("legacy DB blob read for '{key}' timed out"))??
         else {
             return Ok(super::BlobStreamRead::Missing);
         };
-        tracing::debug!(%key, bytes = bytes.len(), "served blob from the legacy DB store");
+        if length > max_bytes {
+            return Ok(super::BlobStreamRead::TooLarge {
+                actual_bytes: Some(length),
+            });
+        }
+        let key = key.to_owned();
+        let source = Box::pin(async_stream::try_stream! {
+            let _permit = permit;
+            let mut offset = 0;
+            while offset < length {
+                let count = (length - offset).min(CHUNK_BYTES as u64) as usize;
+                let chunk = tokio::time::timeout(
+                    super::BLOB_BUFFERED_OPERATION_TIMEOUT,
+                    store.get_blob_chunk(&key, offset, count),
+                ).await.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "legacy blob chunk timed out"))?
+                    .map_err(std::io::Error::other)?;
+                let Some((actual_length, bytes)) = chunk else {
+                    Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "legacy blob disappeared during read"))?
+                };
+                if actual_length != length || bytes.len() != count {
+                    Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "legacy blob changed length during read"))?;
+                }
+                offset += bytes.len() as u64;
+                yield bytes::Bytes::from(bytes);
+            }
+        });
         Ok(super::BlobStreamRead::Found(
-            super::BlobObjectStream::from_bytes(bytes),
+            super::BlobObjectStream::from_stream(length, source),
         ))
     }
 

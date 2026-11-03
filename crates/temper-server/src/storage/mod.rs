@@ -771,6 +771,15 @@ pub trait BlobStore: Send + Sync {
 
     async fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>, String>;
 
+    /// Read at most `max_bytes` at a zero-based offset, returning the actual
+    /// total length and this chunk without materializing the entire value.
+    async fn get_blob_chunk(
+        &self,
+        key: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Option<(u64, Vec<u8>)>, String>;
+
     /// Read a legacy database blob only when its stored size is within the
     /// caller's allocation budget. `None` means missing or over budget.
     async fn get_blob_if_size_at_most(
@@ -1630,6 +1639,15 @@ impl BlobStore for PostgresEventStore {
         self.get_blob(key).await
     }
 
+    async fn get_blob_chunk(
+        &self,
+        key: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Option<(u64, Vec<u8>)>, String> {
+        self.get_blob_chunk(key, offset, max_bytes).await
+    }
+
     async fn get_blob_if_size_at_most(
         &self,
         key: &str,
@@ -1660,6 +1678,15 @@ impl BlobStore for TursoEventStore {
 
     async fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
         self.get_blob(key).await
+    }
+
+    async fn get_blob_chunk(
+        &self,
+        key: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Option<(u64, Vec<u8>)>, String> {
+        self.get_blob_chunk(key, offset, max_bytes).await
     }
 
     async fn get_blob_if_size_at_most(
