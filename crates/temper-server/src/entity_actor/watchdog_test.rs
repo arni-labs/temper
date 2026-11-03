@@ -6,9 +6,13 @@ use std::io::Write;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use crate::registry::SpecRegistry;
+use crate::{ServerState, StorageStack};
 use temper_jit::table::TransitionTable;
 use temper_runtime::ActorSystem;
 use temper_runtime::scheduler::install_deterministic_context;
+use temper_runtime::tenant::TenantId;
+use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
 
 use crate::entity_actor::{EntityActor, EntityMsg, EntityResponse};
@@ -57,7 +61,9 @@ fn add_item() -> EntityMsg {
 
 #[tokio::test(start_paused = true)]
 async fn dst_a_hung_append_is_reported_until_it_ends_and_is_written_once() {
-    for seed in 0..8 {
+    for (seed, deadline) in
+        (0..8).flat_map(|seed| [5, 45].map(move |secs| (seed, Duration::from_secs(secs))))
+    {
         let (_guard, _clock, _ids) = install_deterministic_context(seed);
         let lines = Lines::default();
         let writer = lines.clone();
@@ -68,15 +74,11 @@ async fn dst_a_hung_append_is_reported_until_it_ends_and_is_written_once() {
         let _logs = tracing::subscriber::set_default(subscriber);
 
         let store = Arc::new(SimEventStore::no_faults(seed));
-        let actor = EntityActor::with_persistence(
-            "Order",
-            "hung",
-            Arc::new(RwLock::new(TransitionTable::from_ioa_source(ORDER_IOA))),
-            serde_json::json!({}),
-            BoxedEventStore::from_arc(store.clone()),
-            BackendLabel::Sim,
-        );
-        let actor = ActorSystem::new("watchdog").spawn(actor, "hung");
+        let mut server = server((*store).clone());
+        server.action_dispatch_timeout = deadline;
+        let actor = server
+            .get_or_spawn_tenant_actor(&TenantId::default(), "Order", "hung")
+            .unwrap();
         let _: EntityResponse = actor
             .ask(EntityMsg::GetState, Duration::from_secs(5))
             .await
@@ -92,9 +94,16 @@ async fn dst_a_hung_append_is_reported_until_it_ends_and_is_written_once() {
         });
 
         // Quiet until the ask deadline; then once, and again a minute later.
-        tokio::time::sleep(Duration::from_secs(29)).await;
+        tokio::time::sleep(deadline - Duration::from_secs(1)).await;
         assert_eq!(lines.with(&["handler still running"]), 0, "seed {seed}");
-        tokio::time::sleep(Duration::from_secs(62)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            lines.with(&["handler still running"]),
+            1,
+            "seed {seed}, deadline {deadline:?}: {}",
+            lines.text()
+        );
+        tokio::time::sleep(Duration::from_secs(60)).await;
         let reports = [
             "handler still running",
             "entity_type=Order",
@@ -153,3 +162,20 @@ async fn a_quick_message_is_never_reported() {
     assert_eq!(lines.with(&["handler still running"]), 0);
     assert_eq!(lines.with(&["handler finished"]), 0);
 }
+
+fn server(store: SimEventStore) -> ServerState {
+    let csdl = include_str!("../../../../test-fixtures/specs/model.csdl.xml");
+    let mut registry = SpecRegistry::new();
+    registry.register_tenant(
+        "default",
+        parse_csdl(csdl).unwrap(),
+        csdl.to_owned(),
+        &[("Order", ORDER_IOA)],
+    );
+    let mut state = ServerState::from_registry(ActorSystem::new("watchdog"), registry);
+    state.set_storage_stack(StorageStack::from_sim(store, None));
+    state
+}
+
+#[path = "watchdog_faults_test.rs"]
+mod faults;

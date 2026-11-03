@@ -15,9 +15,6 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
-/// The first report: the dispatch layer's ask deadline
-/// (`state/dispatch/retry.rs`), when callers already see `ask timeout`.
-const FIRST_REPORT: Duration = Duration::from_secs(30);
 /// How often a message still running is reported again.
 const REPORT_EVERY: Duration = Duration::from_secs(60);
 
@@ -110,22 +107,26 @@ impl Drop for Back<'_> {
 
 /// The record a watch reports on.
 pub(super) struct Record<'a> {
+    /// The tenant this record belongs to.
     pub tenant: &'a str,
+    /// The record's entity type.
     pub entity_type: &'a str,
+    /// The record's entity id.
     pub entity_id: &'a str,
 }
 
 /// Run `work` (one message, or the record's start) and report while it runs
-/// past [`FIRST_REPORT`].
+/// past `ask_deadline`, the dispatcher's configured per-attempt timeout.
 pub(super) async fn watched<F: Future>(
     record: Record<'_>,
     message: &str,
+    ask_deadline: Duration,
     now: &Now,
     work: F,
 ) -> F::Output {
     let started = tokio::time::Instant::now(); // determinism-ok: production watchdog, reports only
     let mut work = std::pin::pin!(work);
-    let mut next = FIRST_REPORT;
+    let mut next = ask_deadline;
     let mut reported = false;
     loop {
         tokio::select! {

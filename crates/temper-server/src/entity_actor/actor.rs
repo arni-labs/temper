@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use temper_jit::table::{Effect, Refusal, TransitionTable};
 use temper_observe::wide_event;
@@ -271,6 +271,8 @@ pub struct EntityActor {
     rebuild_from_journal: AtomicBool,
     /// What the current message is awaiting, for the watchdog's reports.
     pub(super) now: super::watchdog::Now,
+    /// Per-attempt ask deadline: when startup and message reports begin.
+    action_dispatch_timeout: Duration,
     /// Says which query-plane and timer rows an event writes, for a store
     /// that keeps them in the journal's transaction.
     entity_rows: Option<EntityRowsHook>,
@@ -324,7 +326,7 @@ impl EntityActor {
     /// Snapshot frequency in events.
     ///
     /// Controlled by `TEMPER_SNAPSHOT_INTERVAL` (default 100).
-    fn snapshot_interval() -> u64 {
+    pub(super) fn snapshot_interval() -> u64 {
         static SNAPSHOT_INTERVAL: OnceLock<u64> = OnceLock::new();
         *SNAPSHOT_INTERVAL.get_or_init(|| {
             std::env::var("TEMPER_SNAPSHOT_INTERVAL") // determinism-ok: read once at startup
@@ -422,6 +424,7 @@ impl EntityActor {
             on_rehydrated: None,
             rebuild_from_journal: AtomicBool::new(false),
             now: super::watchdog::Now::default(),
+            action_dispatch_timeout: crate::state::DEFAULT_ACTION_DISPATCH_TIMEOUT,
             entity_rows: None,
             created_by: None,
         }
@@ -452,6 +455,7 @@ impl EntityActor {
             on_rehydrated: None,
             rebuild_from_journal: AtomicBool::new(false),
             now: super::watchdog::Now::default(),
+            action_dispatch_timeout: crate::state::DEFAULT_ACTION_DISPATCH_TIMEOUT,
             entity_rows: None,
             created_by: None,
         }
@@ -460,6 +464,12 @@ impl EntityActor {
     /// Set the tenant for this actor (must be called before spawning).
     pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
         self.tenant = tenant.into();
+        self
+    }
+
+    /// Use the dispatcher's per-attempt ask deadline for startup and message reports.
+    pub(crate) fn with_action_dispatch_timeout(mut self, timeout: Duration) -> Self {
+        self.action_dispatch_timeout = timeout;
         self
     }
 
@@ -1511,6 +1521,7 @@ impl Actor for EntityActor {
         super::watchdog::watched(
             self.watched_record(),
             "start",
+            self.action_dispatch_timeout,
             &self.now,
             Box::pin(self.start()),
         )
@@ -1527,6 +1538,7 @@ impl Actor for EntityActor {
         let handled = super::watchdog::watched(
             self.watched_record(),
             &message,
+            self.action_dispatch_timeout,
             &self.now,
             Box::pin(self.handle_message(msg, state, ctx)),
         )
