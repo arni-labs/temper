@@ -105,6 +105,12 @@ pub struct SimulationResult {
     pub seed: u64,
     /// Per-actor final states.
     pub actor_final_states: Vec<(String, TemperModelState)>,
+    /// The `reaches` rules a run had not met when its action or tick budget
+    /// ran out (or a fault crashed it) while its record could still move:
+    /// one entry per such run and rule. Not reached within the budget,
+    /// which proves nothing either way, so it is not a violation.
+    #[serde(default)]
+    pub unreached_in_budget: Vec<String>,
 }
 
 /// A liveness violation found during or after simulation.
@@ -285,7 +291,18 @@ fn run_simulation_impl(model: &TemperModel, config: &SimConfig) -> SimulationRes
     }
 
     // Post-simulation liveness checks
-    let liveness_violations = check_liveness_post_simulation(model, &actor_states, &actor_places);
+    // A run that ends while its record can still move was cut off by its
+    // budget or a crash, not stuck.
+    let cut_off: Vec<bool> = actor_states
+        .iter()
+        .map(|(actor_id, state)| {
+            let mut actions = Vec::new();
+            model.actions(state, &mut actions);
+            !actions.is_empty() || sched.actor_state(actor_id) == Some(&SimActorState::Crashed)
+        })
+        .collect();
+    let (liveness_violations, unreached_in_budget) =
+        check_liveness_post_simulation(model, &actor_states, &actor_places, &cut_off);
 
     SimulationResult {
         all_invariants_held: violations.is_empty(),
@@ -298,6 +315,7 @@ fn run_simulation_impl(model: &TemperModel, config: &SimConfig) -> SimulationRes
         liveness_violations,
         seed: config.seed,
         actor_final_states: actor_states,
+        unreached_in_budget,
     }
 }
 
@@ -306,20 +324,26 @@ fn run_simulation_impl(model: &TemperModel, config: &SimConfig) -> SimulationRes
 /// - **NoDeadlock**: Each actor in a "from" state must have at least one valid action.
 /// - **ReachesState**: Each actor must have been in one of the target states
 ///   at some point in its run, wherever it ended. (Weaker than the model
-///   check's whole walk, but catches stuck actors.)
+///   check's whole walk, but catches stuck actors.) An actor whose run was
+///   cut off while it could still move proves nothing: its rule is returned
+///   as not reached within the budget, not as a violation.
 fn check_liveness_post_simulation(
     model: &TemperModel,
     actor_states: &[(String, TemperModelState)],
     actor_places: &[BTreeSet<String>],
-) -> Vec<LivenessViolation> {
+    cut_off: &[bool],
+) -> (Vec<LivenessViolation>, Vec<String>) {
     let mut violations = Vec::new();
+    let mut unreached = Vec::new();
     // Past a budget's deadline the model offers no actions, so every actor
     // would look deadlocked or stuck: the run proves nothing about liveness.
     if model.out_of_time() {
-        return violations;
+        return (violations, unreached);
     }
 
-    for ((actor_id, final_state), places) in actor_states.iter().zip(actor_places) {
+    for (((actor_id, final_state), places), &cut_off) in
+        actor_states.iter().zip(actor_places).zip(cut_off)
+    {
         for live in &model.liveness {
             match &live.kind {
                 LivenessKind::NoDeadlock { from } => {
@@ -350,7 +374,10 @@ fn check_liveness_post_simulation(
                     // been in a target state by the end of simulation: one it
                     // passed through and left still met the rule.
                     let started_from = from.is_empty() || from.contains(&model.initial_status);
-                    if started_from && !places.iter().any(|place| targets.contains(place)) {
+                    let met = places.iter().any(|place| targets.contains(place));
+                    if started_from && !met && cut_off {
+                        unreached.push(live.name.clone());
+                    } else if started_from && !met {
                         violations.push(LivenessViolation {
                             actor_id: actor_id.clone(),
                             property: live.name.clone(),
@@ -366,7 +393,7 @@ fn check_liveness_post_simulation(
         }
     }
 
-    violations
+    (violations, unreached)
 }
 
 /// Check invariants on a state using the model's resolved invariants.

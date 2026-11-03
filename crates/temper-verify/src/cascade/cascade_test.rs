@@ -14,6 +14,7 @@ fn sim_result(seed: u64, healthy: bool) -> SimulationResult {
         liveness_violations: Vec::new(),
         seed,
         actor_final_states: Vec::new(),
+        unreached_in_budget: Vec::new(),
     }
 }
 

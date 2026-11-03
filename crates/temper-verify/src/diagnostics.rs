@@ -328,6 +328,7 @@ mod tests {
             liveness_violations: Vec::new(),
             seed,
             actor_final_states: Vec::new(),
+            unreached_in_budget: Vec::new(),
         }
     }
 

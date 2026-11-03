@@ -599,6 +599,26 @@ impl VerificationCascade {
             )
         };
 
+        // Runs cut off before a `reaches` target prove nothing either way:
+        // say how many and for which rules, so a pass is read as bounded.
+        let mut unreached: Vec<&str> = results
+            .iter()
+            .flat_map(|r| r.unreached_in_budget.iter().map(String::as_str))
+            .collect();
+        let cut_off = unreached.len();
+        unreached.sort_unstable();
+        unreached.dedup();
+        let summary = if unreached.is_empty() {
+            summary
+        } else {
+            format!(
+                "{summary}; {cut_off} run(s) ran out of their action or tick budget before \
+                 reaching the target of {}: not reached within the budget, which proves \
+                 nothing either way",
+                unreached.join(", "),
+            )
+        };
+
         let diagnostics = if all_passed {
             Vec::new()
         } else {
