@@ -187,3 +187,37 @@ fn the_same_specs_give_the_same_verdict_and_trace() {
     assert!(first.contains("BROKEN"), "{first}");
     assert_eq!(first, second);
 }
+
+/// Deep with its fall sent only by another type's reaction, so the walk
+/// cannot be sure Trap is ever reached, and that other type.
+fn falls_by_a_reaction(deep: &str) -> (String, &'static str) {
+    let fall =
+        format!("[[action]]\nname = 'Fall'\nkind = 'input'\nfrom = ['S{DEPTH}']\nto = 'Trap'\n");
+    assert!(deep.contains(&fall));
+    let only_sent = fall.replace("kind = 'input'", "kind = 'internal'");
+    (
+        deep.replace(&fall, &only_sent),
+        "[automaton]\nname = 'Push'\nstates = ['Idle', 'Sent']\ninitial = 'Idle'\n\
+         \n[[action]]\nname = 'Send'\nkind = 'input'\nfrom = ['Idle']\nto = 'Sent'\n\
+         \n[[action.triggers]]\nname = 'fall'\nkind = 'entity'\ntarget_entity = 'Deep'\ntarget_action = 'Fall'\n\
+         \n[action.triggers.resolve_target]\nkind = 'same_id'\n",
+    )
+}
+
+#[test]
+fn a_stuck_state_past_the_room_only_an_unsure_move_reaches_stays_not_checked() {
+    let deep = deep(
+        DEPTH,
+        FLAGS,
+        "[[liveness]]\nname = 'rule'\neventually = \"status != 'Trap' && READ\"\n",
+    );
+    let (deep, push) = falls_by_a_reaction(&deep);
+    let result = liveness_in(&[&deep, push], SMALL);
+    let LivenessOutcome::Incomplete { reason } = &result.outcome else {
+        panic!("only a reaction from outside reaches Trap, got {result}");
+    };
+    assert!(
+        reason.contains("a way the runtime may never take"),
+        "{reason}"
+    );
+}
