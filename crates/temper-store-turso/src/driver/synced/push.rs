@@ -143,7 +143,7 @@ impl SyncCopy {
                 self.inner.timeouts.store(0, Ordering::Release);
                 if sends {
                     PushOutcome::Confirmed.record();
-                    record_changes_pushed((covered - remote_had).unsigned_abs());
+                    record_changes_pushed(0);
                 }
             }
             Ok(Err(error)) => {
