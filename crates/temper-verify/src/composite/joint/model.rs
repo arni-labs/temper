@@ -18,12 +18,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use temper_authz::{May, SendAnalysis};
 use temper_spec::automaton::Automaton;
-use temper_spec::predicate::{Expr, Name, eval};
+use temper_spec::predicate::{Expr, Name, Truth, eval};
 
 use super::env::{Blind, ID, JointEnv, Records};
 use super::senders::{OUTSIDE, Senders};
 use super::slice::slice;
-use super::state::canonical;
+use super::state::{ReactionStep, canonical};
 use super::{JointOutcome, JointState};
 use crate::model::semantics::{Expansion, rule_for, string_values};
 use crate::model::{ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState};
@@ -32,9 +32,7 @@ pub use drops::DroppedReaction;
 pub(crate) use drops::dropped_reactions;
 use order::{Order, Specs};
 pub(super) use read::Timeout;
-use read::{
-    Kernel, Reaction, Unchecked, named_literals, reactions_into, tracked, unchecked_constraints,
-};
+use read::{Kernel, Reaction, Unchecked, named_literals, tracked, unchecked_constraints};
 pub(super) use step::Move;
 pub(super) use walk::{Explored, Unwalked, unwalked_reason};
 
@@ -127,36 +125,45 @@ pub(super) struct JointModel {
     /// model does not tell them apart.
     sender_matters: BTreeSet<String>,
     /// Each entity's transitions (by index) that nothing in the model sends
-    /// and something in the runtime does, with who.
-    unsent: BTreeMap<String, Vec<(usize, Unsent)>>,
+    /// and a module may answer with: one whose trigger names no
+    /// `on_success`, while its call is open. The kernel takes whatever
+    /// action the module's result names, and the model answers only with
+    /// internal actions.
+    unsent: BTreeMap<String, Vec<usize>>,
+    /// The actions (entity, action) of types in scope that a reaction from
+    /// a type outside it sends ([`Outside`]).
+    outside: BTreeMap<(String, String), Outside>,
 }
 
-/// Who in the runtime sends an action nothing in the model sends.
-#[derive(Debug, Clone)]
-enum Unsent {
-    /// A module whose trigger names no `on_success`, while its call is open:
-    /// the kernel takes whatever action the module's result names, and the
-    /// model answers only with internal actions. Only for an action nothing
-    /// else sends.
-    Answer,
-    /// Reactions from these types, outside the scope.
-    Reactions(BTreeSet<String>),
+/// Who sends an action the walk leaves to a module.
+const ANSWER: &str = "a module whose trigger names no on_success";
+
+/// Reactions from types outside the scope into one action of a type in it.
+///
+/// The model holds no record of their source, so it cannot tell when one
+/// fires. It sends such a reaction as a move from outside: whenever its
+/// target's guard may let it, with any parameters, as a sender Cedar may
+/// answer either way for ([`super::senders::Senders::unknown`]). That only
+/// adds behaviour, so an invariant that holds here holds in the runtime.
+/// Liveness never counts on one (`liveness.rs`).
+#[derive(Debug)]
+struct Outside {
+    /// The types it comes from.
+    from: BTreeSet<String>,
+    /// The steps (entity, action) its chain may already hold when it
+    /// arrives: its sources' moves, and every move that can set one of those
+    /// off through the app's reactions. A reaction it sets off that repeats
+    /// one of them may be stopped by the runtime or not.
+    before: BTreeSet<(String, String)>,
+    /// Whether the record it reaches is one its chain made, as its step
+    /// records it: `None` when no source makes it, the target type when
+    /// every source does, and [`MAYBE_MADE`] otherwise.
+    made: Option<String>,
 }
 
-impl Unsent {
-    fn sender(&self) -> String {
-        match self {
-            Unsent::Answer => "a module whose trigger names no on_success".to_string(),
-            Unsent::Reactions(from) => format!(
-                "a reaction from {}",
-                from.iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" or ")
-            ),
-        }
-    }
-}
+/// A step's `generated_for` when the model cannot tell whether its chain
+/// made its record: a step repeats it only maybe.
+pub(super) const MAYBE_MADE: &str = "?";
 
 impl JointModel {
     /// The model of `owner`'s properties `reads` over `scope`. With `cut`,
@@ -285,7 +292,7 @@ impl JointModel {
             .filter(|r| r.principal.is_none())
             .map(|r| r.from.clone())
             .collect();
-        let into = reactions_into(by_name, scope);
+        let outside = outside_reactions(by_name, scope);
         let open: BTreeSet<&String> = kernel
             .calls_on
             .iter()
@@ -294,8 +301,9 @@ impl JointModel {
             .collect();
         let unsent = models
             .iter()
+            .filter(|(entity, _)| open.contains(entity))
             .filter_map(|(entity, model)| {
-                let ways: Vec<(usize, Unsent)> = model
+                let ways: Vec<usize> = model
                     .transitions
                     .iter()
                     .enumerate()
@@ -305,10 +313,7 @@ impl JointModel {
                                 .iter()
                                 .any(|r| &r.to == entity && r.target_action == t.name)
                     })
-                    .filter_map(|(i, t)| match into.get(&(entity.clone(), t.name.clone())) {
-                        Some(from) => Some((i, Unsent::Reactions(from.clone()))),
-                        None => open.contains(entity).then_some((i, Unsent::Answer)),
-                    })
+                    .map(|(i, _)| i)
                     .collect();
                 (!ways.is_empty()).then(|| (entity.clone(), ways))
             })
@@ -329,6 +334,7 @@ impl JointModel {
             senders,
             sender_matters,
             unsent,
+            outside,
         }
     }
 
@@ -340,19 +346,81 @@ impl JointModel {
                 .calls
                 .iter()
                 .any(|call| &call.to == entity && call.on_success.is_empty());
-            for (index, sender) in ways {
+            for index in ways {
                 let t = &self.models[entity].transitions[*index];
-                if (open || !matches!(sender, Unsent::Answer))
-                    && self.enabled(entity, t, state, Blind::Nothing)
-                {
+                if open && self.enabled(entity, t, state, Blind::Nothing) {
                     unwalked.insert(Unwalked {
                         action: format!("{entity}.{}", t.name),
-                        sender: sender.sender(),
+                        sender: ANSWER.to_string(),
                         from: state.records[entity].status.clone(),
                     });
                 }
             }
         }
+    }
+
+    /// The types outside the scope whose reactions send `entity`'s
+    /// `action`, when any do.
+    pub(super) fn outside_from(&self, entity: &str, action: &str) -> Option<&BTreeSet<String>> {
+        self.outside
+            .get(&(entity.to_string(), action.to_string()))
+            .map(|outside| &outside.from)
+    }
+
+    /// The chain a reaction from outside the scope into `entity`'s `action`
+    /// arrives with: a mark standing for the steps it may already hold
+    /// ([`Outside::before`]), then its own step.
+    pub(super) fn outside_chain(&self, entity: &str, action: &str) -> Vec<ReactionStep> {
+        let made = self
+            .outside
+            .get(&(entity.to_string(), action.to_string()))
+            .and_then(|outside| outside.made.clone());
+        vec![
+            ReactionStep {
+                entity_type: String::new(),
+                action: format!("{entity}.{action}"),
+                generated_for: None,
+            },
+            ReactionStep {
+                entity_type: entity.to_string(),
+                action: action.to_string(),
+                generated_for: made,
+            },
+        ]
+    }
+
+    /// Whether the runtime stops `step` because its chain `chain` already
+    /// holds it: true, false, or unknown when a step from outside the scope
+    /// may hold it, or one of the two may have made its record and the
+    /// other not.
+    pub(super) fn repeats(&self, chain: &[ReactionStep], step: &ReactionStep) -> Truth {
+        let mut maybe = false;
+        for taken in chain {
+            if taken.entity_type.is_empty() {
+                let key = taken
+                    .action
+                    .split_once('.')
+                    .map(|(e, a)| (e.to_string(), a.to_string()));
+                maybe |= key
+                    .and_then(|key| self.outside.get(&key))
+                    .is_some_and(|outside| {
+                        outside
+                            .before
+                            .contains(&(step.entity_type.clone(), step.action.clone()))
+                    });
+                continue;
+            }
+            if taken.entity_type != step.entity_type || taken.action != step.action {
+                continue;
+            }
+            let unsure = |s: &ReactionStep| s.generated_for.as_deref() == Some(MAYBE_MADE);
+            if unsure(taken) || unsure(step) {
+                maybe = true;
+            } else if step.repeats(taken) {
+                return Truth::True;
+            }
+        }
+        if maybe { Truth::Unknown } else { Truth::False }
     }
 
     /// The records as they start, without their ids.
@@ -517,4 +585,93 @@ fn deciding(automaton: &Automaton, reactions: &[Reaction], entity: &str) -> BTre
         });
     }
     fields
+}
+
+/// The reactions from types outside `scope` into actions of types in it
+/// ([`Outside`]), by their target (entity, action).
+fn outside_reactions(
+    by_name: &BTreeMap<&str, &Automaton>,
+    scope: &BTreeSet<String>,
+) -> BTreeMap<(String, String), Outside> {
+    use temper_spec::automaton::{TargetResolver, TriggerKind};
+    // Each move (entity, action) of the app, with the moves its reactions
+    // send, read backwards: what can set off each move.
+    let mut set_off_by: BTreeMap<(String, String), BTreeSet<(String, String)>> = BTreeMap::new();
+    for (entity, automaton) in by_name {
+        for action in &automaton.actions {
+            for trigger in &action.triggers {
+                if let (TriggerKind::Entity, Some(to), Some(target)) = (
+                    &trigger.kind,
+                    &trigger.target_entity,
+                    &trigger.target_action,
+                ) {
+                    set_off_by
+                        .entry((to.clone(), target.clone()))
+                        .or_default()
+                        .insert((entity.to_string(), action.name.clone()));
+                }
+            }
+        }
+    }
+    let mut outside: BTreeMap<(String, String), Outside> = BTreeMap::new();
+    let mut makes: BTreeMap<(String, String), BTreeSet<Option<bool>>> = BTreeMap::new();
+    for (from, automaton) in by_name.iter().filter(|(name, _)| !scope.contains(**name)) {
+        for action in &automaton.actions {
+            for trigger in &action.triggers {
+                let (TriggerKind::Entity, Some(to), Some(target)) = (
+                    &trigger.kind,
+                    &trigger.target_entity,
+                    &trigger.target_action,
+                ) else {
+                    continue;
+                };
+                if !scope.contains(to) {
+                    continue;
+                }
+                let key = (to.clone(), target.clone());
+                let entry = outside.entry(key.clone()).or_insert_with(|| Outside {
+                    from: BTreeSet::new(),
+                    before: BTreeSet::new(),
+                    made: None,
+                });
+                entry.from.insert(from.to_string());
+                // Everything that can come before its source's move, and
+                // that move.
+                let mut queue = vec![(from.to_string(), action.name.clone())];
+                while let Some(step) = queue.pop() {
+                    if let Some(earlier) = set_off_by.get(&step) {
+                        queue.extend(
+                            earlier
+                                .iter()
+                                .filter(|e| !entry.before.contains(*e))
+                                .cloned(),
+                        );
+                    }
+                    entry.before.insert(step);
+                }
+                // As `react` records its step: made when it creates its
+                // target; a same-id step inherits what its chain made.
+                makes
+                    .entry(key)
+                    .or_default()
+                    .insert(match &trigger.resolve_target {
+                        Some(TargetResolver::Create) => Some(true),
+                        Some(TargetResolver::SameId | TargetResolver::CreateIfMissing { .. }) => {
+                            None
+                        }
+                        _ => Some(false),
+                    });
+            }
+        }
+    }
+    for (key, ways) in makes {
+        if let Some(entry) = outside.get_mut(&key) {
+            entry.made = match ways.into_iter().collect::<Vec<_>>().as_slice() {
+                [Some(false)] => None,
+                [Some(true)] => Some(key.0.clone()),
+                _ => Some(MAYBE_MADE.to_string()),
+            };
+        }
+    }
+    outside
 }

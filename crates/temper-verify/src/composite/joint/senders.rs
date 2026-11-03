@@ -228,6 +228,10 @@ impl Senders {
         let Some(may) = &self.may else {
             return May::Yes;
         };
+        // Cedar may answer either way for a sender the model does not know.
+        if by >= self.unknown() {
+            return May::Maybe;
+        }
         may.get(entity)
             .and_then(|actions| actions.get(action))
             .and_then(|answers| answers.get(by as usize))
@@ -347,7 +351,7 @@ impl Senders {
             .map_or_else(
                 || {
                     let invoker = invoker / 2;
-                    if same_id {
+                    if same_id || invoker as usize >= self.detached.len() {
                         invoker
                     } else {
                         self.detached[invoker as usize]
@@ -376,11 +380,22 @@ impl Senders {
         OUTSIDE | (by % 2)
     }
 
+    /// The sender of a reaction from a type outside the model's scope: its
+    /// declared principal, or whoever sent its source's move, either of
+    /// which may be no sender the model knows. Cedar may answer either way
+    /// for it ([`Self::may`]), and a reaction that inherits it does too.
+    pub(super) fn unknown(&self) -> u32 {
+        (self.askers.len() * 2) as u32
+    }
+
     /// Who sender `by` is, in words.
     pub(super) fn name(&self, by: u32) -> String {
         match self.askers.get(by as usize / 2) {
             Some(Asker::Outside) => "an outside caller".to_string(),
             Some(Asker::Service { name, .. }) => format!("service:{name}"),
+            None if by >= self.unknown() => {
+                "the sender of a reaction from outside the scope".to_string()
+            }
             None => format!("sender {by}"),
         }
     }

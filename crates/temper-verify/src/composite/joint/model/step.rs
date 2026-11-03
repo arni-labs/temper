@@ -26,6 +26,10 @@ pub(in crate::composite::joint) enum Move {
     /// dispatch path read them and they allowed it; its actor takes it
     /// later.
     Send(String, TemperModelAction),
+    /// A reaction from a type outside the scope, as the sender it runs as:
+    /// a move from outside the model, whenever its target's guard may let
+    /// it (`Outside` in `model.rs`).
+    Reaction(String, TemperModelAction, u32),
     /// A record's state timer fires its action, with no parameters, as
     /// whoever armed it.
     Timer(String, String),
@@ -46,7 +50,15 @@ impl Move {
     /// Whether the system makes this move (a timer, a module, or the
     /// kernel's dispatches) rather than someone outside or a restart.
     pub(in crate::composite::joint) fn by_system(&self) -> bool {
-        !matches!(self, Move::Take(..) | Move::Send(..) | Move::Lost(..))
+        !matches!(
+            self,
+            Move::Take(..) | Move::Send(..) | Move::Reaction(..) | Move::Lost(..)
+        )
+    }
+
+    /// Whether this is a reaction from a type outside the scope.
+    pub(in crate::composite::joint) fn is_outside_reaction(&self) -> bool {
+        matches!(self, Move::Reaction(..))
     }
 
     /// The entity and action an outside move sends.
@@ -141,6 +153,41 @@ impl JointModel {
                 ) {
                     return (Vec::new(), false);
                 };
+            }
+            Move::Reaction(entity, action, by) => {
+                // Nothing the model holds decides whether it is sent or
+                // what Cedar says of it, so it may also not happen.
+                let from =
+                    self.outside_from(entity, &action.name)
+                        .map_or_else(String::new, |from| {
+                            from.iter()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>()
+                                .join(" or ")
+                        });
+                let text = format!("{entity}.{action} (a reaction from {from})");
+                let chain = self.outside_chain(entity, &action.name);
+                if self.action_reads_related(entity, &action.name) {
+                    let mut next = state.clone();
+                    let mut dispatch = sent(entity, action, *by);
+                    dispatch.chain = chain;
+                    add(&mut next, dispatch);
+                    if !self
+                        .expansion
+                        .push(&mut outcomes, (next, format!("{text} sent"), Unsure))
+                    {
+                        return (Vec::new(), false);
+                    };
+                } else {
+                    for (outcome, then) in self.commit(state.clone(), entity, action, &chain, *by) {
+                        if !self
+                            .expansion
+                            .push(&mut outcomes, (outcome, text.clone(), Unsure.then(then)))
+                        {
+                            return (Vec::new(), false);
+                        };
+                    }
+                }
             }
             Move::Timer(entity, name) => {
                 let armed = state.armed.get(entity).copied().unwrap_or(OUTSIDE);

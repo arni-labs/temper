@@ -24,6 +24,12 @@ impl JointModel {
                 if !self.expansion.take() {
                     return out;
                 }
+                if self.outside_from(entity, &t.name).is_some()
+                    && self.enabled(entity, t, state, Blind::Nothing)
+                    && !self.outside_moves(entity, t, state, &values, &mut out)
+                {
+                    return out;
+                }
                 if !self.sendable(entity, &t.name)
                     || !self.enabled(entity, t, state, Blind::Nothing)
                 {
@@ -79,6 +85,41 @@ impl JointModel {
             }
         }
         out
+    }
+
+    /// The moves a reaction from a type outside the scope into `t` makes
+    /// from `state`: with any parameters, in either chain a sender may be
+    /// in, as a sender the model does not know. False when the expansion's
+    /// room is used up.
+    fn outside_moves(
+        &self,
+        entity: &str,
+        t: &crate::model::ResolvedTransition,
+        state: &JointState,
+        values: &BTreeSet<ModelString>,
+        out: &mut Vec<Move>,
+    ) -> bool {
+        let unknown = self.senders.unknown();
+        let mut senders = vec![unknown];
+        if self.senders.timer(unknown) != unknown {
+            senders.push(self.senders.timer(unknown));
+        }
+        let local = &state.records[entity];
+        for (params, _) in
+            successors_budgeted(&self.models[entity], t, local, values, &self.expansion)
+        {
+            for &by in &senders {
+                let action = TemperModelAction {
+                    name: t.name.clone(),
+                    target_state: t.to_state.clone(),
+                    params: params.clone(),
+                };
+                if !self.keep_move(out, Move::Reaction(entity.to_string(), action, by)) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// The answers a module may give the call `call`: its trigger's

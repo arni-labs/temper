@@ -20,6 +20,8 @@ pub(in crate::composite::joint) struct Made {
     pub(in crate::composite::joint) by_system: bool,
     /// It sends an action outside code is relied on to send.
     pub(in crate::composite::joint) relied: bool,
+    /// It is a reaction from a type outside the scope.
+    pub(in crate::composite::joint) outside: bool,
     /// It always ends in one of the states its edges reach: it leads
     /// somewhere, none of its states is unsure, and none was held back.
     pub(in crate::composite::joint) covered: bool,
@@ -132,7 +134,7 @@ impl Explored<'_> {
 /// Why a walk that never took the moves `unwalked` proves nothing.
 pub(in crate::composite::joint) fn unwalked_reason(unwalked: &[String]) -> String {
     format!(
-        "the walk never takes moves the runtime can make, so it never goes where they lead: {}. Declare an action only a module answers with as internal, or name it in its trigger's on_success; the walk does not send a reaction from a type outside the rule's scope",
+        "the walk never takes moves the runtime can make, so it never goes where they lead: {}. Declare an action only a module answers with as internal, or name it in its trigger's on_success",
         unwalked.join("; ")
     )
 }
@@ -260,6 +262,7 @@ impl JointModel {
                         from: index as u32,
                         by_system: mv.by_system(),
                         relied: self.relies(mv),
+                        outside: mv.is_outside_reaction(),
                         covered: !held
                             && !nexts.is_empty()
                             && nexts.iter().all(|n| n.certainty != Certainty::Unsure),
