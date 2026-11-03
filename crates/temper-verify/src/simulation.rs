@@ -9,6 +9,8 @@
 //! - Any failure is reproducible by replaying the same seed
 //! - Specification invariants are checked after every transition
 
+use std::collections::BTreeSet;
+
 use temper_runtime::scheduler::{DeterministicRng, FaultConfig, SimActorState, SimScheduler};
 
 use stateright::Model;
@@ -180,11 +182,14 @@ fn run_simulation_impl(model: &TemperModel, config: &SimConfig) -> SimulationRes
     // Initialize actors
     let mut actor_states: Vec<(String, TemperModelState)> = Vec::new();
     let mut actor_action_counts: Vec<usize> = Vec::new();
+    // The places each actor has been in, its first among them.
+    let mut actor_places: Vec<BTreeSet<String>> = Vec::new();
 
     for i in 0..config.num_actors {
         let actor_id = format!("entity-{i}");
         sched.register_actor(&actor_id);
         let initial = model.init_states()[0].clone();
+        actor_places.push(BTreeSet::from([initial.status.clone()]));
         actor_states.push((actor_id, initial));
         actor_action_counts.push(0);
     }
@@ -269,6 +274,7 @@ fn run_simulation_impl(model: &TemperModel, config: &SimConfig) -> SimulationRes
                     &mut violations,
                 );
 
+                actor_places[idx].insert(new_state.status.clone());
                 actor_states[idx].1 = new_state;
                 actor_action_counts[idx] += 1;
                 total_transitions += 1;
@@ -279,7 +285,7 @@ fn run_simulation_impl(model: &TemperModel, config: &SimConfig) -> SimulationRes
     }
 
     // Post-simulation liveness checks
-    let liveness_violations = check_liveness_post_simulation(model, &actor_states);
+    let liveness_violations = check_liveness_post_simulation(model, &actor_states, &actor_places);
 
     SimulationResult {
         all_invariants_held: violations.is_empty(),
@@ -298,11 +304,13 @@ fn run_simulation_impl(model: &TemperModel, config: &SimConfig) -> SimulationRes
 /// Post-simulation liveness checks.
 ///
 /// - **NoDeadlock**: Each actor in a "from" state must have at least one valid action.
-/// - **ReachesState**: Each actor must have reached one of the target states by simulation end.
-///   (Weaker than Stateright's exhaustive BFS, but catches stuck actors.)
+/// - **ReachesState**: Each actor must have been in one of the target states
+///   at some point in its run, wherever it ended. (Weaker than the model
+///   check's whole walk, but catches stuck actors.)
 fn check_liveness_post_simulation(
     model: &TemperModel,
     actor_states: &[(String, TemperModelState)],
+    actor_places: &[BTreeSet<String>],
 ) -> Vec<LivenessViolation> {
     let mut violations = Vec::new();
     // Past a budget's deadline the model offers no actions, so every actor
@@ -311,7 +319,7 @@ fn check_liveness_post_simulation(
         return violations;
     }
 
-    for (actor_id, final_state) in actor_states {
+    for ((actor_id, final_state), places) in actor_states.iter().zip(actor_places) {
         for live in &model.liveness {
             match &live.kind {
                 LivenessKind::NoDeadlock { from } => {
@@ -339,14 +347,15 @@ fn check_liveness_post_simulation(
                         continue;
                     }
                     // If the actor started from a "from" state, it should have
-                    // reached a target state by the end of simulation.
+                    // been in a target state by the end of simulation: one it
+                    // passed through and left still met the rule.
                     let started_from = from.is_empty() || from.contains(&model.initial_status);
-                    if started_from && !targets.contains(&final_state.status) {
+                    if started_from && !places.iter().any(|place| targets.contains(place)) {
                         violations.push(LivenessViolation {
                             actor_id: actor_id.clone(),
                             property: live.name.clone(),
                             description: format!(
-                                "actor did not reach target states {:?}, stuck at '{}'",
+                                "actor never reached target states {:?}; its run ended at '{}'",
                                 targets, final_state.status
                             ),
                             final_state: final_state.clone(),
