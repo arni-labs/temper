@@ -25,6 +25,16 @@
 //! apart ([`SendAnalysis::tells_timer_chains`]); otherwise every chain is
 //! taken as a request's, and states that differ only in it are one.
 //!
+//! Someone outside is one principal along all of a chain: its reactions,
+//! module answers and timer fires run as it, with the same security context
+//! (`resolve_trigger_principal` clones it, a timer keeps the arming one).
+//! When some policy tells two outside principals apart on a move such a
+//! chain makes, the model keeps one sender per kind of outside principal
+//! the policies tell apart ([`SendAnalysis::outside_kinds`]): a request is
+//! sent as each kind that may send it, and everything after it is decided
+//! for that kind, so a chain is never let through for one principal and
+//! refused for another. Together the kinds cover every outside principal.
+//!
 //! What each sender may send is read from the policies once. A reaction
 //! whose answer depends on the request is decided again when it arrives,
 //! with what the joint state knows of it: its source's id, and its record's
@@ -41,26 +51,43 @@ use temper_authz::{Asker, Attr, Cause, Hop, May, SendAnalysis};
 use temper_spec::automaton::{Automaton, TargetResolver, TriggerKind};
 
 use super::env::ID;
+use super::model::Classes;
 use super::room::Heap;
 use super::state::JointState;
 use crate::model::ModelString;
+use table::reread;
 
-/// Someone outside the kernel, in a request's chain.
+mod build;
+mod kinds;
+mod table;
+
+/// Someone outside the kernel, of no known kind, in a request's chain.
 pub(super) const OUTSIDE: u32 = 0;
 
 /// The senders a model knows, by number, and what Cedar lets each send.
 ///
 /// A sender's number is its asker's place, doubled, plus one in a timer's
-/// chain.
+/// chain. Someone outside of no known kind is first, then each kind of
+/// outside sender, then the services.
 pub(super) struct Senders {
     askers: Vec<Asker>,
+    /// Each asker in a move's words, by place: a walk names a sender in
+    /// every move's label, and a kind takes far longer to name than a step.
+    names: Vec<String>,
+    /// The senders an outside request is sent as: each kind of outside
+    /// sender, or someone outside of no known kind when the policies tell
+    /// none apart.
+    outside: Vec<u32>,
+    /// A failed partition cannot be walked as an unrestricted sender.
+    pub(super) problem: Option<String>,
     /// Each asker's place with resource-relative IDs forgotten after a
     /// different-ID hop.
     detached: Vec<u32>,
     /// Whether some policy tells a timer's chain from a request's.
     timer_chains: bool,
-    /// Entity, then action: what Cedar lets someone outside request.
-    requests: Option<BTreeMap<String, BTreeMap<String, May>>>,
+    /// Entity, then action, then each outside asker's answer (of no known
+    /// kind first): what Cedar lets them request.
+    requests: Option<BTreeMap<String, BTreeMap<String, Vec<May>>>>,
     /// Entity, then action, then each sender's answer as a reaction's.
     may: Option<BTreeMap<String, BTreeMap<String, Vec<May>>>>,
     /// The policies, to decide again a move whose answer depends on the
@@ -75,6 +102,10 @@ pub(super) struct Senders {
     /// request ([`SendAnalysis::applicable`]): all a walk reads of `policies`
     /// when it decides one again.
     reread: BTreeSet<String>,
+    /// The literals each type's id and tracked fields can meet, by (type,
+    /// field): a value the model made up in one may be any literal it never
+    /// meets, which the model does not offer it.
+    meets: BTreeMap<(String, String), BTreeSet<String>>,
 }
 
 /// What a walk reads of its senders, which a model's digest
@@ -85,11 +116,13 @@ impl fmt::Debug for Senders {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Senders")
             .field("askers", &self.askers)
+            .field("outside", &self.outside)
             .field("detached", &self.detached)
             .field("timer_chains", &self.timer_chains)
             .field("requests", &self.requests)
             .field("may", &self.may)
             .field("reread", &self.reread)
+            .field("meets", &self.meets)
             .finish()
     }
 }
@@ -109,86 +142,20 @@ type Question = (
 );
 
 impl Senders {
-    /// The senders of the moves among `entities`, and what `policies` lets
-    /// each send.
-    pub(super) fn new<'a>(
-        by_name: &BTreeMap<&str, &Automaton>,
-        entities: impl IntoIterator<Item = &'a String> + Clone,
-        policies: Option<&SendAnalysis>,
+    /// These senders, knowing which literals each id and tracked field of
+    /// `models` can meet.
+    pub(super) fn meeting(
+        mut self,
+        classes: &Classes,
+        models: &BTreeMap<String, crate::model::TemperModel>,
     ) -> Self {
-        let mut askers = vec![Asker::Outside];
-        for entity in entities.clone() {
-            for action in &by_name[entity.as_str()].actions {
-                for trigger in &action.triggers {
-                    let Some(asker) = declared(trigger, entity, &action.name) else {
-                        continue;
-                    };
-                    if !askers.contains(&asker) {
-                        askers.push(asker);
-                    }
-                }
+        for (entity, model) in models {
+            for field in model.tracked_strings.iter().map(String::as_str).chain([ID]) {
+                let key = (entity.clone(), field.to_string());
+                self.meets.insert(key, classes.literals(entity, field));
             }
         }
-        // ResourceId is relative to the current receiver, not a stable ID.
-        // Precompute a closed set of senders for chains that change receiver ID.
-        let mut detached = Vec::new();
-        for mut asker in askers.clone() {
-            if let Asker::Service { context, .. } = &mut asker {
-                for attr in context.values_mut() {
-                    if *attr == Attr::ResourceId {
-                        *attr = Attr::Unknown;
-                    }
-                }
-            }
-            let at = askers.iter().position(|a| a == &asker).unwrap_or_else(|| {
-                askers.push(asker);
-                askers.len() - 1
-            });
-            detached.push(at as u32);
-        }
-        detached.extend((detached.len()..askers.len()).map(|at| at as u32));
-        let timer_chains = policies.is_some_and(SendAnalysis::tells_timer_chains);
-        let none = BTreeMap::new();
-        let requests = policies.map(|policies| {
-            each(by_name, entities.clone(), &|entity, action| {
-                let request = Cause::request();
-                policies.may(&Asker::Outside, action, entity, &none, Some(&request))
-            })
-        });
-        let may = policies.map(|policies| {
-            each(by_name, entities.clone(), &|entity, action| {
-                let answers = |timed: bool| {
-                    let cause = Cause::reaction(timed, Hop::unknown());
-                    askers
-                        .iter()
-                        .map(|asker| policies.may(asker, action, entity, &none, Some(&cause)))
-                        .collect::<Vec<_>>()
-                };
-                let request_chain = answers(false);
-                let timer_chain = if timer_chains {
-                    answers(true)
-                } else {
-                    request_chain.clone()
-                };
-                request_chain
-                    .into_iter()
-                    .zip(timer_chain)
-                    .flat_map(|(r, t)| [r, t])
-                    .collect()
-            })
-        });
-        let reread = reread(policies, &askers, may.as_ref());
-        Self {
-            askers,
-            detached,
-            timer_chains,
-            requests,
-            may,
-            policies: policies.cloned(),
-            decided: RefCell::default(),
-            decided_bytes: std::cell::Cell::default(),
-            reread,
-        }
+        self
     }
 
     /// Forget what Cedar lets each sender send of `moves` (entity, action),
@@ -209,17 +176,45 @@ impl Senders {
         self.reread = reread(self.policies.as_ref(), &self.askers, self.may.as_ref());
     }
 
-    /// Whether Cedar lets someone outside request `action` on an `entity`
-    /// record.
+    /// Bytes retained by the partition after its temporary work is dropped.
+    pub(super) fn kind_bytes(&self) -> usize {
+        self.askers
+            .iter()
+            .map(|asker| match asker {
+                Asker::OutsideAs(kind) => kind.bytes(),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Bytes retained by sender profiles and their complete answer tables.
+    pub(super) fn construction_bytes(&self) -> usize {
+        self.kind_bytes() + table::bytes(self.requests.as_ref()) + table::bytes(self.may.as_ref())
+    }
+
+    /// Whether Cedar lets someone outside, of no known kind, request
+    /// `action` on an `entity` record.
     pub(super) fn request(&self, entity: &str, action: &str) -> May {
+        self.request_as(OUTSIDE, entity, action)
+    }
+
+    /// Whether Cedar lets the outside sender `by` request `action` on an
+    /// `entity` record.
+    pub(super) fn request_as(&self, by: u32, entity: &str, action: &str) -> May {
         let Some(requests) = &self.requests else {
             return May::Yes;
         };
         requests
             .get(entity)
             .and_then(|actions| actions.get(action))
+            .and_then(|answers| answers.get(by as usize / 2))
             .copied()
             .unwrap_or(May::No)
+    }
+
+    /// The senders an outside request is sent as.
+    pub(super) fn outside(&self) -> &[u32] {
+        &self.outside
     }
 
     /// Whether Cedar lets sender `by` send `action` to an `entity` record as
@@ -263,16 +258,16 @@ impl Senders {
             .records
             .get(rule.from)
             .and_then(|record| record.strings.get(ID));
-        let service_source_id = match asker {
+        let service_source = match asker {
             Asker::Service { context, .. } => match context.get("triggerSourceEntityType") {
-                Some(Attr::Value(Value::String(source))) => state
-                    .records
-                    .get(source)
-                    .and_then(|record| record.strings.get(ID)),
+                Some(Attr::Value(Value::String(source))) => Some(source.as_str()),
                 _ => None,
             },
-            Asker::Outside => None,
+            Asker::Outside | Asker::OutsideAs(_) => None,
         };
+        let service_source_id = service_source
+            .and_then(|source| state.records.get(source))
+            .and_then(|record| record.strings.get(ID));
         let name = rule.to_string();
         let question = (
             by,
@@ -287,7 +282,8 @@ impl Senders {
         if let Some(may) = self.decided.borrow().get(&question) {
             return *may;
         }
-        // A value the model made up is none of the literals it holds.
+        // A value the model made up is none of the literals it holds that
+        // its field can meet; any other it may be.
         let literals: BTreeSet<String> = source_id
             .into_iter()
             .chain(service_source_id)
@@ -297,21 +293,30 @@ impl Senders {
                 _ => None,
             })
             .collect();
+        let none = BTreeSet::new();
+        let symbol = |value: &ModelString, entity: &str, field: &str| {
+            let key = (entity.to_string(), field.to_string());
+            let meets = self.meets.get(&key).unwrap_or(&none);
+            symbol(value, &literals.intersection(meets).cloned().collect())
+        };
         let mut asker = asker.clone();
-        if let (Asker::Service { context, .. }, Some(id)) = (&mut asker, service_source_id) {
-            context.insert("triggerSourceEntityId".to_string(), symbol(id, &literals));
+        if let (Asker::Service { context, .. }, Some(id), Some(source)) =
+            (&mut asker, service_source_id, service_source)
+        {
+            context.insert("triggerSourceEntityId".to_string(), symbol(id, source, ID));
         }
         let text = |value: &str| Attr::Value(Value::String(value.to_string()));
         let hop = Hop {
             rule: text(&name),
             action: text(rule.action),
             entity_type: text(rule.from),
-            entity_id: source_id.map_or(Attr::Unknown, |id| symbol(id, &literals)),
+            entity_id: source_id.map_or(Attr::Unknown, |id| symbol(id, rule.from, ID)),
         };
         let cause = Cause::reaction(by % 2 == 1, hop);
         let strings = target.strings.iter().map(|(field, value)| {
+            let value = symbol(value, entity, field);
             let field = if field == ID { "id" } else { field.as_str() };
-            (field.to_string(), symbol(value, &literals))
+            (field.to_string(), value)
         });
         let booleans = target
             .booleans
@@ -378,53 +383,20 @@ impl Senders {
 
     /// Who sender `by` is, in words.
     pub(super) fn name(&self, by: u32) -> String {
-        match self.askers.get(by as usize / 2) {
-            Some(Asker::Outside) => "an outside caller".to_string(),
-            Some(Asker::Service { name, .. }) => format!("service:{name}"),
+        match self.names.get(by as usize / 2) {
+            Some(name) => name.clone(),
             None => format!("sender {by}"),
         }
     }
 }
 
-/// `answer` for each action of each of `entities`, by entity, then action.
-fn each<'a, T>(
-    by_name: &BTreeMap<&str, &Automaton>,
-    entities: impl IntoIterator<Item = &'a String>,
-    answer: &dyn Fn(&str, &str) -> T,
-) -> BTreeMap<String, BTreeMap<String, T>> {
-    entities
-        .into_iter()
-        .map(|entity| {
-            let actions = by_name[entity.as_str()]
-                .actions
-                .iter()
-                .map(|action| (action.name.clone(), answer(entity, &action.name)))
-                .collect();
-            (entity.clone(), actions)
-        })
-        .collect()
-}
-
-/// The policies that may apply to a move whose answer `may` leaves to the
-/// request: all a walk reads of `policies` when it decides one again.
-fn reread(
-    policies: Option<&SendAnalysis>,
-    askers: &[Asker],
-    may: Option<&BTreeMap<String, BTreeMap<String, Vec<May>>>>,
-) -> BTreeSet<String> {
-    let mut reread = BTreeSet::new();
-    if let (Some(policies), Some(may)) = (policies, may) {
-        for (entity, actions) in may {
-            for (action, answers) in actions {
-                for (by, answer) in answers.iter().enumerate() {
-                    if *answer == May::Maybe {
-                        reread.extend(policies.applicable(&askers[by / 2], action, entity));
-                    }
-                }
-            }
-        }
+/// An asker in a move's words.
+fn asker_name(asker: &Asker) -> String {
+    match asker {
+        Asker::Outside => "an outside caller".to_string(),
+        Asker::OutsideAs(kind) => format!("an outside caller {kind}"),
+        Asker::Service { name, .. } => format!("service:{name}"),
     }
-    reread
 }
 
 /// The sender a reaction declares, as the trigger dispatcher builds it.

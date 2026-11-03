@@ -8,7 +8,7 @@ use temper_authz::May;
 use temper_spec::predicate::{Truth, eval};
 
 use super::super::env::Blind;
-use super::super::senders::{OUTSIDE, Rule};
+use super::super::senders::{OUTSIDE, Rule, Senders};
 use super::super::state::canonical;
 use super::super::{Call, Dispatch, JointState};
 use super::commit::add;
@@ -19,13 +19,14 @@ use crate::model::{ModelString, TemperModelAction};
 /// One move of the walk.
 #[derive(Debug, Clone)]
 pub(in crate::composite::joint) enum Move {
-    /// An action whose guard and constraints read only its own record: its
-    /// actor checks them as it writes, so sending and taking are one step.
-    Take(String, TemperModelAction),
-    /// An action whose guard reads related records, sent from outside: the
-    /// dispatch path read them and they allowed it; its actor takes it
-    /// later.
-    Send(String, TemperModelAction),
+    /// An action whose guard and constraints read only its own record, sent
+    /// from outside by a sender: its actor checks them as it writes, so
+    /// sending and taking are one step.
+    Take(String, TemperModelAction, u32),
+    /// An action whose guard reads related records, sent from outside by a
+    /// sender: the dispatch path read them and they allowed it; its actor
+    /// takes it later.
+    Send(String, TemperModelAction, u32),
     /// A record's state timer fires its action, with no parameters, as
     /// whoever armed it.
     Timer(String, String),
@@ -33,8 +34,9 @@ pub(in crate::composite::joint) enum Move {
     Answer(Call, TemperModelAction),
     /// A module's call fails: its `on_failure` action, if any, is sent.
     Fail(Call),
-    /// A module's call is lost: the server restarts while it runs, and
-    /// nothing answers it.
+    /// A module's call is lost: the server restarts while it runs. Its
+    /// deadline answers it with its `on_failure` action, if it names one,
+    /// as a failed call is answered; otherwise nothing answers it.
     Lost(Call),
     /// The dispatch path reads the related records a reaction needs.
     Read(Dispatch),
@@ -52,7 +54,9 @@ impl Move {
     /// The entity and action an outside move sends.
     pub(in crate::composite::joint) fn outside_action(&self) -> Option<(&str, &str)> {
         match self {
-            Move::Take(entity, action) | Move::Send(entity, action) => Some((entity, &action.name)),
+            Move::Take(entity, action, _) | Move::Send(entity, action, _) => {
+                Some((entity, &action.name))
+            }
             _ => None,
         }
     }
@@ -110,15 +114,15 @@ impl JointModel {
         use Certainty::{OneOf, Sure, Unsure};
         let mut outcomes: Vec<(JointState, String, Certainty)> = Vec::new();
         match mv {
-            Move::Take(entity, action) => {
+            Move::Take(entity, action, by) => {
                 // An outside move the model cannot decide may also be
                 // refused, which leaves the state as it is.
                 let known = self.truth(entity, action, state) == Truth::True
-                    && self.outside_may(entity, &action.name) == May::Yes
+                    && self.outside_may(*by, entity, &action.name) == May::Yes
                     && self.unchecked.meets(entity, &action.name)
                     && self.exact(entity, &action.name, state);
-                let text = format!("{entity}.{action}");
-                for (outcome, then) in self.commit(state.clone(), entity, action, &[], OUTSIDE) {
+                let text = format!("{entity}.{action}{}", self.as_sender(*by));
+                for (outcome, then) in self.commit(state.clone(), entity, action, &[], *by) {
                     let certainty = Certainty::unless(known, Unsure).then(then);
                     if !self
                         .expansion
@@ -128,13 +132,13 @@ impl JointModel {
                     };
                 }
             }
-            Move::Send(entity, action) => {
+            Move::Send(entity, action, by) => {
                 // Its record's guard is read on the dispatch path and in its
                 // actor, which decide it later.
-                let known = self.outside_may(entity, &action.name) == May::Yes;
+                let known = self.outside_may(*by, entity, &action.name) == May::Yes;
                 let mut next = state.clone();
-                add(&mut next, sent(entity, action, OUTSIDE));
-                let text = format!("{entity}.{action} sent");
+                add(&mut next, sent(entity, action, *by));
+                let text = format!("{entity}.{action} sent{}", self.as_sender(*by));
                 if !self.expansion.push(
                     &mut outcomes,
                     (next, text, Certainty::unless(known, Unsure)),
@@ -215,36 +219,27 @@ impl JointModel {
                 let mut next = state.clone();
                 remove_call(&mut next, call);
                 let text = format!("{call} fails");
-                match &call.on_failure {
-                    Some(name) => {
-                        for outcome in self.fire(
-                            next,
-                            &call.to,
-                            name,
-                            &format!("{text}: {}.{name}", call.to),
-                            call.by,
-                        ) {
-                            if !self.expansion.push(&mut outcomes, outcome) {
-                                return (Vec::new(), false);
-                            }
-                        }
-                    }
-                    None => {
-                        if !self.expansion.push(&mut outcomes, (next, text, Sure)) {
-                            return (Vec::new(), false);
-                        }
+                for outcome in self.end_call(next, call, text, call.by) {
+                    if !self.expansion.push(&mut outcomes, outcome) {
+                        return (Vec::new(), false);
                     }
                 }
             }
             Move::Lost(call) => {
+                // The kernel keeps a call's deadline with the move that
+                // started it, so after the restart its `on_failure` answers
+                // it as a failure's does (`request_context::calls`). The
+                // deadline is a scheduled action: it fires as whoever made
+                // that move, starting a timer's chain.
                 let mut next = state.clone();
                 remove_call(&mut next, call);
-                if !self.expansion.push(
-                    &mut outcomes,
-                    (next, format!("{call} is lost: the server restarts"), Sure),
-                ) {
-                    return (Vec::new(), false);
-                };
+                let text = format!("{call} is lost: the server restarts");
+                let by = self.senders.timer(Senders::armer(call.by));
+                for outcome in self.end_call(next, call, text, by) {
+                    if !self.expansion.push(&mut outcomes, outcome) {
+                        return (Vec::new(), false);
+                    }
+                }
             }
             Move::Read(dispatch) => {
                 let mut next = state.clone();
@@ -384,23 +379,6 @@ impl JointModel {
                     .iter()
                     .any(|field| call.asked.get(field) != strings.get(field))
             })
-    }
-
-    /// Whether someone outside may send `action` to an `entity` record.
-    pub(super) fn sendable(&self, entity: &str, action: &str) -> bool {
-        self.outside_may(entity, action) != May::No
-    }
-
-    /// What Cedar lets someone outside send; an action outside code is
-    /// relied on to send is taken as allowed for whoever sends it.
-    fn outside_may(&self, entity: &str, action: &str) -> May {
-        if self
-            .relies_on
-            .contains(&(entity.to_string(), action.to_string()))
-        {
-            return May::Yes;
-        }
-        self.senders.request(entity, action)
     }
 
     /// Whether the guard of the transition `action` names holds on `state`,

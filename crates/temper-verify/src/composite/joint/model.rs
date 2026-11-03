@@ -1,6 +1,7 @@
 //! The joint model: the records in scope, their reactions, the dispatches
 //! and module calls on their way, who may send what, and the walk.
 
+mod classes;
 mod commit;
 mod drops;
 mod held;
@@ -8,6 +9,7 @@ mod initial;
 mod labels;
 mod moves;
 mod order;
+mod outside;
 mod react;
 mod read;
 mod silent;
@@ -28,6 +30,7 @@ use super::{JointOutcome, JointState};
 use crate::model::semantics::{Expansion, rule_for, string_values};
 use crate::model::{ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState};
 
+pub(super) use classes::Classes;
 pub use drops::DroppedReaction;
 pub(crate) use drops::dropped_reactions;
 use order::{Order, Specs};
@@ -67,6 +70,8 @@ pub(super) struct Sending<'s> {
     /// The policies that decide each move as its sender; `None` lets every
     /// sender send everything.
     pub(super) policies: Option<&'s SendAnalysis>,
+    /// Reserve construction bytes before growing sender profiles or answer tables.
+    pub(super) reserve: Option<&'s dyn Fn(usize) -> Result<(), String>>,
     /// Whether the model makes the kernel's own moves: state timers, module
     /// answers and failures, and module calls lost to a restart. Without
     /// them anyone may send any action, which covers what they do.
@@ -83,6 +88,7 @@ impl Sending<'_> {
     pub(super) fn anyone() -> Self {
         Self {
             policies: None,
+            reserve: None,
             kernel_moves: false,
             relies_on: BTreeSet::new(),
         }
@@ -103,7 +109,8 @@ pub(super) struct Walk {
 #[derive(Debug)]
 pub(super) struct JointModel {
     expansion: Expansion,
-    id_literals: BTreeSet<String>,
+    /// The literals each type's id can meet, by type.
+    id_literals: BTreeMap<String, BTreeSet<String>>,
     models: BTreeMap<String, TemperModel>,
     reactions: Vec<Reaction>,
     records: Records,
@@ -220,40 +227,31 @@ impl JointModel {
         sending: Sending<'_>,
         cut: bool,
     ) -> Self {
-        let mut id_literals = BTreeSet::new();
-        for entity in scope {
-            let a = by_name[entity.as_str()];
-            for inv in &a.invariants {
-                read::collect_literals(&inv.assert, &mut id_literals);
-            }
-            for live in &a.liveness {
-                if let Some(goal) = &live.eventually {
-                    read::collect_literals(goal, &mut id_literals);
-                }
-            }
-            for action in &a.actions {
-                read::collect_literals(&action.guard, &mut id_literals);
-                for trigger in &action.triggers {
-                    if let Some(guard) = &trigger.guard {
-                        read::collect_literals(guard, &mut id_literals);
-                    }
-                    for arg in trigger.args.values() {
-                        if let temper_spec::predicate::Arg::Lit(
-                            temper_spec::predicate::Literal::Str(s),
-                        ) = arg
-                        {
-                            id_literals.insert(s.clone());
-                        }
-                    }
-                }
-            }
-        }
+        let classes = Classes::read(by_name, scope);
+        let id_literals = scope
+            .iter()
+            .map(|entity| (entity.clone(), classes.literals(entity, ID)))
+            .collect();
         let kernel = if sending.kernel_moves {
             Kernel::read(by_name, scope)
         } else {
             Kernel::default()
         };
-        let senders = Senders::new(by_name, scope, sending.policies);
+        // A reaction that declares no principal runs as whoever sent its
+        // source action.
+        let inherits = reactions.iter().filter(|r| r.principal.is_none());
+        let sender_matters: BTreeSet<String> = inherits.clone().map(|r| r.from.clone()).collect();
+        let inheriting = inherits
+            .map(|r| (r.to.clone(), r.target_action.clone()))
+            .collect();
+        let senders = Senders::new(
+            by_name,
+            scope,
+            sending.policies,
+            &sender_matters,
+            &inheriting,
+            sending.reserve,
+        );
         let chosen = |entity: &str, action: &str| {
             sending
                 .relies_on
@@ -280,11 +278,6 @@ impl JointModel {
             })
             .collect();
         let unchecked = unchecked_constraints(by_name, &models, &order);
-        let sender_matters = reactions
-            .iter()
-            .filter(|r| r.principal.is_none())
-            .map(|r| r.from.clone())
-            .collect();
         let into = reactions_into(by_name, scope);
         let open: BTreeSet<&String> = kernel
             .calls_on
@@ -313,6 +306,8 @@ impl JointModel {
                 (!ways.is_empty()).then(|| (entity.clone(), ways))
             })
             .collect();
+        // Cedar is told which literals a made-up value may not be.
+        let senders = senders.meeting(&classes, &models);
         Self {
             expansion: Expansion::default(),
             id_literals,
@@ -330,6 +325,16 @@ impl JointModel {
             sender_matters,
             unsent,
         }
+    }
+
+    /// Retain the finished profiles and answer tables, or propagate construction failure.
+    pub(super) fn built(self, memory: &super::room::Construction<'_>) -> Result<Self, String> {
+        if let Some(reason) = &self.senders.problem {
+            memory.set(0)?;
+            return Err(reason.clone());
+        }
+        memory.set(self.senders.construction_bytes())?;
+        Ok(self)
     }
 
     /// Note each move the runtime could make in `state` that the walk never
