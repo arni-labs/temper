@@ -210,6 +210,11 @@ impl JointModel {
                 _ => carried = false,
             }
         }
+        match self.exceeds(&dispatch.to, &t.name, &dispatch.params, target) {
+            Truth::False => return Arrival::Refused,
+            Truth::Unknown => carried = false,
+            Truth::True => {}
+        }
         for param in self.unchecked.nonempty(&dispatch.to, &t.name) {
             match dispatch.params.get(param) {
                 Some(ParamValue::Str(sent)) if sent.is_blank() => return Arrival::Refused,
@@ -259,6 +264,29 @@ impl JointModel {
         parts
             .into_iter()
             .all(|part| related_only(part) || eval(part, &env) == Truth::True)
+    }
+
+    /// Whether `params` exceed each counter of `record` that `entity`'s
+    /// `action` needs a count parameter to exceed, where the model holds the
+    /// counter as a value: unknown when `params` lacks one.
+    pub(super) fn exceeds(
+        &self,
+        entity: &str,
+        action: &str,
+        params: &BTreeMap<String, ParamValue>,
+        record: &TemperModelState,
+    ) -> Truth {
+        let mut truth = Truth::True;
+        for (param, field) in self.unchecked.greater(entity, action) {
+            match (params.get(param), record.counters.get(field)) {
+                (Some(ParamValue::Count(sent)), Some(held)) if sent <= held => {
+                    return Truth::False;
+                }
+                (Some(ParamValue::Count(_)), Some(_)) => {}
+                _ => truth = Truth::Unknown,
+            }
+        }
+        truth
     }
 
     /// The transitions `dispatch` may take on its record.

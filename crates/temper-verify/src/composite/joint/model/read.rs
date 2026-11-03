@@ -311,6 +311,10 @@ pub(super) struct Unchecked {
     /// that the model gives no value. Decided when a dispatch carries the
     /// value, and only then.
     pub(super) nonempty: BTreeMap<(String, String), Vec<String>>,
+    /// Each (entity, action)'s count parameters that must exceed a counter
+    /// the model holds as a value, with that counter. Decided when the move
+    /// carries the count, and only then.
+    pub(super) greater: BTreeMap<(String, String), Vec<(String, String)>>,
 }
 
 impl Unchecked {
@@ -334,6 +338,14 @@ impl Unchecked {
     /// its counters, each with the counter.
     pub(super) fn counts(&self, entity: &str, action: &str) -> &[(String, String)] {
         self.counts
+            .get(&(entity.to_string(), action.to_string()))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// The count parameters of `entity`'s `action` that must exceed one of
+    /// its counters, each with the counter.
+    pub(super) fn greater(&self, entity: &str, action: &str) -> &[(String, String)] {
+        self.greater
             .get(&(entity.to_string(), action.to_string()))
             .map_or(&[], Vec::as_slice)
     }
@@ -380,7 +392,7 @@ pub(super) fn unchecked_constraints(
             let modelled = |param: &str| model.models_string(&action.name, param);
             let decided = |constraint: &ActionConstraint| match constraint {
                 ActionConstraint::ParamGreaterThanField { param, field } => {
-                    order.decides(entity, &action.name, param, field)
+                    order.decides(entity, &action.name, param, field) || counted(field)
                 }
                 ActionConstraint::ParamEqualsField { field, .. } if counted(field) => true,
                 ActionConstraint::ParamNonempty { .. } => true,
@@ -390,6 +402,15 @@ pub(super) fn unchecked_constraints(
                 out.taken.insert(key.clone());
             }
             for constraint in &action.constraints {
+                if let ActionConstraint::ParamGreaterThanField { param, field } = constraint
+                    && counted(field)
+                    && !order.decides(entity, &action.name, param, field)
+                {
+                    out.greater
+                        .entry(key.clone())
+                        .or_default()
+                        .push((param.clone(), field.clone()));
+                }
                 if let ActionConstraint::ParamNonempty { param } = constraint
                     && !modelled(param)
                 {

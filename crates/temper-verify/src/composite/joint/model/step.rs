@@ -116,8 +116,15 @@ impl JointModel {
         match mv {
             Move::Take(entity, action, by) => {
                 // An outside move the model cannot decide may also be
-                // refused, which leaves the state as it is.
-                let known = self.truth(entity, action, state) == Truth::True
+                // refused, which leaves the state as it is; one that does not
+                // exceed a counter it must is refused.
+                let exceeds =
+                    self.exceeds(entity, &action.name, &action.params, &state.records[entity]);
+                if exceeds == Truth::False {
+                    return (Vec::new(), false);
+                }
+                let known = exceeds == Truth::True
+                    && self.truth(entity, action, state) == Truth::True
                     && self.outside_may(*by, entity, &action.name) == May::Yes
                     && self.unchecked.meets(entity, &action.name)
                     && self.exact(entity, &action.name, state);
@@ -188,9 +195,17 @@ impl JointModel {
                     ) {
                         return (Vec::new(), false);
                     };
-                } else if self.stale(call, &action.name, state) {
+                } else if self.stale(call, &action.name, state)
+                    || self.exceeds(
+                        &call.to,
+                        &action.name,
+                        &action.params,
+                        &state.records[&call.to],
+                    ) == Truth::False
+                {
                     // The module answers about the record as the call found
-                    // it, and the record has moved on from that.
+                    // it, and the record has moved on from that, or its count
+                    // does not exceed the counter it must.
                     if !self.expansion.push(
                         &mut outcomes,
                         (next, format!("{text} refused by its record"), Sure),
@@ -202,6 +217,12 @@ impl JointModel {
                     // do not hold, and the call ends there
                     // (`record_generated_callback_refusal`).
                     let known = self.truth(&call.to, action, state) == Truth::True
+                        && self.exceeds(
+                            &call.to,
+                            &action.name,
+                            &action.params,
+                            &state.records[&call.to],
+                        ) == Truth::True
                         && self.unchecked.meets(&call.to, &action.name)
                         && self.exact(&call.to, &action.name, state);
                     if !known {
