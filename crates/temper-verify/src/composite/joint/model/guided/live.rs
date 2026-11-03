@@ -92,6 +92,7 @@ impl Engine<'_, '_> {
                         covered: !held
                             && !nexts.is_empty()
                             && nexts.iter().all(|n| n.certainty != Certainty::Unsure),
+                        held,
                     });
                     let made = (sub.made.len() - 1) as u32;
                     for next in nexts {
