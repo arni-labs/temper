@@ -306,7 +306,7 @@ guard = "empty(file_id) || File[file_id].status in ['Ready']"
 fn test_liveness_reaches_state_through_cross_entity_gate() {
     // A liveness "eventually reaches Published" property can only be proven
     // if the gated edge is explored. With the free-boolean treatment the
-    // ReachesTerminal property holds.
+    // rule holds.
     let src = r#"
 [automaton]
 name = "DesignLanguage"

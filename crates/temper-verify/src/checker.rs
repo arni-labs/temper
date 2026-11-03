@@ -30,7 +30,8 @@ pub struct Counterexample {
     /// safety property it ends at the first state on the path that breaks it.
     pub trace: Vec<(TemperModelState, Option<TemperModelAction>)>,
     /// For a broken `can_reach` rule, the places the trace's last state can
-    /// never reach; empty for any other property.
+    /// never reach; for a broken `reaches` rule, the places the trace never
+    /// gets to; empty for any other property.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub never_reaches: Vec<String>,
 }
@@ -119,12 +120,6 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
     let mut counterexamples = Vec::new();
 
     for (property_name, path) in discoveries {
-        // After the time cut every state still queued had no actions, so it
-        // looks like the end of a walk: an `eventually` property found false
-        // there proves nothing. (A state-limit stop leaves the queue as it was.)
-        if cut_by_time && property_name == crate::model::REACHES_TERMINAL {
-            continue;
-        }
         let mut trace = first_break(&walked, property_name, path.into_vec());
         let violated = match trace.last() {
             Some((state, _)) if property_name == "Invariants" => walked
@@ -200,7 +195,7 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
 /// it over the earlier one, so the path it returns ends at the last such
 /// state it visited, not the first: on a 23-move break it returned 38 moves.
 /// Cutting at the first failing state gives a path that ends where the
-/// property broke. A liveness (`eventually`) path is returned whole.
+/// property broke.
 fn first_break(
     model: &TemperModel,
     name: &str,
@@ -231,7 +226,7 @@ struct Walked {
     cut_short: BTreeMap<String, usize>,
     /// The records that can never reach a place another in theirs can.
     lost_places: Vec<LostPlace>,
-    /// A path for each `can_reach` rule a record breaks.
+    /// A path for each `can_reach` or `reaches` rule a record breaks.
     broken: Vec<Counterexample>,
     /// The places reached, and those only a silent move leaves.
     reached: Reached,
@@ -309,13 +304,14 @@ fn walk(model: &TemperModel) -> Option<Walked> {
             }
         })
         .collect();
-    let (lost_places, broken) = match Reach::of(model, &graph) {
+    let (lost_places, mut broken) = match Reach::of(model, &graph) {
         Some(reach) => (
             lost_places(model, &graph, &reach, &found),
             broken_rules(model, &graph, &reach, &found),
         ),
         None => Default::default(),
     };
+    broken.extend(crate::reaches::broken_rules(model, &graph, &found));
     let left_silently = stuck
         .iter()
         .filter(|place| {

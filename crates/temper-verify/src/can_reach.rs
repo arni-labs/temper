@@ -173,7 +173,7 @@ pub(crate) fn broken_rules(
 
 /// The states on `path` with the action taken from each: the transition's
 /// name and the parameter values that step to the next state.
-fn trace(
+pub(crate) fn trace(
     model: &TemperModel,
     states: &BTreeMap<usize, &TemperModelState>,
     path: &[(usize, Option<usize>)],
