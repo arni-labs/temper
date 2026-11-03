@@ -41,6 +41,7 @@ use temper_authz::{Asker, Attr, Cause, Hop, May, SendAnalysis};
 use temper_spec::automaton::{Automaton, TargetResolver, TriggerKind};
 
 use super::env::ID;
+use super::model::Classes;
 use super::room::Heap;
 use super::state::JointState;
 use crate::model::ModelString;
@@ -75,6 +76,10 @@ pub(super) struct Senders {
     /// request ([`SendAnalysis::applicable`]): all a walk reads of `policies`
     /// when it decides one again.
     reread: BTreeSet<String>,
+    /// The literals each id and field can meet: a value the model made up
+    /// in one may be any literal it never meets, which the model does not
+    /// offer it.
+    classes: Classes,
 }
 
 /// What a walk reads of its senders, which a model's digest
@@ -90,6 +95,7 @@ impl fmt::Debug for Senders {
             .field("requests", &self.requests)
             .field("may", &self.may)
             .field("reread", &self.reread)
+            .field("classes", &self.classes)
             .finish()
     }
 }
@@ -178,6 +184,7 @@ impl Senders {
             })
         });
         let reread = reread(policies, &askers, may.as_ref());
+        let classes = Classes::read(by_name, &entities.into_iter().cloned().collect());
         Self {
             askers,
             detached,
@@ -188,6 +195,7 @@ impl Senders {
             decided: RefCell::default(),
             decided_bytes: std::cell::Cell::default(),
             reread,
+            classes,
         }
     }
 
@@ -263,16 +271,16 @@ impl Senders {
             .records
             .get(rule.from)
             .and_then(|record| record.strings.get(ID));
-        let service_source_id = match asker {
+        let service_source = match asker {
             Asker::Service { context, .. } => match context.get("triggerSourceEntityType") {
-                Some(Attr::Value(Value::String(source))) => state
-                    .records
-                    .get(source)
-                    .and_then(|record| record.strings.get(ID)),
+                Some(Attr::Value(Value::String(source))) => Some(source.as_str()),
                 _ => None,
             },
             Asker::Outside => None,
         };
+        let service_source_id = service_source
+            .and_then(|source| state.records.get(source))
+            .and_then(|record| record.strings.get(ID));
         let name = rule.to_string();
         let question = (
             by,
@@ -287,7 +295,8 @@ impl Senders {
         if let Some(may) = self.decided.borrow().get(&question) {
             return *may;
         }
-        // A value the model made up is none of the literals it holds.
+        // A value the model made up is none of the literals it holds that
+        // its field can meet; any other it may be.
         let literals: BTreeSet<String> = source_id
             .into_iter()
             .chain(service_source_id)
@@ -297,21 +306,28 @@ impl Senders {
                 _ => None,
             })
             .collect();
+        let symbol = |value: &ModelString, entity: &str, field: &str| {
+            let meets = self.classes.literals(entity, field);
+            symbol(value, &literals.intersection(&meets).cloned().collect())
+        };
         let mut asker = asker.clone();
-        if let (Asker::Service { context, .. }, Some(id)) = (&mut asker, service_source_id) {
-            context.insert("triggerSourceEntityId".to_string(), symbol(id, &literals));
+        if let (Asker::Service { context, .. }, Some(id), Some(source)) =
+            (&mut asker, service_source_id, service_source)
+        {
+            context.insert("triggerSourceEntityId".to_string(), symbol(id, source, ID));
         }
         let text = |value: &str| Attr::Value(Value::String(value.to_string()));
         let hop = Hop {
             rule: text(&name),
             action: text(rule.action),
             entity_type: text(rule.from),
-            entity_id: source_id.map_or(Attr::Unknown, |id| symbol(id, &literals)),
+            entity_id: source_id.map_or(Attr::Unknown, |id| symbol(id, rule.from, ID)),
         };
         let cause = Cause::reaction(by % 2 == 1, hop);
         let strings = target.strings.iter().map(|(field, value)| {
+            let value = symbol(value, entity, field);
             let field = if field == ID { "id" } else { field.as_str() };
-            (field.to_string(), symbol(value, &literals))
+            (field.to_string(), value)
         });
         let booleans = target
             .booleans
