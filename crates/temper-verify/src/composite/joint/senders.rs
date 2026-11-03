@@ -3,9 +3,7 @@
 //! - An action sent from outside: whoever sent it, someone outside the kernel.
 //! - A reaction with a declared principal: that service, with the trigger's
 //!   source in its context (`resolve_trigger_principal` in the trigger
-//!   dispatcher). With `as`: the kernel acting for the user the source
-//!   record names, someone the model does not know. Without either: whoever
-//!   sent its source action.
+//!   dispatcher). Without one: whoever sent its source action.
 //! - A module's answer, or its `on_failure`: whoever sent the move that
 //!   called the module, whether the call ran inline or in the background
 //!   (`dispatch_wasm_callback` in `invocation_artifacts.rs`).
@@ -364,11 +362,6 @@ impl Senders {
     pub(super) fn name(&self, by: u32) -> String {
         match self.askers.get(by as usize / 2) {
             Some(Asker::Outside) => "an outside caller".to_string(),
-            Some(Asker::Service {
-                name,
-                acting_for: true,
-                ..
-            }) => format!("service:{name}, acting for the user its record names"),
             Some(Asker::Service { name, .. }) => format!("service:{name}"),
             None => format!("sender {by}"),
         }
@@ -425,16 +418,6 @@ pub(super) fn declared(
     if trigger.kind != TriggerKind::Entity {
         return None;
     }
-    // A reaction with `as` is the kernel acting for whoever the source
-    // record names (`ReactionMaker::For` in the trigger dispatcher): which
-    // user, the model does not know.
-    if trigger.acts_for.is_some() {
-        return Some(Asker::Service {
-            name: "reaction".to_string(),
-            context: BTreeMap::new(),
-            acting_for: true,
-        });
-    }
     let name = trigger.principal.as_deref().filter(|p| !p.is_empty())?;
     let text = |value: &str| Attr::Value(Value::String(value.to_string()));
     // A same-id reaction acts on the record with its source's id.
@@ -489,7 +472,6 @@ fn service(name: &str, context: BTreeMap<String, Attr>) -> Asker {
     Asker::Service {
         name: name.to_string(),
         context,
-        acting_for: false,
     }
 }
 
