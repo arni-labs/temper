@@ -32,6 +32,7 @@ use temper_authz::{Asker, Attr, May, SendAnalysis};
 use temper_spec::automaton::{Automaton, TargetResolver, TriggerKind};
 
 use super::env::ID;
+use super::room::Heap;
 use super::state::JointState;
 use crate::model::ModelString;
 
@@ -51,6 +52,8 @@ pub(super) struct Senders {
     /// The answers decided again so far: a walk asks the same few questions
     /// over and over, and reading the policies takes far longer than a step.
     decided: RefCell<HashMap<Question, May>>,
+    /// The bytes `decided` holds, as a walk counts them against its room.
+    decided_bytes: std::cell::Cell<usize>,
     /// The policies that may apply to a move whose answer depends on the
     /// request ([`SendAnalysis::applicable`]): all a walk reads of `policies`
     /// when it decides one again.
@@ -150,6 +153,7 @@ impl Senders {
             may,
             policies: policies.cloned(),
             decided: RefCell::default(),
+            decided_bytes: std::cell::Cell::default(),
             reread,
         }
     }
@@ -244,8 +248,20 @@ impl Senders {
             .iter()
             .map(|(field, value)| (field.clone(), Attr::Value(Value::Bool(*value))));
         let may = policies.may(&asker, action, entity, &strings.chain(booleans).collect());
+        let entry = super::room::map_bytes::<Question, May>(1)
+            + question.1.heap()
+            + question.2.heap()
+            + question.3.heap()
+            + question.4.heap()
+            + question.5.heap();
+        self.decided_bytes.set(self.decided_bytes.get() + entry);
         self.decided.borrow_mut().insert(question, may);
         may
+    }
+
+    /// The bytes the answers decided again so far hold.
+    pub(super) fn held(&self) -> usize {
+        self.decided_bytes.get()
     }
 
     /// The number of the sender a reaction runs as: its declared principal,

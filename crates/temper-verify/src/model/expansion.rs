@@ -7,6 +7,12 @@ pub(crate) struct Expansion {
     remaining: std::cell::Cell<usize>,
     until: std::cell::Cell<Option<std::time::Instant>>,
     pub(crate) exhausted: std::cell::Cell<bool>,
+    /// Bytes what this expansion builds may still take: a joint walk gives
+    /// each expansion room taken from its own, so what one state's moves
+    /// build counts against the walk's memory.
+    room: std::cell::Cell<usize>,
+    /// The expansion needed more than `room` and stopped short.
+    short: std::cell::Cell<bool>,
 }
 /// Only the name: the allowance is a walk's own accounting, not part of the
 /// model, so a model's digest (`JointProof::digest`) leaves it out.
@@ -22,6 +28,8 @@ impl Default for Expansion {
             remaining: std::cell::Cell::new(usize::MAX),
             until: std::cell::Cell::new(None),
             exhausted: std::cell::Cell::new(false),
+            room: std::cell::Cell::new(usize::MAX),
+            short: std::cell::Cell::new(false),
         }
     }
 }
@@ -38,9 +46,44 @@ impl Expansion {
         self.until
             .set(time.and_then(|t| std::time::Instant::now().checked_add(t)));
         self.exhausted.set(false);
+        self.allow(usize::MAX);
     }
+
+    /// Let what the expansion builds from now on take `bytes`.
+    pub(crate) fn allow(&self, bytes: usize) {
+        self.room.set(bytes);
+        self.short.set(false);
+    }
+
+    /// Count `bytes` more of what the expansion builds, or stop it short.
+    pub(crate) fn hold(&self, bytes: usize) -> bool {
+        match self.room.get().checked_sub(bytes) {
+            Some(left) if !self.short.get() => {
+                self.room.set(left);
+                true
+            }
+            _ => {
+                self.short.set(true);
+                false
+            }
+        }
+    }
+
+    /// Count `bytes` fewer: what it built and dropped.
+    pub(crate) fn give(&self, bytes: usize) {
+        self.room.set(self.room.get().saturating_add(bytes));
+    }
+
+    /// Whether the expansion stopped short of the room it was allowed.
+    pub(crate) fn short(&self) -> bool {
+        self.short.get()
+    }
+
     pub(crate) fn take(&self) -> bool {
         use std::sync::atomic::Ordering;
+        if self.short.get() {
+            return false;
+        }
         if let Some(limit) = &self.limit
             && !limit.lifted.load(Ordering::Relaxed)
             && (limit.past_time()

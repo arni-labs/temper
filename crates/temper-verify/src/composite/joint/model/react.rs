@@ -7,6 +7,7 @@ use temper_spec::automaton::TargetResolver;
 use temper_spec::predicate::{Arg, Literal, ParamKind, Truth, eval};
 
 use super::super::env::{Blind, Found, ID, resolve};
+use super::super::room::whole;
 use super::super::senders::OUTSIDE;
 use super::super::state::ReactionStep;
 use super::super::{Call, Dispatch, JointState};
@@ -103,6 +104,9 @@ impl JointModel {
         chain: &[ReactionStep],
         by: u32,
     ) -> Vec<(JointState, Certainty)> {
+        if !self.expansion.hold(whole(&state)) {
+            return Vec::new();
+        }
         let mut outcomes = vec![(state, Certainty::Sure)];
         for (index, reaction) in self
             .reactions
@@ -111,6 +115,9 @@ impl JointModel {
             .filter(|(_, r)| r.from == source && r.source_action == action)
         {
             let mut after = Vec::new();
+            // The ways before this reaction are dropped as the next ones are
+            // made; [`Self::keep`] counted each.
+            let before: usize = outcomes.iter().map(|(state, _)| whole(state)).sum();
             for (state, known) in outcomes {
                 if !self.expansion.take() {
                     return Vec::new();
@@ -121,8 +128,8 @@ impl JointModel {
                 };
                 let known =
                     known.then(Certainty::unless(fires != Truth::Unknown, Certainty::OneOf));
-                if fires != Truth::True {
-                    after.push((state.clone(), known));
+                if fires != Truth::True && !self.keep(&mut after, state.clone(), known) {
+                    return Vec::new();
                 }
                 if fires == Truth::False {
                     continue;
@@ -142,12 +149,14 @@ impl JointModel {
                     _ => Found::Unknown,
                 };
                 if reaches == Found::Missing {
-                    after.push((state, known));
+                    if !self.keep(&mut after, state, known) {
+                        return Vec::new();
+                    }
                     continue;
                 }
                 let known = known.then(Certainty::unless(reaches == Found::Yes, Certainty::OneOf));
-                if reaches == Found::Unknown {
-                    after.push((state.clone(), known));
+                if reaches == Found::Unknown && !self.keep(&mut after, state.clone(), known) {
+                    return Vec::new();
                 }
                 let generated_for = match &reaction.resolve {
                     Some(TargetResolver::Create) => Some(reaction.to.clone()),
@@ -173,7 +182,9 @@ impl JointModel {
                     generated_for,
                 };
                 if chain.iter().any(|taken| step.repeats(taken)) {
-                    after.push((state, known));
+                    if !self.keep(&mut after, state, known) {
+                        return Vec::new();
+                    }
                     continue;
                 }
                 let mut next_chain = chain.to_vec();
@@ -194,10 +205,17 @@ impl JointModel {
                 };
                 let mut next = state;
                 add(&mut next, dispatch);
-                after.push((next, known));
+                if !self.keep(&mut after, next, known) {
+                    return Vec::new();
+                }
             }
+            self.expansion.give(before);
             outcomes = after;
         }
+        // The states these ways lead to are counted again as the move's
+        // outcomes ([`Self::next`]).
+        self.expansion
+            .give(outcomes.iter().map(|(state, _)| whole(state)).sum());
         outcomes
     }
 

@@ -8,6 +8,7 @@ use temper_authz::May;
 use temper_spec::predicate::{Truth, eval};
 
 use super::super::env::Blind;
+use super::super::room::whole;
 use super::super::senders::OUTSIDE;
 use super::super::state::canonical;
 use super::super::{Call, Dispatch, JointState};
@@ -124,35 +125,46 @@ impl JointModel {
                         target_state: t.to_state.clone(),
                         params,
                     };
-                    out.push(if reads {
+                    let mv = if reads {
                         Move::Send(entity.clone(), action)
                     } else {
                         Move::Take(entity.clone(), action)
-                    });
+                    };
+                    if !self.keep_move(&mut out, mv) {
+                        return out;
+                    }
                 }
             }
             if state.armed.contains_key(entity)
                 && let Some(timeout) = self.timeout(entity, &local.status)
             {
-                out.push(Move::Timer(entity.clone(), timeout.action.clone()));
+                let mv = Move::Timer(entity.clone(), timeout.action.clone());
+                if !self.keep_move(&mut out, mv) {
+                    return out;
+                }
             }
         }
         let mut calls = BTreeSet::new();
         for call in &state.calls {
-            if calls.insert(call) {
-                self.answers(state, call, &values, &mut out);
-                out.push(Move::Fail(call.clone()));
-                out.push(Move::Lost(call.clone()));
+            if calls.insert(call)
+                && !(self.answers(state, call, &values, &mut out)
+                    && self.keep_move(&mut out, Move::Fail(call.clone()))
+                    && self.keep_move(&mut out, Move::Lost(call.clone())))
+            {
+                return out;
             }
         }
         let mut seen = BTreeSet::new();
         for dispatch in &state.inflight {
             if seen.insert(dispatch) {
-                out.push(if dispatch.read {
+                let mv = if dispatch.read {
                     Move::Arrive(dispatch.clone())
                 } else {
                     Move::Read(dispatch.clone())
-                });
+                };
+                if !self.keep_move(&mut out, mv) {
+                    return out;
+                }
             }
         }
         out
@@ -304,25 +316,31 @@ impl JointModel {
             }
         }
         let mut held_back = false;
-        let nexts = outcomes
-            .into_iter()
-            .filter(|(outcome, _, _)| {
-                let fits = self.delivery == Delivery::BeforeNextRequest
-                    || outcome.inflight.len() + outcome.calls.len() <= MAX_IN_FLIGHT;
-                held_back |= !fits;
-                fits
-            })
-            .map(|(mut outcome, text, certainty)| {
-                self.order.normalize(&mut outcome);
-                let renamed = canonical(&mut outcome);
-                Next {
-                    state: outcome,
-                    label: rename_label(&text, mv, &renamed),
-                    renamed,
-                    certainty,
-                }
-            })
-            .collect();
+        let mut nexts = Vec::new();
+        for (mut outcome, text, certainty) in outcomes {
+            let fits = self.delivery == Delivery::BeforeNextRequest
+                || outcome.inflight.len() + outcome.calls.len() <= MAX_IN_FLIGHT;
+            held_back |= !fits;
+            if !fits {
+                continue;
+            }
+            self.order.normalize(&mut outcome);
+            let renamed = canonical(&mut outcome);
+            let next = Next {
+                label: rename_label(&text, mv, &renamed),
+                state: outcome,
+                renamed,
+                certainty,
+            };
+            // What the walk will hold of this state until it packs it.
+            if !self
+                .expansion
+                .hold(whole(&next.state) + whole(&next.label) + whole(&next.renamed))
+            {
+                return (Vec::new(), held_back);
+            }
+            nexts.push(next);
+        }
         (nexts, held_back)
     }
 
@@ -407,14 +425,15 @@ impl JointModel {
     /// The answers a module may give the call `call`: its trigger's
     /// `on_success`, or else any internal action of its record. The module
     /// itself is not modelled: it may give each of these answers, and gives
-    /// each it keeps being able to give at some point.
+    /// each it keeps being able to give at some point. False when the
+    /// expansion's room is used up.
     fn answers(
         &self,
         state: &JointState,
         call: &Call,
         values: &BTreeSet<ModelString>,
         out: &mut Vec<Move>,
-    ) {
+    ) -> bool {
         let model = &self.models[&call.to];
         let local = &state.records[&call.to];
         for t in &model.transitions {
@@ -445,9 +464,12 @@ impl JointModel {
                     target_state: t.to_state.clone(),
                     params,
                 };
-                out.push(Move::Answer(call.clone(), action));
+                if !self.keep_move(out, Move::Answer(call.clone(), action)) {
+                    return false;
+                }
             }
         }
+        true
     }
 }
 
