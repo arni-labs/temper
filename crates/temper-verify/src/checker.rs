@@ -60,8 +60,8 @@ pub struct VerificationResult {
     /// don't fail the check.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lost_places: Vec<LostPlace>,
-    /// `can_reach` rules the completed walk cannot prove because local
-    /// numeric guards are abstract. These prevent a pass, without asserting
+    /// `can_reach` and `reaches` rules the completed walk cannot prove
+    /// because local numeric guards are abstract. These prevent a pass, without asserting
     /// that a concrete record breaks the rule.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unproved_can_reach: Vec<String>,
