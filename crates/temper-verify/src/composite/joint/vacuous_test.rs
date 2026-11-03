@@ -109,7 +109,7 @@ fn a_stuck_state_only_an_unnamed_module_answer_reaches_is_not_checked() {
     let text = result.to_string();
     assert!(!result.holds(), "{text}");
     assert!(text.contains("NOT CHECKED"), "{text}");
-    assert!(text.contains("Ask.Done (answer from"), "{text}");
+    assert!(text.contains("answer from asker"), "{text}");
 }
 
 #[test]
@@ -129,7 +129,7 @@ fn a_break_only_an_unnamed_module_answer_reaches_is_not_checked() {
     let text = result.to_string();
     assert!(!result.holds(), "{text}");
     assert!(text.contains("NOT CHECKED"), "{text}");
-    assert!(text.contains("Ask.Done (answer from"), "{text}");
+    assert!(text.contains("answer from asker"), "{text}");
 }
 
 #[test]
