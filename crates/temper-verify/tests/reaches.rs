@@ -231,3 +231,44 @@ fn a_rule_without_from_is_read_from_a_new_record() {
     let (_, l1) = install_check(PUBLISHED_THEN_ARCHIVED);
     assert!(l1.passed, "{}: {:?}", l1.summary, l1.diagnostics);
 }
+
+/// A waiting record's only move needs `score == 1`, and nothing writes
+/// `score`, so a record can wait forever. L1 does not track an integer, so
+/// it takes the move as one that may fire: the walk cannot tell this record
+/// from one that finishes.
+const SCORE_GATE: &str = r#"
+[automaton]
+name = "NumGate"
+states = ["Waiting", "Done"]
+initial = "Waiting"
+
+[[state]]
+name = "score"
+type = "int"
+initial = 0
+
+[[action]]
+name = "Finish"
+from = ["Waiting"]
+to = "Done"
+guard = "score == 1"
+
+[[liveness]]
+name = "Finishes"
+from = ["Waiting"]
+reaches = ["Done"]
+"#;
+
+#[test]
+fn a_rule_that_needs_a_guard_the_walk_does_not_track_is_not_proved() {
+    let (passed, l1) = install_check(SCORE_GATE);
+    assert!(!passed && !l1.passed, "{}", l1.summary);
+    assert!(l1.summary.contains("not proved"), "{}", l1.summary);
+    assert!(l1.summary.contains("score"), "{}", l1.summary);
+    let verification = l1.verification.as_ref().unwrap();
+    assert!(verification.is_complete, "the walk completed");
+    assert!(
+        verification.counterexamples.is_empty(),
+        "no path is known to break it"
+    );
+}
