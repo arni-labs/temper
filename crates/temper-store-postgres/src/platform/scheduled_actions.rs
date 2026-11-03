@@ -10,35 +10,6 @@ use crate::PostgresEventStore;
 type ScheduledActionColumns = (String, String, String, String, String, String);
 
 impl PostgresEventStore {
-    /// Write the scheduled actions an appended event armed, on the append's
-    /// transaction. Writing the same arm again leaves its row as it is.
-    pub(crate) async fn insert_scheduled_actions(
-        &self,
-        conn: &mut PgConnection,
-        actions: &[ScheduledActionRecord],
-    ) -> Result<(), PersistenceError> {
-        for action in actions {
-            crate::dbm::postgres_query!(
-                &self.schema,
-                "INSERT INTO {schema}scheduled_actions \
-                     (tenant, entity_type, entity_id, arm_id, action, due_at, armed_by) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
-                 ON CONFLICT (tenant, entity_type, entity_id, arm_id) DO NOTHING",
-            )
-            .bind(&action.tenant)
-            .bind(&action.entity_type)
-            .bind(&action.entity_id)
-            .bind(&action.arm_id)
-            .bind(&action.action)
-            .bind(&action.due_at)
-            .bind(&action.armed_by)
-            .execute(&mut *conn)
-            .await
-            .map_err(storage_error)?;
-        }
-        Ok(())
-    }
-
     /// Remove one scheduled action's row.
     pub(crate) async fn remove_scheduled_action(
         &self,
@@ -106,6 +77,38 @@ impl PostgresEventStore {
                     }
                 },
             )
+            .collect())
+    }
+
+    /// The pending scheduled actions of one record, by its key.
+    pub(crate) async fn entity_scheduled_action_rows(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<Vec<ScheduledActionRecord>, PersistenceError> {
+        let rows: Vec<(String, String, String, String)> = crate::dbm::postgres_query_as!(
+            &self.schema,
+            "SELECT arm_id, action, due_at, armed_by FROM {schema}scheduled_actions \
+             WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
+        )
+        .bind(tenant)
+        .bind(entity_type)
+        .bind(entity_id)
+        .fetch_all(self.pool())
+        .await
+        .map_err(storage_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|(arm_id, action, due_at, armed_by)| ScheduledActionRecord {
+                tenant: tenant.to_string(),
+                entity_type: entity_type.to_string(),
+                entity_id: entity_id.to_string(),
+                arm_id,
+                action,
+                due_at,
+                armed_by,
+            })
             .collect())
     }
 }

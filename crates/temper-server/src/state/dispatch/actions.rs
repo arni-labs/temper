@@ -453,7 +453,15 @@ impl crate::state::ServerState {
         mut expected_authorization_precondition: Option<String>,
     ) -> Result<EntityResponse, DispatchError> {
         let params =
-            self.resolve_authenticated_params(tenant, entity_type, action, params, agent_ctx)?;
+            match self.resolve_authenticated_params(tenant, entity_type, action, params, agent_ctx)
+            {
+                Ok(params) => params,
+                Err(error) => {
+                    self.stop_timer_no_one_can_run(tenant, action, agent_ctx, &error)
+                        .await;
+                    return Err(error);
+                }
+            };
 
         // The dispatch runs in the span it was called in: the request's, or the
         // root span of the runtime work that started it. Ids carried in the agent

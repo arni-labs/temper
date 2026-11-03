@@ -3,11 +3,14 @@
 
 mod commit;
 mod drops;
+mod held;
 mod initial;
 mod labels;
+mod moves;
 mod order;
 mod react;
 mod read;
+mod silent;
 mod step;
 mod walk;
 
@@ -255,7 +258,7 @@ impl JointModel {
             sending
                 .relies_on
                 .contains(&(entity.to_string(), action.to_string()))
-                || senders.may(OUTSIDE, entity, action) != May::No
+                || senders.request(entity, action) != May::No
                 || kernel.chooses(entity, action)
         };
         let order = Order::read(&Specs {

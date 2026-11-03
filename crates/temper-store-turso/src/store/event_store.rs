@@ -100,6 +100,16 @@ impl EventStore for TursoEventStore {
         self.scheduled_action_rows(tenant).await
     }
 
+    async fn list_entity_scheduled_actions(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<Vec<ScheduledActionRecord>, PersistenceError> {
+        self.entity_scheduled_action_rows(tenant, entity_type, entity_id)
+            .await
+    }
+
     async fn delete_scheduled_action(
         &self,
         tenant: &str,
@@ -322,10 +332,11 @@ impl EventStore for TursoEventStore {
         }
         if let [append] = appends {
             let sequence_nr = self
-                .append(
+                .append_with_rows(
                     &append.persistence_id,
                     append.expected_sequence,
                     &append.events,
+                    append.commit_rows(),
                 )
                 .await?;
             return Ok(vec![PersistenceAppendResult {

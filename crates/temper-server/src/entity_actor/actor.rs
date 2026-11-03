@@ -1025,11 +1025,16 @@ impl EntityActor {
                     }
 
                     // A refused spawn is the kernel's event too: it changes only
-                    // the field that named the child, through the live helper.
-                    if env.event_type == super::spawn_refusal::SPAWN_REFUSED_EVENT {
+                    // the field that named the child, through the live helper. So
+                    // is a stopped timer, which only says so (`LastEvent::record`).
+                    if env.event_type == super::spawn_refusal::SPAWN_REFUSED_EVENT
+                        || env.event_type == super::timer_needs_person::TIMER_NEEDS_PERSON_EVENT
+                    {
                         match parsed_event {
                             Ok(event) => {
-                                super::spawn_refusal::apply(state, &event.params);
+                                if env.event_type == super::spawn_refusal::SPAWN_REFUSED_EVENT {
+                                    super::spawn_refusal::apply(state, &event.params);
+                                }
                                 state.push_event_bounded(event);
                             }
                             Err(e) => {
@@ -1541,6 +1546,7 @@ impl EntityActor {
                 if name == super::effects::FIELDS_UPDATED_EVENT
                     || name == super::effects::FIELDS_REPLACED_EVENT
                     || name == super::spawn_refusal::SPAWN_REFUSED_EVENT
+                    || name == super::timer_needs_person::TIMER_NEEDS_PERSON_EVENT
                 {
                     ctx.reply(EntityResponse::refused(
                         state.clone(),
@@ -1646,7 +1652,9 @@ impl EntityActor {
                         spec_governed: true,
                         refused: false,
                         answered_action,
+                        trigger_failures: Vec::new(),
                         store_unavailable: false,
+                        unrecorded_at: None,
                     });
                     return Ok(());
                 }
@@ -1793,12 +1801,59 @@ impl EntityActor {
                     // error variants fail immediately (same as before).
                     // The rows of the scheduled actions it arms are written
                     // with the event, so a restart arms them again.
-                    let scheduled = self.arm_scheduled_actions(
-                        &mut result.scheduled_actions,
-                        state,
-                        &event,
+                    let scheduled = self
+                        .arm_scheduled_actions(
+                            &mut result.scheduled_actions,
+                            state,
+                            &event,
+                            caller.as_deref(),
+                        )
+                        .await;
+                    // A machine's move that leaves its record as it was writes
+                    // nothing (`unrecorded`); its triggers still run.
+                    let fires_timer_once = super::timer_fire::fires_once(
                         caller.as_deref(),
+                        &self.tenant,
+                        state,
+                        &name,
                     );
+                    // Bringing a timer forward changes its due time through
+                    // this event's status clock, even if no fields changed.
+                    let brings_timer_forward = self
+                        .table
+                        .read()
+                        .expect("transition table poisoned")
+                        .action_contracts
+                        .get(&name)
+                        .is_some_and(|contract| contract.fire_now_in.contains(&state.status));
+                    if !brings_timer_forward
+                        && super::unrecorded::made_by_machine(&event.origin)
+                        && super::unrecorded::leaves_record_unchanged(
+                            &state_before,
+                            state,
+                            &result,
+                            &event,
+                            &scheduled,
+                            fires_timer_once,
+                        )
+                    {
+                        *state = state_before;
+                        let response = self.answer_unrecorded(state, result, &event);
+                        if let (Some(key), Some(request), Some(cache)) = (
+                            idempotency_key.as_ref(),
+                            request.as_ref(),
+                            self.idempotency_cache.as_ref(),
+                        ) {
+                            cache.put(&actor_key, key, request, &response);
+                        }
+                        ctx.reply(response);
+                        crate::runtime_metrics::record_actor_ask_reply_latency(
+                            &state.entity_type,
+                            &name,
+                            ask_reply_start.elapsed(),
+                        );
+                        return Ok(());
+                    }
                     if let (Some(store), Some(backend)) =
                         (self.event_journal.as_ref(), self.event_backend)
                     {
@@ -2033,12 +2088,14 @@ impl EntityActor {
                                     ))
                                     .await;
 
-                                    let retry_scheduled = self.arm_scheduled_actions(
-                                        &mut retry_result.scheduled_actions,
-                                        state,
-                                        &retry_event,
-                                        caller.as_deref(),
-                                    );
+                                    let retry_scheduled = self
+                                        .arm_scheduled_actions(
+                                            &mut retry_result.scheduled_actions,
+                                            state,
+                                            &retry_event,
+                                            caller.as_deref(),
+                                        )
+                                        .await;
                                     match self
                                         .persist_event(
                                             store,
@@ -2241,7 +2298,9 @@ impl EntityActor {
                         spec_governed: true,
                         refused: false,
                         answered_action: None,
+                        trigger_failures: Vec::new(),
                         store_unavailable: false,
+                        unrecorded_at: None,
                     };
                     // ADR-0048 sub-decision 5: cache the successful response
                     // so a racing retry that lands after this reply returns
@@ -2309,16 +2368,10 @@ impl EntityActor {
                     spec_governed: true,
                     refused: false,
                     answered_action: None,
+                    trigger_failures: Vec::new(),
                     store_unavailable: false,
+                    unrecorded_at: None,
                 });
-            }
-            EntityMsg::GetField { field } => {
-                let value = state
-                    .fields
-                    .get(&field)
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                ctx.reply(value);
             }
             EntityMsg::UpdateFields {
                 caller,
@@ -2361,7 +2414,9 @@ impl EntityActor {
                         spec_governed: true,
                         refused: false,
                         answered_action: None,
+                        trigger_failures: Vec::new(),
                         store_unavailable: false,
+                        unrecorded_at: None,
                     },
                     Err(NotUpdated::RecordChanged) => EntityResponse::record_changed(
                         state.clone(),
@@ -2389,7 +2444,31 @@ impl EntityActor {
                     spec_governed: true,
                     refused: false,
                     answered_action: None,
+                    trigger_failures: Vec::new(),
                     store_unavailable: false,
+                    unrecorded_at: None,
+                });
+            }
+
+            EntityMsg::RecordTimerNeedsPerson { action, checked } => {
+                let outcome =
+                    super::timer_needs_person::commit(self, state, &action, checked).await;
+                // A record that moved since is refused, with nothing written.
+                let moved = outcome == Ok(super::timer_needs_person::Stop::Moved);
+                ctx.reply(EntityResponse {
+                    success: outcome.is_ok() && !moved,
+                    refusal: None,
+                    state: state.clone(),
+                    error: outcome.err(),
+                    custom_effects: vec![],
+                    scheduled_actions: vec![],
+                    spawn_requests: vec![],
+                    spec_governed: true,
+                    refused: moved,
+                    answered_action: None,
+                    trigger_failures: Vec::new(),
+                    store_unavailable: false,
+                    unrecorded_at: None,
                 });
             }
 
@@ -2438,7 +2517,9 @@ impl EntityActor {
                         spec_governed: true,
                         refused: false,
                         answered_action: None,
+                        trigger_failures: Vec::new(),
                         store_unavailable: false,
+                        unrecorded_at: None,
                     });
                     return Ok(());
                 }
@@ -2494,7 +2575,9 @@ impl EntityActor {
                     spec_governed: true,
                     refused: false,
                     answered_action: None,
+                    trigger_failures: Vec::new(),
                     store_unavailable: false,
+                    unrecorded_at: None,
                 });
             }
         }
