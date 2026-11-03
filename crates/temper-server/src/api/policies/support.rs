@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use sha2::{Digest, Sha256};
 use temper_authz::statements::{remove_statements, statement_keys};
 
-use crate::authz::{load_and_activate_tenant_policies, persist_and_activate_policy};
+use crate::authz::{load_and_activate_tenant_policies, record_policy_change};
 use crate::state::ServerState;
 use crate::storage::PolicyStoreRow;
 
@@ -59,18 +59,67 @@ pub(super) async fn persist_new_rule(
         Ok(None) => return rule_added_json(tenant, &policy_id),
         Err(refused) => return refused.into_response(),
     };
-    if let Err(resp) = crate::api::validate_and_reload_policies(state, tenant, &prospective) {
+    if let Err(resp) =
+        persist_and_reload_entry(state, tenant, &policy_id, rule, created_by, prospective).await
+    {
         return resp;
     }
-    persist_and_activate_policy(state, tenant, &policy_id, rule, created_by).await;
+    rule_added_json(tenant, &policy_id)
+}
+
+/// Validate without changing the live engine, save successfully, then activate.
+/// A failed save leaves both the serving engine and its text cache untouched.
+pub(super) async fn persist_and_reload_entry(
+    state: &ServerState,
+    tenant: &str,
+    policy_id: &str,
+    cedar_text: &str,
+    created_by: &str,
+    prospective: String,
+) -> Result<(), axum::response::Response> {
+    if let Err(error) = state.authz.validate_tenant_policies(&prospective) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Policy validation failed: {error}"),
+        )
+            .into_response());
+    }
+    let changed = if let Some(store) = state.policy_store() {
+        match store
+            .save_policy(tenant, policy_id, cedar_text, created_by)
+            .await
+        {
+            Ok(changed) => changed,
+            Err(error) => {
+                tracing::warn!(%error, tenant, policy_id, "failed to store policy entry");
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Policy write failed; live policies unchanged",
+                )
+                    .into_response());
+            }
+        }
+    } else {
+        false
+    };
+    if let Err(error) = state.authz.reload_tenant_policies(tenant, &prospective) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Policy saved but activation failed: {error}"),
+        )
+            .into_response());
+    }
     {
         let mut policies = state.tenant_policies.write().unwrap(); // ci-ok: infallible lock
         policies.insert(tenant.to_string(), prospective);
     }
+    if changed {
+        record_policy_change(state, tenant, policy_id, created_by);
+    }
     let _ = state
         .observe_refresh_tx
         .send(crate::state::ObserveRefreshHint::Policies);
-    rule_added_json(tenant, &policy_id)
+    Ok(())
 }
 
 pub(super) fn policy_row_to_json(row: &PolicyStoreRow) -> serde_json::Value {
@@ -108,8 +157,9 @@ pub(super) async fn reload_tenant_from_store(state: &ServerState, tenant: &str) 
 /// enabled row also holds, and so does every live copy of the posted
 /// statements; then the posted text is added once. Posting the same entry
 /// again leaves the live text as it was, and posting new text under an id
-/// leaves none of its old statements live. The rows already end that way, so
-/// the live text now agrees with what a restart loads from them.
+/// leaves none of its old statements live. An existing disabled entry stays
+/// disabled, matching `save_policy`: its posted text is stored but not activated.
+/// The live text now agrees with what a restart loads from the rows.
 ///
 /// `None` when the row already holds exactly `cedar_text` and all of it is
 /// live: nothing changes, so the caller reloads nothing.
@@ -136,6 +186,7 @@ pub(in crate::api) async fn live_text_with_entry(
     };
     let mut leaving = posted.clone();
     let mut unchanged = false;
+    let mut enabled = true;
     if let Some(store) = state.policy_store() {
         let rows = match store.load_policies_for_tenant(tenant).await {
             Ok(rows) => rows,
@@ -148,17 +199,28 @@ pub(in crate::api) async fn live_text_with_entry(
         };
         let mut previous = BTreeSet::new();
         let mut held_by_others = BTreeSet::new();
-        for row in rows.iter().filter(|row| row.enabled) {
+        for row in rows
+            .iter()
+            .filter(|row| row.enabled || row.policy_id == policy_id)
+        {
+            if row.policy_id == policy_id {
+                enabled = row.enabled;
+                unchanged = row.enabled && row.cedar_text == cedar_text;
+            }
             // A row that does not parse holds no live statement: boot cannot load it.
             let Ok(keys) = statement_keys(&row.cedar_text) else {
                 continue;
             };
             if row.policy_id == policy_id {
-                unchanged = row.cedar_text == cedar_text;
                 previous.extend(keys);
             } else {
                 held_by_others.extend(keys);
             }
+        }
+        if !enabled {
+            // Do not remove a posted statement that another enabled row holds:
+            // this disabled entry will not add it back.
+            leaving.retain(|key| !held_by_others.contains(key));
         }
         leaving.extend(previous.difference(&held_by_others).cloned());
     }
@@ -181,7 +243,9 @@ pub(in crate::api) async fn live_text_with_entry(
         }
     };
     let kept = kept.trim_end();
-    Ok(Some(if kept.is_empty() {
+    Ok(Some(if !enabled {
+        kept.to_string()
+    } else if kept.is_empty() {
         cedar_text.to_string()
     } else {
         format!("{kept}\n{cedar_text}")
