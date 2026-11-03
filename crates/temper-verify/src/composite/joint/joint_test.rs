@@ -659,9 +659,10 @@ fn initial_partitions_stop_within_a_tiny_room() {
 }
 
 /// A record whose one move sets off `reactions` reactions, each with a
-/// guard on another record that the model cannot decide, so the move goes
-/// two ways for each: what it builds doubles with every reaction, while the
-/// states it leads to are all the same one.
+/// guard on `Far`, a type outside the rule's scope, that the model cannot
+/// decide, so the move goes two ways for each. The ways with more in flight
+/// than the walk keeps are dropped as they are built, but the rest still
+/// grow with every reaction, while the states they lead to are a handful.
 fn many_undecided(reactions: usize) -> Vec<String> {
     let mut many = String::from(
         "[automaton]\nname = 'Many'\nstates = ['Start', 'Done']\ninitial = 'Start'\n\n\
@@ -671,7 +672,7 @@ fn many_undecided(reactions: usize) -> Vec<String> {
         many.push_str(&format!(
             "\n[[action.triggers]]\nname = 'again{i}'\nkind = 'entity'\n\
              target_entity = 'Many'\ntarget_action = 'Go'\n\
-             guard = \"Other[Id].status == 'Open'\"\n\
+             guard = \"Far[Id].status == 'Open'\"\n\
              [action.triggers.resolve_target]\nkind = 'same_id'\n"
         ));
     }
@@ -681,7 +682,8 @@ fn many_undecided(reactions: usize) -> Vec<String> {
     );
     let other = "[automaton]\nname = 'Other'\nstates = ['Open']\ninitial = 'Open'\n\n\
                  [[action]]\nname = 'Stay'\nkind = 'input'\nfrom = ['Open']\nto = 'Open'\n";
-    vec![many, other.to_string()]
+    let far = "[automaton]\nname = 'Far'\nstates = ['Open']\ninitial = 'Open'\n";
+    vec![many, other.to_string(), far.to_string()]
 }
 
 fn check_in(sources: &[String], room: &Bytes) -> JointInvariantResult {
@@ -698,9 +700,10 @@ fn check_in(sources: &[String], room: &Bytes) -> JointInvariantResult {
 
 #[test]
 fn what_one_move_builds_counts_against_the_room() {
-    // 2^12 ways for one move, a few KB each: tens of MB built before the
-    // walk keeps the one state they all lead to.
-    let sources = many_undecided(12);
+    // The ways with at most three of 20 reactions in flight, 1,351 of them
+    // and a few KB each: MBs built before the walk keeps the few states
+    // they lead to.
+    let sources = many_undecided(20);
     let room = Bytes::new(1 << 20);
     let result = check_in(&sources, &room);
     let JointOutcome::Incomplete { reason } = &result.outcome else {
