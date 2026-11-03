@@ -50,3 +50,67 @@ context.triggerSourceEntityId == resource.id
     assert_eq!(senders.reaction(None, b, true), b);
     assert_eq!(senders.reaction(Some(&principal), c, true), b);
 }
+
+/// A reaction with `as` is sent by the kernel acting for some user, not
+/// by its source's sender: a policy that admits only a user's agents
+/// leaves it to the request, and one that admits only services refuses it.
+#[test]
+fn a_reaction_with_as_is_sent_for_a_user_the_model_does_not_know() {
+    let a = parse_automaton(
+        r#"
+[automaton]
+name = "A"
+states = ["Ready", "Done"]
+initial = "Ready"
+strict_action_params = true
+[[state]]
+name = "person"
+type = "string"
+initial = ""
+[[action]]
+name = "Claim"
+kind = "input"
+from = ["Ready"]
+params = [{ name = "person", type = "string", source = "authenticated_subject" }]
+[[action]]
+name = "Start"
+kind = "input"
+from = ["Ready"]
+to = "Done"
+[[action.triggers]]
+name = "first"
+kind = "entity"
+target_entity = "A"
+target_action = "Start"
+as = "person"
+[action.triggers.resolve_target]
+kind = "same_id"
+"#,
+    )
+    .unwrap();
+    let asker = declared(&a.actions[1].triggers[0], "A", "Start").unwrap();
+    assert_eq!(
+        asker,
+        Asker::Service {
+            name: "reaction".to_string(),
+            context: BTreeMap::new(),
+            acting_for: true,
+        }
+    );
+    let for_ann = SendAnalysis::new(
+            r#"permit(principal, action, resource) when { context has actingFor && context.actingFor == "ann" };"#,
+        )
+        .unwrap();
+    let services = SendAnalysis::new(
+            r#"permit(principal, action, resource) when { principal has role && principal.role == "service" };"#,
+        )
+        .unwrap();
+    let entities = vec!["A".to_string()];
+    let by_name = BTreeMap::from([("A", &a)]);
+    let senders = Senders::new(&by_name, &entities, Some(&for_ann));
+    let sent = senders.reaction(Some(&asker), OUTSIDE, true);
+    assert_eq!(senders.may(sent, "A", "Start"), May::Maybe);
+    let senders = Senders::new(&by_name, &entities, Some(&services));
+    let sent = senders.reaction(Some(&asker), OUTSIDE, true);
+    assert_eq!(senders.may(sent, "A", "Start"), May::No);
+}
