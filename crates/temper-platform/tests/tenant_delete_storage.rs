@@ -13,8 +13,14 @@ use temper_platform::tenant_api::tenant_api_router;
 use temper_runtime::tenant::TenantId;
 use temper_server::StorageStack;
 use temper_server::identity::IdentityResolver;
+use temper_server::secrets::vault::SecretsVault;
 use temper_store_turso::TenantStoreRouter;
 use tower::ServiceExt;
+
+#[path = "tenant_delete_storage/object_store.rs"]
+mod object_store;
+
+use object_store::{BUCKET, ObjectStore};
 
 const TENANT: &str = "t";
 const OPERATOR_KEY: &str = "tmpr_tenant-delete-storage";
@@ -29,6 +35,7 @@ async fn routed_state(dir: &Path) -> PlatformState {
     .await
     .expect("tenant router");
     let mut state = PlatformState::new(None);
+    state.server.secrets_vault = Some(std::sync::Arc::new(SecretsVault::new(&[3u8; 32])));
     bootstrap_system_tenant(&state, &BTreeMap::new());
     state
         .server
@@ -60,8 +67,8 @@ fn as_tenant(method: Method, uri: &str, body: serde_json::Value, tenant: &str) -
     request
 }
 
-async fn create_tenant(state: &PlatformState) {
-    let created = tenant_api_router()
+async fn create_tenant(state: &PlatformState) -> StatusCode {
+    tenant_api_router()
         .with_state(state.clone())
         .oneshot(as_tenant(
             Method::POST,
@@ -70,11 +77,12 @@ async fn create_tenant(state: &PlatformState) {
             "default",
         ))
         .await
-        .expect("create runs");
-    assert_eq!(created.status(), StatusCode::CREATED);
+        .expect("create runs")
+        .status()
 }
 
-async fn delete_tenant(state: &PlatformState) {
+/// Delete the tenant as itself: its status and what it said.
+async fn delete_tenant(state: &PlatformState) -> (StatusCode, String) {
     state
         .server
         .authz
@@ -93,7 +101,11 @@ async fn delete_tenant(state: &PlatformState) {
         ))
         .await
         .expect("delete runs");
-    assert_eq!(deleted.status(), StatusCode::OK);
+    let status = deleted.status();
+    let body = axum::body::to_bytes(deleted.into_body(), 64 * 1024)
+        .await
+        .expect("delete answer");
+    (status, String::from_utf8_lossy(&body).into_owned())
 }
 
 #[tokio::test]
@@ -102,7 +114,7 @@ async fn a_tenant_created_again_after_delete_starts_empty() {
     let state = routed_state(dir.path()).await;
     let tenant = TenantId::new(TENANT);
 
-    create_tenant(&state).await;
+    assert_eq!(create_tenant(&state).await, StatusCode::CREATED);
     bootstrap_operator_credential(&state, OPERATOR_KEY, TENANT)
         .await
         .expect("the tenant's credential and its type are written");
@@ -121,7 +133,7 @@ async fn a_tenant_created_again_after_delete_starts_empty() {
         "the credential signs in before delete"
     );
 
-    delete_tenant(&state).await;
+    assert_eq!(delete_tenant(&state).await.0, StatusCode::OK);
     assert!(
         IdentityResolver::new()
             .resolve(&state.server, &tenant, OPERATOR_KEY)
@@ -130,7 +142,7 @@ async fn a_tenant_created_again_after_delete_starts_empty() {
         "the deleted tenant's credential does not sign in"
     );
 
-    create_tenant(&state).await;
+    assert_eq!(create_tenant(&state).await, StatusCode::CREATED);
     assert_eq!(
         state
             .server
@@ -146,4 +158,113 @@ async fn a_tenant_created_again_after_delete_starts_empty() {
             .is_err(),
         "the deleted tenant's credential does not sign in to the tenant created again"
     );
+}
+
+#[tokio::test]
+async fn the_server_s_own_tenants_are_never_deleted() {
+    let dir = tempfile::tempdir().expect("data dir");
+    let state = routed_state(dir.path()).await;
+    for own in ["default", "temper-system"] {
+        state
+            .server
+            .authz
+            .reload_tenant_policies(
+                own,
+                r#"permit(principal, action == Action::"delete_tenant", resource);"#,
+            )
+            .expect("policy");
+        let refused = tenant_api_router()
+            .with_state(state.clone())
+            .oneshot(as_tenant(
+                Method::DELETE,
+                &format!("/tenants/{own}"),
+                serde_json::Value::Null,
+                own,
+            ))
+            .await
+            .expect("delete runs");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{own}");
+    }
+    assert!(dir.path().join("platform.db").exists());
+    assert!(
+        state
+            .registry
+            .read()
+            .expect("registry")
+            .get_tenant(&TenantId::new("temper-system"))
+            .is_some(),
+        "the system tenant's specs stay"
+    );
+}
+
+/// The tenant's namespace in its object store: `tenants/<sha256 of its id>/`.
+fn object_namespace(tenant: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(tenant.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("tenants/{hex}/")
+}
+
+#[tokio::test]
+async fn deleting_a_tenant_removes_its_objects_and_a_refused_removal_keeps_the_id() {
+    let dir = tempfile::tempdir().expect("data dir");
+    let state = routed_state(dir.path()).await;
+    let objects = ObjectStore::default();
+    let server = objects.serve().await;
+    let namespace = object_namespace(TENANT);
+    let other = format!("{}x", object_namespace("other"));
+    // More than one DeleteObjects batch, beside another tenant's object and
+    // the default tenant's at the bucket's root.
+    for n in 0..1001 {
+        objects.put(&format!("{namespace}field-overflow/{n:04}"));
+    }
+    objects.put(&other);
+    objects.put("x");
+
+    assert_eq!(create_tenant(&state).await, StatusCode::CREATED);
+    let vault = state.server.secrets_vault.as_ref().expect("vault");
+    vault.cache_secret(TENANT, "blob_endpoint", server.uri());
+    vault.cache_secret(TENANT, "blob_bucket", BUCKET.to_string());
+    // Keys the requests are signed with; the store in memory does not check them.
+    vault.cache_secret(TENANT, "blob_access_key", "access".to_string());
+    vault.cache_secret(TENANT, "blob_secret_key", "secret".to_string());
+
+    objects
+        .refuse_deletes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (status, said) = delete_tenant(&state).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{said}");
+    assert!(
+        said.contains("403"),
+        "the refusal names the provider's answer: {said}"
+    );
+    assert_eq!(
+        objects.keys_under(&namespace),
+        1001,
+        "nothing counts as removed"
+    );
+    assert_ne!(
+        create_tenant(&state).await,
+        StatusCode::CREATED,
+        "the id is not created again while its removal is unfinished"
+    );
+
+    objects
+        .refuse_deletes
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let (status, said) = delete_tenant(&state).await;
+    assert_eq!(status, StatusCode::OK, "deleting again finishes it: {said}");
+    assert_eq!(objects.keys_under(&namespace), 0);
+    assert!(
+        objects.holds(&other) && objects.holds("x"),
+        "only its own objects go"
+    );
+    assert_eq!(
+        objects
+            .delete_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "1,001 objects take two DeleteObjects calls"
+    );
+    assert_eq!(create_tenant(&state).await, StatusCode::CREATED);
 }

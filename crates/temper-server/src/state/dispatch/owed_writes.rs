@@ -256,6 +256,10 @@ impl ServerState {
             loop {
                 tokio::time::sleep(wait).await; // determinism-ok: retry backoff
                 wait = (wait * 2).min(LAST_RETRY_WAIT);
+                // A write no longer held is dropped, as a removed tenant's are.
+                if !state.holds_owed_write(&key) {
+                    break;
+                }
                 match try_again(state.clone()).await {
                     Attempt::Landed => break,
                     Attempt::Failed(error) => {

@@ -350,6 +350,15 @@ impl StateTimeoutTracker {
         map.iter().map(|(k, v)| (k.clone(), *v)).collect()
     }
 
+    /// Drop the seqs of every record of `tenant`, so no timer armed for one
+    /// of them fires.
+    pub fn forget_tenant(&self, tenant: &TenantId) {
+        self.seqs
+            .lock()
+            .expect("state_timeout tracker poisoned")
+            .retain(|key, _| key.tenant != tenant.as_str());
+    }
+
     /// Drop any seq for `key`. Called when an entity is deleted so the map
     /// doesn't grow unbounded over the process lifetime.
     pub fn forget(&self, tenant: &TenantId, entity_type: &str, entity_id: &str) {

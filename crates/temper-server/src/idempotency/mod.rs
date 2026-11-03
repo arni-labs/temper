@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use std::sync::RwLock;
 
 use temper_runtime::scheduler::sim_now;
+use temper_runtime::tenant::TenantId;
 
 use crate::entity_actor::{EntityResponse, EntityState};
 
@@ -184,6 +185,26 @@ impl IdempotencyCache {
             entries: RwLock::new(Entries::default()),
             budget_bytes,
             effects_owners: effects::EffectsOwners::default(),
+        }
+    }
+
+    /// Drop every cached reply of `tenant`'s records (actor keys
+    /// `{tenant}:{type}:{id}`).
+    pub fn forget_tenant(&self, tenant: &TenantId) {
+        let prefix = format!("{tenant}:");
+        let mut entries = self.entries.write().unwrap(); // ci-ok: infallible lock
+        let held: Vec<(String, String)> = entries
+            .by_actor
+            .iter()
+            .filter(|(actor_key, _)| actor_key.starts_with(&prefix))
+            .flat_map(|(actor_key, replies)| {
+                replies
+                    .keys()
+                    .map(|idem_key| (actor_key.clone(), idem_key.clone()))
+            })
+            .collect();
+        for (actor_key, idem_key) in held {
+            entries.remove(&actor_key, &idem_key);
         }
     }
 

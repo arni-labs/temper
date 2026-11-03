@@ -121,6 +121,13 @@ impl SecretsVault {
             .or_else(|| self.get_platform_secret(key))
     }
 
+    /// Drop every cached secret of `tenant`.
+    pub fn forget_tenant(&self, tenant: &str) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.remove(tenant);
+        }
+    }
+
     /// Remove a secret from the in-memory cache.
     pub fn remove_secret(&self, tenant: &str, key: &str) -> bool {
         let mut cache = self.cache.write().unwrap(); // ci-ok: infallible lock

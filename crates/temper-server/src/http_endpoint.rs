@@ -253,6 +253,11 @@ impl HttpEndpointTables {
         self.by_tenant.read().await.get(tenant).cloned()
     }
 
+    /// Drop `tenant`'s route table.
+    pub async fn forget_tenant(&self, tenant: &TenantId) {
+        self.by_tenant.write().await.remove(tenant);
+    }
+
     pub async fn tenant_count(&self) -> usize {
         self.by_tenant.read().await.len()
     }

@@ -57,6 +57,12 @@ impl WasmModuleRegistry {
             .map(|s| s.as_str())
     }
 
+    /// Remove every module registered for `tenant`.
+    pub fn forget_tenant(&mut self, tenant: &TenantId) {
+        self.modules
+            .retain(|(owner, _), _| owner != tenant.as_str());
+    }
+
     /// Remove a module from the registry, returning its hash.
     pub fn remove(&mut self, tenant: &TenantId, module_name: &str) -> Option<String> {
         self.modules

@@ -24,6 +24,7 @@ use crate::state::PlatformState;
 
 mod apps;
 mod auth;
+mod delete;
 mod pushed;
 pub(crate) use apps::{
     get_genesis_app_bundle, get_os_app_guide, install_genesis_app, list_app_installs,
@@ -33,6 +34,7 @@ use auth::{
     PlatformResourceAuthorization, require_authenticated, require_control_plane,
     require_resource_authorization, require_same_tenant, validate_tenant_id,
 };
+pub(crate) use delete::delete_tenant;
 
 /// Request body for `POST /api/tenants`.
 #[derive(Debug, Deserialize)]
@@ -249,72 +251,6 @@ async fn list_tenants(
                 Json(serde_json::json!(TenantListResponse { tenants })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        ),
-    }
-}
-
-/// `DELETE /api/tenants/:id` — remove a tenant and its data.
-pub(crate) async fn delete_tenant(
-    State(state): State<PlatformState>,
-    authenticated: Option<Extension<AuthenticatedRequestContext>>,
-    axum::extract::Path(tenant_id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    let authenticated = match require_authenticated(authenticated.as_deref()) {
-        Ok(authenticated) => authenticated,
-        Err(status) => return authorization_error(status),
-    };
-    if let Err(status) = require_same_tenant(authenticated, &tenant_id).and_then(|_| {
-        require_resource_authorization(
-            &state,
-            authenticated,
-            PlatformResourceAuthorization {
-                action: "delete_tenant",
-                resource_type: "Tenant",
-                resource_id: &tenant_id,
-                attrs: std::collections::BTreeMap::new(),
-            },
-        )
-    }) {
-        return authorization_error(status);
-    }
-    let Some(provider) = turso_provider(&state) else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "no event store configured"})),
-        );
-    };
-
-    if !provider.supports_tenant_admin() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "tenant management requires routed storage mode"})),
-        );
-    }
-
-    // Remove from persistence (Turso registry + users).
-    match provider.remove_tenant(&tenant_id).await {
-        Ok(true) => {
-            // Also remove from in-memory SpecRegistry.
-            let tid = temper_runtime::tenant::TenantId::new(&tenant_id);
-            {
-                let mut registry = state.registry.write().unwrap(); // ci-ok: infallible lock
-                registry.remove_tenant(&tid);
-            }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "deleted": true,
-                    "tenant_id": tenant_id,
-                })),
-            )
-        }
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("tenant '{tenant_id}' not found")})),
-        ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

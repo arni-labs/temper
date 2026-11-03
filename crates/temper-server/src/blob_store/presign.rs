@@ -2,7 +2,7 @@
 //! authorized fetches the bytes from the object store itself, ranges and all, without the server carrying them.
 
 use super::{BlobStore, BlobStoreBackend, S3BlobStore};
-use crate::aws_sigv4;
+use crate::aws_sigv4::{self, query_encode};
 
 /// The longest a link may live: SigV4 allows seven days; a link handed to a browser after an authorization check
 /// should outlive that check by minutes, not days.
@@ -107,24 +107,6 @@ impl S3BlobStore {
             &url[..scheme_end]
         ))
     }
-}
-
-/// Percent-encode a query name or value per SigV4: everything but unreserved characters, `/` included.
-fn query_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 16);
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => {
-                out.push('%');
-                out.push(b"0123456789ABCDEF"[(byte >> 4) as usize] as char);
-                out.push(b"0123456789ABCDEF"[(byte & 0x0f) as usize] as char);
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]

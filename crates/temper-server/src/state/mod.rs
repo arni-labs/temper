@@ -28,6 +28,7 @@ mod spec_change;
 mod start_runtime;
 pub mod status_cache;
 pub(crate) mod storage_caps;
+mod tenant_removal;
 pub mod trajectory;
 pub mod wasm_invocation_log;
 pub(crate) mod write_record;

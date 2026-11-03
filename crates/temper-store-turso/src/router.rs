@@ -18,11 +18,18 @@ use temper_runtime::persistence::{
     EventStore, PersistenceAppend, PersistenceAppendResult, PersistenceEnvelope, PersistenceError,
     storage_error,
 };
-use temper_runtime::tenant::parse_persistence_id_parts;
+use temper_runtime::tenant::{KEPT_TENANTS, parse_persistence_id_parts};
 
 use crate::TursoEventStore;
 use crate::schema;
 use crate::store::WritePriority;
+
+mod remove;
+
+/// Registry statuses whose tenants are connected: `active` ones, and those
+/// being removed (`deleting`), which stay reachable until their removal ends
+/// so a removal that failed part way can be run again.
+const REACHABLE: [&str; 2] = ["active", "deleting"];
 
 /// Routes storage operations to per-tenant Turso databases.
 ///
@@ -245,48 +252,86 @@ impl TenantStoreRouter {
         Ok(out)
     }
 
-    /// Remove a tenant entirely.
-    ///
-    /// Deletes the tenant from `tenant_registry`, removes associated users,
-    /// and evicts the in-memory store connection.
-    #[instrument(skip_all, fields(tenant_id, otel.name = "router.remove_tenant"))]
-    pub async fn remove_tenant(&self, tenant_id: &str) -> Result<bool, PersistenceError> {
-        let conn = self
+    /// Mark a tenant as being removed: its registry row becomes `deleting`,
+    /// a tombstone that keeps its id from being registered again until
+    /// [`Self::remove_tenant`] has removed everything it had. The tenant
+    /// stays reachable meanwhile, so a removal that fails part way can be
+    /// run again. Returns false when no such tenant is registered.
+    #[instrument(skip_all, fields(tenant_id, otel.name = "router.begin_tenant_removal"))]
+    pub async fn begin_tenant_removal(&self, tenant_id: &str) -> Result<bool, PersistenceError> {
+        if KEPT_TENANTS.contains(&tenant_id) {
+            return Err(PersistenceError::Storage(format!(
+                "tenant '{tenant_id}' holds the server's own data and is never removed"
+            )));
+        }
+        let marked = self
             .platform
-            .write_connection("router.remove_tenant", WritePriority::High)
-            .await?;
-
-        // Delete associated users and installed apps first.
-        conn.execute(
-            "DELETE FROM tenant_users WHERE tenant_id = ?1",
-            crate::driver::params![tenant_id],
-        )
-        .await
-        .map_err(storage_error)?;
-        conn.execute(
-            "DELETE FROM tenant_installed_apps WHERE tenant_id = ?1",
-            crate::driver::params![tenant_id],
-        )
-        .await
-        .map_err(storage_error)?;
-
-        // Delete from registry.
-        let result = conn
+            .write_connection("router.begin_tenant_removal", WritePriority::High)
+            .await?
             .execute(
-                "DELETE FROM tenant_registry WHERE tenant_id = ?1",
+                "UPDATE tenant_registry SET status = 'deleting' WHERE tenant_id = ?1",
                 crate::driver::params![tenant_id],
             )
             .await
             .map_err(storage_error)?;
+        Ok(marked > 0)
+    }
 
-        // Evict from in-memory cache.
-        self.tenants.write().await.remove(tenant_id);
-
-        let removed = result > 0;
-        if removed {
-            info!(tenant_id, "Tenant removed from registry");
+    /// Remove a tenant entirely: its database and then its registry rows.
+    ///
+    /// The tenant is marked first ([`Self::begin_tenant_removal`]), then made
+    /// unreachable; the database is removed ([`Self::remove_database`]), and
+    /// only then are the rows deleted, the tombstone last. A removal that fails leaves the
+    /// tombstone, and removing the tenant again finishes it. Returns false
+    /// when no such tenant is registered.
+    #[instrument(skip_all, fields(tenant_id, otel.name = "router.remove_tenant"))]
+    pub async fn remove_tenant(&self, tenant_id: &str) -> Result<bool, PersistenceError> {
+        if !self.begin_tenant_removal(tenant_id).await? {
+            return Ok(false);
         }
-        Ok(removed)
+        // From here the tenant is no longer reachable (`removing` is not in
+        // `REACHABLE`), so no connection reopens its database while it goes.
+        self.platform
+            .write_connection("router.remove_tenant", WritePriority::High)
+            .await?
+            .execute(
+                "UPDATE tenant_registry SET status = 'removing' WHERE tenant_id = ?1",
+                crate::driver::params![tenant_id],
+            )
+            .await
+            .map_err(storage_error)?;
+        self.finish_removal(tenant_id).await?;
+        Ok(true)
+    }
+
+    /// Remove an unreachable (`removing`) tenant's database, then its rows.
+    /// Boot runs this for every tenant whose removal stopped here.
+    async fn finish_removal(&self, tenant_id: &str) -> Result<(), PersistenceError> {
+        self.tenants.write().await.remove(tenant_id);
+        let entry = self
+            .load_tenant_registry()
+            .await?
+            .into_iter()
+            .find(|row| row.tenant_id == tenant_id)
+            .ok_or_else(|| {
+                PersistenceError::Storage(format!("tenant '{tenant_id}' left the registry"))
+            })?;
+        self.remove_database(tenant_id, &entry.turso_db_url).await?;
+
+        let conn = self
+            .platform
+            .write_connection("router.remove_tenant", WritePriority::High)
+            .await?;
+        for table in ["tenant_users", "tenant_installed_apps", "tenant_registry"] {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE tenant_id = ?1"),
+                crate::driver::params![tenant_id],
+            )
+            .await
+            .map_err(storage_error)?;
+        }
+        info!(tenant_id, "Tenant and its database removed");
+        Ok(())
     }
 
     /// Remove a user from a tenant.
@@ -325,12 +370,18 @@ impl TenantStoreRouter {
         let conn = self.platform.connection().await.map_err(storage_error)?;
         let mut rows = conn
             .query(
-                "SELECT turso_db_url, turso_auth_token FROM tenant_registry WHERE tenant_id = ?1",
+                "SELECT turso_db_url, turso_auth_token, status FROM tenant_registry WHERE tenant_id = ?1",
                 crate::driver::params![tenant_id],
             )
             .await
             .map_err(storage_error)?;
         if let Some(row) = rows.next().await.map_err(storage_error)? {
+            let status: String = row.get::<String>(2).map_err(storage_error)?;
+            if status != "active" {
+                return Err(PersistenceError::Storage(format!(
+                    "tenant '{tenant_id}' is {status}"
+                )));
+            }
             // Exists in DB but not connected — reconnect.
             let db_url: String = row.get::<String>(0).map_err(storage_error)?;
             let auth_token: Option<String> = row.get::<Option<String>>(1).ok().flatten();
@@ -355,14 +406,18 @@ impl TenantStoreRouter {
         &self,
         tenant_id: &str,
     ) -> Result<TursoEventStore, PersistenceError> {
-        // Check if already registered.
-        {
-            let tenants = self.tenants.read().await;
-            if tenants.contains_key(tenant_id) {
-                return Err(PersistenceError::Storage(format!(
-                    "tenant '{tenant_id}' already exists"
-                )));
-            }
+        // Check if already registered, in any status: a tenant still being
+        // removed keeps its id until its database is gone.
+        let registered = self.tenants.read().await.contains_key(tenant_id)
+            || self
+                .load_tenant_registry()
+                .await?
+                .iter()
+                .any(|row| row.tenant_id == tenant_id);
+        if registered {
+            return Err(PersistenceError::Storage(format!(
+                "tenant '{tenant_id}' already exists"
+            )));
         }
 
         let (db_url, auth_token) = self.provision_database(tenant_id).await?;
@@ -437,10 +492,15 @@ impl TenantStoreRouter {
     /// Pre-connect to all active tenants in the registry.
     async fn connect_registered_tenants(&self) -> Result<(), PersistenceError> {
         let registry = self.load_tenant_registry().await?;
+        for entry in registry.iter().filter(|entry| entry.status == "removing") {
+            if let Err(e) = self.finish_removal(&entry.tenant_id).await {
+                warn!(tenant = %entry.tenant_id, error = %e, "Tenant removal still unfinished");
+            }
+        }
         let mut tenants = self.tenants.write().await;
 
         for entry in &registry {
-            if entry.status != "active" {
+            if !REACHABLE.contains(&entry.status.as_str()) {
                 continue;
             }
             match TursoEventStore::new(&entry.turso_db_url, entry.turso_auth_token.as_deref()).await
@@ -466,7 +526,7 @@ impl TenantStoreRouter {
         let registry = self.load_tenant_registry().await?;
         let entry = registry
             .iter()
-            .find(|r| r.tenant_id == tenant_id && r.status == "active")
+            .find(|r| r.tenant_id == tenant_id && REACHABLE.contains(&r.status.as_str()))
             .ok_or_else(|| {
                 PersistenceError::Storage(format!("tenant '{tenant_id}' not found in registry"))
             })?;
@@ -498,13 +558,16 @@ impl TenantStoreRouter {
         }
 
         // Local mode: create a file-based database.
-        let base_dir = self.local_base_dir.as_deref().unwrap_or(".temper/tenants");
-
+        let path = self.local_database_path(tenant_id)?;
+        let base_dir = path.parent().unwrap_or(std::path::Path::new("."));
         std::fs::create_dir_all(base_dir).map_err(|e| {
-            PersistenceError::Storage(format!("failed to create tenant directory {base_dir}: {e}"))
+            PersistenceError::Storage(format!(
+                "failed to create tenant directory {}: {e}",
+                base_dir.display()
+            ))
         })?;
 
-        let db_url = format!("file:{base_dir}/{tenant_id}.db");
+        let db_url = format!("file:{}", path.display());
         info!(tenant_id, db_url, "Provisioned local tenant database");
         Ok((db_url, None))
     }

@@ -503,6 +503,8 @@ impl SpecRegistry {
     /// Returns `true` if the tenant was found and removed, `false` otherwise.
     #[instrument(skip_all, fields(otel.name = "registry.remove_tenant", tenant = %tenant))]
     pub fn remove_tenant(&mut self, tenant: &TenantId) -> bool {
+        self.changed_types.retain(|(changed, _)| changed != tenant);
+        self.unavailable.remove(tenant);
         self.tenants.remove(tenant).is_some()
     }
 

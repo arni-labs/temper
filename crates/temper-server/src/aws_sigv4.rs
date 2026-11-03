@@ -52,8 +52,12 @@ pub(crate) fn amz_date_now() -> String {
 /// into the returned map.
 pub(crate) fn build_signed_headers(request: &SignedHeaderRequest<'_>) -> Result<HeaderMap, String> {
     let date = &request.amz_date[..8];
-    let (host, path) = parse_url_host_path(request.url);
+    let (host, path_and_query) = parse_url_host_path(request.url);
+    let (path, query) = path_and_query
+        .split_once('?')
+        .unwrap_or((path_and_query, ""));
     let canonical_uri = uri_encode_path(path);
+    let canonical_query = canonical_query(query);
     let scope = format!("{date}/{}/{}/aws4_request", request.region, request.service);
 
     let mut header_pairs: Vec<(&str, &str)> = vec![
@@ -74,7 +78,7 @@ pub(crate) fn build_signed_headers(request: &SignedHeaderRequest<'_>) -> Result<
         .collect::<Vec<_>>()
         .join(";");
     let canonical_request = format!(
-        "{}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{}",
+        "{}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{}",
         request.method, request.payload_hash
     );
     let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
@@ -168,6 +172,42 @@ pub(crate) fn parse_url_host_path(url: &str) -> (&str, &str) {
     } else {
         (after_scheme, "/")
     }
+}
+
+/// The canonical query string of a URL's query, whose names and values the
+/// caller already encoded with [`query_encode`]: its parameters sorted, each
+/// as `name=value` (a bare `name` gets an empty value).
+fn canonical_query(query: &str) -> String {
+    let mut pairs: Vec<(&str, &str)> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
+        .collect();
+    pairs.sort_unstable();
+    pairs
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Percent-encode a query name or value per SigV4: everything but unreserved
+/// characters, `/` included.
+pub(crate) fn query_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 16);
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => {
+                out.push('%');
+                out.push(b"0123456789ABCDEF"[(byte >> 4) as usize] as char);
+                out.push(b"0123456789ABCDEF"[(byte & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
 }
 
 /// Percent-encode a URL path per the SigV4 canonical URI rules

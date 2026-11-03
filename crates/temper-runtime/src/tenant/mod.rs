@@ -12,6 +12,11 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+/// Tenants whose data is the server's own, which are never removed: the
+/// default tenant every server keeps, and `temper-system`, the platform's own
+/// records.
+pub const KEPT_TENANTS: [&str; 2] = ["default", "temper-system"];
+
 /// A tenant identifier scoping all platform resources.
 ///
 /// Convention: lowercase, alphanumeric + hyphens (e.g., `"alpha"`, `"beta"`, `"my-app"`).

@@ -307,21 +307,22 @@ impl ServerState {
     }
 
     fn local_blob_store(&self, tenant: &TenantId) -> Option<BlobStore> {
+        self.local_blob_root()
+            .map(|root| BlobStore::local_fs(tenant_blob_root(root, tenant)))
+    }
+
+    /// The root of this server's local blob store, which every tenant's
+    /// namespace sits under.
+    pub(super) fn local_blob_root(&self) -> Option<PathBuf> {
         if let Ok(root) = std::env::var("TEMPER_LOCAL_BLOB_DIR") // determinism-ok: deployment config read
             && !root.trim().is_empty()
         {
-            return Some(BlobStore::local_fs(tenant_blob_root(root.into(), tenant)));
+            return Some(root.into());
         }
-        if !self.data_dir.as_os_str().is_empty() {
-            return Some(BlobStore::local_fs(tenant_blob_root(
-                self.data_dir.join("blobs"),
-                tenant,
-            )));
-        }
-        None
+        (!self.data_dir.as_os_str().is_empty()).then(|| self.data_dir.join("blobs"))
     }
 
-    fn blob_staging_root(&self, tenant: &TenantId) -> PathBuf {
+    pub(super) fn blob_staging_root(&self, tenant: &TenantId) -> PathBuf {
         let root = if !self.data_dir.as_os_str().is_empty() {
             self.data_dir.join("blob-ingest-staging")
         } else {
@@ -389,12 +390,12 @@ fn object_key_prefix(prefix: Option<&str>, tenant: &TenantId) -> Option<String> 
     }
 }
 
-fn tenant_object_namespace(tenant: &TenantId) -> Option<String> {
+pub(super) fn tenant_object_namespace(tenant: &TenantId) -> Option<String> {
     (tenant != &TenantId::default())
         .then(|| super::hex_lower(&Sha256::digest(tenant.as_str().as_bytes())))
 }
 
-fn tenant_blob_root(root: PathBuf, tenant: &TenantId) -> PathBuf {
+pub(super) fn tenant_blob_root(root: PathBuf, tenant: &TenantId) -> PathBuf {
     match tenant_object_namespace(tenant) {
         Some(namespace) => root.join(super::TENANT_NAMESPACE_SEGMENT).join(namespace),
         None => root,

@@ -19,11 +19,13 @@ mod http_client;
 mod keys;
 mod limits;
 mod local;
+mod prefix_delete;
 mod presign;
 mod raw_ingest;
 mod s3_buffered_get;
 mod state;
 mod streaming;
+mod tenant_blobs;
 pub(crate) use endpoint::{LocalInternalBlobEndpoint, is_local_internal_blob_endpoint};
 pub use keys::KERNEL_BLOB_PREFIX;
 pub(crate) use keys::{
@@ -41,6 +43,7 @@ pub(crate) use raw_ingest::{
 };
 pub(crate) use streaming::BlobReadBounded;
 pub use streaming::{BlobObjectStream, BlobStreamRead, decode_json_base64_stream};
+pub use tenant_blobs::TenantBlobs;
 
 #[derive(Clone, Debug)]
 pub(crate) struct BlobStore {

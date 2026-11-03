@@ -973,6 +973,11 @@ pub trait TursoStoreProvider: Send + Sync {
 
     async fn list_tenants(&self) -> Result<Vec<String>, PersistenceError>;
 
+    /// Mark a tenant as being removed, so its id is not registered again
+    /// until [`Self::remove_tenant`] finishes; false when there is no such
+    /// tenant.
+    async fn begin_tenant_removal(&self, tenant_id: &str) -> Result<bool, PersistenceError>;
+
     async fn remove_tenant(&self, tenant_id: &str) -> Result<bool, PersistenceError>;
 
     async fn add_tenant_user(
@@ -1253,6 +1258,10 @@ impl TursoStoreProvider for SingleTursoStoreProvider {
         Err(tenant_admin_unsupported())
     }
 
+    async fn begin_tenant_removal(&self, _tenant_id: &str) -> Result<bool, PersistenceError> {
+        Err(tenant_admin_unsupported())
+    }
+
     async fn remove_tenant(&self, _tenant_id: &str) -> Result<bool, PersistenceError> {
         Err(tenant_admin_unsupported())
     }
@@ -1373,6 +1382,10 @@ impl TursoStoreProvider for TenantRoutedTursoStoreProvider {
 
     async fn list_tenants(&self) -> Result<Vec<String>, PersistenceError> {
         self.router.list_tenants().await
+    }
+
+    async fn begin_tenant_removal(&self, tenant_id: &str) -> Result<bool, PersistenceError> {
+        self.router.begin_tenant_removal(tenant_id).await
     }
 
     async fn remove_tenant(&self, tenant_id: &str) -> Result<bool, PersistenceError> {
