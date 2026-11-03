@@ -26,6 +26,7 @@ mod equality_delta_postgres;
 mod equality_probe;
 mod event_metadata;
 mod keyed_existence;
+mod list_cost;
 mod paging;
 mod proof;
 mod spec_deleted;
