@@ -1801,12 +1801,14 @@ impl EntityActor {
                     // error variants fail immediately (same as before).
                     // The rows of the scheduled actions it arms are written
                     // with the event, so a restart arms them again.
-                    let scheduled = self.arm_scheduled_actions(
-                        &mut result.scheduled_actions,
-                        state,
-                        &event,
-                        caller.as_deref(),
-                    );
+                    let scheduled = self
+                        .arm_scheduled_actions(
+                            &mut result.scheduled_actions,
+                            state,
+                            &event,
+                            caller.as_deref(),
+                        )
+                        .await;
                     // A machine's move that leaves its record as it was writes
                     // nothing (`unrecorded`); its triggers still run.
                     let fires_timer_once = super::timer_fire::fires_once(
@@ -2076,12 +2078,14 @@ impl EntityActor {
                                     ))
                                     .await;
 
-                                    let retry_scheduled = self.arm_scheduled_actions(
-                                        &mut retry_result.scheduled_actions,
-                                        state,
-                                        &retry_event,
-                                        caller.as_deref(),
-                                    );
+                                    let retry_scheduled = self
+                                        .arm_scheduled_actions(
+                                            &mut retry_result.scheduled_actions,
+                                            state,
+                                            &retry_event,
+                                            caller.as_deref(),
+                                        )
+                                        .await;
                                     match self
                                         .persist_event(
                                             store,

@@ -349,6 +349,26 @@ pub trait EventStore: Send + Sync + 'static {
         async { Ok(Vec::new()) }
     }
 
+    /// The pending scheduled actions of one record: what an arm compares
+    /// with, so an action armed twice for the same time keeps one row. The
+    /// default reads the tenant's rows and keeps the record's.
+    fn list_entity_scheduled_actions(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<ScheduledActionRecord>, PersistenceError>> + Send
+    {
+        let rows = self.list_scheduled_actions(tenant);
+        async move {
+            Ok(rows
+                .await?
+                .into_iter()
+                .filter(|row| row.entity_type == entity_type && row.entity_id == entity_id)
+                .collect())
+        }
+    }
+
     /// Remove one scheduled action's row once it has fired. Idempotent.
     fn delete_scheduled_action(
         &self,

@@ -211,6 +211,18 @@ impl BoxedEventStore {
         self.store.list_scheduled_actions(tenant).await
     }
 
+    /// The pending scheduled actions of one record.
+    pub async fn list_entity_scheduled_actions(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<Vec<temper_runtime::persistence::ScheduledActionRecord>, PersistenceError> {
+        self.store
+            .list_entity_scheduled_actions(tenant, entity_type, entity_id)
+            .await
+    }
+
     /// Remove one scheduled action's row once it has fired.
     pub async fn delete_scheduled_action(
         &self,

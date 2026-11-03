@@ -364,6 +364,14 @@ impl crate::state::ServerState {
         if response.is_record_changed() {
             return response;
         }
+        // A scheduled action that came due where its action has no
+        // transition did not fire, and nothing is recorded for it.
+        if super::scheduled_actions::scheduled_fire_lapsed(
+            ctx.agent_ctx.fires_scheduled_action.as_ref(),
+            &response,
+        ) {
+            return response;
+        }
 
         // 1. Record metrics
         self.metrics
