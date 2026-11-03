@@ -34,6 +34,24 @@ pub async fn bearer_auth_check(
     let bearer = bearer_credential(&req);
     let tenant = requested_tenant(&req)?;
 
+    // A module's one-time credential is spent as it arrives: its check reads
+    // only the in-memory credential store, never the tenant's records, and its
+    // life (`INTERNAL_INVOCATION_CREDENTIAL_TTL`) must not run out while the
+    // call waits for its tenant below, which has no deadline.
+    let internal = match bearer
+        .as_deref()
+        .filter(|token| temper_server::internal_invocation::is_internal_invocation_bearer(token))
+    {
+        Some(token) => Some(
+            state
+                .server
+                .internal_invocation_credentials
+                .consume_for_request(token, &tenant, req.method(), req.uri())
+                .map_err(|_| StatusCode::UNAUTHORIZED)?,
+        ),
+        None => None,
+    };
+
     // A tenant still starting, or one startup could not restore, has no
     // credential records, policies or types loaded, so any answer now could be
     // wrong: a 401 for a valid credential, a 404, an empty list, a default-deny
@@ -48,16 +66,7 @@ pub async fn bearer_auth_check(
         return Ok(response);
     }
 
-    if bearer
-        .as_deref()
-        .is_some_and(temper_server::internal_invocation::is_internal_invocation_bearer)
-    {
-        let token = bearer.as_deref().ok_or(StatusCode::UNAUTHORIZED)?;
-        let authenticated = state
-            .server
-            .internal_invocation_credentials
-            .consume_for_request(token, &tenant, req.method(), req.uri())
-            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    if let Some(authenticated) = internal {
         // The capability has already been consumed; do not expose it to
         // downstream handlers, logs, or accidental forwarding.
         req.headers_mut().remove("authorization");

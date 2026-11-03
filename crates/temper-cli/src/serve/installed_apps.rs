@@ -104,7 +104,7 @@ pub(super) async fn bootstrap_installed_apps(
     }
 
     let mut own_roots = Vec::new();
-    for (target, roots) in genesis_install::plan_genesis_app_cache_roots(state).await {
+    for (target, roots) in genesis_install::plan_app_cache_roots(state).await {
         if later.defers(state, &target) {
             later.tenant(&target).cache_roots.extend(roots);
         } else {

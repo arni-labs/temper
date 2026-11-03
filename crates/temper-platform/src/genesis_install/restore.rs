@@ -32,7 +32,7 @@ use super::*;
 /// `App`/`Commit`/`Tree`/`Blob` state, and the local OS-app catalog is rebuilt
 /// from those objects instead of from GitHub, submodules, or arbitrary app dirs.
 pub async fn restore_genesis_app_cache_roots(platform: &PlatformState) -> usize {
-    let planned = plan_genesis_app_cache_roots(platform).await;
+    let planned = plan_app_cache_roots(platform).await;
     restore_planned_cache_roots(platform, planned.into_values().flatten().collect()).await
 }
 
@@ -51,7 +51,7 @@ pub struct PlannedCacheRoot {
 /// each installed one, by the tenant it installs into, so a boot can bring
 /// back its own tenants' roots before it serves and each other tenant's
 /// with that tenant ([`restore_planned_cache_roots`]).
-pub async fn plan_genesis_app_cache_roots(
+pub async fn plan_app_cache_roots(
     platform: &PlatformState,
 ) -> std::collections::BTreeMap<String, Vec<PlannedCacheRoot>> {
     let mut planned: std::collections::BTreeMap<String, Vec<PlannedCacheRoot>> =
