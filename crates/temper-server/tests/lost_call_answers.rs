@@ -126,6 +126,16 @@ impl Process {
         name: &str,
         answer: &serde_json::Value,
     ) -> Self {
+        Self::start_with_modules(store, clock, name, LOOKUP, &[("lookup", answer.clone())])
+    }
+
+    fn start_with_modules(
+        store: &SimEventStore,
+        clock: &ProcessClock,
+        name: &str,
+        source: &str,
+        modules: &[(&str, serde_json::Value)],
+    ) -> Self {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .start_paused(true)
@@ -135,15 +145,17 @@ impl Process {
             clock.begin();
             let mut registry = SpecRegistry::new();
             let csdl = parse_csdl(CSDL).unwrap();
-            registry.register_tenant(TENANT, csdl, CSDL.to_string(), &[("Lookup", LOOKUP)]);
+            registry.register_tenant(TENANT, csdl, CSDL.to_string(), &[("Lookup", source)]);
             let mut state = ServerState::from_registry(ActorSystem::new(name), registry);
             state.set_storage_stack(StorageStack::from_sim(store.clone(), None));
             let tenant = TenantId::new(TENANT);
-            let hash = state
-                .wasm_engine
-                .compile_and_cache(answering(answer).as_bytes())
-                .expect("the module compiles");
-            state.register_wasm_module(&tenant, "lookup", &hash);
+            for (module, answer) in modules {
+                let hash = state
+                    .wasm_engine
+                    .compile_and_cache(answering(answer).as_bytes())
+                    .expect("the module compiles");
+                state.register_wasm_module(&tenant, module, &hash);
+            }
             let walk = state.start_runtime().await.expect("the first start");
             walk.await.unwrap();
             state

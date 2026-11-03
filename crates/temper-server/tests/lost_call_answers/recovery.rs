@@ -104,3 +104,70 @@ fn delayed_boot_recovery_does_not_answer_a_current_process_call() {
         process.kill(&clock, Duration::ZERO);
     }
 }
+
+#[test]
+fn failed_cleanup_does_not_block_later_independent_calls() {
+    let source = LOOKUP.replace(
+        "[[action]]\nname = \"Finish\"",
+        r#"[[action.triggers]]
+name = "later"
+kind = "wasm"
+module = "later"
+on_success = "Finish"
+on_failure = "GiveUp"
+
+[action.triggers.config]
+timeout_secs = "30"
+
+[[action]]
+name = "Finish""#,
+    );
+    assert_ne!(source, LOOKUP, "the fixture has two independent triggers");
+    for seed in [16, 17, 18] {
+        let clock = Arc::new(ProcessClock::new());
+        let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+        let store = SimEventStore::no_faults(seed);
+        let process = Process::start_with_modules(
+            &store,
+            &clock,
+            "independent-calls",
+            &source,
+            &[
+                ("lookup", json!({ "params": { "score": 10 } })),
+                ("later", json!({ "params": { "score": 70 } })),
+            ],
+        );
+        process.runtime.block_on(async {
+            store.fail_next_scheduled_deletes(1);
+            ask(&process.state).await;
+            assert!(
+                run_until(|| store
+                    .dump_journal(JOURNAL)
+                    .iter()
+                    .any(|event| event.event_type == "Finish"))
+                .await,
+                "seed {seed}: the second call must answer while the first call's cleanup waits"
+            );
+            assert_eq!(store.scheduled_delete_failures_pending(), 0);
+            let rows = store.list_scheduled_actions(TENANT).await.unwrap();
+            assert_eq!(rows.len(), 1, "only the first call's cleanup is pending");
+            assert!(
+                rows[0].action.is_empty(),
+                "the first call is durably cancelled"
+            );
+            assert!(rows[0].arm_id.ends_with(".call:lookup"));
+            tokio::time::advance(Duration::from_secs(1)).await;
+            for _ in 0..600 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                store
+                    .list_scheduled_actions(TENANT)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+        process.kill(&clock, Duration::ZERO);
+    }
+}
