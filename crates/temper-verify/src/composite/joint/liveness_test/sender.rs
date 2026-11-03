@@ -178,8 +178,8 @@ permit(principal, action == Action::"Address", resource is Note)
 when {{ {condition} && context.via != "request" }};
 "#
     ))
-    .unwrap();
-    let note = parse_automaton(NOTE).unwrap();
+    .expect("fixture policies parse");
+    let note = parse_automaton(NOTE).expect("fixture parses");
     let room = Bytes::new(1 << 20);
     let progress = Progress::default();
     let results = verify_joint_liveness(
@@ -206,8 +206,8 @@ when {{ {condition} && context.via != "request" }};
 
 #[test]
 fn a_proof_keeps_its_senders_charged_until_the_proof_is_dropped() {
-    let note = parse_automaton(NOTE).unwrap();
-    let policies = SendAnalysis::new(MEMBERS_ADD).unwrap();
+    let note = parse_automaton(NOTE).expect("fixture parses");
+    let policies = SendAnalysis::new(MEMBERS_ADD).expect("fixture policies parse");
     let room = Bytes::new(64 << 20);
     let proofs = liveness_proofs(&[&note], Some(&policies), &room);
     let retained = room.held();
