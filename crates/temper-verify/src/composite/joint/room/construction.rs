@@ -1,4 +1,4 @@
-//! A model's sender partition and its temporary construction share the host room.
+//! Sender profiles, answer tables and temporary construction share the host room.
 
 use std::cell::Cell;
 use std::fmt;

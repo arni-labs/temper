@@ -228,3 +228,26 @@ fn a_proof_keeps_its_senders_charged_until_the_proof_is_dropped() {
     drop(proofs);
     assert_eq!(room.held(), 0);
 }
+
+#[test]
+fn a_proof_keeps_answer_tables_charged_without_a_sender_kind_split() {
+    let note = parse_automaton(NOTE).expect("fixture parses");
+    let policies =
+        SendAnalysis::new("permit(principal, action, resource);").expect("fixture policies parse");
+    let room = Bytes::new(64 << 20);
+    let proofs = liveness_proofs(&[&note], Some(&policies), &room);
+    let retained = room.held();
+    assert!(retained > 0, "unsplit senders still retain answer tables");
+    let progress = Progress::default();
+    assert!(
+        proofs[0]
+            .check(Bound {
+                room: &room,
+                progress: &progress
+            })
+            .holds()
+    );
+    assert_eq!(room.held(), retained, "walking retains the tables' charge");
+    drop(proofs);
+    assert_eq!(room.held(), 0, "dropping the proof releases its tables");
+}

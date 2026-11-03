@@ -68,7 +68,7 @@ pub(super) struct Sending<'s> {
     /// The policies that decide each move as its sender; `None` lets every
     /// sender send everything.
     pub(super) policies: Option<&'s SendAnalysis>,
-    /// Reserve construction bytes before growing the sender partition.
+    /// Reserve construction bytes before growing sender profiles or answer tables.
     pub(super) reserve: Option<&'s dyn Fn(usize) -> Result<(), String>>,
     /// Whether the model makes the kernel's own moves: state timers, module
     /// answers and failures, and module calls lost to a restart. Without
@@ -345,13 +345,13 @@ impl JointModel {
         }
     }
 
-    /// Retain only the finished partition, or propagate construction failure.
+    /// Retain the finished profiles and answer tables, or propagate construction failure.
     pub(super) fn built(self, memory: &super::room::Construction<'_>) -> Result<Self, String> {
         if let Some(reason) = &self.senders.problem {
             memory.set(0)?;
             return Err(reason.clone());
         }
-        memory.set(self.senders.kind_bytes())?;
+        memory.set(self.senders.construction_bytes())?;
         Ok(self)
     }
 

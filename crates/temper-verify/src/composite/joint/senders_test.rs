@@ -128,3 +128,60 @@ when { principal has role && principal.role == "visitor" && context.rule == "Not
         "visitor's reaction: {answers:?}"
     );
 }
+
+#[test]
+fn sender_answer_tables_reserve_room_before_they_are_allocated() {
+    use super::super::room::{Bytes, Construction};
+
+    let mut app = parse_automaton(
+        r#"
+[automaton]
+name = "App"
+states = ["Ready"]
+initial = "Ready"
+[[action]]
+name = "Start"
+kind = "input"
+from = ["Ready"]
+to = "Ready"
+"#,
+    )
+    .expect("fixture parses");
+    let template = app.actions[0].clone();
+    app.actions = (0..512)
+        .map(|at| {
+            let mut action = template.clone();
+            action.name = format!("Action{at}");
+            action
+        })
+        .collect();
+    let policies =
+        SendAnalysis::new("permit(principal, action, resource);").expect("fixture policies parse");
+    let entities = BTreeSet::from(["App".to_string()]);
+    // None of these actions is a partition question. They still receive
+    // answers in the full tables, even with no outside-kind split.
+    let none = BTreeSet::new();
+    let room = Bytes::new(4096);
+    let memory = Construction::new(&room);
+    let reserve = |bytes| memory.set(bytes);
+    let senders = Senders::new(
+        &BTreeMap::from([("App", &app)]),
+        &entities,
+        Some(&policies),
+        &none,
+        &BTreeSet::new(),
+        Some(&reserve),
+    );
+    assert!(
+        senders
+            .problem
+            .as_ref()
+            .is_some_and(|p| p.contains("sender answer tables")),
+        "table construction must fail before allocation: {:?}",
+        senders.problem
+    );
+    assert!(senders.requests.is_none() && senders.may.is_none());
+    drop(senders);
+    drop(memory);
+    assert_eq!(room.held(), 0, "failed construction releases its room");
+}

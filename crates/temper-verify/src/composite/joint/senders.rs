@@ -54,8 +54,9 @@ use super::env::ID;
 use super::room::Heap;
 use super::state::JointState;
 use crate::model::ModelString;
-use table::{each, reread};
+use table::reread;
 
+mod build;
 mod kinds;
 mod table;
 
@@ -135,125 +136,6 @@ type Question = (
 );
 
 impl Senders {
-    /// The senders of the moves among `entities`, and what `policies` lets
-    /// each send. A request to one of `roots` starts a chain that runs as
-    /// its sender through the `inheriting` moves (entity, action): those
-    /// are what the kinds of outside sender are told apart on.
-    pub(super) fn new<'a>(
-        by_name: &BTreeMap<&str, &Automaton>,
-        entities: impl IntoIterator<Item = &'a String> + Clone,
-        policies: Option<&SendAnalysis>,
-        roots: &BTreeSet<String>,
-        inheriting: &BTreeSet<(String, String)>,
-        reserve: Option<&dyn Fn(usize) -> Result<(), String>>,
-    ) -> Self {
-        let unlimited = |_: usize| Ok(());
-        let kinds = policies
-            .map(|policies| {
-                kinds::outside(
-                    by_name,
-                    policies,
-                    roots,
-                    inheriting,
-                    reserve.unwrap_or(&unlimited),
-                )
-            })
-            .transpose();
-        let (kinds, problem) = match kinds {
-            Ok(kinds) => (kinds.flatten(), None),
-            Err(reason) => (
-                None,
-                Some(format!("sender-kind construction does not fit: {reason}")),
-            ),
-        };
-        let outside: Vec<u32> = match &kinds {
-            None => vec![OUTSIDE],
-            Some(kinds) => (1..=kinds.len()).map(|at| at as u32 * 2).collect(),
-        };
-        let kinds = kinds.unwrap_or_default();
-        let mut askers = vec![Asker::Outside];
-        askers.extend(kinds.iter().cloned().map(Asker::OutsideAs));
-        for entity in entities.clone() {
-            for action in &by_name[entity.as_str()].actions {
-                for trigger in &action.triggers {
-                    let Some(asker) = declared(trigger, entity, &action.name) else {
-                        continue;
-                    };
-                    if !askers.contains(&asker) {
-                        askers.push(asker);
-                    }
-                }
-            }
-        }
-        // ResourceId is relative to the current receiver, not a stable ID.
-        // Precompute a closed set of senders for chains that change receiver ID.
-        let mut detached = Vec::new();
-        for mut asker in askers.clone() {
-            if let Asker::Service { context, .. } = &mut asker {
-                for attr in context.values_mut() {
-                    if *attr == Attr::ResourceId {
-                        *attr = Attr::Unknown;
-                    }
-                }
-            }
-            let at = askers.iter().position(|a| a == &asker).unwrap_or_else(|| {
-                askers.push(asker);
-                askers.len() - 1
-            });
-            detached.push(at as u32);
-        }
-        detached.extend((detached.len()..askers.len()).map(|at| at as u32));
-        let timer_chains = policies.is_some_and(SendAnalysis::tells_timer_chains);
-        let none = BTreeMap::new();
-        let requests = policies.map(|policies| {
-            each(by_name, entities.clone(), &|entity, action| {
-                let request = Cause::request();
-                askers[..=kinds.len()]
-                    .iter()
-                    .map(|asker| policies.may(asker, action, entity, &none, Some(&request)))
-                    .collect()
-            })
-        });
-        let may = policies.map(|policies| {
-            each(by_name, entities.clone(), &|entity, action| {
-                let answers = |timed: bool| {
-                    let cause = Cause::reaction(timed, Hop::unknown());
-                    askers
-                        .iter()
-                        .map(|asker| policies.may(asker, action, entity, &none, Some(&cause)))
-                        .collect::<Vec<_>>()
-                };
-                let request_chain = answers(false);
-                let timer_chain = if timer_chains {
-                    answers(true)
-                } else {
-                    request_chain.clone()
-                };
-                request_chain
-                    .into_iter()
-                    .zip(timer_chain)
-                    .flat_map(|(r, t)| [r, t])
-                    .collect()
-            })
-        });
-        let reread = reread(policies, &askers, may.as_ref());
-        let names = askers.iter().map(asker_name).collect();
-        Self {
-            askers,
-            names,
-            outside,
-            problem,
-            detached,
-            timer_chains,
-            requests,
-            may,
-            policies: policies.cloned(),
-            decided: RefCell::default(),
-            decided_bytes: std::cell::Cell::default(),
-            reread,
-        }
-    }
-
     /// Forget what Cedar lets each sender send of `moves` (entity, action),
     /// which the model no longer makes: neither a walk nor its digest reads
     /// them.
@@ -281,6 +163,11 @@ impl Senders {
                 _ => 0,
             })
             .sum()
+    }
+
+    /// Bytes retained by sender profiles and their complete answer tables.
+    pub(super) fn construction_bytes(&self) -> usize {
+        self.kind_bytes() + table::bytes(self.requests.as_ref()) + table::bytes(self.may.as_ref())
     }
 
     /// Whether Cedar lets someone outside, of no known kind, request

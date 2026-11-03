@@ -49,8 +49,8 @@ impl JointProof<'_> {
 
 /// Every walk the joint checks make for `automatons`: the invariants'
 /// ([`invariant_proofs`]), then the liveness properties'
-/// ([`liveness_proofs`]). Construction and retained sender profiles take
-/// their memory from `room`, returning it when each proof is dropped.
+/// ([`liveness_proofs`]). Construction, retained sender profiles and answer
+/// tables take their memory from `room`, returning it when each proof is dropped.
 pub fn joint_proofs<'room>(
     automatons: &[&Automaton],
     policies: Option<&SendAnalysis>,
