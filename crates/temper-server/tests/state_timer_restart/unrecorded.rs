@@ -148,3 +148,82 @@ pub(crate) fn a_restart_arms_the_poll_from_the_newest_unrecorded_one(world: &Wor
     let stopped = second.now();
     second.kill(world, stopped);
 }
+
+/// A reset after a one-shot fire is a new arm even though its move has no
+/// journal entry. Unrelated recorded moves and boot reconciliation must use
+/// that arm's clock, including after the actor has replayed its old fire.
+pub(crate) fn one_shot_reset_survives_reconciliation_and_restart(world: &World) {
+    use temper_server::entity_actor::{EventOrigin, EventVia};
+
+    for note_before_restart in [false, true] {
+        let id = if note_before_restart {
+            "reset-noted"
+        } else {
+            "reset-only"
+        };
+        let mut rng = world.rng();
+        let first = Server::start(world, "one-shot-reset-1");
+        let t0 = first.now();
+        first.act("Probe", id, "Arm", &person("alice"));
+        first.run_until(t0 + super::BUDGET + MARGIN);
+        assert_eq!(first.read("Probe", id, "fires").0, 1);
+        assert!(!first.has_row(id), "the original one-shot finished");
+        let journal = first.journal("Probe", id);
+        let reset_at = first.now();
+        let mut reaction = person("alice");
+        reaction.event_origin = Some(EventOrigin {
+            via: Some(EventVia::Reaction),
+            ..Default::default()
+        });
+        first.act("Probe", id, "Reset", &reaction);
+        assert_eq!(
+            first.journal("Probe", id),
+            journal,
+            "the reset writes no event"
+        );
+        assert!(first.has_row(id), "the reset has its own durable arm");
+        if note_before_restart {
+            first.act("Probe", id, "Note", &person("alice"));
+            assert!(
+                first.has_row(id),
+                "an unrelated event preserves the reset arm"
+            );
+        }
+        first.kill(world, reset_at + millis_between(&mut rng, 500, 1_500));
+
+        let second = Server::start(world, "one-shot-reset-2");
+        second.run_for(SETTLE);
+        assert!(
+            second.has_row(id),
+            "boot reconciliation preserves the newer reset"
+        );
+        second.act("Probe", id, "Note", &person("bob"));
+        assert!(
+            second.has_row(id),
+            "a replayed actor's unrelated event preserves the reset"
+        );
+        second.run_until(reset_at + super::BUDGET - MARGIN);
+        assert_eq!(second.read("Probe", id, "fires").0, 1, "no early fire");
+        second.run_until(reset_at + super::BUDGET + MARGIN);
+        assert_eq!(
+            second.read("Probe", id, "fires").0,
+            2,
+            "the reset one-shot fires"
+        );
+        assert!(!second.has_row(id), "the new one-shot ends its row");
+        second.run_for(super::BUDGET * 2);
+        assert_eq!(
+            second.read("Probe", id, "fires").0,
+            2,
+            "it fires only once per reset"
+        );
+        assert!(
+            !second
+                .journal("Probe", id)
+                .iter()
+                .any(|action| action == "Reset")
+        );
+        let stopped = second.now();
+        second.kill(world, stopped);
+    }
+}

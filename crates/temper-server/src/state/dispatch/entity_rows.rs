@@ -21,7 +21,7 @@
 use temper_runtime::persistence::{AppendProjection, StateTimerRecord};
 use temper_runtime::tenant::TenantId;
 
-use super::state_timeouts::{rearm_clock_start, timer_agent};
+use super::state_timeouts::timer_agent;
 use crate::entity_actor::entity_rows::{
     EntityRows, EntityRowsHook, Projection, RowsInput, TimerRow,
 };
@@ -129,10 +129,10 @@ impl ServerState {
         let entered = event.from_status != after.status;
         let reset = !entered && st.reset_on.iter().any(|action| action == &event.action);
         if !(entered || reset) {
-            // A timer that fires once and has fired wants no row.
-            return rearm_clock_start(st, after, event.timestamp)
-                .is_none()
-                .then_some(TimerRow::End);
+            // Only this fire ends a one-shot. An old fire in the journal
+            // can predate an unrecorded reset held by the timer row, so an
+            // unrelated event must leave that row for reconciliation to read.
+            return (event.action == st.on_timeout).then_some(TimerRow::End);
         }
         let caller = input.caller?;
         let read =

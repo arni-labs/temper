@@ -71,6 +71,11 @@ from = ["Armed"]
 params = []
 
 [[action]]
+name = "Reset"
+from = ["Armed"]
+params = []
+
+[[action]]
 name = "Fire"
 from = ["Armed"]
 params = [{ name = "fired_by", type = "string", source = "authenticated_subject" }]
@@ -80,6 +85,7 @@ effect = ["fires += 1"]
 state = "Armed"
 after_seconds = 4
 on_timeout = "Fire"
+reset_on = ["Reset"]
 "#;
 
 /// A repeating timer: every `Tick` resets the clock for the next one.
@@ -421,6 +427,11 @@ fn turso_polls_that_change_the_record_are_recorded() {
 }
 
 #[test]
+fn turso_one_shot_reset_survives_reconciliation_and_restart() {
+    on_turso(unrecorded::one_shot_reset_survives_reconciliation_and_restart);
+}
+
+#[test]
 fn turso_a_restart_arms_the_poll_from_the_newest_unrecorded_one() {
     on_turso(unrecorded::a_restart_arms_the_poll_from_the_newest_unrecorded_one);
 }
@@ -449,6 +460,7 @@ fn postgres_timers_survive_restart() {
             timers_fire_once_as_their_principal_after_restart(&world);
             repeating_timer_resumes_without_replaying_missed_ticks(&world);
             unrecorded::a_restart_arms_the_poll_from_the_newest_unrecorded_one(&world);
+            unrecorded::one_shot_reset_survives_reconciliation_and_restart(&world);
         }
         runtime.block_on(async {
             let pool = sqlx::PgPool::connect(&url).await.unwrap();

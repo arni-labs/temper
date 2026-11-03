@@ -2478,10 +2478,10 @@ impl PostgresEventStore {
         entry: &PostgresWasmInvocationInsert<'_>,
     ) -> Result<(), PersistenceError> {
         let created_at = parse_rfc3339(entry.created_at)?;
-        let id: i64 = crate::dbm::postgres_query_scalar!(&self.schema,
+        crate::dbm::postgres_query!(&self.schema,
             "INSERT INTO {schema}wasm_invocation_logs \
              (tenant, entity_type, entity_id, module_name, trigger_action, callback_action, success, error, duration_ms, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(entry.tenant)
         .bind(entry.entity_type)
@@ -2493,24 +2493,22 @@ impl PostgresEventStore {
         .bind(entry.error)
         .bind(entry.duration_ms as i64)
         .bind(created_at)
-        .fetch_one(self.pool())
+        .execute(self.pool())
         .await
         .map_err(storage_error)?;
-        if id % temper_runtime::persistence::WASM_INVOCATIONS_PRUNE_EVERY == 0 {
-            // Remove the tenant's rows past the bound: every row at or older
-            // than the newest one past it. Ids follow insert order.
-            crate::dbm::postgres_query!(
-                &self.schema,
-                "DELETE FROM {schema}wasm_invocation_logs WHERE tenant = $1 AND id <= ( \
-                     SELECT id FROM {schema}wasm_invocation_logs WHERE tenant = $1 \
-                     ORDER BY id DESC OFFSET $2 LIMIT 1)",
-            )
-            .bind(entry.tenant)
-            .bind(temper_runtime::persistence::WASM_INVOCATIONS_KEPT_PER_TENANT)
-            .execute(self.pool())
-            .await
-            .map_err(storage_error)?;
-        }
+        // Prune the inserting tenant every time: a global id cadence can
+        // indefinitely skip a tenant when writes from tenants interleave.
+        crate::dbm::postgres_query!(
+            &self.schema,
+            "DELETE FROM {schema}wasm_invocation_logs WHERE tenant = $1 AND id <= ( \
+                 SELECT id FROM {schema}wasm_invocation_logs WHERE tenant = $1 \
+                 ORDER BY id DESC OFFSET $2 LIMIT 1)",
+        )
+        .bind(entry.tenant)
+        .bind(temper_runtime::persistence::WASM_INVOCATIONS_KEPT_PER_TENANT)
+        .execute(self.pool())
+        .await
+        .map_err(storage_error)?;
         Ok(())
     }
 

@@ -814,16 +814,21 @@ pub(super) fn timer_agent(armed_by: &AgentContext) -> AgentContext {
 }
 
 /// When the clock of a timer re-armed without a transition started: the
-/// entity's entry into its state or its latest `reset_on`, else `now` (a safe
-/// default whose worst case is one extra budget of wait). None when the timer
-/// keeps the entity in its state without resetting the clock and already fired
+/// entity's entry into its state, its latest recorded `reset_on`, or its
+/// durable arm (an unrecorded reset), whichever is newest; else `now`.
+/// None when the timer keeps the entity in its state without resetting the clock and already fired
 /// since the clock started: it fires once, so there is nothing to arm.
 pub(super) fn rearm_clock_start(
     st: &temper_spec::automaton::StateTimeout,
     state: &EntityState,
     now: DateTime<Utc>,
+    armed_at: Option<DateTime<Utc>>,
 ) -> Option<DateTime<Utc>> {
-    let started_at = state_clock_started_at(state, &st.state, &st.reset_on).unwrap_or(now);
+    let started_at = state_clock_started_at(state, &st.state, &st.reset_on)
+        .into_iter()
+        .chain(armed_at)
+        .max()
+        .unwrap_or(now);
     let fired_since = state
         .status_clock
         .actions
