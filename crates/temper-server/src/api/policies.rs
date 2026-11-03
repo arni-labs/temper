@@ -314,27 +314,31 @@ pub(crate) async fn handle_create_policy(
 
     // The live text with this entry set: its old statements leave, so a
     // repeated or replacing create never stacks copies.
-    let prospective = match live_text_with_entry(&state, &tenant, &policy_id, &cedar_text).await {
-        Ok(text) => text,
+    // A create that changes nothing (the row and live set already hold this
+    // text) reloads and writes nothing.
+    match live_text_with_entry(&state, &tenant, &policy_id, &cedar_text).await {
         Err(refused) => return refused.into_response(),
-    };
-    if let Err(resp) = super::validate_and_reload_policies(&state, &tenant, &prospective) {
-        return resp;
+        Ok(None) => {}
+        Ok(Some(prospective)) => {
+            if let Err(resp) = super::validate_and_reload_policies(&state, &tenant, &prospective) {
+                return resp;
+            }
+
+            // Persist the new policy entry.
+            let created_by = auth.security_context().principal.id.as_str();
+            persist_and_activate_policy(&state, &tenant, &policy_id, &cedar_text, created_by).await;
+
+            // Update in-memory map to match the prospective text.
+            {
+                let mut policies = state.tenant_policies.write().unwrap(); // ci-ok: infallible lock
+                policies.insert(tenant.clone(), prospective);
+            }
+
+            let _ = state
+                .observe_refresh_tx
+                .send(crate::state::ObserveRefreshHint::Policies);
+        }
     }
-
-    // Persist the new policy entry.
-    let created_by = auth.security_context().principal.id.as_str();
-    persist_and_activate_policy(&state, &tenant, &policy_id, &cedar_text, created_by).await;
-
-    // Update in-memory map to match the prospective text.
-    {
-        let mut policies = state.tenant_policies.write().unwrap(); // ci-ok: infallible lock
-        policies.insert(tenant.clone(), prospective);
-    }
-
-    let _ = state
-        .observe_refresh_tx
-        .send(crate::state::ObserveRefreshHint::Policies);
 
     (
         StatusCode::CREATED,

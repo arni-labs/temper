@@ -55,7 +55,8 @@ pub(super) async fn persist_new_rule(
     debug_assert_ne!(policy_id, "primary");
     debug_assert!(!policy_id.is_empty());
     let prospective = match live_text_with_entry(state, tenant, &policy_id, rule).await {
-        Ok(text) => text,
+        Ok(Some(text)) => text,
+        Ok(None) => return rule_added_json(tenant, &policy_id),
         Err(refused) => return refused.into_response(),
     };
     if let Err(resp) = crate::api::validate_and_reload_policies(state, tenant, &prospective) {
@@ -110,6 +111,9 @@ pub(super) async fn reload_tenant_from_store(state: &ServerState, tenant: &str) 
 /// leaves none of its old statements live. The rows already end that way, so
 /// the live text now agrees with what a restart loads from them.
 ///
+/// `None` when the row already holds exactly `cedar_text` and all of it is
+/// live: nothing changes, so the caller reloads nothing.
+///
 /// # Errors
 ///
 /// The status and reason to answer with when the posted text or the live
@@ -119,7 +123,7 @@ pub(in crate::api) async fn live_text_with_entry(
     tenant: &str,
     policy_id: &str,
     cedar_text: &str,
-) -> Result<String, (StatusCode, String)> {
+) -> Result<Option<String>, (StatusCode, String)> {
     let refuse = |status: StatusCode, why: String| Err((status, why));
     let posted = match statement_keys(cedar_text) {
         Ok(keys) => keys,
@@ -130,7 +134,8 @@ pub(in crate::api) async fn live_text_with_entry(
             );
         }
     };
-    let mut leaving = posted;
+    let mut leaving = posted.clone();
+    let mut unchanged = false;
     if let Some(store) = state.policy_store() {
         let rows = match store.load_policies_for_tenant(tenant).await {
             Ok(rows) => rows,
@@ -149,6 +154,7 @@ pub(in crate::api) async fn live_text_with_entry(
                 continue;
             };
             if row.policy_id == policy_id {
+                unchanged = row.cedar_text == cedar_text;
                 previous.extend(keys);
             } else {
                 held_by_others.extend(keys);
@@ -160,6 +166,9 @@ pub(in crate::api) async fn live_text_with_entry(
         let policies = state.tenant_policies.read().unwrap(); // ci-ok: infallible lock
         policies.get(tenant).cloned().unwrap_or_default()
     };
+    if unchanged && statement_keys(&live).is_ok_and(|live_keys| posted.is_subset(&live_keys)) {
+        return Ok(None);
+    }
     let kept = match remove_statements(&live, &leaving) {
         Ok(kept) => kept,
         Err(error) => {
@@ -172,11 +181,11 @@ pub(in crate::api) async fn live_text_with_entry(
         }
     };
     let kept = kept.trim_end();
-    Ok(if kept.is_empty() {
+    Ok(Some(if kept.is_empty() {
         cedar_text.to_string()
     } else {
         format!("{kept}\n{cedar_text}")
-    })
+    }))
 }
 
 pub(super) async fn build_prospective_enabled_text_with_override(

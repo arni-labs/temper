@@ -168,7 +168,12 @@ pub(crate) async fn handle_approve_decision(
     )
     .await
     {
-        Ok(text) => text,
+        Ok(Some(text)) => text,
+        // The same rule is already this decision's row and live.
+        Ok(None) => {
+            let policies = state.tenant_policies.read().unwrap(); // ci-ok: infallible lock
+            policies.get(&tenant).cloned().unwrap_or_default()
+        }
         Err(refused) => return refused.into_response(),
     };
     if let Err(error) = state.authz.validate_tenant_policies(&prospective) {
