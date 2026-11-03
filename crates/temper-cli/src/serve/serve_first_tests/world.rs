@@ -14,7 +14,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{Value, json};
-use temper_authz::{AuthenticatedRequestContext, PrincipalKind, SecurityContext};
+use temper_authz::{AuthenticatedRequestContext, PrincipalKind, SecurityContext, platform_keys};
 use temper_platform::state::PlatformState;
 use temper_runtime::ActorSystem;
 use temper_runtime::scheduler::{
@@ -299,14 +299,38 @@ pub(super) fn request(
     method: Method,
     uri: &str,
 ) -> Request<Body> {
+    let operator = SecurityContext::from_resolved_identity("serve-first-test", "operator", None);
+    with_credential(state, tenant, operator, method, uri)
+}
+
+/// The call a module makes back into the server from a run, timer or
+/// reaction: a one-time credential for the module, bound to the tenant it
+/// enters, as the module host issues it.
+pub(super) fn loopback_request(
+    state: &PlatformState,
+    tenant: &str,
+    method: Method,
+    uri: &str,
+) -> Request<Body> {
+    let mut module = SecurityContext::from_resolved_identity("probe_module", "wasm_module", None);
+    module
+        .context_attrs
+        .insert(platform_keys::MODULE.to_string(), json!("probe_module"));
+    with_credential(state, tenant, module, method, uri)
+}
+
+fn with_credential(
+    state: &PlatformState,
+    tenant: &str,
+    who: SecurityContext,
+    method: Method,
+    uri: &str,
+) -> Request<Body> {
     let credential = state
         .server
         .internal_invocation_credentials
         .issue_for_url(
-            AuthenticatedRequestContext::new(
-                TenantId::new(tenant),
-                SecurityContext::from_resolved_identity("serve-first-test", "operator", None),
-            ),
+            AuthenticatedRequestContext::new(TenantId::new(tenant), who),
             method.as_str(),
             &format!("http://127.0.0.1:3000{uri}"),
         )

@@ -4,8 +4,11 @@
 //! restores every other tenant after, one at a time. A request for a tenant
 //! still starting moves it to the front and waits for it, then gets the
 //! answer the restored tenant gives: never a 404, an empty list, a 401 or a
-//! default-deny 403. A tenant whose restore cannot read its store answers
-//! 503 starting at once. A tenant's timers wait for its restore.
+//! default-deny 403. That holds for a call a module makes back into the
+//! server from another tenant's run, timer or reaction as much as for an
+//! outside request, and however long the wait outlasts the call's one-time
+//! credential. A tenant whose restore cannot read its store answers 503
+//! starting at once. A tenant's timers wait for its restore.
 //!
 //! Each policy read goes through a [`gate::Gate`]: the test holds a tenant's
 //! restore at the read of its Cedar policies, the last thing a request needs
@@ -21,9 +24,12 @@ use axum::http::{Method, StatusCode};
 use serde_json::json;
 use temper_runtime::scheduler::DeterministicRng;
 use temper_runtime::tenant::TenantId;
+use temper_server::internal_invocation::INTERNAL_INVOCATION_CREDENTIAL_TTL;
 
 use gate::Gate;
-use world::{Answer, SETTLE, World, answer, journal, json_body, public_request, request};
+use world::{
+    Answer, SETTLE, World, answer, journal, json_body, loopback_request, public_request, request,
+};
 
 /// Seeds for the request scenario. A seed picks which starting tenants the
 /// requests ask for, and the ids.
@@ -139,7 +145,9 @@ fn requests_for_starting_tenants(seed: u64) {
                 Some(&target),
                 "a request for {target} did not move it to the front"
             );
-            tokio::time::sleep(SETTLE).await;
+            // Longer than a call's one-time credential lives: a waiting call
+            // has no deadline, so its credential must not run out under it.
+            tokio::time::sleep(INTERNAL_INVOCATION_CREDENTIAL_TTL + SETTLE).await;
             assert!(
                 asked.iter().all(|(_, task)| !task.is_finished()),
                 "a request for {target} was answered before its policies were read"
@@ -161,28 +169,30 @@ fn requests_for_starting_tenants(seed: u64) {
             gate.release(tenant);
         }
 
-        let refused = tokio::time::timeout(
-            Duration::from_secs(25),
-            answer(
-                router.clone(),
-                request(&state, &broken, Method::GET, "/tdata/Probes"),
-            ),
-        )
-        .await
-        .expect("a request for a tenant whose restore cannot read its store does not hang");
-        assert_eq!(
-            refused.status,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "{refused:?}"
-        );
-        assert!(
-            refused.body.contains("TenantStarting") && refused.body.contains(&broken),
-            "the refusal names the starting tenant: {refused:?}"
-        );
-        assert!(
-            refused.retry_after.is_some(),
-            "the refusal says when to retry: {refused:?}"
-        );
+        for sent in [
+            request(&state, &broken, Method::GET, "/tdata/Probes"),
+            loopback_request(&state, &broken, Method::GET, "/tdata/Probes"),
+        ] {
+            let refused =
+                tokio::time::timeout(Duration::from_secs(25), answer(router.clone(), sent))
+                    .await
+                    .expect(
+                        "a request for a tenant whose restore cannot read its store does not hang",
+                    );
+            assert_eq!(
+                refused.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{refused:?}"
+            );
+            assert!(
+                refused.body.contains("TenantStarting") && refused.body.contains(&broken),
+                "the refusal names the starting tenant: {refused:?}"
+            );
+            assert!(
+                refused.retry_after.is_some(),
+                "the refusal says when to retry: {refused:?}"
+            );
+        }
     });
     world.end(runtime);
 }
@@ -194,6 +204,9 @@ enum Asked {
     Record,
     Metadata,
     Action,
+    /// A module's call back into the server, from a run, timer or reaction
+    /// of a tenant already restored.
+    Loopback,
 }
 
 /// Send each kind of request for `tenant`, each in its own task.
@@ -202,13 +215,19 @@ fn ask(
     router: &axum::Router,
     tenant: &str,
 ) -> Vec<(Asked, tokio::task::JoinHandle<Answer>)> {
-    [Asked::List, Asked::Record, Asked::Metadata, Asked::Action]
-        .into_iter()
-        .map(|what| {
-            let sent = sent(state, tenant, what);
-            (what, tokio::spawn(answer(router.clone(), sent)))
-        })
-        .collect()
+    [
+        Asked::List,
+        Asked::Record,
+        Asked::Metadata,
+        Asked::Action,
+        Asked::Loopback,
+    ]
+    .into_iter()
+    .map(|what| {
+        let sent = sent(state, tenant, what);
+        (what, tokio::spawn(answer(router.clone(), sent)))
+    })
+    .collect()
 }
 
 fn sent(
@@ -226,6 +245,7 @@ fn sent(
             Method::POST,
             "/tdata/Probes('p1')/Probe.Note",
         ),
+        Asked::Loopback => loopback_request(state, tenant, Method::GET, "/tdata/Probes"),
     }
 }
 
@@ -240,7 +260,7 @@ async fn check_answer(
 ) {
     assert_eq!(got.status, StatusCode::OK, "{what:?} for {tenant}: {got:?}");
     match what {
-        Asked::List => {
+        Asked::List | Asked::Loopback => {
             let items = json_body(&got)["value"]
                 .as_array()
                 .cloned()
