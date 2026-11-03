@@ -1,5 +1,6 @@
 //! A text literal reaches only the ids and fields that can meet it.
 
+use temper_authz::SendAnalysis;
 use temper_spec::automaton::{Automaton, parse_automaton};
 
 use super::*;
@@ -100,18 +101,28 @@ assert = "{rule} || tag == 'kept'"
     [note, boxed]
 }
 
-fn check(sources: &[String]) -> JointInvariantResult {
+/// Only a reaction holds a box: the note's `hand` is all that sets its holder.
+const ONLY_REACTIONS_HOLD: &str = r#"
+permit(principal, action, resource is Note);
+permit(principal, action == Action::"Tag", resource is Box);
+permit(principal, action == Action::"Hold", resource is Box) when { context.via == "reaction" };
+"#;
+
+/// The one result for `sources`, with `policies` (Cedar) deciding each move
+/// as its sender.
+fn check(sources: &[String], policies: Option<&str>) -> JointInvariantResult {
     let automatons: Vec<Automaton> = sources
         .iter()
         .map(|source| parse_automaton(source).expect("fixture parses"))
         .collect();
     let refs: Vec<&Automaton> = automatons.iter().collect();
+    let analysis = policies.map(|text| SendAnalysis::new(text).expect("fixture policies parse"));
     let (room, progress) = (Bytes::new(1 << 30), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,
     };
-    let mut results = verify_joint_invariants(&refs, None, bound);
+    let mut results = verify_joint_invariants(&refs, analysis.as_ref(), bound);
     assert_eq!(results.len(), 1);
     results.remove(0)
 }
@@ -120,8 +131,8 @@ fn check(sources: &[String]) -> JointInvariantResult {
 fn literals_no_id_or_field_meets_do_not_multiply_the_walk() {
     // No action reaches Gone: the rule holds, and the whole walk is made.
     let rule = "Note[holder].status != 'Gone'";
-    let few = check(&note_and_box(1, rule));
-    let many = check(&note_and_box(12, rule));
+    let few = check(&note_and_box(1, rule), None);
+    let many = check(&note_and_box(12, rule), None);
     assert!(matches!(few.outcome, JointOutcome::Holds), "{few}");
     assert!(matches!(many.outcome, JointOutcome::Holds), "{many}");
     // The messages are neither ids nor the box's holder or tag: eleven more
@@ -131,14 +142,125 @@ fn literals_no_id_or_field_meets_do_not_multiply_the_walk() {
 
 #[test]
 fn a_literal_that_names_a_record_still_reaches_its_id() {
-    // The box holds 'main' once the note is sent: the rule breaks when the
-    // note's id is 'main', which the walk must still start from.
-    let result = check(&note_and_box(12, "Note[holder].status != 'Sent'"));
+    // The box holds 'main' once the note is sent, and nothing else: the
+    // rule breaks only when the note's id is 'main', which the walk must
+    // still start from.
+    let rule = "Note[holder].status != 'Sent'";
+    let result = check(&note_and_box(12, rule), Some(ONLY_REACTIONS_HOLD));
     let JointOutcome::Broken { path } = &result.outcome else {
         panic!("expected broken, got {result}");
     };
     assert!(
-        path.iter().any(|step| step.state.contains("holder='main'")),
+        path.iter()
+            .any(|step| step.state.contains("Note=Sent<Id='main'")),
+        "{result}"
+    );
+}
+
+/// A note that, once sent, hands its box the holder `'main'` and then may
+/// ping it to finish; a box tagged with any value while its note is open.
+/// Cedar lets the ping finish a box only when its tag is `"main"`, which no
+/// spec compares the tag with.
+const PING_NOTE: &str = r#"
+[automaton]
+name = "Note"
+states = ["Open", "Sent", "Gone"]
+initial = "Open"
+
+[[action]]
+name = "Send"
+kind = "input"
+from = ["Open"]
+to = "Sent"
+
+[[action.triggers]]
+name = "hand"
+kind = "entity"
+target_entity = "Box"
+target_action = "Hold"
+
+[action.triggers.args]
+holder = "'main'"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+
+[[action]]
+name = "Ping"
+kind = "input"
+from = ["Sent"]
+to = "Sent"
+
+[[action.triggers]]
+name = "ping"
+kind = "entity"
+target_entity = "Box"
+target_action = "Finish"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+"#;
+
+const TAGGED_BOX: &str = r#"
+[automaton]
+name = "Box"
+states = ["Empty", "Held", "Done"]
+initial = "Empty"
+
+[[state]]
+name = "holder"
+type = "string"
+initial = ""
+
+[[state]]
+name = "tag"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Tag"
+kind = "input"
+from = ["Empty"]
+to = "Empty"
+guard = "Note[Id].status == 'Open'"
+params = [{ name = "tag", type = "string" }]
+
+[[action]]
+name = "Hold"
+kind = "internal"
+from = ["Empty"]
+to = "Held"
+params = [{ name = "holder", type = "string" }]
+
+[[action]]
+name = "Finish"
+kind = "internal"
+from = ["Held"]
+to = "Done"
+
+[[invariant]]
+name = "rule"
+assert = "status != 'Done' || tag == 'other' || holder == 'other' || Note[Id].status == 'Gone'"
+"#;
+
+const FINISH_WHEN_TAGGED_MAIN: &str = r#"
+permit(principal, action in [Action::"Send", Action::"Ping", Action::"Tag"], resource);
+permit(principal, action == Action::"Hold", resource is Box) when { context.via == "reaction" };
+permit(principal, action == Action::"Finish", resource is Box) when {
+    context.via == "reaction" && resource.tag == "main"
+};
+"#;
+
+#[test]
+fn cedar_may_take_a_made_up_value_for_a_literal_its_field_never_meets() {
+    // Someone tags the box 'main' while its note is open, before anything
+    // in the walk holds 'main'; the walk gives the tag a made-up value
+    // instead. Once the box holds 'main' as its holder, that value must not
+    // count as certainly not "main" to Cedar: the ping may finish the box.
+    let sources = [PING_NOTE.to_string(), TAGGED_BOX.to_string()];
+    let result = check(&sources, Some(FINISH_WHEN_TAGGED_MAIN));
+    assert!(
+        matches!(result.outcome, JointOutcome::Broken { .. }),
         "{result}"
     );
 }
