@@ -270,6 +270,28 @@ fn skip_if_marked(unavailable: bool, tenant: &str, what: &str) -> bool {
     true
 }
 
+/// Load the Cedar policies of the `--app` tenants read from disk.
+pub(super) fn seed_cedar_policies(
+    state: &PlatformState,
+    tenant_policy_seed: BTreeMap<String, String>,
+) {
+    for (tenant, policy_text) in &tenant_policy_seed {
+        if let Err(e) = state
+            .server
+            .authz
+            .reload_tenant_policies(tenant, policy_text)
+        {
+            eprintln!("  Warning: failed to load Cedar policies for tenant '{tenant}': {e}");
+            continue;
+        }
+    }
+    // Update in-memory text cache.
+    let mut policies = state.server.tenant_policies.write().unwrap(); // ci-ok: infallible lock
+    for (tenant, policy_text) in tenant_policy_seed {
+        policies.insert(tenant, policy_text);
+    }
+}
+
 /// Phase 4: Load webhook configurations from app directories.
 pub(super) fn load_webhooks(apps: &[(String, String)]) -> Option<Arc<WebhookDispatcher>> {
     let mut all_configs = Vec::new();
