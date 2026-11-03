@@ -232,6 +232,21 @@ fn a_rule_without_from_is_read_from_a_new_record() {
     assert!(l1.passed, "{}: {:?}", l1.summary, l1.diagnostics);
 }
 
+/// A simulated record that was published meets the rule, though its run
+/// ends after it is archived.
+#[test]
+fn a_run_that_passed_through_the_target_meets_the_rule_wherever_it_ends() {
+    let result = VerificationCascade::from_ioa(PUBLISHED_THEN_ARCHIVED)
+        .with_sim_seeds(3)
+        .with_prop_test_cases(20)
+        .run();
+    let l2 = result
+        .level_result(CascadeLevel::Simulation)
+        .expect("L2 ran");
+    assert!(l2.passed, "{}: {:?}", l2.summary, l2.diagnostics);
+    assert!(result.all_passed, "{:?}", result.levels);
+}
+
 /// A waiting record's only move needs `score == 1`, and nothing writes
 /// `score`, so a record can wait forever. L1 does not track an integer, so
 /// it takes the move as one that may fire: the walk cannot tell this record
