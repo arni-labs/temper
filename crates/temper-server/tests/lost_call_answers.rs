@@ -14,6 +14,11 @@
 //! - A call that answers leaves nothing behind: no row, and no `GiveUp` after
 //!   a restart past its deadline. Neither does a call whose answer the record
 //!   refuses: the call has ended.
+//!
+//! Engine-boundary exception: the real Wasmtime worker runs outside the
+//! simulator. The bounded wall-clock waits below give it CPU while keeping
+//! Tokio's virtual clock paused; all storage faults, retries and restarts use
+//! explicit virtual time. These waits prove integration, not DST replay.
 
 #[path = "dst_state_timers_follow_state/process_clock.rs"]
 mod process_clock;
@@ -181,7 +186,7 @@ async fn run_until(mut done: impl FnMut() -> bool) -> bool {
         if done() {
             return true;
         }
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(1)); // determinism-ok: real WASM blocking worker needs CPU; virtual time must stay paused
         tokio::task::yield_now().await;
     }
     done()
@@ -347,7 +352,7 @@ fn a_call_whose_answer_is_refused_leaves_no_deadline_behind() {
                 ended = true;
                 break;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(1)); // determinism-ok: real WASM blocking worker needs CPU; virtual time must stay paused
             tokio::task::yield_now().await;
         }
         assert!(ended, "the refused answer removes the call's deadline");
@@ -361,6 +366,61 @@ fn a_call_whose_answer_is_refused_leaves_no_deadline_behind() {
         !events.iter().any(|action| action == "GiveUp"),
         "{events:?}"
     );
+}
+
+#[test]
+fn a_refused_answer_with_failed_cleanup_is_not_lost_at_restart() {
+    for seed in [10, 11, 12] {
+        let clock = Arc::new(ProcessClock::new());
+        let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+        let store = SimEventStore::no_faults(seed);
+        let first = Process::start(&store, &clock, "cleanup-a", &json!({ "params": { "score": 10 } }));
+        first.runtime.block_on(async {
+            store.fail_next_scheduled_deletes(1);
+            ask(&first.state).await;
+            assert!(run_until(|| store.scheduled_delete_failures_pending() == 0).await,
+                "the refused answer reached cleanup and deletion failed");
+            assert_eq!(store.list_scheduled_actions(TENANT).await.unwrap().len(), 1,
+                "the test must stop with cleanup still pending");
+        });
+        first.kill(&clock, Duration::from_secs(10));
+        assert_eq!(status_after_restart(&store, &clock), "Asked",
+            "seed {seed}: recovery must not turn an ended call into a lost one");
+        assert!(!first_journal(&store).iter().any(|action| action == "GiveUp"));
+        assert!(block(store.list_scheduled_actions(TENANT)).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn delayed_boot_recovery_does_not_answer_a_current_process_call() {
+    for seed in [13, 14, 15] {
+        let clock = Arc::new(ProcessClock::new());
+        let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+        let store = SimEventStore::no_faults(seed);
+        store.fail_next_scheduled_lists(TENANT, 1);
+        let process = Process::start(&store, &clock, "boot-retry", &json!({ "params": { "score": 70 } }));
+        process.runtime.block_on(async {
+            process.state.get_or_create_tenant_entity(&TenantId::new(TENANT), "Lookup", ID, json!({})).await.unwrap();
+            store.inject_append_delay(JOURNAL, Duration::ZERO);
+            store.inject_append_delay(JOURNAL, Duration::from_secs(3600));
+            ask(&process.state).await;
+            assert!(run_until(|| !store.append_faults_pending(JOURNAL)).await,
+                "the live call's answer is waiting on storage");
+            // Boot's retry now reads the current call's deadline, while its
+            // successful answer still waits on the actor's storage write.
+            tokio::time::advance(Duration::from_secs(2)).await;
+            for _ in 0..600 { tokio::task::yield_now().await; }
+            assert!(process.state.armed_scheduled_actions().is_empty(),
+                "seed {seed}: boot recovery must not arm a live call's deadline");
+            tokio::time::advance(Duration::from_secs(4 * DEADLINE_SECS)).await;
+            for _ in 0..600 { tokio::task::yield_now().await; }
+            assert!(!journal(&store).await.iter().any(|action| action == "GiveUp"));
+            tokio::time::advance(Duration::from_secs(3600)).await;
+            for _ in 0..600 { tokio::task::yield_now().await; }
+            assert_eq!(journal(&store).await.last().map(String::as_str), Some("Finish"));
+        });
+        process.kill(&clock, Duration::ZERO);
+    }
 }
 
 /// The record's journal, read outside any process.
