@@ -545,7 +545,7 @@ impl crate::state::ServerState {
             }
             // The call has ended, answered or not.
             if let Some(call) = &call {
-                self.end_call(call, &integration.name, req.agent_ctx).await;
+                self.end_call(call, &integration.name, req.agent_ctx);
             }
         }
 

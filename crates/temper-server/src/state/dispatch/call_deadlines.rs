@@ -100,19 +100,17 @@ impl ServerState {
     /// that loses it leaves the row to answer the call. `caller` started the
     /// call. An answer that landed already removed the row; removing it
     /// again does nothing.
-    pub(super) async fn end_call(
-        &self,
-        call: &ScheduledFire,
-        integration: &str,
-        caller: &AgentContext,
-    ) {
+    pub(super) fn end_call(&self, call: &ScheduledFire, integration: &str, caller: &AgentContext) {
         if caller
             .callback_key(integration)
             .is_some_and(|key| self.holds_owed_write(key.as_str()))
         {
             return;
         }
-        self.end_call_row(call).await;
+        let server = self.clone();
+        let call = call.clone();
+        // Settlement remains pending independently of the move's other calls.
+        tokio::spawn(async move { server.end_call_row(&call).await }); // determinism-ok: background call settlement
     }
 
     /// Remove the deadline row of a call whose answer did not land and will
