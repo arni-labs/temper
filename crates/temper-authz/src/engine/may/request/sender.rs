@@ -51,9 +51,14 @@ impl Request<'_> {
         match fact {
             Some(Fact::Absent) => Val::Error,
             Some(Fact::Is(value)) => Val::Known(value.clone()),
-            Some(Fact::Other { unlike, like }) => Val::Other {
+            Some(Fact::Other {
+                unlike,
+                like,
+                string,
+            }) => Val::Other {
                 unlike: unlike.clone(),
                 like: like.clone(),
+                string: *string,
             },
             None => Val::Unknown,
         }

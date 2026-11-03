@@ -89,6 +89,7 @@ enum Val {
     Other {
         unlike: Vec<Json>,
         like: BTreeMap<String, bool>,
+        string: Option<bool>,
     },
     /// Any value, or an error.
     Unknown,
@@ -228,6 +229,10 @@ impl Request<'_> {
                     Some(pattern) => Results::of(like(&text, pattern)),
                     None => ANY,
                 },
+                Val::Other {
+                    string: Some(false),
+                    ..
+                } => ERROR,
                 Val::Other { like, .. } => match like.get(&arg["pattern"].to_string()) {
                     Some(matches) => Results::of(*matches),
                     None => ANY,

@@ -95,3 +95,71 @@ fn a_chain_cedar_refuses_its_own_sender_halfway_never_settles() {
         "{result}"
     );
 }
+
+#[test]
+fn a_non_string_like_error_must_not_hide_a_refused_reaction() {
+    let result = check(
+        r#"
+permit(principal, action == Action::"Add", resource is Note)
+when { principal has flag };
+forbid(principal, action == Action::"Add", resource is Note)
+when { !(principal.flag like "x*") };
+permit(principal, action == Action::"Address", resource is Note)
+when { principal.flag like "x*" };
+"#,
+    );
+    assert!(
+        resting(&result)
+            .iter()
+            .any(|state| state.contains("Note=Posted")),
+        "{result}"
+    );
+}
+
+#[test]
+fn a_chain_keeps_a_sender_selected_by_combined_checks() {
+    let result = check(
+        r#"
+permit(principal, action == Action::"Add", resource is Note)
+when { (principal has role) == (principal has agent_type) };
+permit(principal, action == Action::"Address", resource is Note)
+when { (principal has role) == (principal has agent_type) && context.via != "request" };
+"#,
+    );
+    assert!(result.holds(), "{result}");
+}
+
+#[test]
+fn a_chain_keeps_its_sender_until_the_reaction_rule_is_known() {
+    let policies = MEMBERS_ADD
+        .replace(
+            "context has via && context.via != \"request\"",
+            "context.rule == \"Note:Add:address\"",
+        )
+        .replace(
+            "principal.role == \"visitor\"",
+            "principal.role == \"visitor\" && context.rule == \"Note:Add:address\"",
+        );
+    let result = check(&policies);
+    assert!(result.holds(), "{result}");
+}
+
+#[test]
+fn different_senders_stay_apart_until_the_reaction_rule_is_known() {
+    let result = check(
+        r#"
+permit(principal, action == Action::"Add", resource is Note)
+when { principal has role && principal.role in ["member", "visitor"] };
+permit(principal, action == Action::"Address", resource is Note)
+when { principal has role && principal.role == "member" && context.rule == "Note:Add:address" };
+permit(principal, action == Action::"Address", resource is Note)
+when { principal has role && principal.role == "visitor" && context.rule == "Note:Add:other" };
+"#,
+    );
+    assert!(
+        resting(&result)
+            .iter()
+            .any(|state| state.contains("Note=Posted")),
+        "{result}"
+    );
+}

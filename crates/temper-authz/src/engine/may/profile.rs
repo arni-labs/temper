@@ -56,10 +56,12 @@ pub(super) enum Fact {
     Is(Json),
     /// Some value that is none of `unlike` (the literals the policies compare
     /// it with), matching each `like` pattern (by its JSON text) as marked;
-    /// a pattern not marked may match or not.
+    /// a pattern not marked stays open unless the value is a non-string.
     Other {
         unlike: Vec<Json>,
         like: BTreeMap<String, bool>,
+        /// Whether this is a string, when a `like` test has split it.
+        string: Option<bool>,
     },
 }
 

@@ -52,7 +52,7 @@ pub(super) fn outside(
             .collect()
     };
     // A chain asks a request once, and its reactions after it: kinds whose
-    // reactions answer alike behave alike once they have sent the request,
+    // reactions answer definitely alike behave alike after the request,
     // whichever of them sent it, so they are one sender.
     let reactions = &questions[requests.len()..];
     let mut kinds: Vec<(Vec<May>, Kind)> = Vec::new();
@@ -62,14 +62,20 @@ pub(super) fn outside(
             continue;
         }
         let chain = answers(&asker, reactions);
-        match kinds.iter_mut().find(|(known, _)| *known == chain) {
+        // A Maybe still depends on the later rule or record. It cannot
+        // establish that these senders' reactions will answer alike.
+        match kinds
+            .iter_mut()
+            .find(|(known, _)| !chain.contains(&May::Maybe) && *known == chain)
+        {
             Some((_, same)) => *same = same.clone().join(kind),
             None => kinds.push((chain, kind)),
         }
     }
-    // One kind whose reactions answer as anyone's adds nothing.
+    // One kind whose reactions answer definitely as anyone's adds nothing.
     let anyone = answers(&Asker::Outside, reactions);
     if let [(chain, _)] = &kinds[..]
+        && !chain.contains(&May::Maybe)
         && *chain == anyone
     {
         return None;

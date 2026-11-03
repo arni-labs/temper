@@ -57,3 +57,72 @@ context.triggerSourceEntityId == resource.id
     assert_eq!(senders.reaction(None, b, true), b);
     assert_eq!(senders.reaction(Some(&principal), c, true), b);
 }
+
+#[test]
+fn equal_unknown_answers_keep_senders_that_a_later_rule_distinguishes() {
+    let note = parse_automaton(
+        r#"
+[automaton]
+name = "Note"
+states = ["Unmade", "Posted", "Waiting"]
+initial = "Unmade"
+[[action]]
+name = "Add"
+kind = "input"
+from = ["Unmade"]
+to = "Posted"
+[[action]]
+name = "Address"
+kind = "input"
+from = ["Posted"]
+to = "Waiting"
+"#,
+    )
+    .unwrap();
+    let policy = SendAnalysis::new(
+        r#"
+permit(principal, action == Action::"Add", resource is Note)
+when { principal has role && principal.role in ["member", "visitor"] };
+permit(principal, action == Action::"Address", resource is Note)
+when { principal has role && principal.role == "member" && context.rule == "Note:Add:address" };
+permit(principal, action == Action::"Address", resource is Note)
+when { principal has role && principal.role == "visitor" && context.rule == "Note:Add:other" };
+"#,
+    )
+    .unwrap();
+    let senders = Senders::new(
+        &BTreeMap::from([("Note", &note)]),
+        &["Note".to_string()],
+        Some(&policy),
+        &BTreeSet::from(["Note".to_string()]),
+        &BTreeSet::from([("Note".to_string(), "Address".to_string())]),
+    );
+    let cause = Cause::reaction(
+        false,
+        Hop {
+            rule: Attr::Value(Value::from("Note:Add:address")),
+            ..Hop::unknown()
+        },
+    );
+    let answers: Vec<_> = senders
+        .outside()
+        .iter()
+        .map(|by| {
+            policy.may(
+                &senders.askers[*by as usize / 2],
+                "Address",
+                "Note",
+                &BTreeMap::new(),
+                Some(&cause),
+            )
+        })
+        .collect();
+    assert!(
+        answers.contains(&May::Yes),
+        "member's reaction: {answers:?}"
+    );
+    assert!(
+        answers.contains(&May::No),
+        "visitor's reaction: {answers:?}"
+    );
+}

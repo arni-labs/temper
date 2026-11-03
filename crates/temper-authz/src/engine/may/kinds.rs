@@ -6,8 +6,8 @@
 //! a chain runs as one principal throughout. [`SendAnalysis::outside_kinds`]
 //! splits the outside senders by what the policies test of the principal
 //! (its type, its attributes, the context keys only the kernel sets), only
-//! as far as a split changes an answer some question leaves open, and joins
-//! the kinds every question answers alike. Every outside principal is of
+//! as far as a split changes a residual policy, and joins kinds whose
+//! answers are definite and alike. Every outside principal is of
 //! one kind, so asking each question for each kind misses no sender.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -170,15 +170,14 @@ impl SendAnalysis {
         let mut leaves: Vec<Node> = Vec::new();
         let mut open = vec![read(Profile::default())];
         while let Some(node) = open.pop() {
-            let split = node.undecided.iter().find_map(|test| {
+            let split = node.undecided.first().map(|test| {
                 let children: Vec<Node> = tests
                     .split(&node.profile, test)
                     .into_iter()
                     .map(read)
                     .collect();
-                if children.iter().all(|child| child.answers == node.answers) {
-                    return None;
-                }
+                // Equal Maybe answers can hide a condition on another test.
+                // Only equal residuals let one branch stand for another.
                 let mut alike: Vec<(Vec<String>, Node)> = Vec::new();
                 let mut apart = Vec::new();
                 for child in children {
@@ -196,7 +195,7 @@ impl SendAnalysis {
                     }
                 }
                 apart.extend(alike.into_iter().map(|(_, child)| child));
-                Some(apart)
+                apart
             });
             match split {
                 Some(children) => open.extend(children),
@@ -208,7 +207,11 @@ impl SendAnalysis {
             answers, profile, ..
         } in leaves
         {
-            match kinds.iter_mut().find(|(known, _)| *known == answers) {
+            // A Maybe may resolve differently once a rule or record is known.
+            match kinds
+                .iter_mut()
+                .find(|(known, _)| !answers.contains(&May::Maybe) && *known == answers)
+            {
                 Some((_, kind)) => kind.push(profile),
                 None => kinds.push((answers, vec![profile])),
             }
@@ -392,7 +395,8 @@ impl Tests {
             Test::Named(place, name) => !facts(profile, *place).contains_key(name),
             Test::Like(place, name, pattern) => matches!(
                 facts(profile, *place).get(name),
-                Some(Fact::Other { like, .. }) if !like.contains_key(pattern)
+                Some(Fact::Other { like, string, .. })
+                    if *string != Some(false) && !like.contains_key(pattern)
             ),
         }
     }
@@ -416,6 +420,7 @@ impl Tests {
                 facts.push(Fact::Other {
                     unlike,
                     like: BTreeMap::new(),
+                    string: None,
                 });
                 facts
                     .into_iter()
@@ -436,6 +441,7 @@ impl Tests {
                 facts.push(Fact::Other {
                     unlike: literals,
                     like: BTreeMap::new(),
+                    string: None,
                 });
                 facts
                     .into_iter()
@@ -446,12 +452,25 @@ impl Tests {
                     })
                     .collect()
             }
-            Test::Like(place, name, pattern) => [true, false]
+            Test::Like(place, name, pattern) => [Some(true), Some(false), None]
                 .into_iter()
+                .filter(|matches| {
+                    matches.is_some()
+                        || matches!(
+                            facts(profile, *place).get(name),
+                            Some(Fact::Other { string: None, .. })
+                        )
+                })
                 .map(|matches| {
                     with(&|p: &mut Profile| {
-                        if let Some(Fact::Other { like, .. }) = facts_mut(p, *place).get_mut(name) {
-                            like.insert(pattern.clone(), matches);
+                        if let Some(Fact::Other { like, string, .. }) =
+                            facts_mut(p, *place).get_mut(name)
+                        {
+                            // Non-strings error for every pattern, including under !.
+                            *string = Some(matches.is_some());
+                            if let Some(matches) = matches {
+                                like.insert(pattern.clone(), matches);
+                            }
                         }
                     })
                 })

@@ -171,3 +171,135 @@ when { principal has role && principal.role like "guest*" };
         );
     }
 }
+
+#[test]
+fn like_errors_keep_the_senders_real_request_and_reaction_answers() {
+    let policies = r#"
+permit(principal, action == Action::"Add", resource is Note)
+when { principal has flag };
+forbid(principal, action == Action::"Add", resource is Note)
+when { !(principal.flag like "x*") };
+permit(principal, action == Action::"Address", resource is Note)
+when { principal.flag like "x*" };
+permit(principal, action == Action::"Other", resource is Note)
+when { principal.flag like "y*" };
+"#;
+    let analysis = SendAnalysis::new(policies).unwrap();
+    let engine = AuthzEngine::new(policies).unwrap();
+    let actions = ["Add", "Address", "Other"];
+    let questions: Vec<_> = actions
+        .iter()
+        .map(|action| Question {
+            action,
+            resource_type: "Note",
+            cause: Cause::request(),
+        })
+        .collect();
+    let kinds = analysis.outside_kinds(&questions);
+    let answers: Vec<Vec<May>> = kinds
+        .iter()
+        .map(|kind| {
+            questions
+                .iter()
+                .map(|q| {
+                    analysis.may(
+                        &Asker::OutsideAs(kind.clone()),
+                        q.action,
+                        q.resource_type,
+                        &BTreeMap::new(),
+                        Some(&q.cause),
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    for value in [
+        None,
+        Some(serde_json::json!(false)),
+        Some(serde_json::json!(true)),
+        Some(serde_json::json!(42)),
+        Some(serde_json::json!([])),
+        Some(serde_json::json!({"nested": "x"})),
+        Some(serde_json::json!("xylophone")),
+        Some(serde_json::json!("yes")),
+        Some(serde_json::json!("neither")),
+    ] {
+        let mut context = SecurityContext::from_resolved_identity("someone", "agent", None);
+        if let Some(value) = &value {
+            context
+                .principal
+                .attributes
+                .insert("flag".into(), value.clone());
+        }
+        let expected: Vec<_> = actions
+            .iter()
+            .map(|action| {
+                if engine
+                    .authorize(&context, action, "Note", &HashMap::new())
+                    .is_allowed()
+                {
+                    May::Yes
+                } else {
+                    May::No
+                }
+            })
+            .collect();
+        assert!(
+            answers.contains(&expected),
+            "flag={value:?}: {expected:?} missing from {answers:?}"
+        );
+    }
+    assert!(
+        answers.iter().all(|answers| !answers.contains(&May::Maybe)),
+        "{answers:?}"
+    );
+}
+
+#[test]
+fn combined_sender_checks_split_even_when_each_alone_leaves_maybe() {
+    let analysis = SendAnalysis::new(
+        r#"
+permit(principal, action == Action::"Add", resource is Note)
+when { (principal has role) == (principal has agent_type) };
+permit(principal, action == Action::"Address", resource is Note)
+when { (principal has role) == (principal has agent_type) && context.via != "request" };
+"#,
+    )
+    .unwrap();
+    let questions = [
+        Question {
+            action: "Add",
+            resource_type: "Note",
+            cause: Cause::request(),
+        },
+        Question {
+            action: "Address",
+            resource_type: "Note",
+            cause: Cause::reaction(false, Hop::unknown()),
+        },
+    ];
+    let answers: Vec<Vec<_>> = analysis
+        .outside_kinds(&questions)
+        .into_iter()
+        .map(|kind| {
+            questions
+                .iter()
+                .map(|q| {
+                    analysis.may(
+                        &Asker::OutsideAs(kind.clone()),
+                        q.action,
+                        q.resource_type,
+                        &BTreeMap::new(),
+                        Some(&q.cause),
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    assert!(answers.contains(&vec![May::Yes, May::Yes]), "{answers:?}");
+    assert!(answers.contains(&vec![May::No, May::No]), "{answers:?}");
+    assert!(
+        answers.iter().all(|answers| !answers.contains(&May::Maybe)),
+        "{answers:?}"
+    );
+}
