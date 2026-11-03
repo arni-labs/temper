@@ -146,7 +146,10 @@ fn an_invariant_a_reaction_from_outside_the_scope_breaks_is_broken() {
         matches!(result.outcome, JointOutcome::Broken { .. }),
         "{text}"
     );
-    assert!(text.contains("Ask.Done (a reaction from Push)"), "{text}");
+    assert!(
+        text.contains("Ask.Done -> Done (a reaction from Push)"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -282,7 +285,10 @@ fn a_stuck_state_a_reaction_from_outside_the_scope_reaches_is_stuck() {
         matches!(result.outcome, LivenessOutcome::Stuck { .. }),
         "{text}"
     );
-    assert!(text.contains("Ask.Done (a reaction from Push)"), "{text}");
+    assert!(
+        text.contains("Ask.Done -> Done (a reaction from Push)"),
+        "{text}"
+    );
 }
 
 #[test]
