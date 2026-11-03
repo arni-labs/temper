@@ -115,6 +115,42 @@ async fn local_object_storage_is_namespaced_by_tenant() {
     );
 }
 
+/// Every tenant but `default` keeps its objects under `tenants/<sha256 of its name>` in the store `default` keeps its
+/// own at the root of, so no key of `default`'s may resolve into that prefix.
+#[tokio::test]
+async fn tenant_blob_keys_are_disjoint() {
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let mut state = ServerState::new(
+        ActorSystem::new("tenant-blob-keys-disjoint"),
+        CsdlDocument {
+            version: "4.0".to_string(),
+            schemas: Vec::new(),
+        },
+        String::new(),
+    );
+    state.data_dir = data_dir.path().to_path_buf();
+    let acme = TenantId::new("acme");
+    let namespace = tenant_object_namespace(&acme).expect("acme namespace");
+
+    let written = state
+        .put_blob_object(
+            &TenantId::default(),
+            &format!("tenants/{namespace}/x"),
+            b"default's bytes",
+            None,
+        )
+        .await;
+    assert_eq!(
+        state
+            .get_blob_with_legacy_fallback(&acme, "x")
+            .await
+            .expect("acme read"),
+        None,
+        "acme reads only bytes acme wrote"
+    );
+    assert!(written.is_err(), "the write is refused: {written:?}");
+}
+
 /// A Katagami app whose vault key was lost (Run probe, 21 Oct 2026) restored its data with no readable
 /// `blob_endpoint`, and a File put then answered 204 while its bytes went to this disk and the app's database.
 #[tokio::test]
