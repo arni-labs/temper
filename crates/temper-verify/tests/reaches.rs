@@ -272,3 +272,34 @@ fn a_rule_that_needs_a_guard_the_walk_does_not_track_is_not_proved() {
         "no path is known to break it"
     );
 }
+
+/// A draft is published once its file is ready: a move gated on another
+/// record, which may never open.
+const FILE_GATE: &str = r#"
+[automaton]
+name = "Gated"
+states = ["Draft", "Published"]
+initial = "Draft"
+
+[[action]]
+name = "Publish"
+from = ["Draft"]
+to = "Published"
+guard = "File[file_id].status in ['Ready']"
+
+[[liveness]]
+name = "GetsPublished"
+from = ["Draft"]
+reaches = ["Published"]
+"#;
+
+#[test]
+fn a_rule_that_rests_on_a_gate_another_record_holds_is_not_proved() {
+    let (passed, l1) = install_check(FILE_GATE);
+    assert!(!passed && !l1.passed, "{}", l1.summary);
+    assert!(l1.summary.contains("not proved"), "{}", l1.summary);
+    assert!(l1.summary.contains("GetsPublished"), "{}", l1.summary);
+    let verification = l1.verification.as_ref().unwrap();
+    assert!(verification.is_complete, "the walk completed");
+    assert!(verification.counterexamples.is_empty());
+}
