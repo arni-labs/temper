@@ -186,9 +186,18 @@ fn person(id: &str) -> SecurityContext {
     SecurityContext::from_verified_jwt(id, PrincipalKind::Customer, None, None, None, None)
 }
 
+#[path = "timer_fire_now/dst.rs"]
+mod dst;
+#[path = "dst_state_timers_follow_state/process_clock.rs"]
+mod process_clock;
+
 fn server(name: &str) -> ServerState {
+    server_with_spec(name, CHANGE_IOA, SimEventStore::no_faults(93))
+}
+
+fn server_with_spec(name: &str, change: &str, events: SimEventStore) -> ServerState {
     let mut registry = SpecRegistry::new();
-    let entities = [("Change", CHANGE_IOA), ("Run", RUN_IOA)];
+    let entities = [("Change", change), ("Run", RUN_IOA)];
     registry.register_tenant(
         "default",
         parse_csdl(CSDL).expect("CSDL should parse"),
@@ -212,7 +221,7 @@ fn server(name: &str) -> ServerState {
         );
     }
     let mut state = ServerState::from_registry(ActorSystem::new(name), registry);
-    state.set_storage_stack(StorageStack::from_sim(SimEventStore::no_faults(93), None));
+    state.set_storage_stack(StorageStack::from_sim(events, None));
     state
         .authz
         .reload_tenant_policies("default", POLICY)
@@ -367,7 +376,7 @@ async fn a_timer_the_hook_armed_fires_as_the_hook_and_starts_no_run() {
     let (status, by) = run(&state, "c3", Duration::from_secs(2)).await;
     assert_eq!(
         (status.as_str(), by),
-        ("Waiting", Value::Null),
+        ("Waiting", json!("")),
         "the hook's timer starts no run"
     );
 }

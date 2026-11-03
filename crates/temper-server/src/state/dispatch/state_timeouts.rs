@@ -144,9 +144,19 @@ struct ArmSeq {
     seq: u64,
     journal: u64,
     armed: Option<Box<ArmedTimer>>,
+    // The latest task to own a durable row, even after a withheld fire
+    // releases its live arm. Superseded sleepers must not delete that row.
+    row_owner: Option<RowOwner>,
     // The boot gate follows this record through resets and state entry, even
     // while a durable transition invalidates its prior timer.
     boot_gate: Option<Arc<Semaphore>>,
+}
+
+/// The task responsible for a row, and whether its fire retained that row.
+struct RowOwner {
+    task_seq: u64,
+    arm_id: String,
+    withheld: bool,
 }
 
 /// How an arm treats a timer the entity already has armed.
@@ -203,6 +213,9 @@ impl StateTimeoutTracker {
         }
         entry.seq += 1;
         entry.journal = journal;
+        if let Some(owner) = entry.row_owner.as_mut() {
+            owner.withheld = false;
+        }
         entry.armed.take().map(|armed| *armed)
     }
 
@@ -235,6 +248,11 @@ impl StateTimeoutTracker {
         entry.seq += 1;
         entry.journal = journal;
         entry.boot_gate = timer.boot_gate.clone().or_else(|| entry.boot_gate.clone());
+        entry.row_owner = Some(RowOwner {
+            task_seq: entry.seq,
+            arm_id: timer.arm_id.clone(),
+            withheld: false,
+        });
         entry.armed = Some(Box::new(timer.clone()));
         Some(entry.seq)
     }
@@ -250,7 +268,20 @@ impl StateTimeoutTracker {
         {
             entry.seq += 1;
             entry.armed = None;
+            if let Some(owner) = entry.row_owner.as_mut() {
+                owner.withheld = true;
+            }
         }
+    }
+
+    /// A withheld fire retained this row; an in-flight repair must keep it.
+    fn row_withheld(&self, key: &EntityKey, arm_id: &str) -> bool {
+        self.seqs
+            .lock()
+            .expect("state_timeout tracker poisoned")
+            .get(key)
+            .and_then(|entry| entry.row_owner.as_ref())
+            .is_some_and(|owner| owner.withheld && owner.arm_id == arm_id)
     }
 
     fn boot_gate(&self, key: &EntityKey) -> Option<Arc<Semaphore>> {
@@ -527,6 +558,9 @@ impl crate::state::ServerState {
                         self.persist_state_timer(&newer).await;
                         written = newer;
                     }
+                    None if self
+                        .state_timeout_tracker
+                        .row_withheld(&key, &written.arm_id) => {}
                     None => self.forget_state_timer(&written).await,
                 }
                 if self.state_timeout_tracker.current(&key) == seq {
@@ -671,6 +705,7 @@ impl crate::state::ServerState {
             armed_by: Some(&timer.agent_ctx),
             gate: timer.boot_gate.clone(),
             woke_for: Some(timer.due_at()),
+            prior_arm: Some(timer),
             ..Default::default()
         };
         self.follow_owned_state_timer(
@@ -718,15 +753,18 @@ impl crate::state::ServerState {
     }
 
     /// Whether a newer arm holds this timer's row under the same id: a
-    /// dispatch's arm that replaced a reconcile's for the same event. That
-    /// row is the newer timer's to end.
+    /// dispatch's arm that replaced a reconcile's for the same event, or an
+    /// accelerated task. Ownership survives a withheld fire releasing its
+    /// live arm: only that newer task may end the retained row.
     pub(super) fn state_timer_row_moved_on(&self, timer: &ArmedTimer, armed_seq: u64) -> bool {
         let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
-        self.state_timeout_tracker.current(&key) != armed_seq
-            && self
-                .state_timeout_tracker
-                .armed(&key)
-                .is_some_and(|armed| armed.arm_id == timer.arm_id)
+        self.state_timeout_tracker
+            .seqs
+            .lock()
+            .expect("state_timeout tracker poisoned")
+            .get(&key)
+            .and_then(|entry| entry.row_owner.as_ref())
+            .is_some_and(|owner| owner.task_seq > armed_seq && owner.arm_id == timer.arm_id)
     }
 }
 
@@ -919,7 +957,7 @@ pub(super) fn brought_forward_at(
         .iter()
         .filter_map(|action| state.status_clock.actions.get(action))
         .copied()
-        .filter(|at| *at >= started_at)
+        .filter(|at| *at > started_at)
         .max()
 }
 
@@ -1025,6 +1063,15 @@ mod tests {
     /// Reproduce cancellation landing between a repair's snapshot and write.
     #[tokio::test]
     async fn repair_does_not_resurrect_a_cancelled_row() {
+        repair_row_race(false).await;
+    }
+
+    #[tokio::test]
+    async fn repair_preserves_a_withheld_successors_row() {
+        repair_row_race(true).await;
+    }
+
+    async fn repair_row_race(withheld: bool) {
         use crate::storage::StateTimerStore;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use temper_runtime::persistence::{PersistenceError, StateTimerRecord};
@@ -1033,6 +1080,7 @@ mod tests {
             tracker: Arc<StateTimeoutTracker>,
             writes: AtomicUsize,
             row: Mutex<Option<StateTimerRecord>>,
+            withheld: bool,
         }
         #[async_trait::async_trait]
         impl StateTimerStore for RacingRows {
@@ -1043,6 +1091,10 @@ mod tests {
                 match self.writes.fetch_add(1, Ordering::SeqCst) {
                     0 => {
                         self.tracker.reserve(&timer("New", 2), Reservation::Fresh);
+                    }
+                    1 if self.withheld => {
+                        let seq = self.tracker.current(&key());
+                        self.tracker.release(&timer("New", 2), seq);
                     }
                     1 => {
                         self.tracker.invalidate(&key(), 3);
@@ -1081,6 +1133,7 @@ mod tests {
             tracker: server.state_timeout_tracker.clone(),
             writes: AtomicUsize::new(0),
             row: Mutex::new(None),
+            withheld,
         });
         server.state_timer_rows = Some(rows.clone());
         assert!(
@@ -1089,9 +1142,10 @@ mod tests {
                 .await
         );
         assert_eq!(rows.writes.load(Ordering::SeqCst), 2);
-        assert!(
-            rows.row.lock().unwrap().is_none(),
-            "cancelled repair row must be removed"
+        assert_eq!(
+            rows.row.lock().unwrap().is_some(),
+            withheld,
+            "repair keeps a withheld row and removes a cancelled one"
         );
     }
 

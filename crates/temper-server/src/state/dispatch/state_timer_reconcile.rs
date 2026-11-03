@@ -29,8 +29,9 @@
 //! ([`TimerFollow::RetryRead`]): it may hold the committed arm. A task that owns
 //! the timer reads it again (`follow_owned_state_timer`).
 //!
-//! A timer fires as someone: the caller of the dispatch that reconciles, else
-//! whoever armed the timer it replaces (its row's `armed_by`), else, when
+//! A timer already armed keeps its setter, from its row or its live arm,
+//! across every move that neither enters nor resets its state. A record with
+//! no arm uses the caller of the dispatch that reconciles, else, when
 //! nothing names a setter or only the state-timer service does (a record that
 //! entered its state before rows were kept, or lost its row), the principal of
 //! the record's newest move that names someone, as its journal keeps it
@@ -105,6 +106,9 @@ pub(crate) struct Follow<'a> {
     /// record: it found the record elsewhere, or moved on by an action that
     /// does not reset the timer. See [`elapsed_bucket`].
     pub(crate) woke_for: Option<DateTime<Utc>>,
+    /// The arm whose task released it to follow a newer journal sequence.
+    /// It still owns its captured arguments when no durable row exists.
+    pub(super) prior_arm: Option<&'a super::state_timeouts::ArmedTimer>,
 }
 
 /// How late a timer a follow arms is, as
@@ -168,6 +172,7 @@ impl ServerState {
             gate,
             arming,
             woke_for,
+            prior_arm,
         } = follow;
         let declared = {
             let Ok(registry) = self.registry.read() else {
@@ -188,7 +193,9 @@ impl ServerState {
             return TimerFollow::Settled;
         };
         let turn = self.state_timer_turn(tenant, entity_type, entity_id);
-        let armed = self.armed_state_timer(tenant, entity_type, entity_id);
+        let armed = self
+            .armed_state_timer(tenant, entity_type, entity_id)
+            .or_else(|| prior_arm.cloned());
         // Rows that follow commits are the timers the journal armed: one the
         // record's events left for this state is the timer it has, even when
         // the process never armed it (the move's answer was lost, or the
@@ -228,6 +235,19 @@ impl ServerState {
                 }
             }
         });
+        // A live timer of this same declaration is the record's timer: a
+        // dispatch's caller arms only a timer the record lacks. It matters
+        // when a move brings that timer forward (`fire_now_on`) and no row
+        // names who armed it: the replacement fires as the live timer's
+        // setter, never as the move that brought it forward.
+        let live_declared = armed
+            .as_ref()
+            .filter(|armed| {
+                armed.state == st.state
+                    && armed.action == st.on_timeout
+                    && armed.after_seconds == st.after_seconds
+            })
+            .cloned();
         // An unrecorded reset advances only the durable arm's clock, not
         // the journal's status clock. Read it before deciding a one-shot
         // already fired: the old fire may predate this replacement arm.
@@ -235,7 +255,10 @@ impl ServerState {
             &st,
             current,
             now,
-            committed.as_ref().map(|timer| timer.started_at),
+            committed
+                .as_ref()
+                .or(live_declared.as_ref())
+                .map(|timer| timer.started_at),
         ) else {
             self.cancel_state_timer(tenant, entity_type, entity_id, current.sequence_nr)
                 .await;
@@ -255,22 +278,9 @@ impl ServerState {
                     .is_some_and(|row| row.arm_id == armed.arm_id)
             })
             .map(|armed| armed.agent_ctx.clone());
-        // A live timer of this same declaration is the record's timer: a
-        // dispatch's caller arms only a timer the record lacks. It matters
-        // when a move brings that timer forward (`fire_now_on`) and no row
-        // names who armed it: the replacement fires as the live timer's
-        // setter, never as the move that brought it forward.
-        let live_declared = armed
-            .as_ref()
-            .filter(|armed| {
-                armed.state == st.state
-                    && armed.action == st.on_timeout
-                    && armed.after_seconds == st.after_seconds
-            })
-            .map(|armed| armed.agent_ctx.clone());
         let known = live_of_row
             .or_else(|| committed.as_ref().map(|timer| timer.agent_ctx.clone()))
-            .or(live_declared)
+            .or_else(|| live_declared.as_ref().map(|timer| timer.agent_ctx.clone()))
             .or_else(|| armed_by.cloned())
             .or_else(|| armed.as_ref().map(|armed| armed.agent_ctx.clone()))
             .or_else(|| row.as_ref().and_then(super::state_timer_rows::row_armed_by));
@@ -312,31 +322,30 @@ impl ServerState {
             }
             None => AgentContext::for_service(STATE_TIMER_SERVICE),
         };
-        let mut timer = declared_timer(
-            tenant,
-            entity_type,
-            &st,
-            current,
-            &ReadDefaults::for_entity(self, tenant, entity_type),
-            &identity,
-            started_at,
-        );
-        let reservation = if let Some(committed) = committed {
-            // The committed arm's identity, unless the journal named its setter
-            // in place of the service.
-            let agent_ctx = std::mem::take(&mut timer.agent_ctx);
-            timer = committed;
-            timer.agent_ctx = agent_ctx;
-            // Keep the durable arm's clock, payload, caller and row identity,
-            // but fence its replacement at the record we just reconciled.
-            // Non-resetting actions advance the journal without a new arm.
-            timer.sequence_nr = current.sequence_nr;
-            timer.brought_forward_at =
-                super::state_timeouts::brought_forward_at(&st, current, timer.started_at);
+        let reservation = if committed.is_some() {
             Reservation::Committed
         } else {
             Reservation::Missing
         };
+        // Follow the entire existing arm, including arguments captured on
+        // entry. Without a durable row the live arm is still authoritative;
+        // a delivery may have changed the fields those arguments read.
+        let mut timer = committed.or(live_declared).unwrap_or_else(|| {
+            declared_timer(
+                tenant,
+                entity_type,
+                &st,
+                current,
+                &ReadDefaults::for_entity(self, tenant, entity_type),
+                &identity,
+                started_at,
+            )
+        });
+        // The journal may have named a setter in place of a service identity.
+        timer.agent_ctx = super::state_timeouts::timer_agent(&identity);
+        timer.sequence_nr = current.sequence_nr;
+        timer.brought_forward_at =
+            super::state_timeouts::brought_forward_at(&st, current, timer.started_at);
         timer.boot_gate = gate.or_else(|| armed.and_then(|armed| armed.boot_gate));
         let delay = (timer.due_at() - now).to_std().unwrap_or(Duration::ZERO);
         let bucket = elapsed_bucket(delay, timer.due_at(), woke_for);

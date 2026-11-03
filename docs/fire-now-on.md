@@ -44,8 +44,10 @@ The spec does not load when a move in `fire_now_on`:
 
 ## Details
 
-- Only the record's own timer is brought forward. A move on one record never fires another record's timer.
-- A timer that fires once and already fired is not fired again; a repeating timer (its `on_timeout` in `reset_on`) fires once and starts its clock again, as at a deadline.
+- Only the record's own timer is brought forward. A move on one record never fires another record's timer. The arm keeps its clock, captured arguments and identity, even when its durable row is missing.
+- A reaction or module callback in `fire_now_on` is recorded even when it changes no fields: its event brings the timer forward.
+- A withheld accelerated fire keeps its saved row and armer. Superseded tasks cannot remove that row when their original deadline arrives.
+- A timer that fires once and already fired is not fired again; a repeating timer (its `on_timeout` in `reset_on`) fires once and starts its clock again, as at a deadline. Only deliveries strictly later than that clock start bring the new arm forward; a delivery at the same clock tick as the re-arm cannot fire it again.
 - The fire starts right after the move commits. The record's status clock keeps when the move came, so whatever next follows the record's timer (its actor starting again from stored events, its next move, a boot walk that replays it) fires it at once. A process that stops in the moment between the move and the fire, on a record the boot does not replay, fires the timer at its deadline: the deadline still holds.
 
 Regression tests: `cargo test -p temper-server --test timer_fire_now` and `cargo test -p temper-spec fire_now`.

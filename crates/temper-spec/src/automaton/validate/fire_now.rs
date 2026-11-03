@@ -143,6 +143,6 @@ on_timeout = "Look"
             "reset_on = [\"Heard\"]\nfire_now_on = [\"Heard\"]",
             "also in reset_on",
         );
-        refused(r#"fire_now_on = ["Look"]"#, "its own on_timeout");
+        refused(r#"fire_now_on = ["Look"]"#, "own on_timeout");
     }
 }
