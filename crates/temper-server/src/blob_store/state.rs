@@ -263,24 +263,19 @@ impl ServerState {
             return Ok(super::BlobStreamRead::Missing);
         };
         const CHUNK_BYTES: usize = 64 * 1024;
-        // A permit lives with the stream; dropping a response also drops the
-        // permit. Each database operation has a deadline and reads one chunk.
-        let permit = tokio::time::timeout(
+        // Active downloads use the same stream budget as object storage.
+        // Shared blob I/O permits cover database operations only, so a paused
+        // client cannot occupy the permits needed by unrelated reads or writes.
+        let stream_permit = tokio::time::timeout(
             super::BLOB_IO_QUEUE_TIMEOUT,
-            super::blob_io_semaphore().acquire_owned(),
+            super::streaming::blob_stream_semaphore().acquire_owned(),
         )
         .await
-        .map_err(|_| format!("legacy DB blob read for '{key}' timed out queueing for blob I/O"))?
-        .map_err(|error| format!("legacy DB blob I/O semaphore closed for '{key}': {error}"))?;
+        .map_err(|_| format!("legacy DB blob stream for '{key}' timed out queueing"))?
+        .map_err(|error| format!("blob stream semaphore closed for '{key}': {error}"))?;
         // Open with a zero-byte read: this obtains the actual length without
         // fetching content, including for a caller whose ceiling is too small.
-        let Some((length, _)) = tokio::time::timeout(
-            super::BLOB_BUFFERED_OPERATION_TIMEOUT,
-            store.get_blob_chunk(key, 0, 0),
-        )
-        .await
-        .map_err(|_| format!("legacy DB blob read for '{key}' timed out"))??
-        else {
+        let Some((length, _)) = read_legacy_chunk(store.as_ref(), key, 0, 0).await? else {
             return Ok(super::BlobStreamRead::Missing);
         };
         if length > max_bytes {
@@ -290,15 +285,12 @@ impl ServerState {
         }
         let key = key.to_owned();
         let source = Box::pin(async_stream::try_stream! {
-            let _permit = permit;
+            let _stream_permit = stream_permit;
             let mut offset = 0;
             while offset < length {
                 let count = (length - offset).min(CHUNK_BYTES as u64) as usize;
-                let chunk = tokio::time::timeout(
-                    super::BLOB_BUFFERED_OPERATION_TIMEOUT,
-                    store.get_blob_chunk(&key, offset, count),
-                ).await.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "legacy blob chunk timed out"))?
-                    .map_err(std::io::Error::other)?;
+                let chunk = read_legacy_chunk(store.as_ref(), &key, offset, count)
+                    .await.map_err(std::io::Error::other)?;
                 let Some((actual_length, bytes)) = chunk else {
                     Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "legacy blob disappeared during read"))?
                 };
@@ -357,6 +349,29 @@ impl ServerState {
             .await
             .map_err(|error| format!("metadata blob shadow write failed for '{key}': {error}"))
     }
+}
+
+/// Read one chunk while occupying the shared blob I/O budget only for the
+/// database operation. No permit escapes this call to a response's `yield`.
+async fn read_legacy_chunk(
+    store: &dyn crate::storage::MetadataStore,
+    key: &str,
+    offset: u64,
+    count: usize,
+) -> Result<Option<(u64, Vec<u8>)>, String> {
+    let _io_permit = tokio::time::timeout(
+        super::BLOB_IO_QUEUE_TIMEOUT,
+        super::blob_io_semaphore().acquire_owned(),
+    )
+    .await
+    .map_err(|_| format!("legacy DB blob read for '{key}' timed out queueing for blob I/O"))?
+    .map_err(|error| format!("legacy DB blob I/O semaphore closed for '{key}': {error}"))?;
+    tokio::time::timeout(
+        super::BLOB_BUFFERED_OPERATION_TIMEOUT,
+        store.get_blob_chunk(key, offset, count),
+    )
+    .await
+    .map_err(|_| format!("legacy DB blob read for '{key}' timed out"))?
 }
 
 /// Where a tenant's objects sit in the bucket: under the deployment's own prefix (`blob_prefix`, such as one app's

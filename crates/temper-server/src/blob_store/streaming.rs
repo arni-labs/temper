@@ -29,7 +29,7 @@ const BLOB_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const BLOB_STREAM_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_BLOB_STREAM_MAX_CONCURRENCY: usize = 32;
 
-fn blob_stream_semaphore() -> Arc<tokio::sync::Semaphore> {
+pub(super) fn blob_stream_semaphore() -> Arc<tokio::sync::Semaphore> {
     static SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     Arc::clone(SEMAPHORE.get_or_init(|| {
         let limit = std::env::var("TEMPER_BLOB_STREAM_MAX_CONCURRENCY") // determinism-ok: startup-only tuning knob
