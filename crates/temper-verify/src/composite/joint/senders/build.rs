@@ -146,6 +146,7 @@ impl Senders {
             decided: RefCell::default(),
             decided_bytes: std::cell::Cell::default(),
             reread,
+            meets: BTreeMap::new(),
         }
     }
 
@@ -164,6 +165,7 @@ impl Senders {
             decided: RefCell::default(),
             decided_bytes: std::cell::Cell::default(),
             reread: BTreeSet::new(),
+            meets: BTreeMap::new(),
         }
     }
 }
