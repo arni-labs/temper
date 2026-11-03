@@ -1,7 +1,9 @@
 //! WASM module storage and invocation log persistence.
 
 use crate::driver::params;
-use temper_runtime::persistence::{PersistenceError, storage_error};
+use temper_runtime::persistence::{
+    PersistenceError, WASM_INVOCATIONS_KEPT_PER_TENANT, WASM_INVOCATIONS_PRUNE_EVERY, storage_error,
+};
 use tracing::instrument;
 
 use super::{
@@ -218,10 +220,11 @@ impl TursoEventStore {
             .await?;
         let success_val: i64 = if entry.success { 1 } else { 0 };
         let duration_val: i64 = entry.duration_ms as i64;
-        conn.execute(
+        let mut inserted = conn
+            .query(
             "INSERT INTO wasm_invocation_logs \
              (tenant, entity_type, entity_id, module_name, trigger_action, callback_action, success, error, duration_ms, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) RETURNING id",
             params![
                 entry.tenant,
                 entry.entity_type,
@@ -237,6 +240,38 @@ impl TursoEventStore {
         )
         .await
         .map_err(storage_error)?;
+        let id = match inserted.next().await.map_err(storage_error)? {
+            Some(row) => row.get::<i64>(0).map_err(storage_error)?,
+            None => 0,
+        };
+        drop(inserted);
+        if id > 0 && id % WASM_INVOCATIONS_PRUNE_EVERY == 0 {
+            // Find the newest row past the bound, then remove it and every
+            // older row of the tenant. Ids follow insert order.
+            let mut cutoff = conn
+                .query(
+                    "SELECT id FROM wasm_invocation_logs \
+                     INDEXED BY idx_wasm_invocation_logs_tenant \
+                     WHERE tenant = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2",
+                    params![entry.tenant, WASM_INVOCATIONS_KEPT_PER_TENANT],
+                )
+                .await
+                .map_err(storage_error)?;
+            let cutoff = match cutoff.next().await.map_err(storage_error)? {
+                Some(row) => Some(row.get::<i64>(0).map_err(storage_error)?),
+                None => None,
+            };
+            if let Some(cutoff) = cutoff {
+                conn.execute(
+                    "DELETE FROM wasm_invocation_logs \
+                     INDEXED BY idx_wasm_invocation_logs_tenant \
+                     WHERE tenant = ?1 AND id <= ?2",
+                    params![entry.tenant, cutoff],
+                )
+                .await
+                .map_err(storage_error)?;
+            }
+        }
         Ok(())
     }
 

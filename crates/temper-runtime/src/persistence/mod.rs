@@ -19,6 +19,20 @@ pub use tombstone::{EVENT_KIND_KEY, EventKind, TOMBSTONE_EVENT_TYPE, journal_is_
 /// journals/idempotency keys that were committed atomically with it.
 pub const COMPOSITE_EVENT_TYPE: &str = "CompositeEvent";
 
+/// How many WASM invocation log rows a tenant keeps, newest first. Its only
+/// reader, `/observe/wasm` (module stats and invocation history), reads at
+/// most the newest this many, so an older row is never read again; without a
+/// bound the log grew by one row per integration call for as long as the
+/// tenant ran.
+pub const WASM_INVOCATIONS_KEPT_PER_TENANT: i64 = 10_000;
+
+/// A store prunes a tenant's WASM invocation log to
+/// [`WASM_INVOCATIONS_KEPT_PER_TENANT`] when the row it inserts has an id
+/// divisible by this: about once every this many inserts, so a prune's cost
+/// (finding the cutoff row) is shared by that many inserts, and a tenant holds
+/// at most about this many rows over the bound between prunes.
+pub const WASM_INVOCATIONS_PRUNE_EVERY: i64 = 100;
+
 /// Replay/audit record for one Composite action application.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompositeEvent {
