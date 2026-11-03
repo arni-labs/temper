@@ -39,6 +39,8 @@ struct RuntimeMetrics {
     state_timeout_reset_total: Counter<u64>,
     // A timer acts with its setter's current standing.
     timer_fire_withheld_total: Counter<u64>,
+    // A machine's move that left its record unchanged and wrote nothing.
+    unrecorded_moves_total: Counter<u64>,
     scheduler_overdue_on_replay_total: Counter<u64>,
     scheduler_pending_timers: Gauge<u64>,
     // ADR-0056: re-arm on actor hydration.
@@ -201,6 +203,13 @@ fn metrics() -> &'static RuntimeMetrics {
                 .with_description(
                     "Timer fires whose move was not made because the timer's setter may no \
                      longer read the record.",
+                )
+                .build(),
+            unrecorded_moves_total: meter
+                .u64_counter("temper_unrecorded_moves_total")
+                .with_description(
+                    "Moves a timer, reaction or callback made that left their record unchanged, \
+                     so no event, row or trajectory entry was written for them.",
                 )
                 .build(),
             scheduler_overdue_on_replay_total: meter
@@ -724,6 +733,19 @@ pub fn record_state_timeout_reset(
             KeyValue::new("entity_type", entity_type.to_string()),
             KeyValue::new("state", state.to_string()),
             KeyValue::new("reset_action", reset_action.to_string()),
+        ],
+    );
+}
+
+/// Record a move a machine made that left its record unchanged, so nothing
+/// was written for it (`entity_actor::unrecorded`).
+pub fn record_unrecorded_move(tenant: &str, entity_type: &str, action: &str) {
+    metrics().unrecorded_moves_total.add(
+        1,
+        &[
+            KeyValue::new("tenant", tenant.to_string()),
+            KeyValue::new("entity_type", entity_type.to_string()),
+            KeyValue::new("action", action.to_string()),
         ],
     );
 }

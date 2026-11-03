@@ -36,6 +36,18 @@ pub(crate) fn timer_arm_id(state: &str, sequence_nr: u64) -> String {
     format!("{state}-{sequence_nr}")
 }
 
+/// The id of the timer a move that wrote no event reset at `at`, on a record
+/// at `sequence_nr` (`entity_actor::unrecorded`). It differs from the id the
+/// event at `sequence_nr` armed and from every earlier reset's, so the timer
+/// it replaces, whose task ends after it, does not remove its row.
+pub(crate) fn unrecorded_timer_arm_id(
+    state: &str,
+    sequence_nr: u64,
+    at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    format!("{state}-{sequence_nr}@{}", at.timestamp_micros())
+}
+
 impl ServerState {
     /// What says which rows an event of `entity_type` writes, for its actor.
     /// The actor asks it only of a store that keeps them with the journal.
