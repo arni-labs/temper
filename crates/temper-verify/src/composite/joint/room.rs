@@ -149,15 +149,7 @@ impl Drop for Held<'_> {
     }
 }
 
-/// The bytes a heap block of `size` bytes takes: jemalloc's size classes,
-/// 16 bytes apart up to 128, then four to each doubling.
-pub(super) fn block(size: usize) -> usize {
-    if size <= 128 {
-        return size.next_multiple_of(16).max(16);
-    }
-    let spacing = size.next_power_of_two() / 8;
-    size.next_multiple_of(spacing)
-}
+pub(super) use crate::model::heap::{Heap, block};
 
 /// The bytes a `HashMap<K, V>` that holds `capacity` entries takes: a
 /// bucket and a control byte for each, at most seven of eight buckets full.
@@ -214,8 +206,9 @@ pub(super) fn grow<L: List>(list: &mut L, spare: usize, held: &mut Held<'_>) -> 
     }
     let wanted = (len + spare).max(list.capacity() * 2);
     held.add(wanted * L::ENTRY)?;
+    let old = bytes(list);
     list.reserve_exact(wanted - len);
-    held.sub(wanted * L::ENTRY);
+    held.sub(old);
     Ok(())
 }
 
@@ -230,103 +223,19 @@ pub(super) fn grow_map<K: Eq + Hash, V>(
         return Ok(());
     }
     let wanted = (len + spare).max(map.capacity() * 2);
-    held.add(map_bytes::<K, V>(wanted))?;
-    map.reserve(wanted - len);
-    held.sub(map_bytes::<K, V>(wanted));
-    Ok(())
-}
-
-/// The bytes a `BTreeMap<K, V>` of `len` entries takes in its nodes: eleven
-/// entries to a node, and at least five in each node past the first.
-fn tree_bytes<K, V>(len: usize) -> usize {
-    let nodes = match len {
-        0 => 0,
-        1..=11 => 1,
-        _ => len.div_ceil(5),
+    // Hash tables round their bucket count up to a power of two, leaving
+    // one bucket empty for small tables and an eighth empty thereafter.
+    let buckets = (wanted * 8).div_ceil(7).next_power_of_two().max(4);
+    let capacity = if buckets < 8 {
+        buckets - 1
+    } else {
+        buckets / 8 * 7
     };
-    nodes * block(16 + 11 * (size_of::<K>() + size_of::<V>()) + 12 * size_of::<usize>())
-}
-
-/// The heap memory a value holds beyond its own size: what a walk counts of
-/// the states and moves it builds before it keeps them.
-pub(super) trait Heap {
-    fn heap(&self) -> usize;
-}
-
-/// The bytes `value` takes, itself and what it holds.
-pub(super) fn whole<T: Heap>(value: &T) -> usize {
-    size_of::<T>() + value.heap()
-}
-
-macro_rules! no_heap {
-    ($($t:ty),*) => {$(impl Heap for $t { fn heap(&self) -> usize { 0 } })*};
-}
-no_heap!(bool, u32, usize);
-
-impl Heap for String {
-    fn heap(&self) -> usize {
-        match self.capacity() {
-            0 => 0,
-            n => block(n),
-        }
-    }
-}
-
-impl<T: Heap> Heap for Option<T> {
-    fn heap(&self) -> usize {
-        self.as_ref().map_or(0, Heap::heap)
-    }
-}
-
-impl<T: Heap> Heap for Vec<T> {
-    fn heap(&self) -> usize {
-        let own = match self.capacity() * size_of::<T>() {
-            0 => 0,
-            n => block(n),
-        };
-        own + self.iter().map(Heap::heap).sum::<usize>()
-    }
-}
-
-impl<K: Heap, V: Heap> Heap for std::collections::BTreeMap<K, V> {
-    fn heap(&self) -> usize {
-        tree_bytes::<K, V>(self.len())
-            + self.iter().map(|(k, v)| k.heap() + v.heap()).sum::<usize>()
-    }
-}
-
-impl Heap for crate::model::ModelString {
-    fn heap(&self) -> usize {
-        match self {
-            Self::Literal(text) => text.heap(),
-            _ => 0,
-        }
-    }
-}
-
-impl Heap for crate::model::ParamValue {
-    fn heap(&self) -> usize {
-        match self {
-            Self::Str(value) => value.heap(),
-            _ => 0,
-        }
-    }
-}
-
-impl Heap for crate::model::TemperModelState {
-    fn heap(&self) -> usize {
-        self.status.heap()
-            + self.counters.heap()
-            + self.booleans.heap()
-            + self.lists.heap()
-            + self.strings.heap()
-    }
-}
-
-impl Heap for crate::model::TemperModelAction {
-    fn heap(&self) -> usize {
-        self.name.heap() + self.target_state.heap() + self.params.heap()
-    }
+    held.add(map_bytes::<K, V>(capacity))?;
+    let old = map_bytes::<K, V>(map.capacity());
+    map.reserve(wanted - len);
+    held.sub(old);
+    Ok(())
 }
 
 impl Heap for super::ReactionStep {

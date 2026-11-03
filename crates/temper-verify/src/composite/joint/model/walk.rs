@@ -246,10 +246,10 @@ impl JointModel {
                     };
                 explored.held_back |= held;
                 tables.decided = self.senders.held();
-                // Grow the tables for every state this move may add before
-                // adding any, so none grows past what the room gave.
+                // Every outcome needs an edge; state slots are reserved only
+                // when an unseen packed state is about to be kept.
                 let reserved =
-                    tables.reserve(&mut explored, &mut seen, &mut queue, edges, nexts.len());
+                    tables.reserve(&mut explored, &mut seen, &mut queue, edges, 0, nexts.len());
                 if let Err(reason) = reserved {
                     tables.give(&mut explored.held, room);
                     explored.stop_for_room(reason);
@@ -271,6 +271,12 @@ impl JointModel {
                     let at = match seen.get(&packed) {
                         Some(&at) => at,
                         None => {
+                            if let Err(reason) =
+                                tables.reserve(&mut explored, &mut seen, &mut queue, false, 1, 0)
+                            {
+                                explored.stop_for_room(reason);
+                                break;
+                            }
                             let at = explored.nodes.len() as u32;
                             let label = explored.packer.id(&next.label);
                             tables.states += block(size_of::<[usize; 2]>() + 4 * packed.len());

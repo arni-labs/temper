@@ -6,6 +6,7 @@ mod drops;
 mod held;
 mod initial;
 mod labels;
+mod moves;
 mod order;
 mod react;
 mod read;

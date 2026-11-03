@@ -5,10 +5,16 @@ use std::collections::{HashMap, VecDeque};
 
 use super::super::JointState;
 use super::super::pack::Packed;
-use super::super::room::{Heap, Held, bytes, grow, grow_map, map_bytes, whole};
+use super::super::room::{Heap, Held, bytes, grow, grow_map, map_bytes};
 use super::JointModel;
-use super::step::{Certainty, Move};
+use super::step::{Certainty, Move, Next};
 use super::walk::Explored;
+
+impl Heap for Certainty {
+    fn heap(&self) -> usize {
+        0
+    }
+}
 
 /// The walk's tables as the memory it holds counts them: each at its
 /// capacity, and each packed state as its own heap block. Before each state
@@ -67,8 +73,8 @@ impl Tables {
         held.sub(room);
     }
 
-    /// Make the tables hold `states` more states, one more move and as
-    /// many more edges.
+    /// Make the tables hold `states` new states and, with `edges`, one
+    /// more move and an edge for each outcome.
     pub(super) fn reserve(
         &mut self,
         explored: &mut Explored<'_>,
@@ -76,6 +82,7 @@ impl Tables {
         queue: &mut VecDeque<usize>,
         edges: bool,
         states: usize,
+        outcomes: usize,
     ) -> Result<(), String> {
         let held = &mut explored.held;
         grow(&mut explored.nodes, states, held)?;
@@ -83,7 +90,7 @@ impl Tables {
         grow_map(seen, states, held)?;
         if edges {
             grow(&mut explored.made, 1, held)?;
-            grow(&mut explored.edges, states, held)?;
+            grow(&mut explored.edges, outcomes, held)?;
         }
         Ok(())
     }
@@ -134,6 +141,12 @@ impl Tables {
     }
 }
 
+impl Heap for Next {
+    fn heap(&self) -> usize {
+        self.state.heap() + self.renamed.heap() + self.label.heap()
+    }
+}
+
 impl Heap for Move {
     fn heap(&self) -> usize {
         match self {
@@ -158,20 +171,16 @@ impl JointModel {
         state: JointState,
         known: Certainty,
     ) -> bool {
-        if !self.expansion.hold(whole(&state)) {
-            return false;
-        }
-        after.push((state, known));
-        true
+        self.expansion.push(after, (state, known))
     }
 
     /// Keep `mv` among a state's moves, counting it against the expansion's
     /// room. False when the room is used up.
     pub(super) fn keep_move(&self, out: &mut Vec<Move>, mv: Move) -> bool {
-        if !self.expansion.hold(whole(&mv)) {
-            return false;
-        }
-        out.push(mv);
-        true
+        self.expansion.push(out, mv)
     }
 }
+
+#[cfg(test)]
+#[path = "held_test.rs"]
+mod tests;

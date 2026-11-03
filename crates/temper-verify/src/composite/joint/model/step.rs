@@ -2,21 +2,19 @@
 //! from outside, state timers, module answers, dispatches read on the
 //! dispatch path, and dispatches their records take or refuse.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use temper_authz::May;
 use temper_spec::predicate::{Truth, eval};
 
 use super::super::env::Blind;
-use super::super::room::whole;
 use super::super::senders::OUTSIDE;
 use super::super::state::canonical;
 use super::super::{Call, Dispatch, JointState};
 use super::commit::add;
 use super::labels::rename_label;
 use super::{Delivery, JointModel, MAX_IN_FLIGHT};
-use crate::model::semantics::successors_budgeted;
-use crate::model::{ModelString, ParamValue, TemperModelAction};
+use crate::model::{ModelString, TemperModelAction};
 
 /// One move of the walk.
 #[derive(Debug, Clone)]
@@ -98,78 +96,6 @@ pub(in crate::composite::joint) struct Next {
 }
 
 impl JointModel {
-    /// Every move from `state`: each record's enabled actions someone
-    /// outside may send, with string parameters chosen among the values held
-    /// anywhere in the joint state, and each state timer due (when its
-    /// delivery lets a move from outside come now); each module call's
-    /// answers and failure; and each dispatch in flight.
-    pub(in crate::composite::joint) fn moves(&self, state: &JointState) -> Vec<Move> {
-        let values = self.values(state);
-        let mut out = Vec::new();
-        let asked = self.delivery == Delivery::Any || state.inflight.is_empty();
-        for (entity, model) in self.models.iter().filter(|_| asked) {
-            let local = &state.records[entity];
-            for t in &model.transitions {
-                if !self.expansion.take() {
-                    return out;
-                }
-                if !self.sendable(entity, &t.name)
-                    || !self.enabled(entity, t, state, Blind::Nothing)
-                {
-                    continue;
-                }
-                let reads = self.reads_related(t);
-                for (params, _) in successors_budgeted(model, t, local, &values, &self.expansion) {
-                    let action = TemperModelAction {
-                        name: t.name.clone(),
-                        target_state: t.to_state.clone(),
-                        params,
-                    };
-                    let mv = if reads {
-                        Move::Send(entity.clone(), action)
-                    } else {
-                        Move::Take(entity.clone(), action)
-                    };
-                    if !self.keep_move(&mut out, mv) {
-                        return out;
-                    }
-                }
-            }
-            if state.armed.contains_key(entity)
-                && let Some(timeout) = self.timeout(entity, &local.status)
-            {
-                let mv = Move::Timer(entity.clone(), timeout.action.clone());
-                if !self.keep_move(&mut out, mv) {
-                    return out;
-                }
-            }
-        }
-        let mut calls = BTreeSet::new();
-        for call in &state.calls {
-            if calls.insert(call)
-                && !(self.answers(state, call, &values, &mut out)
-                    && self.keep_move(&mut out, Move::Fail(call.clone()))
-                    && self.keep_move(&mut out, Move::Lost(call.clone())))
-            {
-                return out;
-            }
-        }
-        let mut seen = BTreeSet::new();
-        for dispatch in &state.inflight {
-            if seen.insert(dispatch) {
-                let mv = if dispatch.read {
-                    Move::Arrive(dispatch.clone())
-                } else {
-                    Move::Read(dispatch.clone())
-                };
-                if !self.keep_move(&mut out, mv) {
-                    return out;
-                }
-            }
-        }
-        out
-    }
-
     /// The states `mv` leads to from `state`, each with what the model knows
     /// of it, and whether a state was held back because it would put more
     /// than [`MAX_IN_FLIGHT`] dispatches in flight.
@@ -194,7 +120,12 @@ impl JointModel {
                 let text = format!("{entity}.{action}");
                 for (outcome, then) in self.commit(state.clone(), entity, action, &[], OUTSIDE) {
                     let certainty = Certainty::unless(known, Unsure).then(then);
-                    outcomes.push((outcome, text.clone(), certainty));
+                    if !self
+                        .expansion
+                        .push(&mut outcomes, (outcome, text.clone(), certainty))
+                    {
+                        return (Vec::new(), false);
+                    };
                 }
             }
             Move::Send(entity, action) => {
@@ -204,7 +135,12 @@ impl JointModel {
                 let mut next = state.clone();
                 add(&mut next, sent(entity, action, OUTSIDE));
                 let text = format!("{entity}.{action} sent");
-                outcomes.push((next, text, Certainty::unless(known, Unsure)));
+                if !self.expansion.push(
+                    &mut outcomes,
+                    (next, text, Certainty::unless(known, Unsure)),
+                ) {
+                    return (Vec::new(), false);
+                };
             }
             Move::Timer(entity, name) => {
                 let by = state.armed.get(entity).copied().unwrap_or(OUTSIDE);
@@ -215,7 +151,11 @@ impl JointModel {
                 };
                 let mut next = state.clone();
                 next.armed.remove(entity);
-                outcomes.extend(self.fire(next, entity, name, &text, by));
+                for outcome in self.fire(next, entity, name, &text, by) {
+                    if !self.expansion.push(&mut outcomes, outcome) {
+                        return (Vec::new(), false);
+                    }
+                }
             }
             Move::Answer(call, action) => {
                 let mut next = state.clone();
@@ -228,11 +168,21 @@ impl JointModel {
                 );
                 if self.action_reads_related(&call.to, &action.name) {
                     add(&mut next, sent(&call.to, action, call.by));
-                    outcomes.push((next, format!("{text} sent"), Sure));
+                    if !self
+                        .expansion
+                        .push(&mut outcomes, (next, format!("{text} sent"), Sure))
+                    {
+                        return (Vec::new(), false);
+                    };
                 } else if self.stale(call, &action.name, state) {
                     // The module answers about the record as the call found
                     // it, and the record has moved on from that.
-                    outcomes.push((next, format!("{text} refused by its record"), Sure));
+                    if !self.expansion.push(
+                        &mut outcomes,
+                        (next, format!("{text} refused by its record"), Sure),
+                    ) {
+                        return (Vec::new(), false);
+                    };
                 } else {
                     // The record refuses an answer whose guard or constraints
                     // do not hold, and the call ends there
@@ -242,11 +192,21 @@ impl JointModel {
                         && self.exact(&call.to, &action.name, state);
                     if !known {
                         let refused = format!("{text} refused by its record");
-                        outcomes.push((next.clone(), refused, OneOf));
+                        if !self
+                            .expansion
+                            .push(&mut outcomes, (next.clone(), refused, OneOf))
+                        {
+                            return (Vec::new(), false);
+                        };
                     }
                     for (outcome, then) in self.commit(next, &call.to, action, &[], call.by) {
                         let certainty = Certainty::unless(known, OneOf).then(then);
-                        outcomes.push((outcome, text.clone(), certainty));
+                        if !self
+                            .expansion
+                            .push(&mut outcomes, (outcome, text.clone(), certainty))
+                        {
+                            return (Vec::new(), false);
+                        };
                     }
                 }
             }
@@ -255,20 +215,35 @@ impl JointModel {
                 remove_call(&mut next, call);
                 let text = format!("{call} fails");
                 match &call.on_failure {
-                    Some(name) => outcomes.extend(self.fire(
-                        next,
-                        &call.to,
-                        name,
-                        &format!("{text}: {}.{name}", call.to),
-                        call.by,
-                    )),
-                    None => outcomes.push((next, text, Sure)),
+                    Some(name) => {
+                        for outcome in self.fire(
+                            next,
+                            &call.to,
+                            name,
+                            &format!("{text}: {}.{name}", call.to),
+                            call.by,
+                        ) {
+                            if !self.expansion.push(&mut outcomes, outcome) {
+                                return (Vec::new(), false);
+                            }
+                        }
+                    }
+                    None => {
+                        if !self.expansion.push(&mut outcomes, (next, text, Sure)) {
+                            return (Vec::new(), false);
+                        }
+                    }
                 }
             }
             Move::Lost(call) => {
                 let mut next = state.clone();
                 remove_call(&mut next, call);
-                outcomes.push((next, format!("{call} is lost: the server restarts"), Sure));
+                if !self.expansion.push(
+                    &mut outcomes,
+                    (next, format!("{call} is lost: the server restarts"), Sure),
+                ) {
+                    return (Vec::new(), false);
+                };
             }
             Move::Read(dispatch) => {
                 let mut next = state.clone();
@@ -277,14 +252,24 @@ impl JointModel {
                 if allows != Truth::True {
                     let refused = format!("{dispatch} refused when read");
                     let certainty = Certainty::unless(allows == Truth::False, OneOf);
-                    outcomes.push((next.clone(), refused, certainty));
+                    if !self
+                        .expansion
+                        .push(&mut outcomes, (next.clone(), refused, certainty))
+                    {
+                        return (Vec::new(), false);
+                    };
                 }
                 if allows != Truth::False {
                     let mut read = dispatch.clone();
                     read.read = true;
                     add(&mut next, read);
                     let text = format!("{dispatch}: related records read");
-                    outcomes.push((next, text, Certainty::unless(allows == Truth::True, OneOf)));
+                    if !self.expansion.push(
+                        &mut outcomes,
+                        (next, text, Certainty::unless(allows == Truth::True, OneOf)),
+                    ) {
+                        return (Vec::new(), false);
+                    };
                 }
             }
             Move::Arrive(dispatch) => {
@@ -303,15 +288,24 @@ impl JointModel {
                         "{dispatch} refused by Cedar for {}",
                         self.senders.name(dispatch.by)
                     );
-                    outcomes.push((next.clone(), text, Certainty::unless(may == May::No, OneOf)));
+                    if !self.expansion.push(
+                        &mut outcomes,
+                        (next.clone(), text, Certainty::unless(may == May::No, OneOf)),
+                    ) {
+                        return (Vec::new(), false);
+                    };
                 }
                 if may != May::No {
                     let cedar = Certainty::unless(may == May::Yes, OneOf);
-                    outcomes.extend(
-                        self.deliver(next, dispatch, &dispatch.to_string())
-                            .into_iter()
-                            .map(|(s, t, then)| (s, t, cedar.then(then))),
-                    );
+                    for outcome in self
+                        .deliver(next, dispatch, &dispatch.to_string())
+                        .into_iter()
+                        .map(|(s, t, then)| (s, t, cedar.then(then)))
+                    {
+                        if !self.expansion.push(&mut outcomes, outcome) {
+                            return (Vec::new(), false);
+                        }
+                    }
                 }
             }
         }
@@ -332,14 +326,9 @@ impl JointModel {
                 renamed,
                 certainty,
             };
-            // What the walk will hold of this state until it packs it.
-            if !self
-                .expansion
-                .hold(whole(&next.state) + whole(&next.label) + whole(&next.renamed))
-            {
+            if !self.expansion.push(&mut nexts, next) {
                 return (Vec::new(), held_back);
             }
-            nexts.push(next);
         }
         (nexts, held_back)
     }
@@ -391,7 +380,7 @@ impl JointModel {
     }
 
     /// Whether someone outside may send `action` to an `entity` record.
-    fn sendable(&self, entity: &str, action: &str) -> bool {
+    pub(super) fn sendable(&self, entity: &str, action: &str) -> bool {
         self.outside_may(entity, action) != May::No
     }
 
@@ -420,56 +409,6 @@ impl JointModel {
                     && (t.from_states.is_empty() || t.from_states.contains(status))
             })
             .map_or(Truth::Unknown, |t| eval(&t.guard, &self.env(entity, state)))
-    }
-
-    /// The answers a module may give the call `call`: its trigger's
-    /// `on_success`, or else any internal action of its record. The module
-    /// itself is not modelled: it may give each of these answers, and gives
-    /// each it keeps being able to give at some point. False when the
-    /// expansion's room is used up.
-    fn answers(
-        &self,
-        state: &JointState,
-        call: &Call,
-        values: &BTreeSet<ModelString>,
-        out: &mut Vec<Move>,
-    ) -> bool {
-        let model = &self.models[&call.to];
-        let local = &state.records[&call.to];
-        for t in &model.transitions {
-            let answers = if call.on_success.is_empty() {
-                self.kernel
-                    .internal
-                    .get(&call.to)
-                    .is_some_and(|names| names.contains(&t.name))
-            } else {
-                call.on_success.contains(&t.name)
-            };
-            if !answers || !self.enabled(&call.to, t, state, Blind::Nothing) {
-                continue;
-            }
-            let mut seen = BTreeSet::new();
-            for (mut params, _) in successors_budgeted(model, t, local, values, &self.expansion) {
-                // A parameter tied to a field carries it as the call found it.
-                for param in &t.string_params {
-                    if let Some(value) = param.equals.iter().find_map(|f| call.asked.get(f)) {
-                        params.insert(param.name.clone(), ParamValue::Str(value.clone()));
-                    }
-                }
-                if !seen.insert(params.clone()) {
-                    continue;
-                }
-                let action = TemperModelAction {
-                    name: t.name.clone(),
-                    target_state: t.to_state.clone(),
-                    params,
-                };
-                if !self.keep_move(out, Move::Answer(call.clone(), action)) {
-                    return false;
-                }
-            }
-        }
-        true
     }
 }
 

@@ -1,4 +1,6 @@
-//! Work accounting inside state expansion.
+//! Work and memory accounting inside state expansion.
+
+use super::heap::{Heap, block};
 
 /// Shared work budget for expansion, including intermediate products. A walk
 /// must report incomplete if this budget stops even when its queue is empty.
@@ -67,6 +69,55 @@ impl Expansion {
                 false
             }
         }
+    }
+
+    /// Reserve a vector slot before allocating its replacement block. Both
+    /// blocks count until reserve completes; the old block is then released.
+    pub(crate) fn reserve<T>(&self, out: &mut Vec<T>) -> bool {
+        if out.len() < out.capacity() {
+            return !self.short();
+        }
+        let capacity = out.capacity().saturating_mul(2).max(1);
+        let Some(size) = capacity.checked_mul(size_of::<T>()) else {
+            self.short.set(true);
+            return false;
+        };
+        if !self.hold(block(size)) {
+            return false;
+        }
+        let old = out.capacity() * size_of::<T>();
+        out.reserve_exact(capacity - out.len());
+        if old != 0 {
+            self.give(block(old));
+        }
+        true
+    }
+
+    /// Charge a cloned map and its added entry before cloning either.
+    pub(crate) fn with_entry<K: Ord + Clone + Heap, V: Clone + Heap>(
+        &self,
+        map: &std::collections::BTreeMap<K, V>,
+        key: &K,
+        value: &V,
+    ) -> Option<std::collections::BTreeMap<K, V>> {
+        use super::heap::tree_bytes;
+        let nodes = tree_bytes::<K, V>(map.len() + 1);
+        let entries = map.iter().map(|(k, v)| k.heap() + v.heap()).sum::<usize>();
+        if !self.hold(nodes + entries + key.heap() + value.heap()) {
+            return None;
+        }
+        let mut next = map.clone();
+        next.insert(key.clone(), value.clone());
+        Some(next)
+    }
+
+    /// Keep one value, including spare container capacity and growth overlap.
+    pub(crate) fn push<T: Heap>(&self, out: &mut Vec<T>, value: T) -> bool {
+        if !self.hold(value.heap()) || !self.reserve(out) {
+            return false;
+        }
+        out.push(value);
+        true
     }
 
     /// Count `bytes` fewer: what it built and dropped.
