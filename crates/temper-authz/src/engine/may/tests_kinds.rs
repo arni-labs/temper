@@ -127,11 +127,10 @@ fn every_sender_is_of_a_kind_that_answers_as_it_does() {
     for sender in senders() {
         let own = answers(&Asker::OutsideAs(Kind(vec![sender.clone()])));
         seen += 1;
+        // Exactly: a kind that answers Maybe to everything would cover every
+        // sender and tell the walk nothing.
         assert!(
-            kinds.iter().any(|kind| kind
-                .iter()
-                .zip(&own)
-                .all(|(of_kind, of_sender)| of_kind == of_sender || *of_kind == May::Maybe)),
+            kinds.contains(&own),
             "no kind answers as {sender} does: {own:?}"
         );
     }
