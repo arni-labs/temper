@@ -154,6 +154,8 @@ impl Server {
         let ps = self.platform();
         let mut recorded = ps.list_all_installed_apps().await.expect("list installs");
         recorded.sort();
+        // As `temper serve` replays: the schema first, then each install.
+        crate::os_apps::converge_installed_schemas(&self.state, &recorded).await;
         for (tenant, app) in recorded {
             restore_os_app(&self.state, &tenant, &app)
                 .await
