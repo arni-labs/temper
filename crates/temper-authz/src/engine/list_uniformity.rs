@@ -43,15 +43,37 @@ pub(super) fn classify(
     action: &str,
     resource_type: &str,
 ) -> ListReadUniformity {
-    let Some(principal_uid) = principal_uid(security_ctx) else {
-        return per_entity_unknown();
-    };
-    let Ok(action_uid) = EntityUid::from_str(&format!("Action::\"{action}\"")) else {
-        return per_entity_unknown();
-    };
-    let Ok(resource_type_name) = EntityTypeName::from_str(resource_type) else {
-        return per_entity_unknown();
-    };
+    split(policies, security_ctx, action, resource_type)
+        .map_or_else(per_entity_unknown, |split| split.uniformity)
+}
+
+/// The policies that can match one list read, parted by whether a row can
+/// change their result.
+///
+/// Cedar decides from the set of satisfied policies: a satisfied forbid
+/// denies, otherwise a satisfied permit allows. Whether one policy is
+/// satisfied never depends on another, so `list` can be evaluated once for
+/// the whole read and `row` once per row, and the two results combine into
+/// exactly the decision the whole set gives that row.
+pub(super) struct ListSplit {
+    pub(super) uniformity: ListReadUniformity,
+    /// Policies whose result is the same for every row of the read.
+    pub(super) list: Vec<Policy>,
+    /// Policies whose result can differ from row to row.
+    pub(super) row: Vec<Policy>,
+}
+
+/// Part the policies that can match this list read; `None` when the request
+/// itself cannot be named in Cedar.
+pub(super) fn split(
+    policies: &PolicySet,
+    security_ctx: &SecurityContext,
+    action: &str,
+    resource_type: &str,
+) -> Option<ListSplit> {
+    let principal_uid = principal_uid(security_ctx)?;
+    let action_uid = EntityUid::from_str(&format!("Action::\"{action}\"")).ok()?;
+    let resource_type_name = EntityTypeName::from_str(resource_type).ok()?;
 
     // Keys a row's fields cannot fill: authority keys, and those the request
     // sets itself, which the engine puts in the context before the row's.
@@ -60,37 +82,48 @@ pub(super) fn classify(
     };
     let mut varies = false;
     let mut keys = Some(BTreeSet::new());
+    let mut list = Vec::new();
+    let mut row = Vec::new();
     for policy in policies.policies() {
         if !policy_might_apply(policy, &principal_uid, &action_uid, &resource_type_name) {
             continue;
         }
-        if !policy.is_static() {
-            return per_entity_unknown();
-        }
-        match row_variance(policy, &resource_type_name, &request_fills) {
-            RowVariance::Uniform => {}
+        let variance = if policy.is_static() {
+            row_variance(policy, &resource_type_name, &request_fills)
+        } else {
+            RowVariance::Unknown
+        };
+        match variance {
+            RowVariance::Uniform => list.push(policy.clone()),
             RowVariance::Varies(policy_keys) => {
                 varies = true;
-                match policy_keys {
-                    Some(policy_keys) => {
-                        if let Some(keys) = keys.as_mut() {
-                            keys.extend(policy_keys);
-                        }
-                    }
-                    None => keys = None,
+                match (policy_keys, keys.as_mut()) {
+                    (Some(policy_keys), Some(keys)) => keys.extend(policy_keys),
+                    (Some(_), None) => {}
+                    (None, _) => keys = None,
                 }
+                row.push(policy.clone());
             }
-            RowVariance::Unknown => return per_entity_unknown(),
+            RowVariance::Unknown => {
+                varies = true;
+                keys = None;
+                row.push(policy.clone());
+            }
         }
     }
 
-    if varies {
+    let uniformity = if varies {
         ListReadUniformity::PerEntity {
             attribute_keys: keys,
         }
     } else {
         ListReadUniformity::Uniform
-    }
+    };
+    Some(ListSplit {
+        uniformity,
+        list,
+        row,
+    })
 }
 
 fn per_entity_unknown() -> ListReadUniformity {
