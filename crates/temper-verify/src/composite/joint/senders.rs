@@ -44,7 +44,7 @@ use super::env::ID;
 use super::model::Classes;
 use super::room::Heap;
 use super::state::JointState;
-use crate::model::ModelString;
+use crate::model::{ModelString, TemperModel};
 
 /// Someone outside the kernel, in a request's chain.
 pub(super) const OUTSIDE: u32 = 0;
@@ -76,10 +76,10 @@ pub(super) struct Senders {
     /// request ([`SendAnalysis::applicable`]): all a walk reads of `policies`
     /// when it decides one again.
     reread: BTreeSet<String>,
-    /// The literals each id and field can meet: a value the model made up
-    /// in one may be any literal it never meets, which the model does not
-    /// offer it.
-    classes: Classes,
+    /// The literals each type's id and tracked fields can meet, by (type,
+    /// field): a value the model made up in one may be any literal it never
+    /// meets, which the model does not offer it.
+    meets: BTreeMap<(String, String), BTreeSet<String>>,
 }
 
 /// What a walk reads of its senders, which a model's digest
@@ -95,7 +95,7 @@ impl fmt::Debug for Senders {
             .field("requests", &self.requests)
             .field("may", &self.may)
             .field("reread", &self.reread)
-            .field("classes", &self.classes)
+            .field("meets", &self.meets)
             .finish()
     }
 }
@@ -184,7 +184,6 @@ impl Senders {
             })
         });
         let reread = reread(policies, &askers, may.as_ref());
-        let classes = Classes::read(by_name, &entities.into_iter().cloned().collect());
         Self {
             askers,
             detached,
@@ -195,7 +194,17 @@ impl Senders {
             decided: RefCell::default(),
             decided_bytes: std::cell::Cell::default(),
             reread,
-            classes,
+            meets: BTreeMap::new(),
+        }
+    }
+
+    /// Learn which literals each id and tracked field of `models` can meet.
+    pub(super) fn meet(&mut self, classes: &Classes, models: &BTreeMap<String, TemperModel>) {
+        for (entity, model) in models {
+            for field in model.tracked_strings.iter().map(String::as_str).chain([ID]) {
+                let key = (entity.clone(), field.to_string());
+                self.meets.insert(key, classes.literals(entity, field));
+            }
         }
     }
 
@@ -306,9 +315,11 @@ impl Senders {
                 _ => None,
             })
             .collect();
+        let none = BTreeSet::new();
         let symbol = |value: &ModelString, entity: &str, field: &str| {
-            let meets = self.classes.literals(entity, field);
-            symbol(value, &literals.intersection(&meets).cloned().collect())
+            let key = (entity.to_string(), field.to_string());
+            let meets = self.meets.get(&key).unwrap_or(&none);
+            symbol(value, &literals.intersection(meets).cloned().collect())
         };
         let mut asker = asker.clone();
         if let (Asker::Service { context, .. }, Some(id), Some(source)) =

@@ -233,7 +233,8 @@ impl JointModel {
         } else {
             Kernel::default()
         };
-        let senders = Senders::new(by_name, scope, sending.policies);
+        let mut senders = Senders::new(by_name, scope, sending.policies);
+        senders.meet(&classes, &models);
         let chosen = |entity: &str, action: &str| {
             sending
                 .relies_on
