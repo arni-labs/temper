@@ -76,8 +76,7 @@ pub(super) async fn handle_property_read(
         return *response;
     }
 
-    let fields = body.get("fields").unwrap_or(&body);
-    let Some(field) = fields.get(property) else {
+    let Some(field) = body.get("fields").and_then(|fields| fields.get(property)) else {
         return odata_error(
             StatusCode::NOT_FOUND,
             "PropertyNotFound",

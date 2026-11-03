@@ -172,9 +172,9 @@ async fn a_field_too_large_for_the_whole_read_reads_whole_on_its_own() {
     let (status, record) = get(state, "/tdata/Batches('big')").await;
     assert_eq!(status, StatusCode::OK, "{}", short(&record));
     assert!(
-        record["Items"].get("__temper_blob_ref").is_some(),
+        record["fields"]["Items"].get("__temper_blob_ref").is_some(),
         "the whole read inlines a 1.5 MiB field: {}",
-        short(&record["Items"])
+        short(&record["fields"]["Items"])
     );
 
     let (status, body) = get(state, "/tdata/Batches('big')/Items").await;
