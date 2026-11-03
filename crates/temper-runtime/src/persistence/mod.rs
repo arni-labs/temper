@@ -195,18 +195,20 @@ pub struct StateTimerRecord {
     pub armed_by: String,
 }
 
-/// One pending `schedule(...)` or `schedule_at(...)` action, kept so that a
+/// One pending `schedule(...)` or `schedule_at(...)` action, or the deadline
+/// of a background module call that names an `on_failure`, kept so that a
 /// restarted server arms it again. An entity can have many; each row is
-/// removed in the commit of the event its action fires, or after a fire that
-/// wrote no event.
+/// removed in the commit of the event its action fires (for a call, the
+/// call's answer), or after a fire that wrote no event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduledActionRecord {
     pub tenant: String,
     pub entity_type: String,
     pub entity_id: String,
     /// Names this schedule: the arming event's journal sequence and the
-    /// effect's place among that event's schedules, so a repeated write of
-    /// the same arm lands on the same row.
+    /// effect's place among that event's schedules (`<seq>.<index>`), or the
+    /// called integration for a call's deadline (`<seq>.call:<integration>`),
+    /// so a repeated write of the same arm lands on the same row.
     pub arm_id: String,
     /// The action to dispatch.
     pub action: String,

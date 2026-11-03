@@ -2,6 +2,7 @@
 
 use super::super::owed_writes::{FIRST_RETRY_WAIT, LAST_RETRY_WAIT};
 use super::{ScheduledTimer, scheduled_timer};
+use crate::request_context::calls::called_integration;
 use crate::state::ServerState;
 
 impl ServerState {
@@ -39,10 +40,13 @@ impl ServerState {
             .await
             .map_err(|error| error.to_string())?;
         let prefix = format!("{fire_seq}.");
+        // A call deadline the fire's move wrote waits for the call, which
+        // answers in this process; only a boot arms it.
         let fired = rows.iter().filter(|row| {
             row.entity_type == timer.entity_type
                 && row.entity_id == timer.entity_id
                 && row.arm_id.starts_with(&prefix)
+                && called_integration(&row.arm_id).is_none()
         });
         for row in fired {
             if let Ok(waiting) = scheduled_timer(&timer.tenant, row) {

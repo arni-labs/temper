@@ -32,6 +32,10 @@
 //! It is not a refusal anyone acts on, so it writes no trajectory entry; it
 //! is counted, logged at debug and its row removed. A guard that does not
 //! hold is still a refusal, recorded as one.
+//!
+//! A background module call's deadline is a row of the same kind
+//! (`request_context::calls`), armed only at boot: it answers the lost call
+//! with its `on_failure`, and lapses like any fire on a record moved on.
 
 mod recovery;
 
@@ -349,13 +353,19 @@ impl ServerState {
                             await_integration: false,
                             await_reactions: true,
                         };
+                        let params = self.scheduled_fire_params(
+                            &timer.tenant,
+                            &timer.entity_type,
+                            &timer.action,
+                            &timer.arm_id,
+                        );
                         let outcome = self
                             .dispatch_tenant_action_ext_typed(
                                 &timer.tenant,
                                 &timer.entity_type,
                                 &timer.entity_id,
                                 &timer.action,
-                                serde_json::json!({}),
+                                params,
                                 options,
                             )
                             .await;
@@ -431,7 +441,7 @@ impl ServerState {
 
     /// Remove a refused scheduled action's row, or one that can never fire or
     /// never land. A row left behind fires again at the next boot.
-    async fn forget_scheduled_action(
+    pub(super) async fn forget_scheduled_action(
         &self,
         tenant: &TenantId,
         entity_type: &str,
