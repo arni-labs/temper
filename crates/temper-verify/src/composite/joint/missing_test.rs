@@ -450,7 +450,7 @@ id_field = "f"
 
 [[invariant]]
 name = "rule"
-assert = "status != 'Sent' || T[f].status == 'Hit'"
+assert = "status != 'Sent' || T[Id].status == 'Hit'"
 "#;
 
 /// `triggers` is added to Hit.
@@ -592,7 +592,7 @@ initial = "Open"
 [[state]]
 name = "hits"
 type = "counter"
-initial = "0"
+initial = 0
 
 [[action]]
 name = "Mine"
