@@ -96,7 +96,7 @@ fn senders() -> Vec<Profile> {
 
 #[test]
 fn every_sender_is_of_a_kind_that_answers_as_it_does() {
-    let analysis = SendAnalysis::new(POLICIES).unwrap();
+    let analysis = SendAnalysis::new(POLICIES).expect("the policies parse");
     let causes = [Cause::request(), Cause::reaction(false, Hop::unknown())];
     let actions = ["Add", "Look", "Done", "Hook"];
     let questions: Vec<Question<'_>> = causes
@@ -118,7 +118,7 @@ fn every_sender_is_of_a_kind_that_answers_as_it_does() {
     };
     let kinds: Vec<Vec<May>> = analysis
         .outside_kinds(&questions, &|_| Ok(()))
-        .unwrap()
+        .expect("nothing limits the room")
         .into_iter()
         .map(|kind| answers(&Asker::OutsideAs(kind)))
         .collect();
@@ -151,7 +151,7 @@ permit(principal, action == Action::"Add", resource is Note)
 when { principal has role && principal.role == "b" };
 "#,
     )
-    .unwrap();
+    .expect("the policies parse");
     let cause = Cause::request();
     let questions = ["Look", "Add"].map(|action| Question {
         action,
@@ -167,7 +167,7 @@ when { principal has role && principal.role == "b" };
     };
     let kinds: Vec<Vec<May>> = analysis
         .outside_kinds(&questions, &|_| Ok(()))
-        .unwrap()
+        .expect("nothing limits the room")
         .into_iter()
         .map(|kind| answers(&Asker::OutsideAs(kind)))
         .collect();
