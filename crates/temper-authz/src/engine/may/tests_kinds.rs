@@ -136,3 +136,51 @@ fn every_sender_is_of_a_kind_that_answers_as_it_does() {
     }
     assert!(seen > 10_000, "the world holds {seen} senders");
 }
+
+#[test]
+fn senders_who_read_different_tests_are_not_taken_for_each_other() {
+    // Agents may Look with one role and customers with another, and both may
+    // Add with the second: the same effects, on different roles.
+    let analysis = SendAnalysis::new(
+        r#"
+permit(principal is Agent, action == Action::"Look", resource is Note)
+when { principal has role && principal.role == "a" };
+permit(principal is Customer, action == Action::"Look", resource is Note)
+when { principal has role && principal.role == "b" };
+permit(principal, action == Action::"Add", resource is Note)
+when { principal has role && principal.role == "b" };
+"#,
+    )
+    .unwrap();
+    let cause = Cause::request();
+    let questions = ["Look", "Add"].map(|action| Question {
+        action,
+        resource_type: "Note",
+        cause: cause.clone(),
+    });
+    let answers = |asker: &Asker| -> Vec<May> {
+        let none = BTreeMap::new();
+        questions
+            .iter()
+            .map(|q| analysis.may(asker, q.action, q.resource_type, &none, Some(&q.cause)))
+            .collect()
+    };
+    let kinds: Vec<Vec<May>> = analysis
+        .outside_kinds(&questions, &|_| Ok(()))
+        .unwrap()
+        .into_iter()
+        .map(|kind| answers(&Asker::OutsideAs(kind)))
+        .collect();
+    for (kind, role) in [("Agent", "a"), ("Agent", "b"), ("Customer", "b")] {
+        let mut sender = Profile {
+            kind: Some(is(kind)),
+            ..Profile::default()
+        };
+        sender.attrs.insert("role".to_string(), is(role));
+        let own = answers(&Asker::OutsideAs(Kind(vec![sender])));
+        assert!(
+            kinds.contains(&own),
+            "no kind answers as {kind} {role}: {own:?}"
+        );
+    }
+}
