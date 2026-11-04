@@ -26,9 +26,9 @@ use temper_authz::Read;
 use temper_spec::automaton::{Automaton, Initial, TargetResolver, TriggerKind};
 use temper_spec::predicate::{Arg, Effect, Expr, Literal, Operand, Set};
 
-use super::JointModel;
 use super::super::JointState;
 use super::super::env::ID;
+use super::JointModel;
 use crate::model::{ModelString, ParamValue, TemperModel};
 
 impl JointModel {
@@ -57,10 +57,13 @@ impl JointModel {
                 .filter_map(move |(f, v)| stray(entity.as_str(), f.as_str(), v))
         });
         let on_their_way = state.inflight.iter().flat_map(|dispatch| {
-            dispatch.params.iter().filter_map(|(param, value)| match value {
-                ParamValue::Str(value) => stray(dispatch.to.as_str(), param.as_str(), value),
-                _ => None,
-            })
+            dispatch
+                .params
+                .iter()
+                .filter_map(|(param, value)| match value {
+                    ParamValue::Str(value) => stray(dispatch.to.as_str(), param.as_str(), value),
+                    _ => None,
+                })
         });
         in_records.chain(on_their_way).next()
     }

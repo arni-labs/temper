@@ -213,12 +213,13 @@ impl Renames {
                 continue;
             };
             if self.get(value).is_none() {
-                let same_class = |(old, _): &&(ModelString, ModelString)| {
-                    old.class() == Some(class)
-                };
+                let same_class =
+                    |(old, _): &&(ModelString, ModelString)| old.class() == Some(class);
                 let number = self.0.iter().filter(same_class).count() + 1;
-                self.0
-                    .push((*value, ModelString::in_class(class, number, value.is_blank())));
+                self.0.push((
+                    *value,
+                    ModelString::in_class(class, number, value.is_blank()),
+                ));
             }
         }
     }
