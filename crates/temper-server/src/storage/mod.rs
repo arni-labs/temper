@@ -48,7 +48,6 @@ mod published_artifacts;
 mod query_plane_impls;
 mod query_plane_read;
 mod query_plane_router_impls;
-mod redaction;
 mod state_timers;
 mod trajectory_row;
 mod write_room;
@@ -2178,7 +2177,6 @@ fn pg_wasm_invocation_to_turso(
     }
 }
 
-pub(crate) use redaction::redact_secrets;
 pub(crate) use trajectory_row::bounded_request_body;
 use trajectory_row::{
     trajectory_matched_policy_ids_json, trajectory_request_body_json, trajectory_source_label,

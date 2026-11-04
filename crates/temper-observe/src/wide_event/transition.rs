@@ -20,7 +20,7 @@ pub struct TransitionInput<'a> {
     pub success: bool,
     /// Duration in nanoseconds.
     pub duration_ns: u64,
-    /// Action parameters.
+    /// Action parameters, redacted by [`from_transition`].
     pub params: &'a serde_json::Value,
     /// Number of items affected.
     pub item_count: usize,
@@ -43,7 +43,10 @@ pub fn from_transition(input: TransitionInput<'_>) -> WideEvent {
     attributes.insert("entity_id".into(), serde_json::json!(input.entity_id));
     attributes.insert("tenant".into(), serde_json::json!(input.tenant));
     attributes.insert("from_status".into(), serde_json::json!(input.from_status));
-    attributes.insert("params".into(), input.params.clone());
+    attributes.insert(
+        "params".into(),
+        crate::redaction::redact_secrets(input.params.clone()),
+    );
     attributes.insert("item_count".into(), serde_json::json!(input.item_count));
 
     let mut measurements = BTreeMap::new();

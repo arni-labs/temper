@@ -344,7 +344,7 @@ impl crate::state::ServerState {
         // request bodies in memory, and the truncation preview can never carry
         // a value the full body would have had redacted.
         if let Some(body) = entry.request_body.take() {
-            let redacted = crate::storage::redact_secrets(body);
+            let redacted = temper_observe::redact_secrets(body);
             entry.request_body = Some(crate::storage::bounded_request_body(redacted));
         }
         try_record(backend, sink, entry, self.capture_health.clone())

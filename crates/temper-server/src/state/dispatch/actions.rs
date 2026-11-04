@@ -36,25 +36,6 @@ fn background_reaction_semaphore() -> Arc<Semaphore> {
     )
 }
 
-/// Maximum request-body length, in bytes, echoed into the dispatch-failure log.
-const LOG_REQUEST_BODY_MAX_BYTES: usize = 4096;
-
-/// Bound a serialized request body for the failure log line.
-///
-/// Slicing at a fixed byte offset panics when the cap lands inside a multi-byte
-/// character, which turns a logged dispatch failure into a second failure. The
-/// cut walks back to the nearest character boundary instead.
-fn truncate_request_body_for_log(serialized: &str) -> String {
-    if serialized.len() <= LOG_REQUEST_BODY_MAX_BYTES {
-        return serialized.to_string();
-    }
-    let mut end = LOG_REQUEST_BODY_MAX_BYTES;
-    while end > 0 && !serialized.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}[truncated]", &serialized[..end])
-}
-
 /// `agent_ctx` with a key for the move it sends: the caller's, or one made up
 /// for an unkeyed caller. Everything the move's commit sets off (its answer,
 /// reactions and children) derives its own key from this one, so a write the
@@ -831,7 +812,6 @@ impl crate::state::ServerState {
                     matched_policy_ids: None,
                     capture_seq: None,
                 };
-                let request_body_str = truncate_request_body_for_log(&action_params.to_string());
                 let from_status = entry.from_status.as_deref().unwrap_or("unknown");
                 let to_status = entry.to_status.as_deref().unwrap_or("unknown");
                 let observation_metadata =
@@ -848,7 +828,6 @@ impl crate::state::ServerState {
                     source = ?entry.source,
                     authz_denied = ?entry.authz_denied,
                     spec_governed = ?entry.spec_governed,
-                    request_body = %request_body_str,
                     agent_id = entry.agent_id.as_deref().unwrap_or(""),
                     session_id = entry.session_id.as_deref().unwrap_or(""),
                     agent_type = entry.agent_type.as_deref().unwrap_or(""),
@@ -972,7 +951,3 @@ impl crate::state::ServerState {
         response
     }
 }
-
-#[cfg(test)]
-#[path = "actions_log_test.rs"]
-mod log_truncation_tests;

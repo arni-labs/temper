@@ -1,18 +1,20 @@
-//! Secret redaction for captured request bodies.
+//! Secret redaction for action arguments.
 //!
-//! Every dispatch records the parameters it was called with, successful ones
-//! included, and those parameters are read back through trajectory observation
-//! surfaces and exported into training data. An action that takes an
-//! `api_token`, a `password`, or a card number would put that value in a
-//! durable, widely-readable row.
+//! Action arguments leave the store in two places: the trajectory, which keeps
+//! the arguments every dispatch was called with and is read back through
+//! observation surfaces and exported into training data, and the wide event
+//! each transition emits as a span. An action that takes an `api_token`, a
+//! `password`, or a card number would put that value in both.
 //!
-//! Redaction runs at the single enqueue choke point
-//! (`ServerState::enqueue_trajectory_entry`), before the size cap, so:
+//! Action arguments reach logs and telemetry only through [`redact_secrets`]:
 //!
-//! - every capture site is covered — dispatch, authorization denials, the
-//!   audit endpoint, unmet intents — and a new one cannot forget it;
-//! - a truncated preview can never contain a value the full body would have
-//!   had redacted.
+//! - the trajectory redacts at its single enqueue choke point
+//!   (`ServerState::enqueue_trajectory_entry`), before the size cap, so every
+//!   capture site is covered and a truncated preview can never contain a value
+//!   the full body would have had redacted;
+//! - a transition's wide event redacts where it is built
+//!   ([`crate::wide_event::from_transition`]), so its span and every other
+//!   view of it carry the redacted arguments.
 //!
 //! # What is redacted
 //!
@@ -37,7 +39,7 @@
 use serde_json::{Map, Value};
 
 /// Value written in place of a redacted field.
-pub(crate) const REDACTED_PLACEHOLDER: &str = "[redacted]";
+pub const REDACTED_PLACEHOLDER: &str = "[redacted]";
 
 /// Normalized key names whose value is a secret only as the whole name.
 ///
@@ -45,7 +47,7 @@ pub(crate) const REDACTED_PLACEHOLDER: &str = "[redacted]";
 /// catch ordinary words: `auth` would take `oauth_provider_name`, `pin` would
 /// take `spin`. Names that are safe to match as endings live in
 /// [`SECRET_KEY_SUFFIXES`] instead and are not repeated here.
-pub(crate) const SECRET_KEY_NAMES: &[&str] = &[
+pub const SECRET_KEY_NAMES: &[&str] = &[
     "accountnumber",
     "auth",
     "authorization",
@@ -63,7 +65,7 @@ pub(crate) const SECRET_KEY_NAMES: &[&str] = &[
 ///
 /// Matching the ending is what catches the qualified forms every codebase
 /// grows — `client_secret`, `stripe_api_key`, `user_password`.
-pub(crate) const SECRET_KEY_SUFFIXES: &[&str] = &[
+pub const SECRET_KEY_SUFFIXES: &[&str] = &[
     "accesskey",
     "apikey",
     "cardnumber",
@@ -80,7 +82,7 @@ pub(crate) const SECRET_KEY_SUFFIXES: &[&str] = &[
 ];
 
 /// Replace the value of every secret-named field, at any depth.
-pub(crate) fn redact_secrets(value: Value) -> Value {
+pub fn redact_secrets(value: Value) -> Value {
     match value {
         Value::Object(map) => Value::Object(redact_object(map)),
         Value::Array(items) => Value::Array(items.into_iter().map(redact_secrets).collect()),
