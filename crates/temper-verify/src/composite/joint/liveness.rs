@@ -256,8 +256,13 @@ pub(super) fn settle(
     if good.iter().all(|&g| g) {
         return (LivenessOutcome::Holds, met);
     }
-    // A state the goal can't be read in isn't one it fails in.
-    if unknown {
+    // A state the goal can't be read in isn't one it fails in: unless it fails
+    // in a state it can be read in, it can't say it never settles.
+    let fails = |index: usize| {
+        let state = explored.state(index);
+        state.settled() && eval(goal, &model.env(owner, &state)) == Truth::False
+    };
+    if unknown && !(0..count).any(|index| !good[index] && fails(index)) {
         let reason = model::unknown_read(owner, goal);
         return (LivenessOutcome::Incomplete { reason }, met);
     }

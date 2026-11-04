@@ -456,7 +456,7 @@ id_field = "f"
 
 [[invariant]]
 name = "rule"
-assert = "status != 'Sent' || T[Id].status == 'Hit'"
+assert = "status != 'Sent' || T[Id].status != 'Open'"
 "#;
 
 /// `triggers` is added to Hit.
