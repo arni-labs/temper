@@ -564,6 +564,10 @@ pub struct ServerState {
     /// True while an embedder that answers before its boot ends is still
     /// booting ([`Self::mark_starting`]); false otherwise.
     pub(crate) starting: Arc<tokio::sync::watch::Sender<bool>>,
+    /// The boot spans open now, which `/healthz` names while the server is
+    /// starting. Empty unless the embedder puts these on its tracing
+    /// subscriber (see [`crate::boot_steps`]).
+    pub boot_steps: crate::boot_steps::BootSteps,
     /// Held by each carry pass, so a pass derives its carries only after
     /// the one before it has made its own (see `spec_change::carry_pass`).
     pub(crate) carry_pass: Arc<tokio::sync::Mutex<()>>,
@@ -876,6 +880,7 @@ impl ServerState {
             tenant_restore: Arc::default(),
             runtime_started: Arc::default(),
             starting: Arc::new(tokio::sync::watch::Sender::new(false)),
+            boot_steps: crate::boot_steps::BootSteps::default(),
             carry_pass: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
@@ -1164,6 +1169,7 @@ impl ServerState {
             tenant_restore: Arc::default(),
             runtime_started: Arc::default(),
             starting: Arc::new(tokio::sync::watch::Sender::new(false)),
+            boot_steps: crate::boot_steps::BootSteps::default(),
             carry_pass: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
