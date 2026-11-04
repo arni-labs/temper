@@ -20,6 +20,8 @@ mod json;
 mod kinds;
 mod profile;
 mod request;
+mod someone;
+mod who;
 
 #[cfg(test)]
 mod tests;
@@ -123,8 +125,8 @@ fn decide(applies: impl Iterator<Item = (Effect, Results)>) -> May {
     }
 }
 
-/// The indexes of the policies whose scopes fit an (action, resource type).
-type PoliciesByScope = HashMap<(String, String), Arc<[usize]>>;
+/// What is worked out once for each (action, resource type), for all proofs.
+type ByRequest<T> = Arc<Mutex<HashMap<(String, String), T>>>;
 
 /// A tenant's policies with the built-in platform policy, read for
 /// [`SendAnalysis::may`].
@@ -137,7 +139,11 @@ pub struct SendAnalysis {
     /// The policies whose action and resource scopes fit each (action,
     /// resource type): a proof asks about every action of every type for
     /// every sender, and most policies name one type's actions.
-    scoped: Arc<Mutex<PoliciesByScope>>,
+    scoped: ByRequest<Arc<[usize]>>,
+    /// Whether some sender is surely allowed each (action, resource type) as
+    /// a request ([`SendAnalysis::may_request`]): the proofs of one app ask
+    /// the same ones again.
+    someone: ByRequest<bool>,
 }
 
 impl SendAnalysis {
@@ -160,6 +166,7 @@ impl SendAnalysis {
             policies,
             kinds: Arc::default(),
             scoped: Arc::default(),
+            someone: Arc::default(),
         })
     }
 
@@ -250,6 +257,22 @@ impl SendAnalysis {
             .collect();
         applicable.sort();
         applicable
+    }
+
+    /// Every policy whose action and resource scopes fit `action` on a
+    /// `resource_type` record, as text in a fixed order: no other policy can
+    /// answer about it, whoever asks and whatever the record holds.
+    pub fn fitting(&self, action: &str, resource_type: &str) -> Vec<String> {
+        let mut fitting: Vec<String> = self
+            .scoped(action, resource_type)
+            .iter()
+            .map(|&at| {
+                let (effect, policy) = &self.policies[at];
+                format!("{effect:?} {policy}")
+            })
+            .collect();
+        fitting.sort();
+        fitting
     }
 
     /// Whether some policy can tell a move in a timer's chain from the same
