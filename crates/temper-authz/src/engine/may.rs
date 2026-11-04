@@ -21,6 +21,7 @@ mod kinds;
 mod profile;
 mod request;
 mod someone;
+mod who;
 
 #[cfg(test)]
 mod tests;

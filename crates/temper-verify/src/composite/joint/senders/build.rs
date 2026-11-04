@@ -4,6 +4,21 @@ use super::table::each;
 use super::*;
 
 impl Senders {
+    /// Whether an open answer to sender `by`'s `action` on an `entity` record
+    /// can come out differently for different callers.
+    pub(in crate::composite::joint) fn turns_on_who_asks(
+        &self,
+        by: u32,
+        entity: &str,
+        action: &str,
+    ) -> bool {
+        let (Some(policies), Some(asker)) = (&self.policies, self.askers.get(by as usize / 2))
+        else {
+            return false;
+        };
+        policies.turns_on_who_asks(asker, action, entity)
+    }
+
     /// The senders of the moves among `entities`, and what `policies` lets
     /// each send. A request to one of `roots` starts a chain that runs as
     /// its sender through the `inheriting` moves (entity, action): those

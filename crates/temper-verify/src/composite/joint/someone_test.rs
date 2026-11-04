@@ -152,19 +152,22 @@ permit(principal, action == Action::"Finish", resource is Child) when {
     assert!(takes(path, "Parent.Drop"), "{result}");
 }
 
-/// The rule must be reported as not checked, naming the way through `Fill`.
-fn stays_not_checked(policies: &str) {
+/// The rule must be reported as broken if Cedar allows `Fill`, and no more.
+fn breaks_if_cedar_allows_fill(policies: &str) {
     let result = check(&[ROOM, DOOR], policies);
-    let JointOutcome::Incomplete { reason } = &result.outcome else {
-        panic!("expected not checked, got {result}");
-    };
-    assert!(reason.contains("Room.Fill"), "{result}");
+    assert!(
+        matches!(result.outcome, JointOutcome::Broken { .. }),
+        "{result}"
+    );
+    let text = result.to_string();
+    assert!(text.contains("BROKEN if"), "{text}");
+    assert!(text.contains("Room.Fill"), "{text}");
 }
 
 #[test]
 fn a_permit_that_turns_on_the_record_stays_unsure() {
     // The walk does not hold the note, so Cedar's answer is open for everyone.
-    stays_not_checked(
+    breaks_if_cedar_allows_fill(
         r#"
 permit(principal is Customer, action, resource) when {
     principal.id == "owner" && resource has note && resource.note == "fine"
@@ -177,7 +180,7 @@ permit(principal is Customer, action, resource) when {
 fn a_forbid_that_turns_on_the_record_stays_unsure() {
     // The owner is permitted, but a forbid nobody can rule out may still
     // apply to the very sender who is permitted.
-    stays_not_checked(
+    breaks_if_cedar_allows_fill(
         r#"
 permit(principal is Customer, action, resource) when { principal.id == "owner" };
 forbid(principal, action, resource) when { resource has frozen && resource.frozen == true };
@@ -188,7 +191,7 @@ forbid(principal, action, resource) when { resource has frozen && resource.froze
 #[test]
 fn no_principal_the_kernel_cannot_build_makes_a_move_sure() {
     // The kernel builds only customers, agents and admins for someone outside.
-    stays_not_checked(
+    breaks_if_cedar_allows_fill(
         r#"
 permit(principal, action, resource) when {
     !(principal is Customer) && !(principal is Agent) && !(principal is Admin)
@@ -200,7 +203,7 @@ permit(principal, action, resource) when {
 #[test]
 fn a_principal_type_the_kernel_never_builds_makes_no_move_sure() {
     // A policy may still name a type nothing can be. Who else may is open.
-    stays_not_checked(
+    breaks_if_cedar_allows_fill(
         r#"
 permit(principal is Robot, action, resource);
 permit(principal, action == Action::"Fill", resource is Room) when {

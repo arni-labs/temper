@@ -86,6 +86,7 @@ pub(in crate::composite::joint) fn sure_path(
         steps.push(JointStep {
             action,
             state: render(&state),
+            unsure: false,
         });
         match parent {
             Some(from) => index = from as usize,

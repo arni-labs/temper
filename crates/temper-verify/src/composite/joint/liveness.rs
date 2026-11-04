@@ -59,6 +59,7 @@ use super::fair::FairVerdict;
 use super::model::{self, JointModel};
 use super::proof::liveness_proofs;
 use super::room::Bound;
+use super::{JointState, JointStep};
 
 #[path = "liveness_stuck.rs"]
 mod stuck;
@@ -191,9 +192,10 @@ impl JointLivenessResult {
             LivenessOutcome::Stuck { stuck, cases } => {
                 writeln!(
                     f,
-                    "{}.{} NEVER SETTLES: from {stuck} of {} joint states no path of the system's moves leads to `{}` ({scope}{relying}{bound}). It comes to rest short of it in {} ways, each with a shortest path:",
+                    "{}.{} NEVER SETTLES{}: from {stuck} of {} joint states no path of the system's moves leads to `{}` ({scope}{relying}{bound}). It comes to rest short of it in {} ways, each with a shortest path:",
                     self.entity,
                     self.name,
+                    super::condition(cases.first().map_or(&[], |case| &case.path)),
                     self.states,
                     self.eventually,
                     cases.len()
@@ -335,10 +337,28 @@ pub(super) fn settle(
     let stuck: Vec<usize> = (0..count)
         .filter(|&index| !out[index] && parents[index].is_some())
         .collect();
+    // With no such state, one that sure moves don't reach is stuck if the
+    // runtime can make the moves on the way there.
     let Some(&first) = stuck.first() else {
+        let on_a_way = (0..count)
+            .find(|&index| !out[index])
+            .and_then(|index| Some((index, model.way_resting_on_moves(explored, index, true)?)));
+        let Some((index, path)) = on_a_way else {
+            return (
+                LivenessOutcome::Incomplete {
+                    reason: unsure_reason(explored, &good, &out),
+                },
+                met,
+            );
+        };
+        let case = StuckCase {
+            path,
+            moves: system_moves(model, &explored.state(index), failing[index]),
+        };
         return (
-            LivenessOutcome::Incomplete {
-                reason: unsure_reason(explored, &good, &out),
+            LivenessOutcome::Stuck {
+                stuck: (0..count).filter(|&index| !out[index]).count(),
+                cases: vec![case],
             },
             met,
         );
@@ -358,22 +378,9 @@ pub(super) fn settle(
     }
     let cases = resting
         .into_iter()
-        .map(|index| {
-            let state = &explored.state(index);
-            let mut moves = BTreeSet::new();
-            for mv in model.moves(state) {
-                let relied = failing[index] && model.relies(&mv);
-                if !mv.by_system() && !relied {
-                    continue;
-                }
-                for next in model.next(state, &mv).0 {
-                    moves.insert(next.label);
-                }
-            }
-            StuckCase {
-                path: sure_path(model, explored, &parents, index),
-                moves: moves.into_iter().collect(),
-            }
+        .map(|index| StuckCase {
+            path: sure_path(model, explored, &parents, index),
+            moves: system_moves(model, &explored.state(index), failing[index]),
         })
         .collect();
     (
@@ -383,6 +390,21 @@ pub(super) fn settle(
         },
         met,
     )
+}
+
+/// The moves the system makes from a stuck `state`, in words; with `failing`,
+/// those outside code is relied on to send too.
+fn system_moves(model: &JointModel, state: &JointState, failing: bool) -> Vec<String> {
+    let mut moves = BTreeSet::new();
+    for mv in model.moves(state) {
+        if !mv.by_system() && !(failing && model.relies(&mv)) {
+            continue;
+        }
+        for next in model.next(state, &mv).0 {
+            moves.insert(next.label);
+        }
+    }
+    moves.into_iter().collect()
 }
 
 /// Which walked states reach the goal: those `done` (it holds with nothing

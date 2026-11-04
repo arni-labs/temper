@@ -12,8 +12,8 @@ use super::rule_asserts;
 use crate::model::types::StringParam;
 
 /// The parameters of `action` that write a tracked string variable, or that
-/// a constraint ties to one (`failed_commit` must equal `commit`), with the
-/// action's constraints on each. The model needs the value of the second
+/// a constraint or its guard ties to one (`failed_commit` must equal
+/// `commit`), with the action's constraints on each. The model needs the value of the second
 /// kind to decide whether the record takes the action, though it writes
 /// nothing it tracks. List effects also need concrete inputs, whether they
 /// check membership or only length: removal can choose a held value, and
@@ -35,6 +35,17 @@ pub(super) fn string_params(
                     .is_some_and(|field| tracked_strings.contains(field))
         })
     };
+    // A guard that reads a parameter beside a tracked string compares them,
+    // so whether the record takes the action turns on the parameter's value.
+    let guard_reads = |name: &str| {
+        let (mut param, mut field) = (false, false);
+        action.guard.for_each_name(&mut |read| match read {
+            Name::Param(read) if read == name => param = true,
+            Name::Var(read) if tracked_strings.contains(read) => field = true,
+            _ => {}
+        });
+        param && field
+    };
     let names: BTreeSet<&str> = action
         .params
         .iter()
@@ -51,6 +62,7 @@ pub(super) fn string_params(
         .filter(|name| {
             tracked_strings.contains(*name)
                 || tied(name)
+                || guard_reads(name)
                 || effect_params.get(*name) == Some(&ParamKind::Str)
         })
         .map(|name| {
