@@ -64,7 +64,8 @@ impl<'a> Graph<'a> {
             if rows.is_empty() {
                 continue;
             }
-            let moves = model.moves(&explored.state(state));
+            let state_now = explored.state(state);
+            let moves = model.moves(&state_now);
             if moves.len() != rows.len() {
                 return Err(format!(
                     "state {state} has {} moves on a second look, and the walk made {}",
@@ -73,7 +74,7 @@ impl<'a> Graph<'a> {
                 ));
             }
             for (row, mv) in rows.zip(&moves) {
-                let key = mv.fair_key();
+                let key = model.fair_key(&state_now, mv);
                 let id = *known.entry(key).or_insert_with_key(|key| {
                     graph.keys.push(key.clone());
                     graph.keys.len() as u32 - 1

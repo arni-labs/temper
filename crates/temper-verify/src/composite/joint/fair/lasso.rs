@@ -49,7 +49,7 @@ fn step(model: &JointModel, graph: &Graph, edge: u32) -> JointStep {
     let action = model
         .moves(&before)
         .iter()
-        .filter(|mv| &mv.fair_key() == key)
+        .filter(|mv| &model.fair_key(&before, mv) == key)
         .flat_map(|mv| model.next(&before, mv).0)
         .find(|next| next.state == after)
         .map(|next| next.label);
@@ -110,7 +110,7 @@ fn witnesses(view: &View, component: &[u32], members: &BTreeSet<u32>) -> Vec<Wit
             let way = view
                 .graph
                 .edges_of(row)
-                .find(|(_, edge)| view.usable_edge(row, edge) && members.contains(&edge.to))
+                .find(|(_, edge)| view.taken(row, edge) && members.contains(&edge.to))
                 .map(|(id, _)| id);
             for constraint in view.constraints_of(row) {
                 let entry = seen.entry(constraint).or_default();
@@ -118,6 +118,10 @@ fn witnesses(view: &View, component: &[u32], members: &BTreeSet<u32>) -> Vec<Wit
                 if possible {
                     entry.possible_at.insert(state);
                 }
+            }
+            if let Some(timer) = view.timer_reset_by(row) {
+                let entry = seen.entry(timer).or_default();
+                entry.way = entry.way.or(way);
             }
         }
     }

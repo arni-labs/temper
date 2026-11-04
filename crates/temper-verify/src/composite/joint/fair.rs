@@ -23,17 +23,21 @@
 //!   gives the same verdict without the 2^k branches.
 //!
 //! A move that only stays where it is does not count as taken or as possible:
-//! TLC's `<<A>>_vars`.
+//! TLC's `<<A>>_vars`. Two such moves are real events the joint state cannot
+//! show, so they count as taken: a call that ended and started again, and a
+//! `reset_on` move.
 //!
 //! # What is fair by default
 //!
 //! Each default is what the kernel does, in `temper-server`:
 //!
-//! - A state timer, weakly. Its row is durable and is armed again at boot
+//! - A state timer, weakly, one for each state even when two fire one action.
+//!   Its row is durable and is armed again at boot
 //!   (`state/dispatch/state_timeouts.rs`). It fires once while its record stays
 //!   in the state; leaving cancels it, so nothing owes it when the record keeps
-//!   leaving. Strong would be false.
-//! - A module call ending, weakly, by its answer or its failure as one move.
+//!   leaving, and a `reset_on` move starts its clock again, so nothing owes it
+//!   while those keep coming. Strong would be false.
+//! - A module call ending, weakly, by any answer or its failure as one move.
 //!   The engine stops a call at its deadline (`state/dispatch/call_deadlines.rs`)
 //!   and a call that fails is answered once. The kernel owes the ending, never
 //!   the success, so a call that fails and is retried forever is a fair cycle.

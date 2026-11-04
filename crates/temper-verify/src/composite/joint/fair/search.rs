@@ -27,6 +27,10 @@ pub(super) struct Rules {
     /// By [`Graph::keys`] index: what the runtime owes, then what the
     /// rule names.
     of_key: Vec<[Option<u32>; 2]>,
+    /// By [`Graph::keys`] index: the timer a move starts again.
+    resets: Vec<Option<u32>>,
+    /// By [`Graph::keys`] index: its way that stays put still happened.
+    stays_taken: Vec<bool>,
 }
 
 impl Rules {
@@ -89,9 +93,28 @@ impl Rules {
                 [runtime, rule]
             })
             .collect();
+        let resets = graph
+            .keys
+            .iter()
+            .map(|key| {
+                let (action, state) = key.resets.as_ref()?;
+                Some(
+                    *owed
+                        .entry((MoveKind::Timer, key.entity.as_str(), action, state))
+                        .or_insert_with(|| add(weak(false, false))),
+                )
+            })
+            .collect();
+        let stays_taken = graph
+            .keys
+            .iter()
+            .map(|key| key.kind == MoveKind::Call || key.resets.is_some())
+            .collect();
         Self {
             constraints,
             of_key,
+            resets,
+            stays_taken,
         }
     }
 
@@ -153,6 +176,29 @@ impl View<'_> {
             && self.open[edge.to as usize]
             && self.usable(row)
             && (self.side == Side::May || edge.sure)
+    }
+
+    /// Whether going by this way of `row` counts as making the move. A way that
+    /// stays in the same joint state usually is no move at all, but two are real
+    /// events the joint state cannot show: a call that ended and started again
+    /// (it has no call number), and a `reset_on` move that started a timer's
+    /// clock again (it has no deadline).
+    pub(super) fn taken(&self, row: u32, edge: &Edge) -> bool {
+        if self.usable_edge(row, edge) {
+            return true;
+        }
+        let from = self.graph.explored.made[row as usize].from;
+        edge.to == from
+            && self.open[from as usize]
+            && self.usable(row)
+            && (self.side == Side::May || edge.sure)
+            && self.rules.stays_taken[self.graph.key_of(row) as usize]
+    }
+
+    /// The timer the move `row` starts again, which it counts as discharging:
+    /// nothing owes a timer whose clock keeps starting over.
+    pub(super) fn timer_reset_by(&self, row: u32) -> Option<u32> {
+        self.rules.resets[self.graph.key_of(row) as usize]
     }
 
     /// Whether the move `row` counts as possible on this side.
@@ -261,9 +307,12 @@ impl View<'_> {
                 let taken = self
                     .graph
                     .edges_of(row)
-                    .any(|(_, edge)| self.usable_edge(row, edge) && set_of[edge.to as usize] == id);
+                    .any(|(_, edge)| self.taken(row, edge) && set_of[edge.to as usize] == id);
                 for constraint in self.constraints_of(row) {
                     scratch.note(constraint, state, possible, taken);
+                }
+                if let Some(timer) = self.timer_reset_by(row) {
+                    scratch.note(timer, state, false, taken);
                 }
             }
         }
