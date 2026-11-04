@@ -38,6 +38,7 @@ async fn a_tenants_invocation_log_keeps_its_newest_rows_up_to_the_bound() {
             .await
             .unwrap();
     }
+    store.prune_wasm_invocations("busy").await.unwrap();
     let rows = store
         .load_recent_wasm_invocations("busy", 2 * busy)
         .await
@@ -75,6 +76,7 @@ async fn interleaved_tenants_each_keep_their_newest_invocations() {
         }
     }
     for tenant in ["odd", "even"] {
+        store.prune_wasm_invocations(tenant).await.unwrap();
         let rows = store
             .load_recent_wasm_invocations(tenant, 2 * inserted)
             .await
@@ -125,8 +127,11 @@ async fn a_journal_append_can_land_between_log_cleanup_batches() {
     tx.commit().await.unwrap();
     drop(conn);
 
-    let newest = invocation("backlog", "newest");
-    let (pruned, remaining) = tokio::join!(store.persist_wasm_invocation(&newest), async {
+    store
+        .persist_wasm_invocation(&invocation("backlog", "newest"))
+        .await
+        .unwrap();
+    let (pruned, remaining) = tokio::join!(store.prune_wasm_invocations("backlog"), async {
         store
             .append(
                 "backlog:Job:job-1",
@@ -175,4 +180,10 @@ async fn recording_an_invocation_deletes_nothing() {
         inserted,
         "every recorded invocation is still there until the log is trimmed"
     );
+    store.prune_wasm_invocations("busy").await.unwrap();
+    let rows = store
+        .load_recent_wasm_invocations("busy", 2 * inserted)
+        .await
+        .unwrap();
+    assert_eq!(rows.len() as i64, WASM_INVOCATIONS_KEPT_PER_TENANT);
 }

@@ -893,6 +893,9 @@ pub trait WasmInvocationStore: Send + Sync {
         entry: &TursoWasmInvocationInsert<'_>,
     ) -> Result<(), PersistenceError>;
 
+    /// Trim one tenant's log to its newest rows. Recording never does this.
+    async fn prune_wasm_invocations(&self, tenant: &str) -> Result<(), PersistenceError>;
+
     /// Load one tenant's most recent invocations, newest first.
     async fn load_recent_wasm_invocations(
         &self,
@@ -1936,6 +1939,10 @@ impl WasmInvocationStore for PostgresEventStore {
         .await
     }
 
+    async fn prune_wasm_invocations(&self, tenant: &str) -> Result<(), PersistenceError> {
+        self.prune_wasm_invocations(tenant).await
+    }
+
     async fn load_recent_wasm_invocations(
         &self,
         tenant: &str,
@@ -1954,6 +1961,10 @@ impl WasmInvocationStore for TursoEventStore {
         entry: &TursoWasmInvocationInsert<'_>,
     ) -> Result<(), PersistenceError> {
         self.persist_wasm_invocation(entry).await
+    }
+
+    async fn prune_wasm_invocations(&self, tenant: &str) -> Result<(), PersistenceError> {
+        self.prune_wasm_invocations(tenant).await
     }
 
     async fn load_recent_wasm_invocations(
