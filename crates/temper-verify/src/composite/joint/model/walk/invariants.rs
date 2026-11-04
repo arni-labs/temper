@@ -130,7 +130,7 @@ impl JointModel {
                     reason: maybe_broken(first[i].map(|label| explored.label(label))),
                 },
                 (None, None) if unknown[i] => JointOutcome::Incomplete {
-                    reason: super::super::other_records::unknown_read(owner, invariants[i]),
+                    reason: super::super::unknown_read(owner, invariants[i]),
                 },
                 (None, None) => match &explored.stopped {
                     Some(reason) => JointOutcome::Incomplete {

@@ -97,14 +97,21 @@ fn a_trigger_guard_on_a_record_in_scope_is_read_from_it() {
     // The thread is opened whenever the post names one not made yet.
     let rule = "[[invariant]]\nname = \"rule\"\nassert = \"status != 'Unmade' => Thread[thread].status != 'Unmade'\"\n";
     let result = invariant(&[&post(rule), THREAD], None);
-    assert!(result.holds(), "{result}");
+    // The reads are of the thread it names, which may be another.
+    let JointOutcome::Incomplete { reason } = &result.outcome else {
+        panic!("{result}");
+    };
+    assert!(reason.contains("Post.thread"), "{reason}");
 }
 
 #[test]
 fn a_liveness_that_relies_on_a_trigger_guard_on_a_record_in_scope_settles() {
     let rule = "[[liveness]]\nname = \"rule\"\neventually = \"status == 'Posted' => Thread[thread].status != 'Unmade'\"\n";
     let result = liveness(&[&post(rule), THREAD]);
-    assert!(result.holds(), "{result}");
+    let LivenessOutcome::Incomplete { reason } = &result.outcome else {
+        panic!("{result}");
+    };
+    assert!(reason.contains("Post.thread"), "{reason}");
 }
 
 /// `Go` shuts `B`, then notes `A` once `B` is shut: the runtime reads the

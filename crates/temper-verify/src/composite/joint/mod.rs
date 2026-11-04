@@ -442,6 +442,9 @@ mod widen_tests;
 #[cfg(test)]
 #[path = "missing_test.rs"]
 mod missing_tests;
+#[cfg(test)]
+#[path = "other_records_test.rs"]
+mod other_records_tests;
 
 #[cfg(test)]
 #[path = "trigger_guard_test.rs"]

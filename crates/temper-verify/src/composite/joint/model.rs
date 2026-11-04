@@ -39,6 +39,7 @@ pub(crate) use drops::dropped_reactions;
 use from_outside::{Outside, outside_reactions};
 pub use guided::{Candidate, Guide, GuidedSearch, STEPS as GUIDED_STEPS, guided_search, plain};
 use order::{Order, Specs};
+pub(super) use other_records::unknown_read;
 pub(super) use read::Timeout;
 use read::{Kernel, Reaction, Unchecked, named_literals, tracked, unchecked_constraints};
 pub(super) use step::{Certainty, Move};

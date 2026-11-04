@@ -124,7 +124,12 @@ fn a_purge_cedar_allows_only_for_its_own_app_settles() {
     let own_app = "context has triggerSourceEntityId && resource has app_id && \
                    context.triggerSourceEntityId == resource.app_id";
     let result = check([APP, INSTALL], &policies(own_app));
-    assert!(result.holds(), "{result}");
+    // The walk settles under that Cedar. Cedar reads the App's id, and a claim
+    // past that walk would have to cover a second App, which the walk does not.
+    let LivenessOutcome::Incomplete { reason } = &result.outcome else {
+        panic!("{result}");
+    };
+    assert!(reason.contains("another App may send"), "{reason}");
 }
 
 #[test]

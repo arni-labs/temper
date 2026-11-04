@@ -240,6 +240,7 @@ pub(super) fn settle(
     let mut met = premise.is_none();
     let mut failing = vec![false; count];
     let mut done = vec![false; count];
+    let mut unknown = false;
     for index in 0..count {
         let state = explored.state(index);
         let env = model.env(owner, &state);
@@ -249,10 +250,16 @@ pub(super) fn settle(
         }
         failing[index] = truth != Truth::True;
         done[index] = truth == Truth::True && state.settled();
+        unknown |= truth == Truth::Unknown && state.settled();
     }
     let good = reach(explored, &done, &failing, false);
     if good.iter().all(|&g| g) {
         return (LivenessOutcome::Holds, met);
+    }
+    // A state the goal can't be read in isn't one it fails in.
+    if unknown {
+        let reason = model::unknown_read(owner, goal);
+        return (LivenessOutcome::Incomplete { reason }, met);
     }
     // A reaction from a type outside the scope is a move the system makes,
     // but nothing the model holds says it comes. A state it may lead out of
