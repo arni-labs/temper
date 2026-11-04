@@ -440,6 +440,10 @@ mod outside_count_tests;
 mod widen_tests;
 
 #[cfg(test)]
+#[path = "missing_test.rs"]
+mod missing_tests;
+
+#[cfg(test)]
 #[path = "trigger_guard_test.rs"]
 mod trigger_guard_tests;
 
