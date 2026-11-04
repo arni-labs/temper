@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use temper_spec::automaton::{ActionConstraint, Automaton, Initial};
+use temper_spec::automaton::{ActionConstraint, ActionParam, Automaton, Initial, VarType};
 use temper_spec::predicate::{
     Arg, CmpOp, Effect, Expr, Literal, Name, Operand, ParamKind, Set, VarKind,
 };
@@ -35,9 +35,16 @@ pub(super) fn string_params(
                     .is_some_and(|field| tracked_strings.contains(field))
         })
     };
-    // A guard that reads a parameter beside a tracked string compares them,
-    // so whether the record takes the action turns on the parameter's value.
+    // A guard that reads a string parameter beside a tracked string compares
+    // them, so whether the record takes the action turns on the parameter's value.
     let guard_reads = |name: &str| {
+        let not_text = action.params.iter().any(|param| {
+            param.name() == name
+                && matches!(param, ActionParam::Typed { param_type, .. } if !matches!(param_type, VarType::String))
+        });
+        if not_text {
+            return false;
+        }
         let (mut param, mut field) = (false, false);
         action.guard.for_each_name(&mut |read| match read {
             Name::Param(read) if read == name => param = true,
