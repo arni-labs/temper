@@ -141,14 +141,55 @@ fn an_invariant_premise_no_settled_state_meets_proves_nothing() {
 }
 
 #[test]
-fn an_unnamed_answer_that_may_be_the_way_out_leaves_a_rule_not_checked() {
-    // Only the module's answer leads on, and it may never give it, so this is
-    // neither a pass nor a broken rule.
+fn a_failed_call_nothing_retries_is_stuck_whatever_the_module_may_answer() {
+    // The module's call can fail, and then nothing leads on: the answer it
+    // might have given does not change that.
     let result = liveness("input", false, "status == 'Asked' => status == 'Done'");
     let text = result.to_string();
     assert!(
-        matches!(result.outcome, LivenessOutcome::Incomplete { .. }),
+        matches!(result.outcome, LivenessOutcome::Stuck { .. }),
         "{text}"
+    );
+}
+
+#[test]
+fn an_unnamed_answer_that_is_the_only_way_out_leaves_a_rule_not_checked() {
+    // A failed call asks again, so the record never comes to rest. Only the
+    // module's answer leads on, and it may never give it, so this is neither
+    // a pass nor a broken rule.
+    let spec = ask(
+        "input",
+        false,
+        r#"
+[[action]]
+name = "Again"
+kind = "internal"
+from = ["Asked"]
+to = "Asked"
+
+[[action.triggers]]
+name = "ask_again"
+kind = "wasm"
+module = "asker"
+on_failure = "Again"
+
+[[liveness]]
+name = "rule"
+eventually = "status == 'Asked' => status == 'Done'"
+"#,
+    )
+    .replace(
+        "module = \"asker\"\n\n[[action]]\nname = \"Done\"",
+        "module = \"asker\"\non_failure = \"Again\"\n\n[[action]]\nname = \"Done\"",
+    );
+    let automatons = parsed(&[&spec]);
+    let refs: Vec<&Automaton> = automatons.iter().collect();
+    let analysis = SendAnalysis::new(POLICIES).expect("fixture policies parse");
+    let mut results = bounded(|bound| verify_joint_liveness(&refs, Some(&analysis), bound));
+    let result = results.remove(0);
+    assert!(
+        matches!(result.outcome, LivenessOutcome::Incomplete { .. }),
+        "{result}"
     );
 }
 
