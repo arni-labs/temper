@@ -390,15 +390,10 @@ fn a_reaction_from_outside_the_scope_makes_neither_verdict() {
     );
 }
 
-/// Fairness says a move is taken, not where it leads: taking this one forever
-/// only goes round again.
+/// The walk takes the rule's word for what it relies on, so the verdict says so.
 #[test]
 fn a_verdict_names_what_its_rule_relies_on() {
-    let source = model!("loop_weak").replace(
-        "fairness = { weak = [\"Exit\"] }\n",
-        "relies_on = [\"Exit\"]\nfairness = {}\n",
-    );
-    let result = check(&source);
+    let result = check(model!("loop_weak"));
     assert_holds(&result);
     let verdict = result.fair.as_ref().expect("the rule asks for fairness");
     assert!(
@@ -409,6 +404,8 @@ fn a_verdict_names_what_its_rule_relies_on() {
     );
 }
 
+/// Fairness says a move is taken, not where it leads: taking this one forever
+/// only goes round again.
 #[test]
 fn fairness_on_a_move_that_leads_back_into_the_cycle_changes_nothing() {
     let source = model!("never_weak").replace(
