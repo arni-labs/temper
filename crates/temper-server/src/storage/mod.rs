@@ -2340,7 +2340,7 @@ fn count_written(persistence_id: &str, events: &[PersistenceEnvelope]) {
             Err(_) => ("unknown", "unknown"),
         };
     for event in events {
-        let via = event.payload["origin"]["via"].as_str().unwrap_or("unknown");
+        let via = event.payload["via"].as_str().unwrap_or("unknown");
         crate::runtime_metrics::record_event_written(tenant, entity_type, &event.event_type, via);
     }
 }
