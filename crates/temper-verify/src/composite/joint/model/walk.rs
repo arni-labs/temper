@@ -289,9 +289,7 @@ impl Explored<'_> {
 impl JointModel {
     /// Whether `mv` sends an action outside code is relied on to send.
     pub(in crate::composite::joint) fn relies(&self, mv: &super::Move) -> bool {
-        mv.outside_action().is_some_and(|(entity, action)| {
-            self.relies_on
-                .contains(&(entity.to_string(), action.to_string()))
-        })
+        mv.outside_action()
+            .is_some_and(|(entity, action)| self.relies_on.contains(pair!(entity, action)))
     }
 }

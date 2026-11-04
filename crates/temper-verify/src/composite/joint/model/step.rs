@@ -414,7 +414,7 @@ impl JointModel {
         let strings = &state.records[call.to.as_str()].strings;
         self.unchecked
             .equals
-            .get(&(call.to.to_string(), action.to_string()))
+            .get(pair!(&call.to, action))
             .is_some_and(|fields| {
                 fields
                     .iter()

@@ -174,14 +174,17 @@ impl Order {
     /// Whether `entity`'s `action` parameter `param` carries a counter kept
     /// as a sequence number.
     pub(super) fn carries(&self, entity: &str, action: &str, param: &str) -> bool {
-        let key = (entity.to_string(), action.to_string(), param.to_string());
-        self.families.iter().any(|f| f.params.contains(&key))
+        self.families.iter().any(|f| {
+            f.params
+                .iter()
+                .any(|(e, a, p)| e == entity && a == action && p == param)
+        })
     }
 
     /// Whether the model decides this parameter's comparison with this field.
     pub(super) fn decides(&self, entity: &str, action: &str, param: &str, field: &str) -> bool {
         self.compared
-            .get(&(entity.to_string(), action.to_string()))
+            .get(pair!(entity, action))
             .is_some_and(|pairs| pairs.iter().any(|(p, f)| p == param && f == field))
     }
 
@@ -196,7 +199,7 @@ impl Order {
         params: &Fields<ParamValue>,
         target: &TemperModelState,
     ) -> Truth {
-        let Some(pairs) = self.compared.get(&(entity.to_string(), action.to_string())) else {
+        let Some(pairs) = self.compared.get(pair!(entity, action)) else {
             return Truth::True;
         };
         let mut truth = Truth::True;
@@ -219,10 +222,9 @@ impl Order {
             let ModelEffect::AddCounter { var, .. } = effect else {
                 return true;
             };
-            let key = (entity.to_string(), var.to_string());
             self.families
                 .iter()
-                .filter(|family| family.fields.contains(&key))
+                .filter(|family| family.fields.contains(pair!(entity, var)))
                 .all(|family| {
                     let value = state.records[entity]
                         .counters
@@ -238,21 +240,20 @@ impl Order {
     /// carries a count not greater than a field that never goes down, and
     /// the model knows that (not both [`BEHIND`] or further behind).
     fn doomed(&self, dispatch: &Dispatch, target: &TemperModelState) -> bool {
-        let key = (dispatch.to.to_string(), dispatch.action.to_string());
-        self.compared.get(&key).is_some_and(|pairs| {
-            pairs.iter().any(|(param, field)| {
-                let rising = self
-                    .rising
-                    .contains(&(dispatch.to.to_string(), field.to_string()));
-                let held = target.counters.get(field).copied();
-                match (held, dispatch.params.get(param)) {
-                    (Some(held), Some(ParamValue::Count(sent))) => {
-                        rising && *sent <= held && (*sent, held) != (0, 0)
+        self.compared
+            .get(pair!(&dispatch.to, &dispatch.action))
+            .is_some_and(|pairs| {
+                pairs.iter().any(|(param, field)| {
+                    let rising = self.rising.contains(pair!(&dispatch.to, field));
+                    let held = target.counters.get(field).copied();
+                    match (held, dispatch.params.get(param)) {
+                        (Some(held), Some(ParamValue::Count(sent))) => {
+                            rising && *sent <= held && (*sent, held) != (0, 0)
+                        }
+                        _ => false,
                     }
-                    _ => false,
-                }
+                })
             })
-        })
     }
 
     /// Keep each family's values in `state` as how far behind its newest

@@ -60,6 +60,9 @@
 //! every reference finds, with a move's dispatches landing before the next
 //! move from outside, and names each reaction a target refuses.
 
+#[macro_use]
+mod pair;
+
 mod env;
 mod fair;
 mod liveness;

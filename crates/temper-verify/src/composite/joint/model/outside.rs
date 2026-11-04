@@ -94,8 +94,13 @@ impl JointModel {
                 }
                 follows(next);
             }
-            let key = (entity.to_string(), action.to_string());
-            for spec in self.kernel.calls_on.get(&key).into_iter().flatten() {
+            for spec in self
+                .kernel
+                .calls_on
+                .get(pair!(entity, action))
+                .into_iter()
+                .flatten()
+            {
                 for name in spec.on_success.iter().chain(&spec.on_failure) {
                     follows((entity, name.as_str()));
                 }
@@ -143,8 +148,7 @@ impl JointModel {
     }
 
     fn relied(&self, entity: &str, action: &str) -> bool {
-        self.relies_on
-            .contains(&(entity.to_string(), action.to_string()))
+        self.relies_on.contains(pair!(entity, action))
     }
 
     /// A request `by` makes in a move's words: `then` after the action, then

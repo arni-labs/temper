@@ -50,8 +50,12 @@ impl JointModel {
         }];
         let chain = if chain.is_empty() { &root } else { chain };
         let mut outcomes = self.react(state, source, action, Sent { chain, ..sent });
-        let key = (source.to_string(), action.to_string());
-        let Some(specs) = self.kernel.calls_on.get(&key).filter(|_| self.kernel_moves) else {
+        let Some(specs) = self
+            .kernel
+            .calls_on
+            .get(pair!(source, action))
+            .filter(|_| self.kernel_moves)
+        else {
             return outcomes;
         };
         // Who answers reads the same to every sender when no reaction of

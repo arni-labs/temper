@@ -154,8 +154,12 @@ impl JointModel {
     /// Store new ids for what `source`'s `action` spawns outside the scope.
     /// Nothing the model holds has such an id.
     pub(super) fn store_outside_spawns(&self, state: &mut JointState, source: &str, action: &str) {
-        let key = (source.to_string(), action.to_string());
-        for field in self.outside_spawns.get(&key).into_iter().flatten() {
+        for field in self
+            .outside_spawns
+            .get(pair!(source, action))
+            .into_iter()
+            .flatten()
+        {
             let id = minted(self, state);
             self.write(state, source, field, id);
         }

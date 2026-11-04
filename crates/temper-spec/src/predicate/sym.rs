@@ -14,6 +14,8 @@
 // many of these.
 #![allow(clippy::borrowed_box)]
 
+use rustc_hash::FxHashMap;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -35,6 +37,23 @@ fn table() -> &'static Table {
 impl Sym {
     /// The one copy of `text`.
     pub fn new(text: &str) -> Self {
+        // A walk's threads name the same few things millions of times; each
+        // keeps what it has looked up so they don't queue on the one lock.
+        thread_local! {
+            static SEEN: RefCell<FxHashMap<&'static str, Sym>> = RefCell::default();
+        }
+        SEEN.with(|seen| {
+            if let Some(found) = seen.borrow().get(text) {
+                return *found;
+            }
+            let found = Self::kept(text);
+            seen.borrow_mut().insert(found.as_str(), found);
+            found
+        })
+    }
+
+    /// The one copy of `text`, from the table every thread shares.
+    fn kept(text: &str) -> Self {
         let table = table();
         let found = table
             .read()
