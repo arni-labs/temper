@@ -379,10 +379,17 @@ pub(super) fn canonical_quietly(state: &mut JointState, rewrote: bool) {
 }
 
 /// How far a state's symbols are numbered as [`canonical`] would number them:
-/// one, two, three, as each is first used, and each number with one meaning.
-/// False too for more symbols than this keeps track of.
+/// in each class one, two, three, as each is first used, and each number with
+/// one meaning. False too for more symbols than this keeps track of.
 #[derive(Debug, Clone, Copy, Default)]
 struct InOrder {
+    classes: [ClassOrder; 8],
+}
+
+/// How far [`InOrder`] has got in one class. No count is a slot still free.
+#[derive(Debug, Clone, Copy, Default)]
+struct ClassOrder {
+    class: usize,
     count: usize,
     blanks: u64,
 }
@@ -390,21 +397,32 @@ struct InOrder {
 impl InOrder {
     /// Whether `value` carries the numbering on.
     fn fits(&mut self, value: &ModelString) -> bool {
-        let (id, blank) = match value {
-            ModelString::Literal(_) => return true,
-            ModelString::Symbol(id) => (*id, false),
-            ModelString::BlankSymbol(id) => (*id, true),
+        let (Some(class), Some(number)) = (value.class(), value.number()) else {
+            return true;
         };
-        if id >= u64::BITS as usize {
+        if number >= u64::BITS as usize {
             return false;
         }
-        if id == self.count + 1 {
-            self.count = id;
-            self.blanks |= u64::from(blank) << id;
-            true
-        } else {
-            id != 0 && id <= self.count && (self.blanks >> id & 1 == 1) == blank
+        let blank = value.is_blank();
+        for slot in &mut self.classes {
+            if slot.count == 0 {
+                *slot = ClassOrder {
+                    class,
+                    ..ClassOrder::default()
+                };
+            }
+            if slot.class != class {
+                continue;
+            }
+            return if number == slot.count + 1 {
+                slot.count = number;
+                slot.blanks |= u64::from(blank) << number;
+                true
+            } else {
+                number != 0 && number <= slot.count && (slot.blanks >> number & 1 == 1) == blank
+            };
         }
+        false
     }
 
     /// Whether what `state` has on its way carries the numbering on.

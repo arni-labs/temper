@@ -18,6 +18,10 @@ pub enum SymbolicString {
     BlankSymbol(usize),
 }
 
+/// Where a made-up value's class sits in its id, past any number of values
+/// a walk could hold at once.
+const CLASS_SHIFT: u32 = 16;
+
 impl SymbolicString {
     /// Whether this is the empty concrete string.
     pub fn is_empty(&self) -> bool {
@@ -38,6 +42,25 @@ impl SymbolicString {
             Self::Literal(_) => None,
             Self::Symbol(n) | Self::BlankSymbol(n) => Some(*n),
         }
+    }
+    /// A made-up value: the `number`th of its class. Two classes never hold
+    /// the same value, so a state need not say how values of classes nothing
+    /// compares relate. Class 0 is every value of a model with no classes.
+    pub fn in_class(class: usize, number: usize, blank: bool) -> Self {
+        let id = class << CLASS_SHIFT | number;
+        if blank {
+            Self::BlankSymbol(id)
+        } else {
+            Self::Symbol(id)
+        }
+    }
+    /// The class of a made-up value.
+    pub fn class(&self) -> Option<usize> {
+        self.symbol_id().map(|id| id >> CLASS_SHIFT)
+    }
+    /// A made-up value's number within its class.
+    pub fn number(&self) -> Option<usize> {
+        self.symbol_id().map(|id| id & ((1 << CLASS_SHIFT) - 1))
     }
     /// Its value for predicate evaluation.
     pub fn val(&self) -> super::eval::Val<'_> {
@@ -61,8 +84,17 @@ impl fmt::Display for SymbolicString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Literal(s) => s.fmt(f),
-            Self::Symbol(n) => write!(f, "#{n}"),
-            Self::BlankSymbol(n) => write!(f, "#blank{n}"),
+            Self::Symbol(n) | Self::BlankSymbol(n) => {
+                f.write_str(if matches!(self, Self::Symbol(_)) {
+                    "#"
+                } else {
+                    "#blank"
+                })?;
+                match n >> CLASS_SHIFT {
+                    0 => write!(f, "{n}"),
+                    class => write!(f, "{class}.{}", n & ((1 << CLASS_SHIFT) - 1)),
+                }
+            }
         }
     }
 }

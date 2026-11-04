@@ -302,6 +302,10 @@ mod sure_tests;
 mod someone_tests;
 
 #[cfg(test)]
+#[path = "classes_test.rs"]
+mod classes_tests;
+
+#[cfg(test)]
 #[path = "outside_test.rs"]
 mod outside_tests;
 

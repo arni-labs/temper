@@ -23,16 +23,17 @@ impl JointModel {
     pub(in crate::composite::joint) fn init_with_ids(
         &self,
         ids: &BTreeMap<String, String>,
-    ) -> (JointState, BTreeMap<String, ModelString>) {
-        let mut names: BTreeMap<String, ModelString> = BTreeMap::new();
+    ) -> (JointState, BTreeMap<(usize, String), ModelString>) {
+        let mut names: BTreeMap<(usize, String), ModelString> = BTreeMap::new();
         let mut records = self.blank();
         for (entity, record) in records.iter_mut() {
             let name = ids
                 .get(entity.as_str())
                 .cloned()
                 .unwrap_or_else(|| format!("{entity}#id"));
-            let next = ModelString::Symbol(names.len() + 1);
-            let value = *names.entry(name).or_insert(next);
+            let class = self.class_of(entity.as_str(), ID);
+            let next = ModelString::in_class(class, names.len() + 1, false);
+            let value = *names.entry((class, name)).or_insert(next);
             std::sync::Arc::make_mut(record).strings.insert(ID, value);
         }
         let mut state = JointState {
@@ -93,6 +94,10 @@ impl JointModel {
             .into_iter()
             .map(|l| ModelString::from(l.as_str()))
             .collect();
+        let classes: Vec<usize> = blank
+            .keys()
+            .map(|entity| self.class_of(entity.as_str(), ID))
+            .collect();
         // Two records of a type never share an id.
         let types: Vec<String> = blank
             .keys()
@@ -107,7 +112,7 @@ impl JointModel {
                         .zip(&types)
                         .all(|(block, entity)| seen.insert((*block, entity)))
                 })
-                .flat_map(move |blocks| id_values(blocks, literals.clone()))
+                .flat_map(move |blocks| id_values(blocks, literals.clone(), classes.clone()))
                 .map(move |ids| {
                     let mut records = blank.clone();
                     for (record, id) in records.values_mut().zip(ids) {
@@ -131,9 +136,11 @@ impl JointModel {
 
 /// Each fresh ID equality class may be nonblank or whitespace-only. Equal
 /// IDs share that choice; literal classes retain their concrete values.
+/// `classes` is the class of made-up values each id takes.
 fn id_values(
     blocks: Vec<usize>,
     literals: Vec<ModelString>,
+    classes: Vec<usize>,
 ) -> impl Iterator<Item = Vec<ModelString>> {
     let symbols = blocks
         .iter()
@@ -147,14 +154,11 @@ fn id_values(
         }
         let ids = blocks
             .iter()
-            .map(|&block| {
+            .zip(&classes)
+            .map(|(&block, &class)| {
                 literals.get(block).cloned().unwrap_or_else(|| {
                     let symbol = block - literals.len();
-                    if blank[symbol] {
-                        ModelString::BlankSymbol(symbol + 1)
-                    } else {
-                        ModelString::Symbol(symbol + 1)
-                    }
+                    ModelString::in_class(class, symbol + 1, blank[symbol])
                 })
             })
             .collect();
@@ -220,11 +224,11 @@ mod tests {
     fn equal_ids_share_blankness_and_distinct_ids_choose_it_independently() {
         use ModelString::{BlankSymbol as B, Symbol as S};
         assert_eq!(
-            id_values(vec![0, 0], vec![]).collect::<Vec<_>>(),
+            id_values(vec![0, 0], vec![], vec![0, 0]).collect::<Vec<_>>(),
             vec![vec![S(1), S(1)], vec![B(1), B(1)]],
         );
         assert_eq!(
-            id_values(vec![0, 1], vec![]).collect::<Vec<_>>(),
+            id_values(vec![0, 1], vec![], vec![0, 0]).collect::<Vec<_>>(),
             vec![
                 vec![S(1), S(2)],
                 vec![S(1), B(2)],
@@ -238,17 +242,17 @@ mod tests {
     fn literal_ids_keep_their_values_alongside_both_symbol_kinds() {
         let literals = vec![ModelString::from("known"), ModelString::from(" ")];
         assert_eq!(
-            id_values(vec![0, 1, 2], literals.clone()).collect::<Vec<_>>(),
+            id_values(vec![0, 1, 2], literals.clone(), vec![0, 0, 0]).collect::<Vec<_>>(),
             vec![
                 vec![literals[0], literals[1], ModelString::Symbol(1)],
                 vec![literals[0], literals[1], ModelString::BlankSymbol(1)],
             ],
         );
         assert_eq!(
-            id_values(vec![0, 1], literals.clone()).collect::<Vec<_>>(),
+            id_values(vec![0, 1], literals.clone(), vec![0, 0]).collect::<Vec<_>>(),
             vec![literals],
         );
-        assert_eq!(id_values(vec![], vec![]).count(), 1);
+        assert_eq!(id_values(vec![], vec![], vec![0; 1]).count(), 1);
     }
 
     #[test]

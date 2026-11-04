@@ -163,6 +163,7 @@ pub fn build_model_tracking(
         initial_booleans: initial_booleans.into(),
         initial_lists: initial_lists.into(),
         string_literals: string_literals(automaton, &string_inputs),
+        string_classes: BTreeMap::new(),
         initial_strings: initial_strings.into(),
         tracked_strings,
         counter_bounds,

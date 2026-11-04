@@ -128,10 +128,10 @@ fn snake(name: &str) -> String {
 }
 
 /// A value no record, dispatch or call in `state` holds: a new record's id.
-fn minted(model: &JointModel, state: &JointState) -> ModelString {
+fn minted(model: &JointModel, state: &JointState, entity: &str, field: &str) -> ModelString {
     let mut values = model.values(state);
     values.extend(state.calls.iter().flat_map(|c| c.asked.values().cloned()));
-    fresh_string(&values, false)
+    fresh_string(&values, model.class_of(entity, field), false)
 }
 
 impl JointModel {
@@ -160,7 +160,7 @@ impl JointModel {
             .into_iter()
             .flatten()
         {
-            let id = minted(self, state);
+            let id = minted(self, state, source, field);
             self.write(state, source, field, id);
         }
     }
@@ -182,7 +182,7 @@ impl JointModel {
         // of a type, so the new one is not held and its moves are not walked.
         if child == source {
             let mut next = state;
-            let id = minted(self, &next);
+            let id = minted(self, &next, child, ID);
             if let Some(field) = &spawn.store_id_in {
                 self.write(&mut next, source, field, id);
             }
@@ -252,7 +252,7 @@ impl JointModel {
         }
         let replaced = self.replaces_cleanly(&state, child);
         let mut next = state.clone();
-        let id = named.unwrap_or_else(|| minted(self, &state));
+        let id = named.unwrap_or_else(|| minted(self, &state, child, ID));
         self.start_child(&mut next, child, id);
         self.give_parent_fields(&mut next, source, child, spawn);
         self.store_child_id(&mut next, source, child, spawn);

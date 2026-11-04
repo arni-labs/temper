@@ -19,18 +19,19 @@ pub fn string_values<'a>(
         .collect()
 }
 
-/// A value equal to none of `values`, preserving whether it is blank.
-pub(crate) fn fresh_string(values: &BTreeSet<ModelString>, blank: bool) -> ModelString {
+/// A value of `class` equal to none of `values`, blank or not.
+pub(crate) fn fresh_string(
+    values: &BTreeSet<ModelString>,
+    class: usize,
+    blank: bool,
+) -> ModelString {
     let largest = values
         .iter()
-        .filter_map(ModelString::symbol_id)
+        .filter(|value| value.class() == Some(class))
+        .filter_map(ModelString::number)
         .max()
         .unwrap_or(0);
-    if blank {
-        ModelString::BlankSymbol(largest + 1)
-    } else {
-        ModelString::Symbol(largest + 1)
-    }
+    ModelString::in_class(class, largest + 1, blank)
 }
 
 /// The values one string parameter may take in `state`.
@@ -45,10 +46,17 @@ fn string_candidates(
         match param.equals.iter().find_map(|var| tracked(var)) {
             Some(value) => BTreeSet::from([value]),
             None => {
-                let mut all: BTreeSet<ModelString> = values.clone();
+                let class = model.string_class(&param.name);
+                // A made-up value of another class is, to everything that
+                // reads this parameter, one more fresh value.
+                let mut all: BTreeSet<ModelString> = values
+                    .iter()
+                    .filter(|value| value.class().is_none_or(|of| of == class))
+                    .copied()
+                    .collect();
                 all.insert("".into());
-                all.insert(fresh_string(values, false));
-                all.insert(fresh_string(values, true));
+                all.insert(fresh_string(values, class, false));
+                all.insert(fresh_string(values, class, true));
                 if let Some(literals) = model.string_literals.get(param.name.as_str()) {
                     all.extend(literals.iter().map(|text| ModelString::from(text.as_str())));
                 }
@@ -197,18 +205,20 @@ pub fn canonical_names<'a>(values: impl IntoIterator<Item = &'a ModelString>) ->
 pub struct Renames(Vec<(ModelString, ModelString)>);
 
 impl Renames {
-    /// Number the symbols among `values` the list does not have yet, carrying
-    /// on from the last.
+    /// Number the symbols among `values` the list does not have yet, each
+    /// carrying on from the last of its class.
     pub fn name_all<'a>(&mut self, values: impl IntoIterator<Item = &'a ModelString>) {
         for value in values {
-            let id = self.0.len() + 1;
-            let name = match value {
-                ModelString::Literal(_) => continue,
-                ModelString::Symbol(_) => ModelString::Symbol(id),
-                ModelString::BlankSymbol(_) => ModelString::BlankSymbol(id),
+            let Some(class) = value.class() else {
+                continue;
             };
             if self.get(value).is_none() {
-                self.0.push((*value, name));
+                let same_class = |(old, _): &&(ModelString, ModelString)| {
+                    old.class() == Some(class)
+                };
+                let number = self.0.iter().filter(same_class).count() + 1;
+                self.0
+                    .push((*value, ModelString::in_class(class, number, value.is_blank())));
             }
         }
     }

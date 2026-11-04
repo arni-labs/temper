@@ -90,11 +90,12 @@ pub fn replay_joint_invariants(
                     let Some(ParamValue::Str(value)) = params.get(param) else {
                         return true;
                     };
-                    match bindings.get(name) {
+                    let name = (model.class_of(&wanted.entity, param), name.clone());
+                    match bindings.get(&name) {
                         Some(bound) => value == bound,
-                        None if name.is_empty() => value.is_empty(),
+                        None if name.1.is_empty() => value.is_empty(),
                         None if value.symbol_id().is_some() && !used.contains(value) => {
-                            bindings.insert(name.clone(), *value);
+                            bindings.insert(name, *value);
                             used.insert(*value);
                             true
                         }
@@ -146,7 +147,8 @@ pub fn replay_joint_invariants(
                     if let Some(ParamValue::Str(value)) = action.params.get(param)
                         && !name.is_empty()
                     {
-                        names.entry(name.clone()).or_insert_with(|| *value);
+                        let class = model.class_of(&wanted.entity, param);
+                        names.entry((class, name.clone())).or_insert_with(|| *value);
                     }
                 }
             }

@@ -50,7 +50,8 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value;
-use temper_authz::{Asker, Attr, Cause, Hop, May, SendAnalysis};
+use temper_authz::platform_keys::{CAUSE_ENTITY_ID, TRIGGER_SOURCE_ENTITY_ID};
+use temper_authz::{Asker, Attr, Cause, Hop, May, Read, SendAnalysis};
 use temper_spec::automaton::{Automaton, TargetResolver, TriggerKind};
 
 use super::env::ID;
@@ -154,6 +155,30 @@ impl Senders {
             }
         }
         self
+    }
+
+    /// What each comparison in the policies reads that a question here can
+    /// answer with a made-up value: a record's fields, and the two context
+    /// keys that name a record ([`symbol`]).
+    pub(super) fn compared(&self) -> Vec<Vec<Read>> {
+        let Some(policies) = &self.policies else {
+            return Vec::new();
+        };
+        policies
+            .compared()
+            .into_iter()
+            .map(|reads| {
+                reads
+                    .into_iter()
+                    .filter(|read| match read {
+                        Read::Resource(_) => true,
+                        Read::Context(key) => {
+                            matches!(key.as_str(), TRIGGER_SOURCE_ENTITY_ID | CAUSE_ENTITY_ID)
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     /// Forget what Cedar lets each sender send of `moves` (entity, action),

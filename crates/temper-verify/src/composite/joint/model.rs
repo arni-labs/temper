@@ -321,6 +321,12 @@ impl JointModel {
             .collect();
         // Cedar is told which literals a made-up value may not be.
         let senders = senders.meeting(&classes, &models);
+        // From here on classes only say which made-up values can meet, and
+        // Cedar is one more thing that can compare them.
+        let mut classes = classes;
+        classes.read_policies(&senders.compared(), scope);
+        let mut models = models;
+        classes.number(&mut models);
         Self {
             expansion: PerThread::default(),
             id_literals,
@@ -367,6 +373,13 @@ impl JointModel {
             .get(entity)?
             .iter()
             .find(|timeout| timeout.state == status)
+    }
+
+    /// The class of made-up values `entity`'s string field or parameter takes.
+    pub(super) fn class_of(&self, entity: &str, field: &str) -> usize {
+        self.models
+            .get(entity)
+            .map_or(0, |model| model.string_class(field))
     }
 
     /// The strings `state` holds, in records and in dispatches.

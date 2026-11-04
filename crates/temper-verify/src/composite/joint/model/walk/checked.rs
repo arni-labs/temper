@@ -173,6 +173,9 @@ impl Walker {
             let Some(fresh) = self.built(|| self.model.moves(&state)) else {
                 return;
             };
+            if let Some(stray) = self.model.value_out_of_class(&state) {
+                panic!("{stray} in {}", render(&state));
+            }
             assert!(
                 *remembered == fresh,
                 "a state's remembered moves differ from its moves: {remembered:?} and {fresh:?} from {}",
