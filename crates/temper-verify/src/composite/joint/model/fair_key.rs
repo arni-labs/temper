@@ -16,7 +16,7 @@ pub(in crate::composite::joint) enum MoveKind {
     OutsideReaction,
     /// A state timer.
     Timer,
-    /// A module call ending: its answer, or its failure.
+    /// A module call ending: its answer, its failure, or no answer at all.
     Call,
     /// A module call lost to a restart.
     Lost,
@@ -37,7 +37,8 @@ pub(in crate::composite::joint) struct FairKey {
     pub(in crate::composite::joint) kind: MoveKind,
     /// The entity type the move acts on.
     pub(in crate::composite::joint) entity: String,
-    /// The action it sends; empty for a call that fails with no `on_failure`.
+    /// The action it sends; empty for a call that fails with no `on_failure`,
+    /// or that ends with no answer.
     pub(in crate::composite::joint) action: String,
     /// Which call or dispatch, for those kinds; which state, for a timer.
     pub(in crate::composite::joint) instance: String,
@@ -106,6 +107,7 @@ impl Move {
                 call.on_failure.as_deref().unwrap_or_default(),
                 call_instance(call),
             ),
+            Move::Silent(call) => key(MoveKind::Call, &call.to, "", call_instance(call)),
             Move::Lost(call) => key(
                 MoveKind::Lost,
                 &call.to,

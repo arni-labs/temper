@@ -68,6 +68,9 @@ mod unknown;
 /// Someone outside the kernel, of no known kind, in a request's chain.
 pub(super) const OUTSIDE: u32 = 0;
 
+/// Sender ids by entity, then by action.
+type AlikeSenders = BTreeMap<String, BTreeMap<String, Arc<[u32]>>>;
+
 /// The senders a model knows, by number, and what Cedar lets each send.
 ///
 /// A sender's number is its asker's place, doubled, plus one in a timer's
@@ -102,7 +105,7 @@ pub(super) struct Senders {
     decided: RwLock<HashMap<Question, May>>,
     /// The senders each (entity, action) is sent as from outside, of those
     /// that may, one for each way what follows can go.
-    alike: RwLock<BTreeMap<String, BTreeMap<String, Arc<[u32]>>>>,
+    alike: RwLock<AlikeSenders>,
     /// The bytes `decided` holds, as a walk counts them against its room.
     decided_bytes: AtomicUsize,
     /// The policies that may apply to a move whose answer depends on the

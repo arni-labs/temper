@@ -64,7 +64,8 @@ impl Rules {
                     MoveKind::Timer | MoveKind::Delivery | MoveKind::OutsideReaction => {
                         Some((key.action.as_str(), key.instance.as_str()))
                     }
-                    // Its answers and its failure are one move: the call ends.
+                    // Its answers, its failure and no answer are one move: the
+                    // call ends.
                     MoveKind::Call => Some(("", key.instance.as_str())),
                     MoveKind::Outside if relied[index] => Some((key.action.as_str(), "")),
                     MoveKind::Outside | MoveKind::Lost => None,

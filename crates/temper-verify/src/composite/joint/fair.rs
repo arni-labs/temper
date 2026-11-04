@@ -37,10 +37,12 @@
 //!   in the state; leaving cancels it, so nothing owes it when the record keeps
 //!   leaving, and a `reset_on` move starts its clock again, so nothing owes it
 //!   while those keep coming. Strong would be false.
-//! - A module call ending, weakly, by any answer or its failure as one move.
-//!   The engine stops a call at its deadline (`state/dispatch/call_deadlines.rs`)
-//!   and a call that fails is answered once. The kernel owes the ending, never
-//!   the success, so a call that fails and is retried forever is a fair cycle.
+//! - A module call ending, weakly, by any answer, its failure or no answer at
+//!   all as one move. The engine stops a call at its deadline
+//!   (`state/dispatch/call_deadlines.rs`) and a call that fails is answered once.
+//!   The kernel owes the ending, never the success, so a call that fails and is
+//!   retried forever is a fair cycle, and one that ends with no answer leaves its
+//!   record where it is unless something else moves it.
 //!   A rule that means "it succeeds in the end" says `strong = ["Answer"]`.
 //! - A dispatch's delivery, weakly. A reaction is attempted after its source
 //!   commits (`trigger/dispatcher.rs`), and only a store failure retries it
