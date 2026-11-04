@@ -199,7 +199,9 @@ impl ServerState {
                         tracing::error!(callback = %action, %error, "{msg}");
                         Err(msg)
                     }
-                    _ => Ok(None),
+                    // The caller is gone. Its module's call still reads the
+                    // answer, to know whether it changed anything.
+                    (_, reply) => Ok(reply.ok()),
                 }
             }
         }

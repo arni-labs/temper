@@ -1358,24 +1358,6 @@ impl crate::state::ServerState {
                     }
                 };
 
-                instrument_wasm_dispatch_phase(
-                    phase_parent_span.clone(),
-                    ctx,
-                    module_name,
-                    WASM_DISPATCH_PHASE_RECORD_INVOCATION,
-                    self.record_invocation(
-                        ctx.entity_ref,
-                        module_name,
-                        ctx.action,
-                        Some(result.callback_action.clone()),
-                        true,
-                        None,
-                        result.duration_ms,
-                        None,
-                    ),
-                )
-                .await;
-
                 // The answer: one of the trigger's `on_success` actions, the
                 // first the record takes with the module's values (see
                 // `answers.rs`); none for an empty answer (`"empty": true`). A trigger without
@@ -1423,27 +1405,64 @@ impl crate::state::ServerState {
                     .choose_answer(ctx.entity_ref, answers, &callback_params)
                     .await;
 
-                if let Some(callback_action) = callback_action {
-                    let callback_response = instrument_wasm_dispatch_phase_result(
+                let answered = match callback_action {
+                    Some(callback_action) => {
+                        instrument_wasm_dispatch_phase_result(
+                            phase_parent_span.clone(),
+                            ctx,
+                            module_name,
+                            WASM_DISPATCH_PHASE_DISPATCH_CALLBACK,
+                            self.dispatch_wasm_callback(
+                                ctx.entity_ref,
+                                &integration.name,
+                                callback_action,
+                                callback_params,
+                                ctx.agent_ctx,
+                                ctx.mode,
+                            ),
+                        )
+                        .await
+                    }
+                    None => Ok(None),
+                };
+                // The log holds the calls that did something: a record polled
+                // through a module otherwise wrote a row for every look, and
+                // another to prune one past the bound. A call that wrote through
+                // a composite did something whatever its answer.
+                let changed_nothing = !composite_result_consumed
+                    && match &answered {
+                        Ok(Some(response)) => response.unrecorded_at.is_some(),
+                        _ => result.empty_answer,
+                    };
+                if changed_nothing {
+                    self.observe_invocation(
+                        ctx.entity_ref,
+                        module_name,
+                        ctx.action,
+                        true,
+                        None,
+                        result.duration_ms,
+                    );
+                } else {
+                    instrument_wasm_dispatch_phase(
                         phase_parent_span.clone(),
                         ctx,
                         module_name,
-                        WASM_DISPATCH_PHASE_DISPATCH_CALLBACK,
-                        self.dispatch_wasm_callback(
+                        WASM_DISPATCH_PHASE_RECORD_INVOCATION,
+                        self.record_invocation(
                             ctx.entity_ref,
-                            &integration.name,
-                            callback_action,
-                            callback_params,
-                            ctx.agent_ctx,
-                            ctx.mode,
+                            module_name,
+                            ctx.action,
+                            Some(result.callback_action.clone()),
+                            true,
+                            None,
+                            result.duration_ms,
+                            None,
                         ),
                     )
-                    .await?;
-                    if let Some(resp) = callback_response {
-                        return Ok(Some(resp));
-                    }
+                    .await;
                 }
-                Ok(None)
+                answered
             }
             Ok(result) => {
                 with_wasm_dispatch_phase(

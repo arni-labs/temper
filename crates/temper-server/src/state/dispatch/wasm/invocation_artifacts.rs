@@ -15,6 +15,8 @@ use tracing::{Instrument, instrument};
 
 impl crate::state::ServerState {
     /// Record a WASM invocation (persist log entry + emit observability events).
+    /// A successful call that changed nothing is only observed
+    /// ([`Self::observe_invocation`]).
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn record_invocation(
         &self,
@@ -61,7 +63,26 @@ impl crate::state::ServerState {
             }
             .instrument(span),
         );
+        self.observe_invocation(
+            entity_ref,
+            module_name,
+            trigger_action,
+            success,
+            error.as_deref(),
+            duration_ms,
+        );
+    }
 
+    /// Emit a WASM invocation's observability events, which write no row.
+    pub(super) fn observe_invocation(
+        &self,
+        entity_ref: WasmEntityRef<'_>,
+        module_name: &str,
+        trigger_action: &str,
+        success: bool,
+        error: Option<&str>,
+        duration_ms: u64,
+    ) {
         let wide = wide_event::from_wasm_invocation(wide_event::WasmInvocationInput {
             module_name,
             trigger_action,
@@ -70,7 +91,7 @@ impl crate::state::ServerState {
             tenant: &entity_ref.tenant.to_string(),
             success,
             duration_ns: duration_ms * 1_000_000,
-            error: error.as_deref(),
+            error,
         });
         wide_event::emit_span(&wide);
         wide_event::emit_metrics(&wide);
