@@ -17,6 +17,7 @@ mod levels;
 mod making;
 mod memo;
 mod mirror;
+mod nodes;
 mod run;
 mod shared;
 

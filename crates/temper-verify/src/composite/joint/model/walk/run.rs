@@ -13,7 +13,8 @@ use super::super::super::room::{Bound, Held, bytes, grow, map_bytes};
 use super::super::JointModel;
 use super::checked::Walker;
 use super::levels::Levels;
-use super::shared::{Seen, Shared, Trail, lock, read, state_bytes};
+use super::nodes::Nodes;
+use super::shared::{Seen, Shared, Trail, lock, state_bytes};
 use super::{Explored, Keep, Node};
 
 /// The room an expansion is first given; it doubles until what the
@@ -109,12 +110,12 @@ impl JointModel {
         }
         let starts = explored.nodes.len() as u32;
         let shared = Arc::new(Shared {
+            nodes: Nodes::new(std::mem::take(&mut explored.nodes)),
             trail: RwLock::new(Trail {
-                nodes: std::mem::take(&mut explored.nodes),
                 made: Vec::new(),
                 edges: Vec::new(),
-                states,
             }),
+            states: AtomicUsize::new(states),
             packer: RwLock::new(std::mem::take(&mut explored.packer)),
             seen,
             stop: AtomicBool::new(false),
@@ -151,12 +152,12 @@ impl JointModel {
         explored.reached = shared.levels.reached();
         explored.held.reached(explored.reached);
         let trail = shared.trail.into_inner().expect("a walk thread panicked");
-        explored.nodes = trail.nodes;
+        explored.nodes = shared.nodes.into_nodes();
         explored.made = trail.made;
         explored.edges = trail.edges;
         explored.packer = shared.packer.into_inner().expect("a walk thread panicked");
         explored.held_back = shared.held_back.load(Ordering::Relaxed);
-        let tables = trail.states
+        let tables = shared.states.into_inner()
             + explored.packer.bytes()
             + bytes(&explored.nodes)
             + bytes(&explored.made)
@@ -207,7 +208,7 @@ impl JointModel {
                 shared.answers.notify_all();
             }
             drop(gate);
-            held.walked(read(&shared.trail).nodes.len());
+            held.walked(shared.nodes.len());
         }
         {
             let _gate = lock(&shared.gate);

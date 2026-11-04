@@ -24,7 +24,7 @@ use super::super::moves::{Move, dispatch_move};
 use super::levels::deeper;
 use super::making::Target;
 use super::memo::{Holder, Memo, check_step};
-use super::shared::{Seen, Shared, Trail, read, state_bytes, write};
+use super::shared::{Seen, Shared, state_bytes, write};
 use super::{Edge, Keep, Made, Node, Via};
 
 /// What a walk sees each state with: the model, its number, the state, and
@@ -145,17 +145,14 @@ impl Walker {
             return;
         }
         let index = job.at as usize;
-        let (packed, sure) = {
-            let trail = read(&shared.trail);
-            let node = &trail.nodes[index];
-            (node.packed.clone(), node.start())
-        };
+        let node = shared.nodes.get(job.at);
+        let (packed, sure) = (&node.packed, node.start());
         let mut memo = self
             .memos
             .get_or_default()
             .try_borrow_mut()
             .expect("a thread walks one state at a time");
-        let state = memo.mirror.unpack(&packed, &shared.packer);
+        let state = memo.mirror.unpack(packed, &shared.packer);
         if (self.visit)(&self.model, index, &state, sure) {
             shared.stop.store(true, Ordering::Relaxed);
             return;
@@ -169,7 +166,7 @@ impl Walker {
             checked_moves: check_step(memo.steps).then(Vec::new),
             memo: &mut memo,
         };
-        if self.walk_groups(&packed, &mut walking, jobs).is_none() {
+        if self.walk_groups(packed, &mut walking, jobs).is_none() {
             return;
         }
         if let Some(remembered) = &walking.checked_moves {
@@ -278,34 +275,38 @@ impl Walker {
     pub(super) fn add(&self, from: Walked, batch: &mut Batch, jobs: &mut Vec<Walked>) -> usize {
         let shared = &*self.shared;
         let before = jobs.len();
-        let states = {
-            let mut trail = write(&shared.trail);
-            let trail = &mut *trail;
-            let first_made = trail.made.len() as u32;
+        let mut trail = (self.keep == Keep::Edges).then(|| write(&shared.trail));
+        let first_made = trail.as_mut().map_or(0, |trail| {
+            let first = trail.made.len() as u32;
             trail.made.append(&mut batch.made);
-            for way in batch.ways.drain(..) {
-                let to = match way.to {
-                    To::Known(at) => at,
-                    To::Check {
-                        packed,
-                        via,
-                        surely,
-                    } => self.check(trail, packed, from, via, surely, jobs),
-                };
-                if self.keep == Keep::Edges {
-                    trail.edges.push(Edge {
-                        made: first_made + way.made,
-                        to,
-                        sure: way.sure,
-                    });
-                }
+            first
+        });
+        let mut new_bytes = 0;
+        for way in batch.ways.drain(..) {
+            let to = match way.to {
+                To::Known(at) => at,
+                To::Check {
+                    packed,
+                    via,
+                    surely,
+                } => self.check(packed, from, via, surely, jobs, &mut new_bytes),
+            };
+            if let Some(trail) = &mut trail {
+                trail.edges.push(Edge {
+                    made: first_made + way.made,
+                    to,
+                    sure: way.sure,
+                });
             }
-            trail.nodes.len()
-        };
+        }
+        drop(trail);
+        if new_bytes > 0 {
+            shared.states.fetch_add(new_bytes, Ordering::Relaxed);
+        }
         let made = jobs.len() - before;
         shared.levels.made(deeper(from.depth), made);
         shared.waiting.fetch_add(made, Ordering::Relaxed);
-        states
+        shared.nodes.len()
     }
 
     /// The number of the state `packed`, which `via` leads to from the state
@@ -314,12 +315,12 @@ impl Walker {
     /// to be walked.
     fn check(
         &self,
-        trail: &mut Trail,
         packed: Packed,
         from: Walked,
         via: Via,
         surely: bool,
         jobs: &mut Vec<Walked>,
+        new_bytes: &mut usize,
     ) -> u32 {
         let parent = (from.at, via);
         let depth = deeper(from.depth);
@@ -329,9 +330,8 @@ impl Walker {
                 self.shared.levels.found_again(found.get().depth, depth);
                 if self.keep == Keep::Sure && surely && !found.get().sure {
                     found.get_mut().sure = true;
-                    let node = &mut trail.nodes[at as usize];
-                    node.parent = Some(parent);
-                    if node.found_sure() {
+                    self.shared.nodes.change_way(at, parent);
+                    if self.shared.nodes.get(at).found_sure() {
                         jobs.push(Walked {
                             at,
                             again: true,
@@ -342,16 +342,16 @@ impl Walker {
                 at
             }
             Entry::Vacant(free) => {
-                let at = u32::try_from(trail.nodes.len()).expect("fewer than 2^32 states");
-                trail.states += state_bytes(&packed);
+                *new_bytes += state_bytes(&packed);
+                let at = self
+                    .shared
+                    .nodes
+                    .add(Node::new(packed, Some(parent), surely, true));
                 free.insert(Seen {
                     at,
                     sure: surely,
                     depth,
                 });
-                trail
-                    .nodes
-                    .push(Node::new(packed, Some(parent), surely, true));
                 jobs.push(Walked {
                     at,
                     again: false,
