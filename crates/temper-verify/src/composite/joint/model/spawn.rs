@@ -398,7 +398,7 @@ impl JointModel {
         if self.models[entity].tracked_strings.contains(field)
             && let Some(record) = state.records.get_mut(entity)
         {
-            std::rc::Rc::make_mut(record)
+            std::sync::Arc::make_mut(record)
                 .strings
                 .insert(field.to_string(), value);
         }
