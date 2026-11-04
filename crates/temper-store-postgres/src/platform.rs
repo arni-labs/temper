@@ -2527,6 +2527,19 @@ impl PostgresEventStore {
         Ok(())
     }
 
+    /// How many WASM invocation log rows `tenant` holds.
+    pub async fn count_wasm_invocations(&self, tenant: &str) -> Result<i64, PersistenceError> {
+        let (count,): (i64,) = crate::dbm::postgres_query_as!(
+            &self.schema,
+            "SELECT COUNT(*)::bigint FROM {schema}wasm_invocation_logs WHERE tenant = $1",
+        )
+        .bind(tenant)
+        .fetch_one(self.pool())
+        .await
+        .map_err(storage_error)?;
+        Ok(count)
+    }
+
     /// Trim `tenant`'s WASM invocation log to its newest
     /// [`temper_runtime::persistence::WASM_INVOCATIONS_KEPT_PER_TENANT`] rows.
     ///

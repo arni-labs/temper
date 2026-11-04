@@ -180,10 +180,14 @@ async fn recording_an_invocation_deletes_nothing() {
         inserted,
         "every recorded invocation is still there until the log is trimmed"
     );
+    assert_eq!(
+        store.count_wasm_invocations("busy").await.unwrap(),
+        inserted
+    );
     store.prune_wasm_invocations("busy").await.unwrap();
-    let rows = store
-        .load_recent_wasm_invocations("busy", 2 * inserted)
-        .await
-        .unwrap();
-    assert_eq!(rows.len() as i64, WASM_INVOCATIONS_KEPT_PER_TENANT);
+    assert_eq!(
+        store.count_wasm_invocations("busy").await.unwrap(),
+        WASM_INVOCATIONS_KEPT_PER_TENANT,
+        "a trim leaves exactly the bound"
+    );
 }
