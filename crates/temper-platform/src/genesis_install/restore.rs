@@ -462,3 +462,7 @@ async fn ensure_prior_root_available(
 #[cfg(test)]
 #[path = "restore/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "restore/one_materialization_tests.rs"]
+mod one_materialization_tests;
