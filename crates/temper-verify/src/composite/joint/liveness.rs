@@ -54,16 +54,17 @@ use temper_authz::SendAnalysis;
 use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Truth, eval};
 
+use super::JointStep;
 use super::fair::FairVerdict;
 use super::model::{self, JointModel};
 use super::proof::liveness_proofs;
 use super::room::Bound;
-use super::{JointState, JointStep};
 
 #[path = "liveness_stuck.rs"]
 mod stuck;
 pub(super) use stuck::sure_path;
 use stuck::{may_reach, unsure_reason};
+use stuck::{outside_moves, system_moves};
 
 /// What the joint check found for one `eventually` property.
 #[derive(Debug, Clone)]
@@ -391,21 +392,6 @@ pub(super) fn settle(
     )
 }
 
-/// The moves the system makes from a stuck `state`, in words; with `failing`,
-/// those outside code is relied on to send too.
-fn system_moves(model: &JointModel, state: &JointState, failing: bool) -> Vec<String> {
-    let mut moves = BTreeSet::new();
-    for mv in model.moves(state) {
-        if !(mv.by_system() || failing && model.relies(&mv)) {
-            continue;
-        }
-        for next in model.next(state, &mv).0 {
-            moves.insert(next.label);
-        }
-    }
-    moves.into_iter().collect()
-}
-
 /// Which walked states reach the goal: those `done` (it holds with nothing
 /// in flight), and those with a move the system makes that either can lead
 /// to one that does, or always ends in a few states that all do. With
@@ -466,31 +452,6 @@ fn reach(explored: &model::Explored, done: &[bool], failing: &[bool], outside: b
         }
     }
     good
-}
-
-/// The reactions from types outside the scope that may be taken in `state`,
-/// as `Entity.Action (from Status) by a reaction from Type`.
-fn outside_moves(model: &JointModel, state: &super::JointState) -> Vec<String> {
-    model
-        .moves(state)
-        .into_iter()
-        .filter_map(|mv| match mv {
-            model::Move::Reaction(entity, action, _) => Some(format!(
-                "{entity}.{} (from {}) by a reaction from {}",
-                action.name,
-                state.records[entity.as_str()].status,
-                model
-                    .outside_from(&entity, &action.name)
-                    .map(|from| from
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" or "))
-                    .unwrap_or_default()
-            )),
-            _ => None,
-        })
-        .collect()
 }
 
 /// The bytes [`settle`] holds for `explored`: per state, its marks, its sure
