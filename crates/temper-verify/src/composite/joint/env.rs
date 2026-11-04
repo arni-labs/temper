@@ -123,6 +123,8 @@ pub(super) struct JointEnv<'a> {
     /// A reference whose id field names another record than the one the
     /// model holds of its type reads as unknown, not as no record.
     pub(super) unheld_unknown: bool,
+    /// The names of each type's records.
+    pub(super) copies: &'a BTreeMap<String, Vec<String>>,
 }
 
 fn var_of<'a>(model: &TemperModel, state: &'a TemperModelState, name: &str) -> Val<'a> {
@@ -157,20 +159,22 @@ impl JointEnv<'_> {
         if self.blind == Blind::Related {
             return None;
         }
-        match resolve_from(
-            self.models,
-            self.records,
-            self.state,
-            self.own_record(),
-            self.owner,
-            id_field,
-            entity_type,
-        ) {
-            Found::Yes => Some(self.state.records.get(entity_type).map(|record| &**record)),
-            Found::Missing if self.unheld_unknown => None,
-            Found::Missing => Some(None),
-            Found::Unknown => None,
+        for name in self.copies.get(entity_type)? {
+            match resolve_from(
+                self.models,
+                self.records,
+                self.state,
+                self.own_record(),
+                self.owner,
+                id_field,
+                name,
+            ) {
+                Found::Yes => return Some(self.state.records.get(name.as_str()).map(|r| &**r)),
+                Found::Missing => {}
+                Found::Unknown => return None,
+            }
         }
+        (!self.unheld_unknown).then_some(None)
     }
 }
 
