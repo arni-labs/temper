@@ -475,3 +475,23 @@ fn a_list_keeps_its_literals() {
     let moves = moves(&check(&model!("literals", "Items", "Board"), 1));
     assert!(moves.iter().any(|m| m.contains("item='c'")), "{moves:?}");
 }
+
+fn sent() -> Model {
+    model!("sent", "Card", "Note")
+}
+
+#[test]
+fn sent_literals_no_read_tells_apart_are_walked_as_one() {
+    let two = check(&sent(), 1);
+    let one = check(&fixed(&sent(), 1, "'thank you'", "'well done'"), 1);
+    assert_eq!(two.states, one.states, "{two} {one}");
+}
+
+#[test]
+fn a_sent_literal_a_rule_names_stays_its_own() {
+    let moves = moves(&check(&sent(), 1));
+    assert!(
+        moves.iter().any(|m| m.contains("text='try again'")),
+        "{moves:?}"
+    );
+}

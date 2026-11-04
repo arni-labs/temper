@@ -37,6 +37,8 @@ use temper_spec::predicate::{Arg, CmpOp, Effect, Expr, Literal, Operand, Set};
 
 use crate::model::TemperModel;
 
+use super::read::Reaction;
+
 mod numbers;
 
 /// What in a record a value sits in.
@@ -59,6 +61,13 @@ impl Slot {
 
 /// A slot of one entity type.
 type Term = (String, Slot);
+
+/// What the reads `named` can see of `literal`, and whether a constraint that
+/// trims it would find it blank.
+fn kind(named: &[&BTreeSet<String>], literal: &str) -> (bool, Vec<bool>) {
+    let names = named.iter().map(|named| named.contains(literal)).collect();
+    (literal.trim().is_empty(), names)
+}
 
 /// The equality classes of the terms of the types in a scope, each with the
 /// literals it holds.
@@ -105,12 +114,22 @@ impl Classes {
 
     /// Leave each field and parameter of `models` only the literals something
     /// that reads it compares or copies there. A value Cedar reads (`cedar`)
-    /// is told apart by whatever the policy says of it.
+    /// is told apart by whatever the policy says of it, and so is all its
+    /// class, whose values can be copied into it.
     pub(in crate::composite::joint) fn narrow(
-        &self,
+        &mut self,
         models: &mut BTreeMap<String, TemperModel>,
         cedar: impl Fn(&str) -> bool,
     ) {
+        for (entity, model) in models.iter() {
+            let parameters = model.transitions.iter().flat_map(|t| &t.string_params);
+            let names = parameters
+                .map(|param| param.name.to_string())
+                .chain(model.tracked_strings.iter().cloned());
+            let read: Vec<String> = names.filter(|name| cedar(name)).collect();
+            self.exact
+                .extend(read.iter().map(|name| (entity.clone(), Slot::named(name))));
+        }
         for (entity, model) in models {
             let parameters = model.transitions.iter().flat_map(|t| &t.string_params);
             let names: BTreeSet<String> = parameters
@@ -120,12 +139,50 @@ impl Classes {
             for name in names {
                 let literals = model.string_literals.entry(name.clone()).or_default();
                 literals.extend(self.literals(entity, &name));
-                if !cedar(&name) {
-                    *literals = self.one_of_each_kind(entity, &name, literals);
-                }
+                *literals = self.one_of_each_kind(entity, &name, literals);
             }
             model.literals_by_class = true;
         }
+    }
+
+    /// Have each reaction in `reactions` send, for a literal, the one of its
+    /// kind the walk offers: to every read of its class they are one value.
+    pub(super) fn send_one_of_each_kind(&self, reactions: &mut [Reaction]) {
+        for reaction in reactions {
+            for (param, arg) in &mut reaction.args {
+                if let Arg::Lit(Literal::Str(text)) = arg {
+                    *text = self.one_like(&reaction.to, param, text);
+                }
+            }
+        }
+    }
+
+    /// The first literal of `entity`'s `field`'s class that the reads of the
+    /// class cannot tell from `literal`.
+    fn one_like(&self, entity: &str, field: &str, literal: &str) -> String {
+        let root = self.root(&(entity.to_string(), Slot::named(field)));
+        let Some(reads) = self.reads_of(&root) else {
+            return literal.to_string();
+        };
+        let held = self.held.get(&root).into_iter().flatten();
+        held.filter(|other| !other.is_empty())
+            .find(|other| !literal.is_empty() && kind(&reads, other) == kind(&reads, literal))
+            .map_or_else(|| literal.to_string(), String::clone)
+    }
+
+    /// The reads that can tell literals of the class `root` apart, or `None`
+    /// when its value itself is read, which tells them all apart.
+    fn reads_of(&self, root: &Term) -> Option<Vec<&BTreeSet<String>>> {
+        if self.exact.iter().any(|term| self.root(term) == *root) {
+            return None;
+        }
+        Some(
+            self.reads
+                .iter()
+                .filter(|(term, _)| self.root(term) == *root)
+                .map(|(_, named)| named)
+                .collect(),
+        )
     }
 
     /// `literals`, which `entity`'s field `field` may be offered, without
@@ -144,21 +201,12 @@ impl Classes {
         let literals = literals
             .iter()
             .filter(|literal| literal.is_empty() || held.contains(*literal));
-        if self.exact.iter().any(|term| self.root(term) == root) {
+        let Some(reads) = self.reads_of(&root) else {
             return literals.cloned().collect();
-        }
-        let reads: Vec<&BTreeSet<String>> = self
-            .reads
-            .iter()
-            .filter(|(term, _)| self.root(term) == root)
-            .map(|(_, named)| named)
-            .collect();
+        };
         let mut kinds = BTreeSet::new();
         literals
-            .filter(|literal| {
-                let kind: Vec<bool> = reads.iter().map(|named| named.contains(*literal)).collect();
-                literal.is_empty() || kinds.insert(kind)
-            })
+            .filter(|literal| literal.is_empty() || kinds.insert(kind(&reads, literal)))
             .cloned()
             .collect()
     }

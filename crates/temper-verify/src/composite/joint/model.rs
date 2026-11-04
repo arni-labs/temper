@@ -226,7 +226,7 @@ impl JointModel {
     fn compose(
         by_name: &BTreeMap<&str, &Automaton>,
         scope: &BTreeSet<String>,
-        (mut models, reactions): (BTreeMap<String, TemperModel>, Vec<Reaction>),
+        (mut models, mut reactions): (BTreeMap<String, TemperModel>, Vec<Reaction>),
         read: &BTreeMap<String, BTreeSet<String>>,
         sending: Sending<'_>,
         cut: bool,
@@ -235,7 +235,7 @@ impl JointModel {
             .keys()
             .map(|entity| (entity.clone(), vec![entity.clone()]))
             .collect();
-        let classes = Classes::read(by_name, scope);
+        let mut classes = Classes::read(by_name, scope);
         let id_literals = scope
             .iter()
             .map(|entity| (entity.clone(), classes.literals(entity, ID)))
@@ -261,6 +261,7 @@ impl JointModel {
             sending.reserve,
         );
         classes.narrow(&mut models, |field| senders.reads_field(field));
+        classes.send_one_of_each_kind(&mut reactions);
         // A reaction from outside the scope chooses its parameters, as requests do.
         let outside = outside_reactions(by_name, scope);
         let chosen = |entity: &str, action: &str| {
@@ -324,7 +325,6 @@ impl JointModel {
         let senders = senders.meeting(&classes, &models);
         // From here on classes only say which made-up values can meet, and
         // Cedar is one more thing that can compare them.
-        let mut classes = classes;
         classes.read_policies(&senders.compared(), scope);
         let mut models = models;
         classes.number(&mut models);

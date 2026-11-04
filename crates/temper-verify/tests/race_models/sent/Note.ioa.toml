@@ -1,0 +1,52 @@
+[automaton]
+name = "Note"
+states = ["Unmade", "Open"]
+initial = "Unmade"
+
+[[action]]
+name = "Add"
+kind = "input"
+from = ["Unmade"]
+to = "Open"
+
+[[action]]
+name = "Praise"
+kind = "input"
+from = ["Open"]
+to = "Open"
+
+[[action.triggers]]
+name = "praise"
+kind = "entity"
+target_entity = "Card"
+target_action = "Write"
+args = { text = "'well done'" }
+resolve_target = { kind = "same_id" }
+
+[[action]]
+name = "Thank"
+kind = "input"
+from = ["Open"]
+to = "Open"
+
+[[action.triggers]]
+name = "thank"
+kind = "entity"
+target_entity = "Card"
+target_action = "Write"
+args = { text = "'thank you'" }
+resolve_target = { kind = "same_id" }
+
+[[action]]
+name = "Scold"
+kind = "input"
+from = ["Open"]
+to = "Open"
+
+[[action.triggers]]
+name = "scold"
+kind = "entity"
+target_entity = "Card"
+target_action = "Write"
+args = { text = "'try again'" }
+resolve_target = { kind = "same_id" }

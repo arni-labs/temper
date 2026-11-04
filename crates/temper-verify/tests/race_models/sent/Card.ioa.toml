@@ -1,0 +1,30 @@
+[automaton]
+name = "Card"
+states = ["Unmade", "Blank", "Written"]
+initial = "Unmade"
+
+[[state]]
+name = "text"
+type = "string"
+initial = ""
+
+[[invariant]]
+name = "NeverScolded"
+assert = "text != 'try again' || Note[Id].status == 'Unmade'"
+
+[[action]]
+name = "Add"
+kind = "input"
+from = ["Unmade"]
+to = "Blank"
+
+[[action]]
+name = "Write"
+kind = "input"
+from = ["Blank", "Written"]
+to = "Written"
+params = ["text"]
+
+[[action.constraints]]
+kind = "param_nonempty"
+param = "text"
