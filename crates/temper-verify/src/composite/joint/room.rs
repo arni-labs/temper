@@ -95,6 +95,8 @@ pub struct Progress {
     /// How many moves the walk is working at. Threads can find a state late,
     /// so this says how far it has got, and `depth` what is proved.
     pub reached: AtomicUsize,
+    /// When the check first found a rule broken.
+    pub first_broken: std::sync::OnceLock<std::time::Instant>,
 }
 
 /// Where a joint check takes its memory, and where it says how far it got.

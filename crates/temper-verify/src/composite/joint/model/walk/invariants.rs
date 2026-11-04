@@ -2,8 +2,9 @@
 //! where sure moves alone lead.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use super::super::super::{JointOutcome, premise};
 use super::super::{JointModel, Walk};
@@ -16,7 +17,7 @@ impl JointModel {
     /// of `owner` in each settled one (nothing in flight). An invariant is
     /// broken only where sure moves alone lead: elsewhere the walk may have
     /// gone a way the runtime never goes, so it cannot tell.
-    pub(in crate::composite::joint) fn walk(
+    pub(super) fn walk_once(
         self: &Arc<Self>,
         owner: &str,
         invariants: &[&Expr],
@@ -69,6 +70,8 @@ impl JointModel {
             return Walk {
                 states: 0,
                 held_back: false,
+                stopped: false,
+                broken: vec![None; invariants.len()],
                 outside: vec![BTreeSet::new(); invariants.len()],
                 outcomes: invariants
                     .iter()
@@ -161,12 +164,26 @@ impl JointModel {
             })
             .collect();
         let (states, held_back) = (explored.len(), explored.held_back);
+        let stopped = explored.stopped.is_some();
         // Past where it stopped, phase two (`guided.rs`).
-        let outcomes = self.guided_invariants(owner, invariants, outcomes, explored, bound);
+        let outcomes: Vec<JointOutcome> =
+            self.guided_invariants(owner, invariants, outcomes, explored, bound);
+        if outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, JointOutcome::Broken { .. }))
+        {
+            let at = found.first_broken.get().copied();
+            bound
+                .progress
+                .first_broken
+                .get_or_init(|| at.unwrap_or_else(Instant::now));
+        }
         Walk {
             states,
+            broken: vec![None; outcomes.len()],
             outcomes,
             held_back,
+            stopped,
             outside,
         }
     }
@@ -182,6 +199,8 @@ struct Found {
     unknown: Vec<AtomicBool>,
     /// A settled state met its premise, or it has none.
     met: Vec<AtomicBool>,
+    /// When sure moves first broke one.
+    first_broken: OnceLock<Instant>,
 }
 
 const NONE: usize = usize::MAX;
@@ -196,10 +215,12 @@ impl Found {
                 .iter()
                 .map(|premise| AtomicBool::new(premise.is_none()))
                 .collect(),
+            first_broken: OnceLock::new(),
         }
     }
 
     fn broken(&self, invariant: usize, state: usize) {
+        self.first_broken.get_or_init(Instant::now);
         self.broken[invariant].fetch_min(state, Ordering::Relaxed);
     }
 

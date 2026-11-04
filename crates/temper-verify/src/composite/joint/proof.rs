@@ -128,9 +128,11 @@ impl InvariantProof<'_> {
             .invariants
             .iter()
             .zip(walk.outcomes)
-            .map(|(inv, outcome)| {
-                let mut found = result(inv, walk.states, outcome);
-                found.in_flight_bound = walk.held_back.then_some(model::MAX_IN_FLIGHT);
+            .zip(&walk.broken)
+            .map(|((inv, outcome), broken)| {
+                let held = walk.held_back.then_some(model::MAX_IN_FLIGHT);
+                let mut found = result(inv, broken.map_or(walk.states, |at| at.states), outcome);
+                found.in_flight_bound = broken.map(|at| at.in_flight).or(held);
                 found
             })
             .collect();

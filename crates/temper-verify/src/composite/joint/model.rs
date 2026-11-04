@@ -114,6 +114,18 @@ pub(super) struct Walk {
     /// One per invariant: when it is false only where the walk went by a
     /// reaction from types outside the scope, those types, else none.
     pub(super) outside: Vec<BTreeSet<String>>,
+    /// One per invariant: when a walk found it broken, how much that walk
+    /// let be in flight and how many states it took.
+    pub(super) broken: Vec<Option<BrokenAt>>,
+    /// Whether the last walk ran out of room.
+    pub(super) stopped: bool,
+}
+
+/// How much a walk let be in flight when it found a break, and how far it had got.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BrokenAt {
+    pub(super) in_flight: usize,
+    pub(super) states: usize,
 }
 
 /// The joint model of one entity's properties that read related entities.
@@ -159,6 +171,8 @@ pub(super) struct JointModel {
     /// child's type is outside the scope.
     outside_spawns: BTreeMap<(String, String), Vec<String>>,
     /// Each type's record as it first stands, made on first use.
+    /// How much a walk now lets be in flight: at most [`MAX_IN_FLIGHT`].
+    in_flight: std::sync::atomic::AtomicUsize,
     first: std::sync::OnceLock<BTreeMap<String, TemperModelState>>,
     /// Each type's statuses from which its record can send nothing more,
     /// made on first use.
@@ -332,6 +346,7 @@ impl JointModel {
             unsent,
             outside,
             outside_spawns: spawn::outside_spawns(by_name, scope),
+            in_flight: std::sync::atomic::AtomicUsize::new(MAX_IN_FLIGHT),
             first: std::sync::OnceLock::new(),
             settled: std::sync::OnceLock::new(),
         }

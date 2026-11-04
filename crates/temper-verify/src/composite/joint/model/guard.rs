@@ -9,7 +9,8 @@ use temper_spec::predicate::{Truth, eval};
 use super::super::super::{Dispatch, JointState, ReactionStep};
 use super::super::JointModel;
 use super::super::commit::add;
-use super::{Certainty, MAX_IN_FLIGHT, remove};
+use super::{Certainty, remove};
+use std::sync::atomic::Ordering;
 
 impl JointModel {
     /// The states reading `dispatch`'s trigger guard leads to: dropped when
@@ -90,7 +91,7 @@ impl JointModel {
             let most = commits.entry((parent, from, action)).or_default();
             *most = (*most).max(copies);
         }
-        busy + commits.into_values().sum::<usize>() <= MAX_IN_FLIGHT
+        busy + commits.into_values().sum::<usize>() <= self.in_flight.load(Ordering::Relaxed)
     }
 
     /// Whether reading or landing `dispatch` now may come before an earlier
