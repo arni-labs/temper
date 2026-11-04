@@ -541,8 +541,8 @@ kind = "same_id"
     assert!(not_checked(&result), "{result}");
 }
 
-/// A B that opens the T of its own id and hits the T it names, and that T,
-/// which only a B can hit.
+/// A B that hits the T it names and tells the T of its own id, and a T that
+/// counts the hits, which only a B can send.
 const HITS: &str = r#"
 [automaton]
 name = "B"
@@ -586,29 +586,34 @@ id_field = "f"
 const HIT_BY_B: &str = r#"
 [automaton]
 name = "T"
-states = ["Open", "Once"]
+states = ["Open"]
 initial = "Open"
+
+[[state]]
+name = "hits"
+type = "counter"
+initial = "0"
 
 [[action]]
 name = "Mine"
 kind = "input"
-from = ["Open", "Once"]
+from = ["Open"]
 
 [[action]]
 name = "Hit"
 kind = "input"
 from = ["Open"]
-to = "Once"
+effect = "increment hits"
 
 [[invariant]]
 name = "rule"
-assert = "status != 'Once' || B[Id].status != 'Start'"
+assert = "hits < 2 || B[Id].status == 'Start'"
 "#;
 
 #[test]
 fn a_second_sender_may_land_on_the_record_the_walk_holds() {
-    // With one B, its T is hit only once it has gone. In the runtime another B
-    // can name that T while this one is in Start.
+    // One B goes once, so the T it names is hit once. In the runtime a second B
+    // can name that T too.
     let policies = only_hits_may_send(r#"Action::"Go""#);
     let result = checked_under(&[HITS, HIT_BY_B], Some(&policies));
     let JointOutcome::Incomplete { reason } = &result.outcome else {
@@ -653,10 +658,10 @@ fn a_second_sender_stops_a_settling_claim_too() {
     let target = HIT_BY_B.replace(
         r#"[[invariant]]
 name = "rule"
-assert = "status != 'Once' || B[Id].status != 'Start'""#,
+assert = "hits < 2 || B[Id].status == 'Start'""#,
         r#"[[liveness]]
 name = "settles"
-eventually = "status != 'Once' || B[Id].status != 'Start'""#,
+eventually = "hits < 2 || B[Id].status == 'Start'""#,
     );
     let automatons: Vec<Automaton> = [HITS, target.as_str()]
         .iter()
