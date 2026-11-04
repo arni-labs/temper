@@ -1395,35 +1395,29 @@ impl PostgresEventStore {
         .map_err(storage_error)
     }
 
+    /// Record that `app_name` is installed in `tenant`: a new local record
+    /// when it has none, and nothing changed when it has one, whatever its
+    /// source. Its digests and provenance are written by
+    /// [`Self::record_installed_app_metadata`].
     pub async fn record_installed_app(
         &self,
         tenant: &str,
         app_name: &str,
     ) -> Result<(), PersistenceError> {
-        let record = PostgresInstalledAppRow {
-            tenant: tenant.to_string(),
-            app_name: app_name.to_string(),
-            source_kind: "local".to_string(),
-            app_ref: String::new(),
-            version_hash: String::new(),
-            pinned_version_hash: String::new(),
-            current_version_hash: String::new(),
-            follow_policy: "pinned".to_string(),
-            closure_id: String::new(),
-            registry_url: String::new(),
-            registry_tenant: String::new(),
-            app_version: String::new(),
-            bundle_digest: String::new(),
-            spec_digest: String::new(),
-            policy_digest: String::new(),
-            wasm_digest: String::new(),
-            content_digest: String::new(),
-            seed_digest: String::new(),
-            installed_at: String::new(),
-            last_reconciled_at: None,
-            status: "installed".to_string(),
-        };
-        self.record_installed_app_metadata(&record).await
+        crate::dbm::postgres_query!(&self.schema,
+            "INSERT INTO {schema}tenant_installed_apps \
+             (tenant, app_name, source_kind, app_ref, version_hash, pinned_version_hash, current_version_hash, follow_policy, closure_id, registry_url, registry_tenant, \
+              app_version, bundle_digest, spec_digest, policy_digest, wasm_digest, \
+              content_digest, seed_digest, installed_at, last_reconciled_at, status) \
+             VALUES ($1, $2, 'local', '', '', '', '', 'pinned', '', '', '', '', '', '', '', '', '', '', now(), NULL, 'installed') \
+             ON CONFLICT (tenant, app_name) DO NOTHING",
+        )
+        .bind(tenant)
+        .bind(app_name)
+        .execute(self.pool())
+        .await
+        .map_err(storage_error)?;
+        Ok(())
     }
 
     pub async fn record_installed_app_metadata(

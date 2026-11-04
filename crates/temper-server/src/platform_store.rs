@@ -205,7 +205,9 @@ pub trait PlatformStore: Send + Sync {
     /// Check if an OS app is already installed for a tenant.
     async fn is_app_installed(&self, tenant: &str, app_name: &str) -> Result<bool, String>;
 
-    /// Record that an OS app was installed in a tenant.
+    /// Record that an OS app was installed in a tenant: a new local record
+    /// when the app has none, and an existing record left as it is, so a
+    /// replay keeps where the app came from.
     async fn record_installed_app(&self, tenant: &str, app_name: &str) -> Result<(), String>;
 
     /// Record digest metadata for an installed OS app bundle.
