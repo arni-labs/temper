@@ -8,7 +8,7 @@ use crate::automaton::parser::{LivenessEnforcement, parse_automaton_with_livenes
 fn lost(strict: bool, kind: &str, set: &str, other: &str) -> Vec<String> {
     let initial = match kind {
         "bool" => "false",
-        "list" => "\"[]\"",
+        "list" => "[]",
         "string" => "\"\"",
         _ => "0",
     };
