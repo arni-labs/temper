@@ -9,6 +9,21 @@ use super::room::{Bytes, Progress};
 use super::*;
 
 fn checked(sources: &[&str]) -> JointInvariantResult {
+    checked_under(sources, None)
+}
+
+/// Lets anyone send what `open` names, and the service `hits` send anything.
+fn only_hits_may_send(open: &str) -> SendAnalysis {
+    SendAnalysis::new(&format!(
+        r#"
+permit(principal, action in [{open}], resource);
+permit(principal == Agent::"service:hits", action, resource);
+"#
+    ))
+    .unwrap()
+}
+
+fn checked_under(sources: &[&str], policies: Option<&SendAnalysis>) -> JointInvariantResult {
     let automatons: Vec<Automaton> = sources
         .iter()
         .map(|source| parse_automaton(source).expect("fixture parses"))
@@ -19,7 +34,7 @@ fn checked(sources: &[&str]) -> JointInvariantResult {
         room: &room,
         progress: &progress,
     };
-    let mut results = verify_joint_invariants(&refs, None, bound);
+    let mut results = verify_joint_invariants(&refs, policies, bound);
     assert_eq!(results.len(), 1);
     results.remove(0)
 }
@@ -123,6 +138,7 @@ name = "close"
 kind = "entity"
 target_entity = "T"
 target_action = "Close"
+principal = "hits"
 
 [action.triggers.resolve_target]
 kind = "field"
@@ -133,8 +149,8 @@ id_field = "f"
         "T[f].status != 'Never'",
         "status != 'Made' || T[f].status != 'Closed'",
     );
-    let target = TARGET.replace(r#"kind = "input""#, r#"kind = "internal""#);
-    let result = checked(&[&holder, &target]);
+    let policies = only_hits_may_send(r#"Action::"Add", Action::"Go""#);
+    let result = checked_under(&[&holder, TARGET], Some(&policies));
     assert!(not_checked(&result), "{result}");
 }
 
@@ -550,6 +566,7 @@ name = "mine"
 kind = "entity"
 target_entity = "T"
 target_action = "Mine"
+principal = "hits"
 
 [action.triggers.resolve_target]
 kind = "same_id"
@@ -559,6 +576,7 @@ name = "hit"
 kind = "entity"
 target_entity = "T"
 target_action = "Hit"
+principal = "hits"
 
 [action.triggers.resolve_target]
 kind = "field"
@@ -573,12 +591,12 @@ initial = "Open"
 
 [[action]]
 name = "Mine"
-kind = "internal"
+kind = "input"
 from = ["Open", "Once"]
 
 [[action]]
 name = "Hit"
-kind = "internal"
+kind = "input"
 from = ["Open"]
 to = "Once"
 
@@ -591,7 +609,8 @@ assert = "status != 'Once' || B[Id].status != 'Start'"
 fn a_second_sender_may_land_on_the_record_the_walk_holds() {
     // With one B, its T is hit only once it has gone. In the runtime another B
     // can name that T while this one is in Start.
-    let result = checked(&[HITS, HIT_BY_B]);
+    let policies = only_hits_may_send(r#"Action::"Go""#);
+    let result = checked_under(&[HITS, HIT_BY_B], Some(&policies));
     let JointOutcome::Incomplete { reason } = &result.outcome else {
         panic!("{result}");
     };
@@ -649,7 +668,8 @@ eventually = "status != 'Once' || B[Id].status != 'Start'""#,
         room: &room,
         progress: &progress,
     };
-    let results = verify_joint_liveness(&refs, None, bound);
+    let policies = only_hits_may_send(r#"Action::"Go""#);
+    let results = verify_joint_liveness(&refs, Some(&policies), bound);
     assert_eq!(results.len(), 1);
     assert!(
         matches!(results[0].outcome, LivenessOutcome::Incomplete { .. }),
