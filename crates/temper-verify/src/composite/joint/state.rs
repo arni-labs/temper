@@ -4,10 +4,12 @@
 use std::fmt;
 use std::sync::Arc;
 
+use super::env::ID;
 use super::room::{Heap, block};
-use crate::model::Renames;
-use crate::model::semantics::canonical_names;
-use crate::model::{Fields, ModelString, ParamValue, Sym, TemperModelAction, TemperModelState};
+use crate::model::{
+    Fields, ModelString, ParamValue, Renames, Sym, TemperModelAction, TemperModelState,
+    names_no_record,
+};
 
 /// The records in scope, one per type, and the dispatches and module calls
 /// on their way. A move changes one record or two and the rest stay as they
@@ -182,7 +184,7 @@ pub(super) fn render(state: &JointState) -> String {
 /// the dispatches in flight; returns each value's new name. What a renaming
 /// leaves as it was stays shared with the states that hold it.
 pub(super) fn canonical(state: &mut JointState) -> Renames {
-    let mut renamed = canonical_names(record_strings(&state.records));
+    let mut renamed = names_of_records(&state.records);
     renamed.name_all(strings_on_their_way(state));
     if renamed.any_moved() {
         rename_records(&mut state.records, &renamed);
@@ -191,6 +193,20 @@ pub(super) fn canonical(state: &mut JointState) -> Renames {
     state.inflight.sort();
     state.calls.sort();
     renamed
+}
+
+/// The new names of a state's records' strings: their ids first, since what
+/// a value names decides what it is called.
+fn names_of_records(records: &Fields<Arc<TemperModelState>>) -> Renames {
+    let mut renamed = Renames::default();
+    renamed.name_ids(record_ids(records));
+    renamed.name_all(record_strings(records));
+    renamed
+}
+
+/// The ids of a state's records.
+fn record_ids(records: &Fields<Arc<TemperModelState>>) -> impl Iterator<Item = &ModelString> {
+    records.values().filter_map(|record| record.strings.get(ID))
 }
 
 /// The strings of a state's records, in the order they are numbered.
@@ -310,12 +326,15 @@ pub(super) struct RecordNames {
 impl RecordNames {
     /// What renumbering `records` comes to.
     pub(super) fn of(records: &Fields<Arc<TemperModelState>>) -> Self {
-        let renamed = canonical_names(record_strings(records));
+        let renamed = names_of_records(records);
         let moved = renamed.any_moved();
         let mut so_far = InOrder::default();
         let mut renumbered = records.clone();
         if moved {
             rename_records(&mut renumbered, &renamed);
+        }
+        for value in record_ids(&renumbered) {
+            so_far.fits_id(value);
         }
         for value in record_strings(&renumbered) {
             so_far.fits(value);
@@ -369,7 +388,8 @@ impl RecordNames {
 /// flight is sorted already, unless `rewrote` says a dispatch was rewritten.
 pub(super) fn canonical_quietly(state: &mut JointState, rewrote: bool) {
     let mut so_far = InOrder::default();
-    if !record_strings(&state.records).all(|value| so_far.fits(value))
+    if !record_ids(&state.records).all(|value| so_far.fits_id(value))
+        || !record_strings(&state.records).all(|value| so_far.fits(value))
         || !so_far.holds_rest_of(state)
     {
         canonical(state);
@@ -395,11 +415,24 @@ struct ClassOrder {
 }
 
 impl InOrder {
-    /// Whether `value` carries the numbering on.
+    /// Whether the record id `value` carries the numbering on.
+    fn fits_id(&mut self, value: &ModelString) -> bool {
+        self.carries_on(value, true)
+    }
+
+    /// Whether `value`, past the record ids, carries the numbering on.
     fn fits(&mut self, value: &ModelString) -> bool {
+        self.carries_on(value, false)
+    }
+
+    fn carries_on(&mut self, value: &ModelString, id: bool) -> bool {
         let (Some(class), Some(number)) = (value.class(), value.number()) else {
             return true;
         };
+        let one_value = names_no_record(class);
+        if number == 0 {
+            return one_value && !id;
+        }
         if number >= u64::BITS as usize {
             return false;
         }
@@ -415,11 +448,14 @@ impl InOrder {
                 continue;
             }
             return if number == slot.count + 1 {
+                if one_value && !id {
+                    return false;
+                }
                 slot.count = number;
                 slot.blanks |= u64::from(blank) << number;
                 true
             } else {
-                number != 0 && number <= slot.count && (slot.blanks >> number & 1 == 1) == blank
+                number <= slot.count && (slot.blanks >> number & 1 == 1) == blank
             };
         }
         false

@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use temper_authz::Read;
 use temper_spec::automaton::{ActionConstraint, Automaton, Initial, TargetResolver, TriggerKind};
-use temper_spec::predicate::{Arg, Effect, Expr, Literal, Operand, Set};
+use temper_spec::predicate::{Arg, CmpOp, Effect, Expr, Literal, Operand, Set};
 
 use super::super::JointState;
 use super::super::env::ID;
@@ -98,6 +98,9 @@ pub(in crate::composite::joint) struct Classes {
     held: BTreeMap<Term, BTreeSet<String>>,
     /// The parameters a `param_nonempty` constraint refuses a blank value in.
     reads_blank: BTreeSet<Term>,
+    /// Terms read other than against a record's id, or that a record's id can
+    /// come from ([`Self::number`]).
+    apart: BTreeSet<Term>,
 }
 
 impl Classes {
@@ -144,7 +147,7 @@ impl Classes {
                     })
                     .collect();
                 for pair in terms.windows(2) {
-                    self.link(&pair[0], &pair[1]);
+                    self.compared(&pair[0], &pair[1]);
                 }
             }
         }
@@ -156,6 +159,12 @@ impl Classes {
     /// that compares or copies one value into another links their terms, so
     /// a walk that keeps the values of each class apart and numbers them from
     /// one in each class merges only states nothing can tell apart.
+    ///
+    /// A class whose values are only ever read against a record's id goes
+    /// further, and its class number is odd ([`crate::model::names_no_record`]). Reading a
+    /// value that names no record finds no record, whichever value it is, and
+    /// no such value can become an id, so they are all one value. The record
+    /// ids stay numbered.
     pub(in crate::composite::joint) fn number(&self, models: &mut BTreeMap<String, TemperModel>) {
         let mut numbers: BTreeMap<Term, usize> = BTreeMap::new();
         let reads_blank: BTreeSet<Term> = self
@@ -163,6 +172,7 @@ impl Classes {
             .iter()
             .map(|term| self.root(term))
             .collect();
+        let apart: BTreeSet<Term> = self.apart.iter().map(|term| self.root(term)).collect();
         for (entity, model) in models.iter_mut() {
             let params = model.transitions.iter().flat_map(|t| &t.string_params);
             let names: BTreeSet<String> = model
@@ -174,12 +184,12 @@ impl Classes {
                 .collect();
             for name in names {
                 let root = self.root(&(entity.clone(), Slot::named(&name)));
-                let next = numbers.len() + 1;
-                if !reads_blank.contains(&root) {
-                    let class = numbers.get(&root).copied().unwrap_or(next);
+                let next = (numbers.len() + 1) * 2 + usize::from(!apart.contains(&root));
+                let blank = reads_blank.contains(&root);
+                let class = *numbers.entry(root).or_insert(next);
+                if !blank {
                     model.never_blank.insert(class);
                 }
-                let class = *numbers.entry(root).or_insert(next);
                 model.string_classes.insert(name, class);
             }
         }
@@ -221,14 +231,17 @@ impl Classes {
                     self.reads_blank.insert(term(constraint.param()));
                 }
                 if let Some(field) = constraint.field() {
-                    self.link(&term(constraint.param()), &term(field));
+                    self.compared(&term(constraint.param()), &term(field));
                 }
             }
             for effect in &action.effect {
                 match effect {
                     Effect::Assign { var, value, .. } => self.copy(&term(var), entity, value),
-                    Effect::Append { list, value } | Effect::Remove { list, value } => {
+                    Effect::Append { list, value } => self.copy(&term(list), entity, value),
+                    // Removing compares the value with each of the list's.
+                    Effect::Remove { list, value } => {
                         self.copy(&term(list), entity, value);
+                        self.apart.insert(term(list));
                     }
                     Effect::Spawn {
                         entity_type,
@@ -271,10 +284,14 @@ impl Classes {
                     self.copy(&target(param), entity, arg);
                 }
                 match &trigger.resolve_target {
-                    Some(
-                        TargetResolver::Field { id_field }
-                        | TargetResolver::CreateIfMissing { id_field },
-                    ) => self.link(&term(id_field), &target("Id")),
+                    Some(TargetResolver::Field { id_field }) => {
+                        self.link(&term(id_field), &target("Id"));
+                    }
+                    // The field's value can become a record's id.
+                    Some(TargetResolver::CreateIfMissing { id_field }) => {
+                        self.link(&term(id_field), &target("Id"));
+                        self.apart.insert(term(id_field));
+                    }
                     Some(TargetResolver::SameId) => self.link(&term("Id"), &target("Id")),
                     Some(TargetResolver::Static { entity_id }) => {
                         self.hold(&target("Id"), entity_id);
@@ -290,7 +307,12 @@ impl Classes {
         match value {
             Arg::Lit(Literal::Str(text)) => self.hold(into, text),
             Arg::Var(name) | Arg::Param(name) => {
-                self.link(into, &(entity.to_string(), Slot::named(name)));
+                let from = (entity.to_string(), Slot::named(name));
+                self.link(into, &from);
+                // A value that can become a record's id.
+                if into.1 == Slot::Id && from.1 != Slot::Id {
+                    self.apart.insert(from);
+                }
             }
             Arg::Lit(_) => {}
         }
@@ -332,9 +354,15 @@ impl Classes {
                 self.visit(owner, a);
                 self.visit(owner, b);
             }
-            Expr::Compare { lhs, rhs, .. } => {
+            Expr::Compare { lhs, rhs, op } => {
                 match (self.term(owner, lhs), self.term(owner, rhs), lhs, rhs) {
-                    (Some(a), Some(b), _, _) => self.link(&a, &b),
+                    (Some(a), Some(b), _, _) => {
+                        self.compared(&a, &b);
+                        // An order reads more than whether they are equal.
+                        if !matches!(op, CmpOp::Eq | CmpOp::Ne) {
+                            self.apart.insert(a);
+                        }
+                    }
                     (Some(t), None, _, Operand::Lit(Literal::Str(text)))
                     | (None, Some(t), Operand::Lit(Literal::Str(text)), _) => {
                         self.hold(&t, text);
@@ -353,7 +381,7 @@ impl Classes {
                         }
                     }
                     (Some(t), Set::Var(list), _) => {
-                        self.link(&t, &(owner.to_string(), Slot::named(list)));
+                        self.compared(&t, &(owner.to_string(), Slot::named(list)));
                     }
                     (None, Set::Var(list), Operand::Lit(Literal::Str(text))) => {
                         self.hold(&(owner.to_string(), Slot::named(list)), text);
@@ -362,6 +390,14 @@ impl Classes {
                 }
             }
             Expr::Const(_) | Expr::Empty(_) | Expr::Var(_) => {}
+        }
+    }
+
+    /// Something tells whether the values of `a` and `b` are equal.
+    fn compared(&mut self, a: &Term, b: &Term) {
+        self.link(a, b);
+        if a.1 != Slot::Id && b.1 != Slot::Id {
+            self.apart.insert(a.clone());
         }
     }
 

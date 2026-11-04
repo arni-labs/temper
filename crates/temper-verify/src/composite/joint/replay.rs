@@ -94,7 +94,10 @@ pub fn replay_joint_invariants(
                     match bindings.get(&name) {
                         Some(bound) => value == bound,
                         None if name.1.is_empty() => value.is_empty(),
-                        None if value.symbol_id().is_some() && !used.contains(value) => {
+                        // A value naming no record may be the value others are.
+                        None if value.symbol_id().is_some()
+                            && (value.number() == Some(0) || !used.contains(value)) =>
+                        {
                             bindings.insert(name, *value);
                             used.insert(*value);
                             true

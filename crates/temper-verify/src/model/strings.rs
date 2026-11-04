@@ -19,6 +19,12 @@ pub fn string_values<'a>(
         .collect()
 }
 
+/// Whether a made-up value of `class` that names no record is the only such
+/// value. An odd class is one nothing compares except with a record's id.
+pub(crate) fn names_no_record(class: usize) -> bool {
+    class % 2 == 1
+}
+
 /// A value of `class` equal to none of `values`, blank or not.
 pub(crate) fn fresh_string(
     values: &BTreeSet<ModelString>,
@@ -55,9 +61,16 @@ fn string_candidates(
                     .copied()
                     .collect();
                 all.insert("".into());
-                all.insert(fresh_string(values, class, false));
+                let fresh = |blank| {
+                    if names_no_record(class) {
+                        ModelString::in_class(class, 0, blank)
+                    } else {
+                        fresh_string(values, class, blank)
+                    }
+                };
+                all.insert(fresh(false));
                 if model.blank_read(class) {
-                    all.insert(fresh_string(values, class, true));
+                    all.insert(fresh(true));
                 }
                 if let Some(literals) = model.string_literals.get(param.name.as_str()) {
                     all.extend(literals.iter().map(|text| ModelString::from(text.as_str())));
@@ -207,14 +220,30 @@ pub fn canonical_names<'a>(values: impl IntoIterator<Item = &'a ModelString>) ->
 pub struct Renames(Vec<(ModelString, ModelString)>);
 
 impl Renames {
-    /// Number the symbols among `values` the list does not have yet, each
-    /// carrying on from the last of its class.
+    /// Number the symbols among `values`, which are record ids, the list does
+    /// not have yet, each carrying on from the last of its class.
+    pub fn name_ids<'a>(&mut self, values: impl IntoIterator<Item = &'a ModelString>) {
+        self.name(values, false);
+    }
+
+    /// As [`Self::name_ids`] for any other values, given the record ids first:
+    /// one that names no record, in a class where those are one value, gets
+    /// that value.
     pub fn name_all<'a>(&mut self, values: impl IntoIterator<Item = &'a ModelString>) {
+        self.name(values, true);
+    }
+
+    fn name<'a>(&mut self, values: impl IntoIterator<Item = &'a ModelString>, ids_named: bool) {
         for value in values {
             let Some(class) = value.class() else {
                 continue;
             };
             if self.get(value).is_none() {
+                if ids_named && names_no_record(class) {
+                    self.0
+                        .push((*value, ModelString::in_class(class, 0, value.is_blank())));
+                    continue;
+                }
                 let same_class =
                     |(old, _): &&(ModelString, ModelString)| old.class() == Some(class);
                 let number = self.0.iter().filter(same_class).count() + 1;
