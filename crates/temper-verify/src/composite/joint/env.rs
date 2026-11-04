@@ -168,6 +168,13 @@ impl JointEnv<'_> {
         ) {
             Found::Yes => Some(self.state.records.get(entity_type).map(|record| &**record)),
             Found::NoId => Some(None),
+            // A record's own id names at most one record of a type, and no
+            // other record of the owner's type holds that id. Any run of the
+            // two is one the walks make with the ids equal, so ids that differ
+            // add only that there is no such record.
+            Found::Other if matches!(id_field, "Id" | "id") => Some(None),
+            // Any other field can name a record the model does not hold, in
+            // any state, and any number of records can name the same one.
             Found::Other | Found::Unknown => None,
         }
     }

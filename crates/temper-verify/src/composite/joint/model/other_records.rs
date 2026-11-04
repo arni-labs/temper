@@ -1,14 +1,15 @@
 //! What another record of a type can do to the records the walk holds.
 //!
 //! The model holds one record of each type, and the runtime holds any number.
-//! Every read of another record is unknown ([`super::super::env`]), so a rule
-//! over one says NOT CHECKED. Moves are the other side: a walk covers a move
-//! that lands on a held record from a type outside the scope ([`super::from_outside`])
-//! and from a request, but not from a second record of a type in scope.
+//! A read by any field but the record's own id may find another record, so it
+//! is unknown ([`super::super::env`]) and a rule over one says NOT CHECKED.
+//! Moves are the other side: a walk covers a move that lands on a held record
+//! from a request and from a type outside the scope
+//! ([`super::from_outside`]), but not from a second record of a type in scope.
 //!
-//! A reference can't be excused by renaming, by calling the record it names
-//! the held one. Two holders may name one record, and then the second moves
-//! that record while the first has not moved.
+//! A reference can't be excused by calling the record it names the held one.
+//! Two holders may name one record, and then the second moves that record
+//! while the first has not moved. A record's own id has no such second holder.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -107,6 +108,7 @@ pub(in crate::composite::joint) fn unknown_read(owner: &str, rule: &Expr) -> Str
     let reads: BTreeSet<String> = rule
         .related_types()
         .into_iter()
+        .filter(|(_, field)| !matches!(field.as_str(), "Id" | "id"))
         .map(|(_, field)| format!("{owner}.{field}"))
         .collect();
     if reads.is_empty() {
