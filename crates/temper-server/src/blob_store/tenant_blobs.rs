@@ -15,7 +15,10 @@ use crate::state::ServerState;
 pub struct TenantBlobs {
     tenant: TenantId,
     object_store: Option<BlobStore>,
-    local_dirs: Vec<PathBuf>,
+    /// Its blobs on this server's disk, when the server keeps them there.
+    local_dir: Option<PathBuf>,
+    /// Uploads on their way to its object store.
+    staging_dir: PathBuf,
 }
 
 impl ServerState {
@@ -42,28 +45,56 @@ impl ServerState {
             }
             _ => None,
         };
-        let local_dirs = self
-            .local_blob_root()
-            .map(|root| tenant_blob_root(root, tenant))
-            .into_iter()
-            .chain([self.blob_staging_root(tenant)])
-            .collect::<Vec<_>>();
-        for dir in &local_dirs {
+        let blobs = TenantBlobs {
+            tenant: tenant.clone(),
+            object_store,
+            local_dir: self
+                .local_blob_root()
+                .map(|root| tenant_blob_root(root, tenant)),
+            staging_dir: self.blob_staging_root(tenant),
+        };
+        for dir in blobs.local_dirs() {
             assert!(
                 dir.ends_with(&namespace),
                 "{} is not a tenant namespace",
                 dir.display()
             );
         }
-        Ok(TenantBlobs {
-            tenant: tenant.clone(),
-            object_store,
-            local_dirs,
-        })
+        Ok(blobs)
     }
 }
 
 impl TenantBlobs {
+    fn local_dirs(&self) -> impl Iterator<Item = &PathBuf> {
+        self.local_dir.iter().chain([&self.staging_dir])
+    }
+
+    /// A blob an earlier tenant with this id left behind, which a new tenant
+    /// must not be given: the first object under its namespace in its object
+    /// store, or the first file in its directory on disk. Uploads still
+    /// staging are not blobs anyone reads, so they are not counted. `None`
+    /// when there is none.
+    pub async fn left_over(&self) -> Result<Option<String>, String> {
+        if let Some(store) = self.object_store.as_ref()
+            && let Some(key) = store.first_object().await?
+        {
+            return Ok(Some(format!("object '{key}' in its object store")));
+        }
+        let Some(dir) = self.local_dir.as_ref() else {
+            return Ok(None);
+        };
+        // determinism-ok: production blob store filesystem boundary
+        let mut entries = match tokio::fs::read_dir(dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("failed to read {}: {error}", dir.display())),
+        };
+        match entries.next_entry().await {
+            Ok(entry) => Ok(entry.map(|entry| format!("blob {}", entry.path().display()))),
+            Err(error) => Err(format!("failed to read {}: {error}", dir.display())),
+        }
+    }
+
     /// Remove every blob of the tenant: each object under its namespace in
     /// its object store, then its directories on disk. A list or delete the
     /// object store refuses fails with the provider's reason, and what was
@@ -76,7 +107,7 @@ impl TenantBlobs {
             })?;
             tracing::info!(%tenant, removed, "removed tenant objects from its object store");
         }
-        for dir in &self.local_dirs {
+        for dir in self.local_dirs() {
             // determinism-ok: production blob store filesystem boundary
             match tokio::fs::remove_dir_all(dir).await {
                 Ok(()) => {}

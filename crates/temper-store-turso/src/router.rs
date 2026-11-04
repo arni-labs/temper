@@ -24,6 +24,7 @@ use crate::TursoEventStore;
 use crate::schema;
 use crate::store::WritePriority;
 
+mod provision;
 mod remove;
 
 /// Registry statuses whose tenants are connected: `active` ones, and those
@@ -256,7 +257,8 @@ impl TenantStoreRouter {
     /// a tombstone that keeps its id from being registered again until
     /// [`Self::remove_tenant`] has removed everything it had. The tenant
     /// stays reachable meanwhile, so a removal that fails part way can be
-    /// run again. Returns false when no such tenant is registered.
+    /// run again. Returns false when no such tenant is registered, or its
+    /// create has not ended (creating it again finishes that).
     #[instrument(skip_all, fields(tenant_id, otel.name = "router.begin_tenant_removal"))]
     pub async fn begin_tenant_removal(&self, tenant_id: &str) -> Result<bool, PersistenceError> {
         if KEPT_TENANTS.contains(&tenant_id) {
@@ -269,8 +271,8 @@ impl TenantStoreRouter {
             .write_connection("router.begin_tenant_removal", WritePriority::High)
             .await?
             .execute(
-                "UPDATE tenant_registry SET status = 'deleting' WHERE tenant_id = ?1",
-                crate::driver::params![tenant_id],
+                "UPDATE tenant_registry SET status = 'deleting' WHERE tenant_id = ?1 AND status != ?2",
+                crate::driver::params![tenant_id, provision::PROVISIONING],
             )
             .await
             .map_err(storage_error)?;
@@ -377,6 +379,11 @@ impl TenantStoreRouter {
             .map_err(storage_error)?;
         if let Some(row) = rows.next().await.map_err(storage_error)? {
             let status: String = row.get::<String>(2).map_err(storage_error)?;
+            if status == provision::PROVISIONING {
+                // A create that stopped part way: finish it.
+                self.register_tenant(tenant_id).await?;
+                return Ok(false);
+            }
             if status != "active" {
                 return Err(PersistenceError::Storage(format!(
                     "tenant '{tenant_id}' is {status}"
@@ -395,55 +402,6 @@ impl TenantStoreRouter {
         // Not in DB either — provision new.
         self.register_tenant(tenant_id).await?;
         Ok(false)
-    }
-
-    /// Register and connect a new tenant.
-    ///
-    /// In local mode, creates a new SQLite file in `local_base_dir`.
-    /// In cloud mode (with `cloud` feature), provisions via Turso Cloud API.
-    #[instrument(skip_all, fields(tenant_id, otel.name = "router.register_tenant"))]
-    pub async fn register_tenant(
-        &self,
-        tenant_id: &str,
-    ) -> Result<TursoEventStore, PersistenceError> {
-        // Check if already registered, in any status: a tenant still being
-        // removed keeps its id until its database is gone.
-        let registered = self.tenants.read().await.contains_key(tenant_id)
-            || self
-                .load_tenant_registry()
-                .await?
-                .iter()
-                .any(|row| row.tenant_id == tenant_id);
-        if registered {
-            return Err(PersistenceError::Storage(format!(
-                "tenant '{tenant_id}' already exists"
-            )));
-        }
-
-        let (db_url, auth_token) = self.provision_database(tenant_id).await?;
-
-        // Connect first (before moving values into params).
-        let store = TursoEventStore::new(&db_url, auth_token.as_deref()).await?;
-
-        // Register in platform DB.
-        let conn = self
-            .platform
-            .write_connection("router.register_tenant", WritePriority::High)
-            .await?;
-        conn.execute(
-            "INSERT INTO tenant_registry (tenant_id, turso_db_url, turso_auth_token)
-             VALUES (?1, ?2, ?3)",
-            crate::driver::params![tenant_id, db_url, auth_token],
-        )
-        .await
-        .map_err(storage_error)?;
-        self.tenants
-            .write()
-            .await
-            .insert(tenant_id.to_string(), store.clone());
-
-        info!(tenant_id, "Registered and connected new tenant");
-        Ok(store)
     }
 
     // ── Private helpers ──────────────────────────────────────────────────
@@ -540,179 +498,6 @@ impl TenantStoreRouter {
 
         info!(tenant = tenant_id, "Connected to tenant database on demand");
         Ok(store)
-    }
-
-    /// Provision a new database for a tenant.
-    ///
-    /// In local mode: creates a `file:{base_dir}/{tenant_id}.db` SQLite file.
-    /// In cloud mode: calls the Turso Cloud API to create a database.
-    async fn provision_database(
-        &self,
-        tenant_id: &str,
-    ) -> Result<(String, Option<String>), PersistenceError> {
-        #[cfg(feature = "cloud")]
-        if let (Some(api_token), Some(org)) = (&self.turso_api_token, &self.turso_org) {
-            return self
-                .provision_cloud_database(tenant_id, api_token, org)
-                .await;
-        }
-
-        // Local mode: create a file-based database.
-        let path = self.local_database_path(tenant_id)?;
-        let base_dir = path.parent().unwrap_or(std::path::Path::new("."));
-        std::fs::create_dir_all(base_dir).map_err(|e| {
-            PersistenceError::Storage(format!(
-                "failed to create tenant directory {}: {e}",
-                base_dir.display()
-            ))
-        })?;
-
-        let db_url = format!("file:{}", path.display());
-        info!(tenant_id, db_url, "Provisioned local tenant database");
-        Ok((db_url, None))
-    }
-
-    /// Provision a database via the Turso Cloud Platform API.
-    #[cfg(feature = "cloud")]
-    async fn provision_cloud_database(
-        &self,
-        tenant_id: &str,
-        api_token: &str,
-        org: &str,
-    ) -> Result<(String, Option<String>), PersistenceError> {
-        let client = reqwest::Client::new();
-
-        // Sanitize tenant ID for use as a database name (alphanumeric + hyphens).
-        let db_name = format!("temper-{tenant_id}");
-
-        let mut body = serde_json::json!({
-            "name": db_name,
-        });
-        if let Some(group) = &self.turso_group {
-            body["group"] = serde_json::Value::String(group.clone());
-        }
-
-        // Create the database.
-        let resp = client
-            .post(format!(
-                "{}/v1/organizations/{org}/databases",
-                self.turso_api_base_url
-            ))
-            .bearer_auth(api_token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| PersistenceError::Storage(format!("Turso API request failed: {e}")))?;
-
-        let hostname = if resp.status() == reqwest::StatusCode::CONFLICT {
-            // DB already exists: recover by reading its hostname and creating a fresh token.
-            let lookup_resp = client
-                .get(format!(
-                    "{}/v1/organizations/{org}/databases/{db_name}",
-                    self.turso_api_base_url
-                ))
-                .bearer_auth(api_token)
-                .send()
-                .await
-                .map_err(|e| {
-                    PersistenceError::Storage(format!("Turso API lookup request failed: {e}"))
-                })?;
-
-            if !lookup_resp.status().is_success() {
-                let status = lookup_resp.status();
-                let body_text = lookup_resp
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "<no body>".to_string());
-                return Err(PersistenceError::Storage(format!(
-                    "Turso API database lookup returned {status}: {body_text}"
-                )));
-            }
-
-            let lookup_json: serde_json::Value = lookup_resp.json().await.map_err(|e| {
-                PersistenceError::Storage(format!("Turso API database lookup parse: {e}"))
-            })?;
-
-            lookup_json["database"]["Hostname"]
-                .as_str()
-                .or_else(|| lookup_json["database"]["hostname"].as_str())
-                .ok_or_else(|| {
-                    PersistenceError::Storage(format!(
-                        "Turso API missing hostname in lookup response: {lookup_json}"
-                    ))
-                })?
-                .to_string()
-        } else {
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body_text = resp
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "<no body>".to_string());
-                return Err(PersistenceError::Storage(format!(
-                    "Turso API returned {status}: {body_text}"
-                )));
-            }
-
-            let create_resp: serde_json::Value = resp
-                .json()
-                .await
-                .map_err(|e| PersistenceError::Storage(format!("Turso API response parse: {e}")))?;
-
-            create_resp["database"]["Hostname"]
-                .as_str()
-                .or_else(|| create_resp["database"]["hostname"].as_str())
-                .ok_or_else(|| {
-                    PersistenceError::Storage(format!(
-                        "Turso API missing hostname in response: {create_resp}"
-                    ))
-                })?
-                .to_string()
-        };
-
-        let db_url = format!("libsql://{hostname}");
-
-        // Create an auth token for the database (new or existing).
-        let token_resp = client
-            .post(format!(
-                "{}/v1/organizations/{org}/databases/{db_name}/auth/tokens",
-                self.turso_api_base_url
-            ))
-            .bearer_auth(api_token)
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .map_err(|e| {
-                PersistenceError::Storage(format!("Turso API token request failed: {e}"))
-            })?;
-
-        if !token_resp.status().is_success() {
-            let status = token_resp.status();
-            let body_text = token_resp
-                .text()
-                .await
-                .unwrap_or_else(|_| "<no body>".to_string());
-            return Err(PersistenceError::Storage(format!(
-                "Turso API token creation returned {status}: {body_text}"
-            )));
-        }
-
-        let token_json: serde_json::Value = token_resp
-            .json()
-            .await
-            .map_err(|e| PersistenceError::Storage(format!("Turso token parse: {e}")))?;
-
-        let auth_token = token_json["jwt"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| {
-                PersistenceError::Storage(format!(
-                    "Turso API missing jwt in token response: {token_json}"
-                ))
-            })?;
-
-        info!(tenant_id, db_url, "Provisioned Turso Cloud tenant database");
-        Ok((db_url, Some(auth_token)))
     }
 
     /// List all connected tenant IDs (cached connections only).
@@ -1242,62 +1027,5 @@ mod tests {
 
         let tenants = router.list_tenants().await.expect("list tenants");
         assert_eq!(tenants, vec!["repeat".to_string()]);
-    }
-
-    #[cfg(feature = "cloud")]
-    #[tokio::test]
-    async fn test_provision_cloud_database_recovers_from_conflict() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        let org = "acme";
-        let db_name = "temper-alpha";
-
-        Mock::given(method("POST"))
-            .and(path(format!("/v1/organizations/{org}/databases")))
-            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
-                "error": "database already exists"
-            })))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path(format!("/v1/organizations/{org}/databases/{db_name}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "database": {
-                    "hostname": "alpha.db.turso.io"
-                }
-            })))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path(format!(
-                "/v1/organizations/{org}/databases/{db_name}/auth/tokens"
-            )))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                "jwt": "token-123"
-            })))
-            .mount(&server)
-            .await;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let platform_path = dir.path().join("platform.db");
-        let platform_url = format!("file:{}", platform_path.display());
-
-        let mut router = TenantStoreRouter::new(&platform_url, None, None)
-            .await
-            .expect("router");
-        router = router.with_cloud_config("api-token".to_string(), org.to_string(), None);
-        router.turso_api_base_url = server.uri();
-
-        let (db_url, auth_token) = router
-            .provision_cloud_database("alpha", "api-token", org)
-            .await
-            .expect("provision should recover from 409");
-
-        assert_eq!(db_url, "libsql://alpha.db.turso.io");
-        assert_eq!(auth_token.as_deref(), Some("token-123"));
     }
 }

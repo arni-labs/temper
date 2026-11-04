@@ -38,6 +38,20 @@ impl BlobStore {
             BlobStoreBackend::S3(store) => store.remove_every_object().await,
         }
     }
+
+    /// The first object under this object store's key prefix, if any.
+    pub(crate) async fn first_object(&self) -> Result<Option<String>, String> {
+        match &self.backend {
+            BlobStoreBackend::LocalFs { .. } => {
+                Err("a local store's objects are read as its directory".to_string())
+            }
+            BlobStoreBackend::S3(store) => {
+                let prefix = store.namespace_prefix()?;
+                let page = store.list_page(&prefix, None, Some(1)).await?;
+                Ok(page.contents.into_iter().next().map(|object| object.key))
+            }
+        }
+    }
 }
 
 /// One ListObjectsV2 page.
@@ -74,23 +88,28 @@ struct DeleteError {
 }
 
 impl S3BlobStore {
-    async fn remove_every_object(&self) -> Result<usize, String> {
-        let Some(prefix) = self
-            .key_prefix
+    /// The store's key prefix as a list prefix (`.../`). A store without one
+    /// is a whole bucket, which is never removed.
+    fn namespace_prefix(&self) -> Result<String, String> {
+        self.key_prefix
             .as_deref()
             .map(|prefix| prefix.trim_matches('/'))
             .filter(|prefix| !prefix.is_empty())
-        else {
-            return Err(
+            .map(|prefix| format!("{prefix}/"))
+            .ok_or_else(|| {
                 "an object store without a key prefix is a whole bucket, which is never removed"
-                    .to_string(),
-            );
-        };
-        let prefix = format!("{prefix}/");
+                    .to_string()
+            })
+    }
+
+    async fn remove_every_object(&self) -> Result<usize, String> {
+        let prefix = self.namespace_prefix()?;
         let mut removed = 0;
         let mut continuation: Option<String> = None;
         loop {
-            let page = self.list_page(&prefix, continuation.as_deref()).await?;
+            let page = self
+                .list_page(&prefix, continuation.as_deref(), None)
+                .await?;
             let keys: Vec<String> = page.contents.into_iter().map(|object| object.key).collect();
             if let Some(stray) = keys.iter().find(|key| !key.starts_with(&prefix)) {
                 return Err(format!(
@@ -112,6 +131,7 @@ impl S3BlobStore {
         &self,
         prefix: &str,
         continuation: Option<&str>,
+        max_keys: Option<usize>,
     ) -> Result<ListBucketResult, String> {
         let mut url = format!(
             "{}/{}?list-type=2&prefix={}",
@@ -121,6 +141,9 @@ impl S3BlobStore {
         );
         if let Some(token) = continuation {
             url.push_str(&format!("&continuation-token={}", query_encode(token)));
+        }
+        if let Some(max_keys) = max_keys {
+            url.push_str(&format!("&max-keys={max_keys}"));
         }
         let body = self.send(Method::GET, &url, None, "list").await?;
         quick_xml::de::from_str(&body).map_err(|error| {

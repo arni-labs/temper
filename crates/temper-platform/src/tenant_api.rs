@@ -175,6 +175,28 @@ async fn create_tenant(
         );
     }
 
+    match left_over_storage(&state, provider.as_ref(), &req.tenant_id).await {
+        Ok(None) => {}
+        Ok(Some(left_over)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "tenant '{}' cannot be created: an earlier tenant with this id left its {left_over}, \
+                         which a new tenant does not take over; nothing was removed",
+                        req.tenant_id
+                    )
+                })),
+            );
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error})),
+            );
+        }
+    }
+
     match provider.register_tenant(&req.tenant_id).await {
         Ok(_store) => {
             // Bootstrap agent specs for the new tenant.
@@ -198,6 +220,29 @@ async fn create_tenant(
             Json(serde_json::json!({"error": e.to_string()})),
         ),
     }
+}
+
+/// Storage an earlier tenant with `tenant_id` left behind, which a tenant
+/// created under the id must not be given: its database, or its blobs. The
+/// default tenant's blobs are the store's root, which holds every tenant's,
+/// so only its database is checked.
+async fn left_over_storage(
+    state: &PlatformState,
+    provider: &dyn TursoStoreProvider,
+    tenant_id: &str,
+) -> Result<Option<String>, String> {
+    if let Some(database) = provider
+        .left_over_database(tenant_id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(Some(database));
+    }
+    let tenant = temper_runtime::tenant::TenantId::new(tenant_id);
+    if tenant == temper_runtime::tenant::TenantId::default() {
+        return Ok(None);
+    }
+    state.server.tenant_blobs(&tenant)?.left_over().await
 }
 
 /// `GET /api/tenants` — list all registered tenants.

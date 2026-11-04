@@ -61,7 +61,11 @@ impl ObjectStore {
             .keys()
             .filter(|key| key.starts_with(&prefix))
             .filter(|key| after.as_ref().is_none_or(|after| *key > after));
-        let page: Vec<&String> = keys.by_ref().take(S3_MAX_KEYS).collect();
+        let max_keys = query
+            .get("max-keys")
+            .and_then(|max| max.parse().ok())
+            .map_or(S3_MAX_KEYS, |max: usize| max.min(S3_MAX_KEYS));
+        let page: Vec<&String> = keys.by_ref().take(max_keys).collect();
         let truncated = keys.next().is_some();
         let mut body = format!("<ListBucketResult><IsTruncated>{truncated}</IsTruncated>");
         for key in &page {

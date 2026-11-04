@@ -978,6 +978,12 @@ pub trait TursoStoreProvider: Send + Sync {
     /// tenant.
     async fn begin_tenant_removal(&self, tenant_id: &str) -> Result<bool, PersistenceError>;
 
+    /// A database an earlier tenant with this id left at its place while no
+    /// registry row names it, which a create of the id refuses to take over;
+    /// `None` when there is none.
+    async fn left_over_database(&self, tenant_id: &str)
+    -> Result<Option<String>, PersistenceError>;
+
     async fn remove_tenant(&self, tenant_id: &str) -> Result<bool, PersistenceError>;
 
     async fn add_tenant_user(
@@ -1262,6 +1268,13 @@ impl TursoStoreProvider for SingleTursoStoreProvider {
         Err(tenant_admin_unsupported())
     }
 
+    async fn left_over_database(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<String>, PersistenceError> {
+        Err(tenant_admin_unsupported())
+    }
+
     async fn remove_tenant(&self, _tenant_id: &str) -> Result<bool, PersistenceError> {
         Err(tenant_admin_unsupported())
     }
@@ -1386,6 +1399,13 @@ impl TursoStoreProvider for TenantRoutedTursoStoreProvider {
 
     async fn begin_tenant_removal(&self, tenant_id: &str) -> Result<bool, PersistenceError> {
         self.router.begin_tenant_removal(tenant_id).await
+    }
+
+    async fn left_over_database(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<String>, PersistenceError> {
+        self.router.left_over_database(tenant_id).await
     }
 
     async fn remove_tenant(&self, tenant_id: &str) -> Result<bool, PersistenceError> {

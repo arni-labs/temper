@@ -63,6 +63,12 @@ impl TursoStoreProvider for ObserveModuleInstall {
     async fn begin_tenant_removal(&self, tenant_id: &str) -> Result<bool, PersistenceError> {
         self.inner.begin_tenant_removal(tenant_id).await
     }
+    async fn left_over_database(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<String>, PersistenceError> {
+        self.inner.left_over_database(tenant_id).await
+    }
     async fn remove_tenant(&self, tenant_id: &str) -> Result<bool, PersistenceError> {
         self.inner.remove_tenant(tenant_id).await
     }
