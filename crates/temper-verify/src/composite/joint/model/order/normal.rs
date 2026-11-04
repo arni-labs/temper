@@ -12,24 +12,18 @@ impl Order {
     /// carries a count not greater than a field that never goes down, and
     /// the model knows that (not both [`BEHIND`] or further behind).
     fn doomed(&self, dispatch: &Dispatch, records: &Fields<Arc<TemperModelState>>) -> bool {
-        if !self.compares.contains(&(dispatch.to, dispatch.action)) {
+        let Some(pairs) = self.refusals.get(&(dispatch.to, dispatch.action)) else {
             return false;
-        }
+        };
         let target = &records[&dispatch.to];
-        self.compared
-            .get(pair!(&dispatch.to, &dispatch.action))
-            .is_some_and(|pairs| {
-                pairs.iter().any(|(param, field)| {
-                    let rising = self.rising.contains(pair!(&dispatch.to, field));
-                    let held = target.counters.get(field).copied();
-                    match (held, dispatch.params.get(param)) {
-                        (Some(held), Some(ParamValue::Count(sent))) => {
-                            rising && *sent <= held && (*sent, held) != (0, 0)
-                        }
-                        _ => false,
-                    }
-                })
-            })
+        pairs.iter().any(|(param, field)| {
+            match (target.counters.get(field), dispatch.params.get(param)) {
+                (Some(held), Some(ParamValue::Count(sent))) => {
+                    *sent <= *held && (*sent, *held) != (0, 0)
+                }
+                _ => false,
+            }
+        })
     }
 
     /// Keep each family's values in `state` as how far behind its newest
@@ -41,9 +35,11 @@ impl Order {
     pub(in crate::composite::joint::model) fn normalize(&self, state: &mut JointState) -> bool {
         let mut rewrote = false;
         let records = &state.records;
-        state
-            .inflight
-            .retain(|dispatch| !self.doomed(dispatch, records));
+        if !self.refusals.is_empty() {
+            state
+                .inflight
+                .retain(|dispatch| !self.doomed(dispatch, records));
+        }
         for family in &self.numbered {
             let newest = newest(family, state);
             let keep = |value: usize| BEHIND - (newest - value).min(BEHIND);

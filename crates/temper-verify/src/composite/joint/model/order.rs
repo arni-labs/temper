@@ -25,7 +25,7 @@ use temper_spec::predicate::{Arg, Expr, Literal, Name, Truth};
 use super::super::JointState;
 use super::Reaction;
 use crate::model::{Fields, ModelEffect, ParamValue, Sym, TemperModel, TemperModelState};
-use rustc_hash::FxHashSet;
+use rustc_hash::FxHashMap;
 
 mod fan;
 mod normal;
@@ -50,8 +50,9 @@ pub(super) struct Order {
     /// Each (entity, action)'s `param_greater_than_field` constraints the
     /// model decides, as (parameter, field).
     compared: BTreeMap<(String, String), Vec<(String, String)>>,
-    /// The (entity, action)s of `compared`, to ask of each dispatch.
-    compares: FxHashSet<(Sym, Sym)>,
+    /// What can refuse a dispatch whenever it lands: each (entity, action)'s
+    /// (parameter, field) of `compared` whose field is in `rising`.
+    refusals: FxHashMap<(Sym, Sym), Box<[(Sym, Sym)]>>,
     /// The fields that never go down: each write adds to them, or takes a
     /// count only when it is greater.
     rising: BTreeSet<Field>,
@@ -89,6 +90,24 @@ impl Numbered {
                 .collect(),
         }
     }
+}
+
+/// What of `compared` can refuse a dispatch whenever it lands.
+fn refusals(
+    compared: &BTreeMap<(String, String), Vec<(String, String)>>,
+    rising: &BTreeSet<Field>,
+) -> FxHashMap<(Sym, Sym), Box<[(Sym, Sym)]>> {
+    compared
+        .iter()
+        .filter_map(|((entity, action), pairs)| {
+            let pairs: Box<[(Sym, Sym)]> = pairs
+                .iter()
+                .filter(|(_, field)| rising.contains(&(entity.clone(), field.clone())))
+                .map(|(param, field)| (Sym::new(param), Sym::new(field)))
+                .collect();
+            (!pairs.is_empty()).then(|| ((Sym::new(entity), Sym::new(action)), pairs))
+        })
+        .collect()
 }
 
 /// What the families are read from: the specs, their models before slicing, the
@@ -175,14 +194,11 @@ impl Order {
                 })
             })
             .cloned()
-            .collect();
+            .collect::<BTreeSet<Field>>();
         Self {
             numbered: families.iter().map(Numbered::of).collect(),
             families,
-            compares: compared
-                .keys()
-                .map(|(entity, action)| (Sym::new(entity), Sym::new(action)))
-                .collect(),
+            refusals: refusals(&compared, &rising),
             compared,
             rising,
         }
