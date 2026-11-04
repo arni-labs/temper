@@ -41,7 +41,7 @@ impl JointModel {
                         target_state: t.to_state.clone(),
                         params,
                     };
-                    for &by in &senders {
+                    for &by in senders.iter() {
                         let mv = if reads {
                             Move::Send(entity.clone(), action.clone(), by)
                         } else {
