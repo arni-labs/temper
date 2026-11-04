@@ -9,7 +9,7 @@ impl Senders {
     /// What each comparison in the policies reads that a question here can
     /// answer with a made-up value: a record's fields, and the two context
     /// keys that name a record (`symbol`).
-    pub(super) fn compared(&self) -> Vec<Vec<Read>> {
+    pub(in crate::composite::joint) fn compared(&self) -> Vec<Vec<Read>> {
         let Some(policies) = &self.policies else {
             return Vec::new();
         };
