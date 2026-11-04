@@ -397,7 +397,7 @@ pub(super) fn settle(
 fn system_moves(model: &JointModel, state: &JointState, failing: bool) -> Vec<String> {
     let mut moves = BTreeSet::new();
     for mv in model.moves(state) {
-        if !mv.by_system() && !(failing && model.relies(&mv)) {
+        if !(mv.by_system() || failing && model.relies(&mv)) {
             continue;
         }
         for next in model.next(state, &mv).0 {
