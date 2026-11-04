@@ -10,7 +10,7 @@ mod held;
 mod initial;
 mod labels;
 mod moves;
-mod one_name;
+pub(super) mod one_name;
 mod order;
 mod outside;
 mod react;
@@ -38,7 +38,6 @@ pub use drops::DroppedReaction;
 pub(crate) use drops::dropped_reactions;
 use from_outside::{Outside, outside_reactions};
 pub use guided::{Candidate, Guide, GuidedSearch, STEPS as GUIDED_STEPS, guided_search, plain};
-pub(super) use one_name::OneNames;
 use order::{Order, Specs};
 pub(super) use read::Timeout;
 use read::{Kernel, Reaction, Unchecked, named_literals, tracked, unchecked_constraints};
@@ -121,7 +120,7 @@ pub(super) struct JointModel {
     id_literals: BTreeMap<String, BTreeSet<String>>,
     models: BTreeMap<String, TemperModel>,
     reactions: Vec<Reaction>,
-    one_names: OneNames,
+    one_names: one_name::OneNames,
     records: Records,
     /// With one record of a type, each entity's id fields that references
     /// use: each holds that record's id.
@@ -216,7 +215,6 @@ impl JointModel {
         cut: bool,
     ) -> Self {
         let classes = Classes::read(by_name, scope);
-        let one_names = OneNames::read(by_name, scope, &reactions);
         let id_literals = scope
             .iter()
             .map(|entity| (entity.clone(), classes.literals(entity, ID)))
@@ -306,8 +304,8 @@ impl JointModel {
             expansion: Expansion::default(),
             id_literals,
             models,
+            one_names: one_name::OneNames::read(by_name, scope, &reactions),
             reactions,
-            one_names,
             records: Records::ById,
             refs: BTreeMap::new(),
             delivery: Delivery::Any,
@@ -334,7 +332,7 @@ impl JointModel {
     }
 
     /// The records as they start, without their ids.
-    fn blank(&self) -> BTreeMap<String, TemperModelState> {
+    fn blank(&self) -> BTreeMap<std::rc::Rc<str>, std::rc::Rc<TemperModelState>> {
         self.models
             .iter()
             .map(|(entity, model)| {
@@ -342,7 +340,7 @@ impl JointModel {
                     .into_iter()
                     .next()
                     .expect("a model has one initial state");
-                (entity.clone(), init)
+                (entity.as_str().into(), std::rc::Rc::new(init))
             })
             .collect()
     }
@@ -358,12 +356,14 @@ impl JointModel {
         let mut records = self.blank();
         for (entity, record) in &mut records {
             let name = ids
-                .get(entity)
+                .get(&**entity)
                 .cloned()
                 .unwrap_or_else(|| format!("{entity}#id"));
             let next = ModelString::Symbol(names.len() + 1);
             let value = names.entry(name).or_insert(next).clone();
-            record.strings.insert(ID.to_string(), value);
+            std::rc::Rc::make_mut(record)
+                .strings
+                .insert(ID.to_string(), value);
         }
         let mut state = JointState {
             records,
@@ -403,7 +403,7 @@ impl JointModel {
 
     /// The strings `state` holds, in records and in dispatches.
     pub(super) fn values(&self, state: &JointState) -> BTreeSet<ModelString> {
-        let mut values = string_values(state.records.values());
+        let mut values = string_values(state.records.values().map(|record| &**record));
         for dispatch in &state.inflight {
             for value in dispatch.values() {
                 if let ParamValue::Str(text) = value

@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use temper_spec::predicate::{Env, Val, VarKind};
 
 use super::JointState;
-use super::model::OneNames;
+use super::model::one_name::OneNames;
 use crate::model::{TemperModel, TemperModelState};
 
 /// The key under which each record keeps its own id among its strings.
@@ -70,7 +70,7 @@ pub(super) fn resolve(
         models,
         records,
         state,
-        state.records.get(owner),
+        state.records.get(owner).map(|record| &**record),
         owner,
         id_field,
         related,
@@ -150,7 +150,8 @@ fn var_of<'a>(model: &TemperModel, state: &'a TemperModelState, name: &str) -> V
 impl JointEnv<'_> {
     /// The owner's record as this evaluation reads it.
     fn own_record(&self) -> Option<&TemperModelState> {
-        self.own.or_else(|| self.state.records.get(self.owner))
+        self.own
+            .or_else(|| self.state.records.get(self.owner).map(|record| &**record))
     }
 
     /// The related record `id_field` names, if the reference finds one;
@@ -168,7 +169,7 @@ impl JointEnv<'_> {
             id_field,
             entity_type,
         ) {
-            Found::Yes => Some(self.state.records.get(entity_type)),
+            Found::Yes => Some(self.state.records.get(entity_type).map(|record| &**record)),
             Found::NoId => Some(None),
             Found::Other if self.one_names.has(self.owner, id_field, entity_type) => Some(None),
             Found::Other | Found::Unknown => None,
