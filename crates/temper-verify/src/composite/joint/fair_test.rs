@@ -184,6 +184,58 @@ fn a_rule_cannot_name_an_action_its_entity_lacks_or_one_twice() {
     }
 }
 
+/// The status a broken verdict's cycle ends at, and the moves on it.
+fn broken_moves(result: &JointLivenessResult) -> Vec<String> {
+    let FairOutcome::Broken { lasso } = fair(result) else {
+        panic!("expected BROKEN, got {result}");
+    };
+    lasso
+        .cycle
+        .iter()
+        .map(|step| step.action.clone().unwrap_or_default())
+        .collect()
+}
+
+/// A call answered by a move that stays where it is ended all the same: the
+/// joint state has no call number to show it. Polling forever is fair.
+#[test]
+fn a_call_answered_by_staying_can_go_on_forever() {
+    let result = check(model!("poll_self"));
+    let moves = broken_moves(&result);
+    assert!(moves.iter().any(|mv| mv.contains("Still")), "{result}");
+}
+
+/// A `reset_on` move starts the clock again, so the timer is never due while
+/// it keeps coming, whether or not it changes anything the state holds.
+#[test]
+fn a_move_that_resets_a_timer_can_keep_it_from_firing() {
+    for source in [model!("heartbeat"), model!("heartbeat_field")] {
+        let result = check(source);
+        let moves = broken_moves(&result);
+        assert!(moves.iter().any(|mv| mv.contains("Beat")), "{result}");
+    }
+}
+
+/// Leaving a state cancels its timer, so each state's timer is owed on its own
+/// even when two of them fire one action.
+#[test]
+fn timers_of_two_states_are_owed_apart_when_they_share_an_action() {
+    for source in [model!("shared_timer"), model!("split_timer")] {
+        let result = check(source);
+        assert!(
+            matches!(fair(&result), FairOutcome::Broken { .. }),
+            "{result}"
+        );
+    }
+}
+
+/// Two calls to one module are two endings owed: the second's answers do not
+/// let the first wait forever.
+#[test]
+fn two_calls_to_one_module_are_owed_apart() {
+    assert_holds(&check(model!("merged_calls")));
+}
+
 /// A walk on many threads numbers states in another order and leaves its moves
 /// interleaved, and the verdict does not move.
 #[test]
