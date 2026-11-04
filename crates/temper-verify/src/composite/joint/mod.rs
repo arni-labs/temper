@@ -428,6 +428,10 @@ mod guided_tests;
 mod sure_tests;
 
 #[cfg(test)]
+#[path = "pair_test.rs"]
+mod pair_tests;
+
+#[cfg(test)]
 #[path = "outside_test.rs"]
 mod outside_tests;
 
