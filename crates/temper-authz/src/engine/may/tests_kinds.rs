@@ -195,7 +195,7 @@ fn a_list_of_people_tells_senders_apart_as_comparing_with_each_does() {
            permit(principal, action == Action::"Stop", resource)
             when { principal is Customer && ["a", "b"].contains(principal.id) };"#,
     )
-    .unwrap();
+    .expect("the test policy parses");
     let cause = Cause::reaction(false, Hop::unknown());
     let question = |action| Question {
         action,
@@ -204,7 +204,7 @@ fn a_list_of_people_tells_senders_apart_as_comparing_with_each_does() {
     };
     let kinds = policies
         .outside_kinds(&[question("Ban"), question("Stop")], &|_| Ok(()))
-        .unwrap();
+        .expect("the test policy parses");
     let none = BTreeMap::new();
     let may = |kind: &Kind, action| {
         let asker = Asker::OutsideAs(kind.clone());
