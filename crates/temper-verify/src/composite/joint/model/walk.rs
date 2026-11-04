@@ -11,6 +11,7 @@ use super::JointModel;
 
 mod checked;
 mod invariants;
+mod levels;
 mod run;
 mod shared;
 
@@ -123,6 +124,8 @@ pub(in crate::composite::joint) struct Explored<'a> {
     /// The moves (names in `packer`) that are reactions from a type outside
     /// the scope, with the type and action each one sends.
     pub(super) outside: BTreeMap<u32, (String, String)>,
+    /// How many moves from a start it covered: it walked every state that near.
+    pub(in crate::composite::joint) covered: usize,
     /// The memory its tables hold, given back when it is dropped.
     pub(in crate::composite::joint) held: Held<'a>,
 }
@@ -132,9 +135,10 @@ impl Explored<'_> {
     fn stop_for_room(&mut self, reason: String) {
         self.stopped = Some(format!(
             "the walk does not fit in the memory it may hold: {reason} \
-             (it held {} MB at {} states)",
+             (it held {} MB at {} states, having walked every state within {} moves of a start)",
             self.held.bytes / MB,
-            self.len()
+            self.len(),
+            self.covered
         ));
     }
 

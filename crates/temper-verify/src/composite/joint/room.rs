@@ -89,6 +89,9 @@ pub struct Progress {
     pub states: AtomicUsize,
     /// Bytes the walk holds.
     pub bytes: AtomicUsize,
+    /// How many moves from a start the walk has covered: it has walked every
+    /// state that near.
+    pub depth: AtomicUsize,
 }
 
 /// Where a joint check takes its memory, and where it says how far it got.
@@ -158,6 +161,11 @@ impl<'a> Held<'a> {
     /// Say how many states the walk has.
     pub(super) fn walked(&self, states: usize) {
         self.bound.progress.states.store(states, Ordering::Relaxed);
+    }
+
+    /// Say how many moves from a start the walk has covered.
+    pub(super) fn covered(&self, depth: usize) {
+        self.bound.progress.depth.store(depth, Ordering::Relaxed);
     }
 }
 
