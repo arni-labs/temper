@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use super::cache_paths::app_cache_dir;
+use super::cache_paths::{app_cache_dir, replace_directory};
 use crate::os_apps::AppFileSource;
 
 /// Where in a cache directory its list is kept. App folders are named by app
@@ -70,6 +70,38 @@ pub(super) fn keep_app(root: &Path, app: &str, paths: &[&str]) {
     let paths = paths.iter().map(ToString::to_string).collect();
     written.insert(app.to_string(), paths);
     keep(root, &written).expect("keep the written-file list");
+}
+
+/// Copy the files `from`'s list names, and the list, into `to`, replacing
+/// `to` whole, and return `to`'s apps. The copy is made beside `to` and
+/// renamed into place, so a reader never sees half of it.
+pub(super) fn copy(from: &Path, to: &Path) -> Result<Vec<(String, AppFileSource)>, String> {
+    let written = load(from)?;
+    let parent = to
+        .parent()
+        .ok_or_else(|| format!("cache directory '{}' has no parent", to.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create '{}': {error}", parent.display()))?;
+    let staged = tempfile::Builder::new()
+        .prefix(".genesis-copy-")
+        .tempdir_in(parent)
+        .map_err(|error| format!("stage a copy beside '{}': {error}", to.display()))?;
+    for (app, paths) in &written {
+        let source = app_cache_dir(from, app)?;
+        let destination = app_cache_dir(staged.path(), app)?;
+        for path in paths {
+            let target = destination.join(path);
+            if let Some(dir) = target.parent() {
+                std::fs::create_dir_all(dir)
+                    .map_err(|error| format!("create '{}': {error}", dir.display()))?;
+            }
+            std::fs::copy(source.join(path), &target)
+                .map_err(|error| format!("copy '{}' from '{}': {error}", path, source.display()))?;
+        }
+    }
+    keep(staged.path(), &written)?;
+    replace_directory(staged.keep(), to)?;
+    app_files(to, written)
 }
 
 /// `written`'s apps, each at its folder in `root`.

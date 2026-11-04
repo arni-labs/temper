@@ -45,6 +45,9 @@ pub struct PlannedCacheRoot {
     app_ref: String,
     cache_root: std::path::PathBuf,
     root: GenesisAppBundle,
+    /// Where this boot first materialized this version from this source, shared
+    /// by every planned install of it: the others copy it, not the records.
+    materialized: std::sync::Arc<tokio::sync::OnceCell<std::path::PathBuf>>,
 }
 
 /// Read the service-side `AppInstallation` rows and plan a cache root for
@@ -56,6 +59,10 @@ pub async fn plan_app_cache_roots(
 ) -> std::collections::BTreeMap<String, Vec<PlannedCacheRoot>> {
     let mut planned: std::collections::BTreeMap<String, Vec<PlannedCacheRoot>> =
         std::collections::BTreeMap::new();
+    let mut versions: std::collections::BTreeMap<
+        (String, String),
+        std::sync::Arc<tokio::sync::OnceCell<_>>,
+    > = std::collections::BTreeMap::new();
     for source_tenant in genesis_source_tenants() {
         let tenant = TenantId::new(&source_tenant);
         let installation_ids = platform
@@ -119,6 +126,10 @@ pub async fn plan_app_cache_roots(
                 repository_id,
                 version_hash,
             };
+            let materialized = versions
+                .entry((source_tenant.clone(), app_ref.clone()))
+                .or_default()
+                .clone();
             planned
                 .entry(target_tenant.clone())
                 .or_default()
@@ -129,15 +140,18 @@ pub async fn plan_app_cache_roots(
                     app_ref,
                     cache_root,
                     root,
+                    materialized,
                 });
         }
     }
     planned
 }
 
-/// Write each of `planned`'s files from the service's own records into its
-/// cache directory and register its apps for the tenant it installs into.
-/// Returns how many were restored; a failure is logged and skipped.
+/// Write each of `planned`'s files into its cache directory and register its
+/// apps for the tenant it installs into. A version is read from the service's
+/// own records once per boot, by the first of its installs restored; the
+/// others copy that directory into their own. Returns how many were restored;
+/// a failure is logged and skipped.
 pub async fn restore_planned_cache_roots(
     platform: &PlatformState,
     planned: Vec<PlannedCacheRoot>,
@@ -151,11 +165,28 @@ pub async fn restore_planned_cache_roots(
             app_ref,
             cache_root,
             root,
+            materialized,
         } = planned;
+        if let Some(first) = materialized.get() {
+            match written::copy(first, &cache_root) {
+                Ok(written) => {
+                    register_written_apps(&target_tenant, cache_root, written);
+                    restored += 1;
+                    continue;
+                }
+                Err(error) => tracing::warn!(
+                    target_tenant = %target_tenant,
+                    app_ref = %app_ref,
+                    error = %error,
+                    "Failed to copy an app version restored for another tenant; reading it from its records"
+                ),
+            }
+        }
         let tenant = TenantId::new(&source_tenant);
         match materialize_app_closure(&platform.server, &tenant, &cache_root, root).await {
             Ok(written) => {
                 legacy_specs::convert_legacy_bundle_specs(&cache_root);
+                let _ = materialized.set(cache_root.clone());
                 register_written_apps(&target_tenant, cache_root, written);
                 restored += 1;
             }
