@@ -16,6 +16,7 @@ mod invariants;
 mod levels;
 mod making;
 mod memo;
+mod mirror;
 mod run;
 mod shared;
 

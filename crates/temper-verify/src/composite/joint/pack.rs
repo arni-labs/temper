@@ -74,7 +74,7 @@ impl<T: Eq + Hash + Heap> Table<T> {
 }
 
 /// What numbers a state's values when it is packed.
-trait Numbers {
+pub(super) trait Numbers {
     fn record(&mut self, record: &Arc<TemperModelState>) -> Option<u32>;
     fn dispatch(&mut self, dispatch: &Arc<Dispatch>) -> Option<u32>;
     fn call(&mut self, call: &Arc<Call>) -> Option<u32>;
@@ -120,7 +120,11 @@ impl Numbers for Packer {
 
 /// `state` as a short run of numbers, written to `out`, or false when
 /// `numbers` has none for a value in it.
-fn words(state: &JointState, numbers: &mut impl Numbers, out: &mut Vec<u32>) -> Option<()> {
+pub(super) fn words(
+    state: &JointState,
+    numbers: &mut impl Numbers,
+    out: &mut Vec<u32>,
+) -> Option<()> {
     out.clear();
     for record in state.records.values() {
         out.push(numbers.record(record)?);
@@ -192,20 +196,29 @@ impl Packer {
         words(state, &mut known, out).is_some()
     }
 
-    /// The record the tables hold equal to `record`, if they do: holding that
-    /// one, a state is packed without its record being read.
-    pub(super) fn held_record(
-        &self,
-        record: &Arc<TemperModelState>,
-    ) -> Option<Arc<TemperModelState>> {
-        let id = self.records.known(record)?;
-        Some(self.records.items[id as usize].clone())
+    /// The record numbered `id`.
+    pub(super) fn record(&self, id: u32) -> &Arc<TemperModelState> {
+        &self.records.items[id as usize]
     }
 
-    /// The dispatch the tables hold equal to `dispatch`, if they do.
-    pub(super) fn held_dispatch(&self, dispatch: &Arc<Dispatch>) -> Option<Arc<Dispatch>> {
-        let id = self.dispatches.known(dispatch)?;
-        Some(self.dispatches.items[id as usize].clone())
+    /// The dispatch numbered `id`.
+    pub(super) fn dispatch(&self, id: u32) -> &Arc<Dispatch> {
+        &self.dispatches.items[id as usize]
+    }
+
+    /// The call numbered `id`.
+    pub(super) fn call(&self, id: u32) -> &Arc<Call> {
+        &self.calls.items[id as usize]
+    }
+
+    /// The type of the timers numbered `id`.
+    pub(super) fn armed_type(&self, id: u32) -> Sym {
+        self.armed_types[id as usize]
+    }
+
+    /// The types of the records every state of the walk holds, in order.
+    pub(super) fn types(&self) -> &[Sym] {
+        &self.types
     }
 
     pub(super) fn unpack(&self, packed: &[u32]) -> JointState {

@@ -17,13 +17,13 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
-use super::super::super::pack::Packer;
 use super::super::super::room::{Heap, block, map_bytes};
 use super::super::super::state::canonical_quietly;
 use super::super::super::{Call, Dispatch, JointState};
 use super::super::order::values;
 use super::super::step::{Certainty, Move, Outcome};
 use super::super::{Delivery, JointModel};
+use super::mirror::Mirror;
 use crate::model::{Fields, ModelString, TemperModelState};
 
 /// How many steps a thread checks before it starts to skip most of them.
@@ -204,6 +204,8 @@ pub(super) struct Memo {
     pub(super) packed: Vec<u32>,
     /// Where a state a move leads to is written as it is worked out.
     pub(super) scratch: JointState,
+    /// The thread's own copy of the values it uses.
+    pub(super) mirror: Mirror,
 }
 
 impl Memo {
@@ -317,21 +319,21 @@ impl Memo {
     }
 
     /// Keep `outcomes` as where a move goes from `state`, and say where.
-    fn keep_ways(&mut self, state: &JointState, outcomes: &[Outcome], packer: &Packer) -> Slot {
+    fn keep_ways(&mut self, state: &JointState, outcomes: &[Outcome]) -> Slot {
         let first = u32::try_from(self.ways.len()).expect("fewer than 2^32 ways");
         for (after, _, certainty) in outcomes {
             let mut records = after.records.clone();
             for record in records.values_mut() {
-                if let Some(held) = packer.held_record(record)
-                    && !Arc::ptr_eq(&held, record)
+                if let Some(own) = self.mirror.own_record(record)
+                    && !Arc::ptr_eq(&own, record)
                 {
-                    *record = held;
+                    *record = own;
                 }
             }
             let mut inflight = Change::between(&state.inflight, &after.inflight);
             for dispatch in &mut inflight.gained {
-                if let Some(held) = packer.held_dispatch(dispatch) {
-                    *dispatch = held;
+                if let Some(own) = self.mirror.own_dispatch(dispatch) {
+                    *dispatch = own;
                 }
             }
             let calls = Change::between(&state.calls, &after.calls);
@@ -372,9 +374,8 @@ impl Memo {
         (place, holder, at): (u32, Holder, usize),
         state: &JointState,
         outcomes: &[Outcome],
-        packer: &Packer,
     ) {
-        let slot = self.keep_ways(state, outcomes, packer);
+        let slot = self.keep_ways(state, outcomes);
         let group = match holder {
             Holder::Records => self.record_groups[place as usize].as_mut(),
             Holder::Call(call) => self.call_groups.get_mut(&(place, call)),
@@ -388,9 +389,8 @@ impl Memo {
         (place, dispatch): (u32, u32),
         state: &JointState,
         outcomes: &[Outcome],
-        packer: &Packer,
     ) {
-        let slot = self.keep_ways(state, outcomes, packer);
+        let slot = self.keep_ways(state, outcomes);
         self.dispatches.insert((place, dispatch), slot);
     }
 
@@ -398,6 +398,7 @@ impl Memo {
     /// capacity, as the walk's are.
     pub(super) fn counted(&mut self) -> usize {
         let holds = self.values
+            + self.mirror.bytes()
             + map_bytes::<Box<[u64]>, u32>(self.places.capacity())
             + block(self.record_groups.capacity() * size_of::<Option<Group>>())
             + map_bytes::<(u32, u32), Group>(self.call_groups.capacity())

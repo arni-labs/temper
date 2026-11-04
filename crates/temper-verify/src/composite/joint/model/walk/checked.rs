@@ -150,16 +150,16 @@ impl Walker {
             let node = &trail.nodes[index];
             (node.packed.clone(), node.start())
         };
-        let state = read(&shared.packer).unpack(&packed);
-        if (self.visit)(&self.model, index, &state, sure) {
-            shared.stop.store(true, Ordering::Relaxed);
-            return;
-        }
         let mut memo = self
             .memos
             .get_or_default()
             .try_borrow_mut()
             .expect("a thread walks one state at a time");
+        let state = memo.mirror.unpack(&packed, &shared.packer);
+        if (self.visit)(&self.model, index, &state, sure) {
+            shared.stop.store(true, Ordering::Relaxed);
+            return;
+        }
         let mut walking = Walking {
             job,
             sure,

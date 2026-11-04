@@ -147,21 +147,16 @@ impl Walker {
         let (nexts, held) = match outcomes {
             Some(outcomes) => {
                 if !model.expansion.flight_was_read() {
-                    let packer = read(&self.shared.packer);
                     match target {
-                        Target::Group(place, holder, at) => walking.memo.keep_group_move(
-                            (place, holder, at),
-                            state,
-                            &outcomes,
-                            &packer,
-                        ),
-                        Target::Dispatch(place, id, _) => {
+                        Target::Group(place, holder, at) => {
                             walking
                                 .memo
-                                .keep_dispatch((place, id), state, &outcomes, &packer);
+                                .keep_group_move((place, holder, at), state, &outcomes);
+                        }
+                        Target::Dispatch(place, id, _) => {
+                            walking.memo.keep_dispatch((place, id), state, &outcomes);
                         }
                     }
-                    drop(packer);
                     self.remember(walking.memo.counted());
                 }
                 self.built(|| model.finished(state, &mv, outcomes.clone()))?
@@ -220,8 +215,11 @@ impl Walker {
         let shared = &*self.shared;
         let edges = self.keep == Keep::Edges;
         let memo = &mut *walking.memo;
-        if !read(&shared.packer).known_into(&memo.scratch, &mut memo.packed) {
-            write(&shared.packer).pack_into(&memo.scratch, &mut memo.packed);
+        if !memo.mirror.known_into(&memo.scratch, &mut memo.packed) {
+            if !read(&shared.packer).known_into(&memo.scratch, &mut memo.packed) {
+                write(&shared.packer).pack_into(&memo.scratch, &mut memo.packed);
+            }
+            memo.mirror.learn(&memo.scratch, &memo.packed);
         }
         let packed = memo.packed.as_slice();
         let depth = deeper(walking.job.depth);
