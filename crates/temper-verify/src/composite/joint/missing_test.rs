@@ -592,7 +592,7 @@ initial = "Open"
 [[state]]
 name = "hits"
 type = "counter"
-initial = "0"
+initial = 0
 
 [[action]]
 name = "Mine"
