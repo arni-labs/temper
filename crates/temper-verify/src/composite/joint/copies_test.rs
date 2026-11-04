@@ -245,6 +245,63 @@ fn a_status_a_late_guard_never_reads_splits_no_state() {
     assert!(result.states <= 1_900, "{result}");
 }
 
+/// Four moves send one reaction, and Cedar lets only `Drop`'s through.
+fn source_move() -> Model {
+    model!("sourcemove", "Ticket", "Board")
+}
+
+/// The same moves, under policies that can't tell them apart.
+fn source_move_unread(rule: &str) -> Model {
+    let mut model = fixed(
+        &source_move(),
+        0,
+        "status == 'Dropped' => Board[board].status != 'Pinged'",
+        rule,
+    );
+    model.1 = r#"permit(principal, action in [Action::"Start", Action::"Keep", Action::"Drop", Action::"Poke", Action::"Prod"], resource);
+permit(principal, action == Action::"Ping", resource) when { context has via && context.via != "request" };"#;
+    model
+}
+
+#[test]
+fn a_policy_that_reads_the_source_move_keeps_its_moves_apart() {
+    for records in [1, 2] {
+        let result = check(&source_move(), records);
+        assert!(
+            matches!(result.outcome, JointOutcome::Broken { .. }),
+            "{result}"
+        );
+        let moves = moves(&result);
+        assert!(moves.iter().any(|m| m.contains(".Drop")), "{moves:#?}");
+        assert!(moves.iter().any(|m| m.contains(".Ping")), "{moves:#?}");
+    }
+}
+
+#[test]
+fn a_reaction_walked_as_another_move_still_lands_and_names_its_own_move() {
+    let result = check(
+        &source_move_unread("status == 'Dropped' => Board[board].status != 'Pinged'"),
+        1,
+    );
+    assert!(
+        matches!(result.outcome, JointOutcome::Broken { .. }),
+        "{result}"
+    );
+    let moves = moves(&result);
+    assert!(moves.iter().any(|m| m.contains(".Drop")), "{moves:#?}");
+}
+
+#[test]
+fn moves_nothing_can_tell_apart_are_walked_as_one() {
+    let model = source_move_unread("status == 'New' => Board[board].status != 'Pinged'");
+    let one = check(&model, 1);
+    assert!(one.holds(), "{one}");
+    assert!(one.states <= 204, "{one}");
+    let two = check(&model, 2);
+    assert!(two.holds(), "{two}");
+    assert!(two.states <= 43_936, "{two}");
+}
+
 #[test]
 fn a_spawn_makes_one_child() {
     let result = check(&pass(), 2);
@@ -301,4 +358,50 @@ assert = "status == 'C' => Toggle[other].status != 'Z' || status == 'C'"
     let one = check(&model, 1);
     let two = check(&model, 2);
     assert!(two.states < one.states * one.states, "{one} {two}");
+}
+
+fn parent_read() -> Model {
+    model!("parentread", "Alarm", "Probe")
+}
+
+#[test]
+fn a_trigger_guard_finds_its_record_by_a_field_of_the_sender() {
+    // Clearing the alarm before the probe opens is refused at the probe; the
+    // probe then ends itself, because its trigger reads its parent. With the
+    // parent's id unread the guard went both ways and the rule could not hold.
+    for records in [1, 2] {
+        assert!(check(&parent_read(), records).holds(), "{records} records");
+    }
+}
+
+#[test]
+fn without_the_read_of_its_parent_the_probe_stays_open() {
+    let unread = fixed(
+        &parent_read(),
+        1,
+        "Alarm[parent_id].status == 'Cleared'",
+        "false",
+    );
+    let moves = moves(&check(&unread, 1));
+    assert!(moves.iter().any(|m| m.contains("Alarm.Clear")), "{moves:?}");
+    assert!(moves.iter().any(|m| m.contains("Probe.Open")), "{moves:?}");
+}
+
+#[test]
+fn a_reaction_carries_what_its_target_requires() {
+    // The target refuses `End` with no reason: with the reason the rule holds
+    // above, and without it the probe stays open under a cleared alarm.
+    let silent = fixed(
+        &parent_read(),
+        0,
+        "[action.triggers.args]\nwhy = \"why\"\n",
+        "",
+    );
+    let moves = moves(&check(&silent, 1));
+    assert!(
+        moves
+            .iter()
+            .any(|m| m.contains("Probe.End") && m.contains("refused")),
+        "{moves:?}"
+    );
 }
