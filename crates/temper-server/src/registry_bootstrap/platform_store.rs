@@ -149,6 +149,7 @@ async fn write_back_converted_rows(
         .map(|(row, source)| ConvertedSpec {
             entity_type: row.entity_type.clone(),
             source,
+            original: row.ioa_source.clone(),
             csdl_xml: row.csdl_xml.clone().unwrap_or_default(),
             verified: verified_before
                 .get(&row.entity_type)

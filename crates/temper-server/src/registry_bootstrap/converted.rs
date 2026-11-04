@@ -1,5 +1,6 @@
 //! Stored specs in the old predicate syntax: converted at the first boot that
-//! reads them and written back, so no later boot converts them again.
+//! reads them and written back, so no later boot converts them again. The
+//! text each was stored with is kept first, so the conversion can be undone.
 
 use std::sync::Arc;
 
@@ -21,6 +22,8 @@ pub(super) struct ConvertedSpec {
     pub(super) entity_type: String,
     /// The converted source.
     pub(super) source: String,
+    /// The source as stored, kept before the converted one replaces it.
+    pub(super) original: String,
     /// The CSDL stored with the spec.
     pub(super) csdl_xml: String,
     /// Whether the spec was verified as stored.
@@ -74,6 +77,10 @@ impl Converted {
 /// Write converted specs back so the conversion happens once. A failed write
 /// only means the next boot converts the stored source again.
 ///
+/// Each spec's stored text is kept first, in the store's `spec_originals`, and
+/// a spec whose original could not be kept is not written: no stored text is
+/// lost. Undoing a conversion is an `upsert_spec` of the kept original.
+///
 /// Writing a new source resets the row's verification, and nothing re-verifies
 /// a restored spec, so its entity type would refuse writes (423). The
 /// conversion keeps the spec's meaning, so a spec that was verified as stored
@@ -89,6 +96,13 @@ pub(super) async fn write_back(
     let mut carry_verification = Vec::new();
     let mut written: Vec<(&str, String, &str)> = Vec::new();
     for spec in converted {
+        if let Err(error) = store
+            .keep_spec_original(tenant, &spec.entity_type, &spec.original)
+            .await
+        {
+            tracing::warn!(tenant, entity_type = %spec.entity_type, %error, "failed to keep a spec's stored text; its conversion is not written");
+            continue;
+        }
         let hash = temper_store_turso::spec_content_hash(&spec.source);
         if let Err(error) = store
             .upsert_spec(

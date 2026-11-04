@@ -245,6 +245,7 @@ fn register_tenant_rows<R: SpecRowLike>(
                 converted.push(ConvertedSpec {
                     entity_type: entity_type.clone(),
                     source: source.clone(),
+                    original: ioa,
                     csdl_xml: get_csdl(row).unwrap_or_default(),
                     verified: row.verified(),
                 });
