@@ -197,6 +197,99 @@ fn requests_for_starting_tenants(seed: u64) {
     world.end(runtime);
 }
 
+#[test]
+fn serve_first_healthz_answers_starting_while_the_runtime_starts() {
+    let world = World::new(0);
+    let runtime = world.live_process();
+    runtime.block_on(async {
+        let (gate, _waits) = Gate::new(&[], &[]);
+        let (state, later) = world.restore(gate).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a port");
+        let port = listener.local_addr().expect("the bound port").port();
+        let router = super::sync_copy::serve_router(
+            temper_platform::router::build_platform_routes(state.clone()),
+            None,
+        );
+        // As `temper serve` does: it listens, then starts its runtime. The
+        // runtime has not started yet: this test holds it until it says so.
+        let serving = super::boot::serve(&state, listener, router);
+
+        let health = tokio::time::timeout(ANSWER_WAIT, get(port, "/healthz"))
+            .await
+            .expect("/healthz answers while the server's runtime is starting");
+        assert_eq!(health.0, 200, "{health:?}");
+        assert_eq!(
+            json_value(&health.1)["status"],
+            json!("starting"),
+            "/healthz says the server is starting: {health:?}"
+        );
+        let held = tokio::spawn(get(port, "/version"));
+        tokio::time::sleep(SETTLE).await;
+        assert!(
+            !held.is_finished(),
+            "a request other than /healthz was answered before the runtime started"
+        );
+
+        super::boot::start_serving(&state, later).await;
+        let version = tokio::time::timeout(ANSWER_WAIT, held)
+            .await
+            .expect("a request held while starting is answered once the server serves")
+            .expect("the request's task");
+        assert_eq!(version.0, 200, "{version:?}");
+        let health = tokio::time::timeout(ANSWER_WAIT, get(port, "/healthz"))
+            .await
+            .expect("/healthz answers once the server serves");
+        assert_eq!(health.0, 200, "{health:?}");
+        assert_eq!(
+            json_value(&health.1)["status"],
+            json!("serving"),
+            "/healthz says the server serves: {health:?}"
+        );
+        serving.abort();
+    });
+    world.end(runtime);
+}
+
+/// How long a test waits for an answer the server should give at once.
+const ANSWER_WAIT: Duration = Duration::from_secs(10);
+
+/// `GET path` on the server listening on `port`: the answer's status code
+/// and body.
+async fn get(port: u16, path: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect to the server");
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .expect("send the request");
+    let mut raw = String::new();
+    stream
+        .read_to_string(&mut raw)
+        .await
+        .expect("read the answer");
+    let status = raw
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status line: {raw:?}"));
+    let body = raw
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+fn json_value(body: &str) -> serde_json::Value {
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("not JSON ({e}): {body}"))
+}
+
 /// What the requests for one tenant ask.
 #[derive(Clone, Copy, Debug)]
 enum Asked {

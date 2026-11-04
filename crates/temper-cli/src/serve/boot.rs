@@ -12,6 +12,9 @@
 use std::collections::BTreeMap;
 
 use anyhow::Result;
+use axum::Router;
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 
 use temper_platform::state::PlatformState;
 use temper_server::registry::SpecRegistry;
@@ -102,4 +105,21 @@ pub(super) async fn start_serving(state: &PlatformState, later: Later) {
     // Last, with nothing awaited after it: no other tenant is read before the
     // server serves.
     restore::spawn_walk(state.clone(), later);
+    state.server.mark_serving();
+}
+
+/// Serve `router` on `listener` in the background, once [`start_serving`]
+/// has ended. The server is starting until then.
+pub(super) fn serve(
+    state: &PlatformState,
+    listener: TcpListener,
+    router: Router,
+) -> JoinHandle<std::io::Result<()>> {
+    state.server.mark_starting();
+    let server = state.server.clone();
+    // determinism-ok: the listener's task, as `axum::serve` was in `temper serve`.
+    tokio::spawn(async move {
+        server.until_serving().await;
+        axum::serve(listener, router).await
+    })
 }
