@@ -54,7 +54,6 @@ use temper_authz::SendAnalysis;
 use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Truth, eval};
 
-use super::JointStep;
 use super::fair::FairVerdict;
 use super::model::{self, JointModel};
 use super::proof::liveness_proofs;
