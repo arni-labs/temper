@@ -45,6 +45,8 @@ type Param = (String, String, String);
 #[derive(Debug, Default)]
 pub(super) struct Order {
     pub(super) families: Vec<Family>,
+    /// The families as each state asks of them, by name.
+    numbered: Vec<Numbered>,
     /// Each (entity, action)'s `param_greater_than_field` constraints the
     /// model decides, as (parameter, field).
     compared: BTreeMap<(String, String), Vec<(String, String)>>,
@@ -61,6 +63,32 @@ pub(super) struct Family {
     params: BTreeSet<Param>,
     /// The most a move adds to one of its fields.
     step: usize,
+}
+
+/// What each state asks of a family: where its values are, by interned name.
+#[derive(Debug)]
+struct Numbered {
+    fields: Box<[(Sym, Sym)]>,
+    params: Box<[(Sym, Sym, Sym)]>,
+}
+
+impl Numbered {
+    fn of(family: &Family) -> Self {
+        Self {
+            fields: family
+                .fields
+                .iter()
+                .map(|(entity, field)| (Sym::new(entity), Sym::new(field)))
+                .collect(),
+            params: family
+                .params
+                .iter()
+                .map(|(entity, action, param)| {
+                    (Sym::new(entity), Sym::new(action), Sym::new(param))
+                })
+                .collect(),
+        }
+    }
 }
 
 /// What the families are read from: the specs, their models before slicing, the
@@ -149,6 +177,7 @@ impl Order {
             .cloned()
             .collect();
         Self {
+            numbered: families.iter().map(Numbered::of).collect(),
             families,
             compares: compared
                 .keys()
