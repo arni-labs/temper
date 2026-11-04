@@ -95,8 +95,47 @@ fn a_reference_set_once_as_its_holder_is_made_breaks_a_rule_it_can_break() {
 }
 
 #[test]
-fn a_reference_set_once_as_its_holder_is_made_reads_no_such_record() {
-    assert!(checked(&[&holder(ADD), TARGET]).holds());
+fn a_reference_set_once_as_its_holder_is_made_may_find_another_record() {
+    let result = checked(&[&holder(ADD), TARGET]);
+    let JointOutcome::Incomplete { reason } = &result.outcome else {
+        panic!("{result}");
+    };
+    assert!(
+        reason.contains("A.f") && reason.contains("does not hold"),
+        "the reason names what it could not read: {reason}"
+    );
+}
+
+#[test]
+fn two_holders_of_one_record_are_not_one_run_renamed() {
+    // One A closes T only as it leaves Made, so with one A no T is closed
+    // while its A is in Made. A second A naming the same T closes it then.
+    let goes = format!(
+        r#"{ADD}
+[[action]]
+name = "Go"
+kind = "input"
+from = ["Made"]
+to = "Gone"
+
+[[action.triggers]]
+name = "close"
+kind = "entity"
+target_entity = "T"
+target_action = "Close"
+
+[action.triggers.resolve_target]
+kind = "field"
+id_field = "f"
+"#
+    );
+    let holder = holder(&goes).replace(
+        "T[f].status != 'Never'",
+        "status != 'Made' || T[f].status != 'Closed'",
+    );
+    let target = TARGET.replace(r#"kind = "input""#, r#"kind = "internal""#);
+    let result = checked(&[&holder, &target]);
+    assert!(not_checked(&result), "{result}");
 }
 
 #[test]
@@ -300,8 +339,7 @@ to = "Gone"
     assert!(not_checked(&result), "{result}");
 }
 
-/// A post that opens the thread it names when that is not made yet, copying
-/// the thread's id into a field of the thread.
+/// A post that opens the thread it names when that is not made yet.
 const POST: &str = r#"
 [automaton]
 name = "Post"
@@ -359,11 +397,9 @@ params = ["title"]
 "#;
 
 #[test]
-fn a_reference_is_one_name_though_its_id_is_copied_into_a_field() {
-    // Literal classes put the thread's id and its title together. That is one
-    // value in two places, not a second name for a thread.
+fn a_post_that_opens_the_thread_it_names_may_find_another_thread() {
     let result = checked(&[POST, THREAD]);
-    assert!(result.holds(), "{result}");
+    assert!(not_checked(&result), "{result}");
 }
 
 /// Sends a reaction to the T that `f` names, and reads whether it arrived.
@@ -429,19 +465,7 @@ fn a_reaction_to_another_record_that_keeps_to_itself_is_a_sure_drop() {
     );
 }
 
-#[test]
-fn a_reaction_to_another_record_may_come_back_into_scope() {
-    let reacts = r#"
-[[action.triggers]]
-name = "tell"
-kind = "entity"
-target_entity = "S"
-target_action = "Ping"
-
-[action.triggers.resolve_target]
-kind = "same_id"
-"#;
-    let other = r#"
+const PING: &str = r#"
 [automaton]
 name = "S"
 states = ["Idle", "Pinged"]
@@ -453,6 +477,183 @@ kind = "input"
 from = ["Idle"]
 to = "Pinged"
 "#;
-    let result = checked(&[SENDS, &hit_target(reacts), other]);
+
+const TELLS_S: &str = r#"
+[[action.triggers]]
+name = "tell"
+kind = "entity"
+target_entity = "S"
+target_action = "Ping"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+"#;
+
+#[test]
+fn a_reaction_that_leaves_the_scope_for_good_is_a_sure_drop() {
+    let result = checked(&[SENDS, &hit_target(TELLS_S), PING]);
+    assert!(
+        matches!(result.outcome, JointOutcome::Broken { .. }),
+        "{result}"
+    );
+}
+
+#[test]
+fn a_reaction_to_another_record_may_come_back_through_a_type_outside_the_scope() {
+    let back = r#"
+[[action]]
+name = "Back"
+kind = "internal"
+from = ["Sent"]
+to = "Start"
+
+[[invariant]]"#;
+    let sends = SENDS.replace("[[invariant]]", back);
+    let ping = format!(
+        r#"{PING}
+[[action.triggers]]
+name = "back"
+kind = "entity"
+target_entity = "A"
+target_action = "Back"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+"#
+    );
+    let result = checked(&[&sends, &hit_target(TELLS_S), &ping]);
     assert!(not_checked(&result), "{result}");
+}
+
+/// A B that opens the T of its own id and hits the T it names, and that T,
+/// which only a B can hit.
+const HITS: &str = r#"
+[automaton]
+name = "B"
+states = ["Start", "Went"]
+initial = "Start"
+
+[[state]]
+name = "f"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Go"
+kind = "input"
+from = ["Start"]
+to = "Went"
+params = ["f"]
+
+[[action.triggers]]
+name = "mine"
+kind = "entity"
+target_entity = "T"
+target_action = "Mine"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+
+[[action.triggers]]
+name = "hit"
+kind = "entity"
+target_entity = "T"
+target_action = "Hit"
+
+[action.triggers.resolve_target]
+kind = "field"
+id_field = "f"
+"#;
+
+const HIT_BY_B: &str = r#"
+[automaton]
+name = "T"
+states = ["Open", "Once"]
+initial = "Open"
+
+[[action]]
+name = "Mine"
+kind = "internal"
+from = ["Open", "Once"]
+
+[[action]]
+name = "Hit"
+kind = "internal"
+from = ["Open"]
+to = "Once"
+
+[[invariant]]
+name = "rule"
+assert = "status != 'Once' || B[Id].status != 'Start'"
+"#;
+
+#[test]
+fn a_second_sender_may_land_on_the_record_the_walk_holds() {
+    // With one B, its T is hit only once it has gone. In the runtime another B
+    // can name that T while this one is in Start.
+    let result = checked(&[HITS, HIT_BY_B]);
+    let JointOutcome::Incomplete { reason } = &result.outcome else {
+        panic!("{result}");
+    };
+    assert!(reason.contains('B') && reason.contains("T.Hit"), "{reason}");
+}
+
+#[test]
+fn a_rule_over_records_that_share_an_id_can_still_hold() {
+    let shares = r#"
+[automaton]
+name = "A"
+states = ["Start", "Went"]
+initial = "Start"
+
+[[action]]
+name = "Go"
+kind = "input"
+from = ["Start"]
+to = "Went"
+
+[[action.triggers]]
+name = "close"
+kind = "entity"
+target_entity = "T"
+target_action = "Close"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+
+[[invariant]]
+name = "rule"
+assert = "T[Id].status != 'Never'"
+"#;
+    let result = checked(&[shares, TARGET]);
+    assert!(result.holds(), "{result}");
+}
+
+#[test]
+fn a_second_sender_stops_a_settling_claim_too() {
+    let target = HIT_BY_B.replace(
+        r#"[[invariant]]
+name = "rule"
+assert = "status != 'Once' || B[Id].status != 'Start'""#,
+        r#"[[liveness]]
+name = "settles"
+eventually = "status != 'Once' || B[Id].status != 'Start'""#,
+    );
+    let automatons: Vec<Automaton> = [HITS, target.as_str()]
+        .iter()
+        .map(|source| parse_automaton(source).expect("fixture parses"))
+        .collect();
+    let refs: Vec<&Automaton> = automatons.iter().collect();
+    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let bound = Bound {
+        room: &room,
+        progress: &progress,
+    };
+    let results = verify_joint_liveness(&refs, None, bound);
+    assert_eq!(results.len(), 1);
+    assert!(
+        matches!(results[0].outcome, LivenessOutcome::Incomplete { .. }),
+        "{}",
+        results[0]
+    );
 }
