@@ -75,11 +75,18 @@ pub(super) fn leaves_record_unchanged(
         || !scheduled.armed.is_empty()
         || scheduled.fired.is_some();
     // What only its event would say: that a timer which fires once has fired
-    // (the status clock's entry for its action), and that a move naming
-    // someone came after a timer stopped for want of one (`timer_needs_person`).
+    // (the status clock's entry for its action), that a move naming someone
+    // came after a timer stopped for want of one (`timer_needs_person`), and
+    // that someone other than the last to move asked for this one. A record says
+    // who moved it last on every read, and its later timers run as the newest
+    // move that names someone (`journal_setter`), so that first move changes
+    // the record. The same caller asking again changes nothing.
     let clears_timer_stop =
         before.last_event.timer_needs_person.is_some() && event.origin.by.is_some();
-    record_kept && !writes_beside && !fires_timer_once && !clears_timer_stop
+    let names_someone_new = event.origin.via == Some(EventVia::Request)
+        && event.origin.by.is_some()
+        && event.origin.by != before.last_event.last_event_by;
+    record_kept && !writes_beside && !fires_timer_once && !clears_timer_stop && !names_someone_new
 }
 
 impl EntityActor {

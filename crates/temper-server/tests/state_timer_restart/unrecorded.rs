@@ -5,9 +5,9 @@
 //! is a relay's `Pass`, a reaction's move that changes nothing either, whose
 //! own trigger counts on a tally. So every period the tally's journal gains a
 //! `Count`, while the poller's and the relay's gain nothing, and the poller's
-//! timer row stays as it is. A person's `Poll` changes nothing too, and writes
-//! no event either. A restart finds the row past due and looks once at once,
-//! then keeps the pace.
+//! timer row stays as it is. A person's `Poll` changes nothing too, and is
+//! written once, as the first to name them; asked again, it writes nothing. A
+//! restart finds the row past due and looks once at once, then keeps the pace.
 
 use std::time::Duration;
 
@@ -89,15 +89,14 @@ pub(crate) fn polls_that_change_nothing_write_nothing_and_still_trigger(world: &
         "the trigger's move that changes its record is written once per period"
     );
 
-    // The same Poll, asked for by a person: it changes nothing, so it writes
-    // no event, and its trigger still runs. It reset the timer, so that reset
-    // has its own row for a restart to keep.
+    // The same Poll, asked for by a person. The first names someone new, so it
+    // is written: the record says who moved it last, and its timers follow them.
     server.act("Poller", id, "Poll", &person("bob"));
     let asked = server.journal("Poller", id);
     assert_eq!(
         count(&asked, "Poll"),
-        0,
-        "a person's move that changes nothing writes no event: {asked:?}"
+        1,
+        "the first move to name someone is written: {asked:?}"
     );
     assert_eq!(server.read("Tally", id, "count").0, 5);
     assert_ne!(
@@ -105,6 +104,17 @@ pub(crate) fn polls_that_change_nothing_write_nothing_and_still_trigger(world: &
         arm_ids(&row),
         "a reset by someone else writes the timer's row"
     );
+
+    // The same person again: nothing new to say, so no event, and its trigger
+    // still runs.
+    server.act("Poller", id, "Poll", &person("bob"));
+    let again = server.journal("Poller", id);
+    assert_eq!(
+        count(&again, "Poll"),
+        1,
+        "the same caller's move that changes nothing writes no event: {again:?}"
+    );
+    assert_eq!(server.read("Tally", id, "count").0, 6);
     let stopped = server.now();
     server.kill(world, stopped);
 }

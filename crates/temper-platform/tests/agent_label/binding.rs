@@ -27,11 +27,6 @@ name = "author"
 type = "string"
 initial = ""
 
-[[state]]
-name = "note"
-type = "string"
-initial = ""
-
 [[action]]
 name = "Publish"
 kind = "input"
@@ -64,7 +59,7 @@ params = [{ name = "author", type = "string", source = "authenticated_agent_labe
 name = "Edit"
 kind = "input"
 from = ["Posted"]
-params = [{ name = "note", type = "string" }]
+params = []
 "#;
 
 async fn post_server(seed: u64) -> PlatformState {
@@ -108,7 +103,7 @@ async fn a_move_binds_its_agents_label_and_later_moves_leave_it() {
     let post = read(&state, "Posts", "p").await;
     assert_eq!(post["fields"]["author"], LABEL, "{post}");
 
-    let (status, body) = post_move(&state, "p", "Edit", &person(), r#"{"note":"hello"}"#).await;
+    let (status, body) = post_move(&state, "p", "Edit", &person(), "{}").await;
     assert!(status.is_success(), "{status}: {body}");
     let post = read(&state, "Posts", "p").await;
     assert_eq!(post["fields"]["author"], LABEL, "{post}");
