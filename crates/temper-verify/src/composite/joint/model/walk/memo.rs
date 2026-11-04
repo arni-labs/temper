@@ -13,18 +13,19 @@
 
 use std::collections::BTreeSet;
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use rustc_hash::FxHashMap;
 
+use super::super::super::pack::Packer;
 use super::super::super::room::{Heap, block, map_bytes};
-use super::super::super::state::canonical_quietly;
+use super::super::super::state::{RecordNames, canonical_quietly};
 use super::super::super::{Call, Dispatch, JointState};
 use super::super::order::values;
 use super::super::step::{Certainty, Move, Outcome};
 use super::super::{Delivery, JointModel};
 use super::mirror::Mirror;
-use crate::model::{Fields, ModelString, TemperModelState};
+use crate::model::{Fields, ModelString, Renames, TemperModelState};
 
 /// How many steps a thread checks before it starts to skip most of them.
 const CHECK_FIRST: u64 = 1 << 12;
@@ -204,6 +205,10 @@ pub(super) struct Memo {
     pub(super) packed: Vec<u32>,
     /// Where a state a move leads to is written as it is worked out.
     pub(super) scratch: JointState,
+    /// What renumbering comes to for each list of records, once asked.
+    names: Vec<Option<Box<RecordNames>>>,
+    /// Where names are worked out as a state is renumbered.
+    naming: Renames,
     /// The thread's own copy of the values it uses.
     pub(super) mirror: Mirror,
 }
@@ -307,7 +312,7 @@ impl Memo {
 
     /// Where way `at`, of those of a [`Slot`], goes from `state`, written to
     /// the thread's scratch state, and what the model knows of it.
-    pub(super) fn way(&mut self, at: usize, state: &JointState) -> Certainty {
+    pub(super) fn way(&mut self, at: usize, state: &JointState) -> (Certainty, u32) {
         let way = self.ways[at];
         let out = &mut self.scratch;
         out.records
@@ -315,26 +320,41 @@ impl Memo {
         out.armed.clone_from(&self.armed.items[way.armed as usize]);
         self.inflight.items[way.inflight as usize].on(&state.inflight, &mut out.inflight);
         self.calls.items[way.calls as usize].on(&state.calls, &mut out.calls);
-        way.certainty
+        (way.certainty, way.records)
+    }
+
+    /// What renumbering comes to for list `list` of records.
+    fn know_names(&mut self, list: u32, tables: &RwLock<Packer>) {
+        let at = list as usize;
+        if self.names.len() <= at {
+            self.names.resize_with(at + 1, || None);
+        }
+        if self.names[at].is_none() {
+            let mut names = RecordNames::of(&self.records.items[at]);
+            for record in names.records.values_mut() {
+                *record = self.mirror.own_record(record, tables);
+            }
+            self.values += names.heap();
+            self.names[at] = Some(Box::new(names));
+        }
     }
 
     /// Keep `outcomes` as where a move goes from `state`, and say where.
-    fn keep_ways(&mut self, state: &JointState, outcomes: &[Outcome]) -> Slot {
+    fn keep_ways(
+        &mut self,
+        state: &JointState,
+        outcomes: &[Outcome],
+        tables: &RwLock<Packer>,
+    ) -> Slot {
         let first = u32::try_from(self.ways.len()).expect("fewer than 2^32 ways");
         for (after, _, certainty) in outcomes {
             let mut records = after.records.clone();
             for record in records.values_mut() {
-                if let Some(own) = self.mirror.own_record(record)
-                    && !Arc::ptr_eq(&own, record)
-                {
-                    *record = own;
-                }
+                *record = self.mirror.own_record(record, tables);
             }
             let mut inflight = Change::between(&state.inflight, &after.inflight);
             for dispatch in &mut inflight.gained {
-                if let Some(own) = self.mirror.own_dispatch(dispatch) {
-                    *dispatch = own;
-                }
+                *dispatch = self.mirror.own_dispatch(dispatch, tables);
             }
             let calls = Change::between(&state.calls, &after.calls);
             let record_bytes = block(records.len() * size_of::<(usize, usize)>())
@@ -374,8 +394,9 @@ impl Memo {
         (place, holder, at): (u32, Holder, usize),
         state: &JointState,
         outcomes: &[Outcome],
+        tables: &RwLock<Packer>,
     ) {
-        let slot = self.keep_ways(state, outcomes);
+        let slot = self.keep_ways(state, outcomes, tables);
         let group = match holder {
             Holder::Records => self.record_groups[place as usize].as_mut(),
             Holder::Call(call) => self.call_groups.get_mut(&(place, call)),
@@ -389,8 +410,9 @@ impl Memo {
         (place, dispatch): (u32, u32),
         state: &JointState,
         outcomes: &[Outcome],
+        tables: &RwLock<Packer>,
     ) {
-        let slot = self.keep_ways(state, outcomes);
+        let slot = self.keep_ways(state, outcomes, tables);
         self.dispatches.insert((place, dispatch), slot);
     }
 
@@ -399,6 +421,7 @@ impl Memo {
     pub(super) fn counted(&mut self) -> usize {
         let holds = self.values
             + self.mirror.bytes()
+            + block(self.names.capacity() * size_of::<usize>())
             + map_bytes::<Box<[u64]>, u32>(self.places.capacity())
             + block(self.record_groups.capacity() * size_of::<Option<Group>>())
             + map_bytes::<(u32, u32), Group>(self.call_groups.capacity())
@@ -418,13 +441,27 @@ impl Memo {
 impl JointModel {
     /// `state`, which a move left, in its one form, unless it would put more
     /// in flight than the walk keeps: as [`Self::finished`] leaves it.
-    pub(super) fn settled_quietly(&self, state: &mut JointState) -> bool {
+    pub(super) fn settled_quietly(
+        &self,
+        memo: &mut Memo,
+        list: u32,
+        tables: &RwLock<Packer>,
+    ) -> bool {
+        let state = &mut memo.scratch;
         if self.delivery != Delivery::BeforeNextRequest && !self.fits(state) {
             return false;
         }
         let rewrote = self.order.normalize(state);
         self.in_one_order(state);
-        canonical_quietly(state, rewrote);
+        if state.records.same(&memo.records.items[list as usize]) {
+            memo.know_names(list, tables);
+            let names = memo.names[list as usize]
+                .as_ref()
+                .expect("its names were just worked out");
+            names.renumber(&mut memo.scratch, &mut memo.naming, rewrote);
+        } else {
+            canonical_quietly(state, rewrote);
+        }
         true
     }
 }

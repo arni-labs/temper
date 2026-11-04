@@ -105,9 +105,9 @@ impl Walker {
         let made = self.note_move(target, walking);
         let (mut held, mut covered, mut ways) = (false, true, 0);
         for way in slot.ways() {
-            let known = walking.memo.way(way, state);
+            let (known, list) = walking.memo.way(way, state);
             let known = if unsure { Certainty::Unsure } else { known };
-            if !model.settled_quietly(&mut walking.memo.scratch) {
+            if !model.settled_quietly(&mut *walking.memo, list, &self.shared.packer) {
                 held = true;
                 continue;
             }
@@ -149,12 +149,20 @@ impl Walker {
                 if !model.expansion.flight_was_read() {
                     match target {
                         Target::Group(place, holder, at) => {
-                            walking
-                                .memo
-                                .keep_group_move((place, holder, at), state, &outcomes);
+                            walking.memo.keep_group_move(
+                                (place, holder, at),
+                                state,
+                                &outcomes,
+                                &self.shared.packer,
+                            );
                         }
                         Target::Dispatch(place, id, _) => {
-                            walking.memo.keep_dispatch((place, id), state, &outcomes);
+                            walking.memo.keep_dispatch(
+                                (place, id),
+                                state,
+                                &outcomes,
+                                &self.shared.packer,
+                            );
                         }
                     }
                     self.remember(walking.memo.counted());

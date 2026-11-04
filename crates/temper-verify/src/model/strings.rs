@@ -187,17 +187,7 @@ pub fn canonical_values<'a>(values: impl IntoIterator<Item = &'a mut ModelString
 /// use. Literals keep their names and are left out.
 pub fn canonical_names<'a>(values: impl IntoIterator<Item = &'a ModelString>) -> Renames {
     let mut renamed = Renames::default();
-    for value in values {
-        let id = renamed.0.len() + 1;
-        let name = match value {
-            ModelString::Literal(_) => continue,
-            ModelString::Symbol(_) => ModelString::Symbol(id),
-            ModelString::BlankSymbol(_) => ModelString::BlankSymbol(id),
-        };
-        if renamed.get(value).is_none() {
-            renamed.0.push((*value, name));
-        }
-    }
+    renamed.name_all(values);
     renamed
 }
 
@@ -207,6 +197,22 @@ pub fn canonical_names<'a>(values: impl IntoIterator<Item = &'a ModelString>) ->
 pub struct Renames(Vec<(ModelString, ModelString)>);
 
 impl Renames {
+    /// Number the symbols among `values` the list does not have yet, carrying
+    /// on from the last.
+    pub fn name_all<'a>(&mut self, values: impl IntoIterator<Item = &'a ModelString>) {
+        for value in values {
+            let id = self.0.len() + 1;
+            let name = match value {
+                ModelString::Literal(_) => continue,
+                ModelString::Symbol(_) => ModelString::Symbol(id),
+                ModelString::BlankSymbol(_) => ModelString::BlankSymbol(id),
+            };
+            if self.get(value).is_none() {
+                self.0.push((*value, name));
+            }
+        }
+    }
+
     /// The new name of `value`, when it is a symbol the state holds.
     pub fn get(&self, value: &ModelString) -> Option<&ModelString> {
         self.0

@@ -4,6 +4,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use super::room::{Heap, block};
 use crate::model::Renames;
 use crate::model::semantics::canonical_names;
 use crate::model::{Fields, ModelString, ParamValue, Sym, TemperModelAction, TemperModelState};
@@ -181,87 +182,189 @@ pub(super) fn render(state: &JointState) -> String {
 /// the dispatches in flight; returns each value's new name. What a renaming
 /// leaves as it was stays shared with the states that hold it.
 pub(super) fn canonical(state: &mut JointState) -> Renames {
-    let renamed = canonical_names(
-        state
-            .records
-            .values()
-            .flat_map(|s| s.strings.values().chain(s.lists.values().flatten()))
-            .chain(
-                state
-                    .inflight
-                    .iter()
-                    .flat_map(|d| strings(d.params.values())),
-            )
-            .chain(state.inflight.iter().flat_map(|d| {
-                d.unread_guard
-                    .iter()
-                    .flat_map(|c| strings(c.fields.values()))
-            }))
-            .chain(state.calls.iter().flat_map(|c| c.asked.values())),
-    );
-    let moved = |value: &ModelString| renamed.get(value).is_some_and(|name| name != value);
-    let rewrite = |value: &mut ModelString| {
-        if let Some(name) = renamed.get(value) {
-            *value = *name;
-        }
-    };
-    let rewrite_param = |value: &mut ParamValue| {
-        if let ParamValue::Str(text) = value {
-            rewrite(text);
-        }
-    };
+    let mut renamed = canonical_names(record_strings(&state.records));
+    renamed.name_all(strings_on_their_way(state));
     if renamed.any_moved() {
-        for record in state.records.values_mut() {
-            let touched = record
-                .strings
-                .values()
-                .chain(record.lists.values().flatten())
-                .any(moved);
-            if touched {
-                let record = Arc::make_mut(record);
-                record.strings.values_mut().for_each(rewrite);
-                record.lists.values_mut().flatten().for_each(rewrite);
-            }
-        }
-        for dispatch in &mut state.inflight {
-            let touched = strings(dispatch.values()).any(moved);
-            if touched {
-                let dispatch = Arc::make_mut(dispatch);
-                dispatch.params.values_mut().for_each(rewrite_param);
-                if let Some(committed) = &mut dispatch.unread_guard {
-                    committed.fields.values_mut().for_each(rewrite_param);
-                }
-            }
-        }
-        for call in &mut state.calls {
-            if call.asked.values().any(moved) {
-                Arc::make_mut(call).asked.values_mut().for_each(rewrite);
-            }
-        }
+        rename_records(&mut state.records, &renamed);
+        rename_on_their_way(state, &renamed);
     }
     state.inflight.sort();
     state.calls.sort();
     renamed
 }
 
+/// The strings of a state's records, in the order they are numbered.
+fn record_strings(records: &Fields<Arc<TemperModelState>>) -> impl Iterator<Item = &ModelString> {
+    records
+        .values()
+        .flat_map(|s| s.strings.values().chain(s.lists.values().flatten()))
+}
+
+/// The strings of what is on its way, in the order they are numbered.
+fn strings_on_their_way(state: &JointState) -> impl Iterator<Item = &ModelString> {
+    state
+        .inflight
+        .iter()
+        .flat_map(|d| strings(d.params.values()))
+        .chain(state.inflight.iter().flat_map(|d| {
+            d.unread_guard
+                .iter()
+                .flat_map(|c| strings(c.fields.values()))
+        }))
+        .chain(state.calls.iter().flat_map(|c| c.asked.values()))
+}
+
+fn rewrite(renamed: &Renames, value: &mut ModelString) {
+    if let Some(name) = renamed.get(value) {
+        *value = *name;
+    }
+}
+
+fn moved(renamed: &Renames, value: &ModelString) -> bool {
+    renamed.get(value).is_some_and(|name| name != value)
+}
+
+fn rename_records(records: &mut Fields<Arc<TemperModelState>>, renamed: &Renames) {
+    for record in records.values_mut() {
+        let touched = record
+            .strings
+            .values()
+            .chain(record.lists.values().flatten())
+            .any(|value| moved(renamed, value));
+        if touched {
+            let record = Arc::make_mut(record);
+            record
+                .strings
+                .values_mut()
+                .for_each(|value| rewrite(renamed, value));
+            record
+                .lists
+                .values_mut()
+                .flatten()
+                .for_each(|value| rewrite(renamed, value));
+        }
+    }
+}
+
+fn rename_on_their_way(state: &mut JointState, renamed: &Renames) {
+    let rewrite_param = |value: &mut ParamValue| {
+        if let ParamValue::Str(text) = value {
+            rewrite(renamed, text);
+        }
+    };
+    for dispatch in &mut state.inflight {
+        if strings(dispatch.values()).any(|value| moved(renamed, value)) {
+            let dispatch = Arc::make_mut(dispatch);
+            dispatch.params.values_mut().for_each(rewrite_param);
+            if let Some(committed) = &mut dispatch.unread_guard {
+                committed.fields.values_mut().for_each(rewrite_param);
+            }
+        }
+    }
+    for call in &mut state.calls {
+        if call.asked.values().any(|value| moved(renamed, value)) {
+            Arc::make_mut(call)
+                .asked
+                .values_mut()
+                .for_each(|value| rewrite(renamed, value));
+        }
+    }
+}
+
+/// What renumbering comes to for a list of records, which is the same whatever
+/// else a state holds: records are numbered first.
+#[derive(Debug)]
+pub(super) struct RecordNames {
+    /// The records with their new numbers.
+    pub(super) records: Fields<Arc<TemperModelState>>,
+    renamed: Renames,
+    moved: bool,
+    so_far: InOrder,
+}
+
+impl RecordNames {
+    /// What renumbering `records` comes to.
+    pub(super) fn of(records: &Fields<Arc<TemperModelState>>) -> Self {
+        let renamed = canonical_names(record_strings(records));
+        let moved = renamed.any_moved();
+        let mut so_far = InOrder::default();
+        let mut renumbered = records.clone();
+        if moved {
+            rename_records(&mut renumbered, &renamed);
+        }
+        for value in record_strings(&renumbered) {
+            so_far.fits(value);
+        }
+        Self {
+            records: renumbered,
+            renamed,
+            moved,
+            so_far,
+        }
+    }
+
+    /// The bytes it takes, past its records' own.
+    pub(super) fn heap(&self) -> usize {
+        block(size_of::<Self>())
+            + block(self.records.len() * size_of::<(Sym, Arc<TemperModelState>)>())
+            + self.renamed.heap()
+    }
+
+    /// Renumber `state`, which holds the records this was worked out from.
+    /// `names` is somewhere to work. What is in flight is sorted already,
+    /// unless `rewrote` says a dispatch was rewritten.
+    pub(super) fn renumber(&self, state: &mut JointState, names: &mut Renames, rewrote: bool) {
+        if !self.moved && self.so_far.holds_rest_of(state) {
+            if rewrote {
+                state.inflight.sort();
+            }
+            return;
+        }
+        if self.moved {
+            state.records.clone_from(&self.records);
+            if strings_on_their_way(state).next().is_none() {
+                if rewrote {
+                    state.inflight.sort();
+                }
+                return;
+            }
+        }
+        names.clone_from(&self.renamed);
+        names.name_all(strings_on_their_way(state));
+        if names.any_moved() {
+            rename_on_their_way(state, names);
+        }
+        state.inflight.sort();
+        state.calls.sort();
+    }
+}
+
 /// [`canonical`] when nothing needs to know what changed its name, which is
 /// nothing for most states: their names are already in order. What is in
 /// flight is sorted already, unless `rewrote` says a dispatch was rewritten.
 pub(super) fn canonical_quietly(state: &mut JointState, rewrote: bool) {
-    if !numbered_in_order(state) {
+    let mut so_far = InOrder::default();
+    if !record_strings(&state.records).all(|value| so_far.fits(value))
+        || !so_far.holds_rest_of(state)
+    {
         canonical(state);
     } else if rewrote {
         state.inflight.sort();
     }
 }
 
-/// Whether the state's symbols are numbered as [`canonical`] would number
-/// them: one, two, three, as each is first used, and each number with one
-/// meaning. False too for more symbols than this keeps track of.
-fn numbered_in_order(state: &JointState) -> bool {
-    let mut count = 0;
-    let mut blanks = 0_u64;
-    let mut fits = |value: &ModelString| {
+/// How far a state's symbols are numbered as [`canonical`] would number them:
+/// one, two, three, as each is first used, and each number with one meaning.
+/// False too for more symbols than this keeps track of.
+#[derive(Debug, Clone, Copy, Default)]
+struct InOrder {
+    count: usize,
+    blanks: u64,
+}
+
+impl InOrder {
+    /// Whether `value` carries the numbering on.
+    fn fits(&mut self, value: &ModelString) -> bool {
         let (id, blank) = match value {
             ModelString::Literal(_) => return true,
             ModelString::Symbol(id) => (*id, false),
@@ -270,40 +373,19 @@ fn numbered_in_order(state: &JointState) -> bool {
         if id >= u64::BITS as usize {
             return false;
         }
-        let is_blank = blanks >> id & 1 == 1;
-        if id == count + 1 {
-            count = id;
-            blanks |= u64::from(blank) << id;
+        if id == self.count + 1 {
+            self.count = id;
+            self.blanks |= u64::from(blank) << id;
             true
         } else {
-            id != 0 && id <= count && is_blank == blank
-        }
-    };
-    for record in state.records.values() {
-        if !record.strings.values().all(&mut fits)
-            || !record.lists.values().flatten().all(&mut fits)
-        {
-            return false;
+            id != 0 && id <= self.count && (self.blanks >> id & 1 == 1) == blank
         }
     }
-    let mut param = |value: &ParamValue| match value {
-        ParamValue::Str(text) => fits(text),
-        _ => true,
-    };
-    state
-        .inflight
-        .iter()
-        .all(|dispatch| dispatch.params.values().all(&mut param))
-        && state.inflight.iter().all(|dispatch| {
-            dispatch
-                .unread_guard
-                .iter()
-                .all(|committed| committed.fields.values().all(&mut param))
-        })
-        && state
-            .calls
-            .iter()
-            .all(|call| call.asked.values().all(&mut fits))
+
+    /// Whether what `state` has on its way carries the numbering on.
+    fn holds_rest_of(mut self, state: &JointState) -> bool {
+        strings_on_their_way(state).all(|value| self.fits(value))
+    }
 }
 
 /// The strings among `values`.

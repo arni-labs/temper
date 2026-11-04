@@ -196,6 +196,26 @@ impl Packer {
         words(state, &mut known, out).is_some()
     }
 
+    /// The number of `record`, if the tables hold it.
+    pub(super) fn known_record(&self, record: &Arc<TemperModelState>) -> Option<u32> {
+        self.records.known(record)
+    }
+
+    /// The number of `record`, added to the tables if they do not hold it.
+    pub(super) fn number_record(&mut self, record: &Arc<TemperModelState>) -> u32 {
+        self.records.id(record)
+    }
+
+    /// The number of `dispatch`, if the tables hold it.
+    pub(super) fn known_dispatch(&self, dispatch: &Arc<Dispatch>) -> Option<u32> {
+        self.dispatches.known(dispatch)
+    }
+
+    /// The number of `dispatch`, added to the tables if they do not hold it.
+    pub(super) fn number_dispatch(&mut self, dispatch: &Arc<Dispatch>) -> u32 {
+        self.dispatches.id(dispatch)
+    }
+
     /// The record numbered `id`.
     pub(super) fn record(&self, id: u32) -> &Arc<TemperModelState> {
         &self.records.items[id as usize]

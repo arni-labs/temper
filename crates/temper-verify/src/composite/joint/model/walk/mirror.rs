@@ -14,7 +14,7 @@ use rustc_hash::FxHashMap;
 use super::super::super::pack::{Numbers, Packer, words};
 use super::super::super::room::{Heap, block, map_bytes};
 use super::super::super::state::{Call, Dispatch, JointState};
-use super::shared::read;
+use super::shared::{read, write};
 use crate::model::{Sym, TemperModelState};
 
 /// A thread's own copies of the values of one table.
@@ -139,19 +139,30 @@ impl Mirror {
         }
     }
 
-    /// Its copy of `record`, if it has seen one equal to it.
+    /// Its copy of `record`, numbering that in the tables if none has it.
     pub(super) fn own_record(
-        &self,
+        &mut self,
         record: &Arc<TemperModelState>,
-    ) -> Option<Arc<TemperModelState>> {
-        self.records.get(self.records.known(record)?).cloned()
+        tables: &RwLock<Packer>,
+    ) -> Arc<TemperModelState> {
+        let id = self.records.known(record).unwrap_or_else(|| {
+            let known = read(tables).known_record(record);
+            known.unwrap_or_else(|| write(tables).number_record(record))
+        });
+        self.records.own(id, record)
     }
 
-    /// Its copy of `dispatch`, if it has seen one equal to it.
-    pub(super) fn own_dispatch(&self, dispatch: &Arc<Dispatch>) -> Option<Arc<Dispatch>> {
-        self.dispatches
-            .get(self.dispatches.known(dispatch)?)
-            .cloned()
+    /// Its copy of `dispatch`, numbering that in the tables if none has it.
+    pub(super) fn own_dispatch(
+        &mut self,
+        dispatch: &Arc<Dispatch>,
+        tables: &RwLock<Packer>,
+    ) -> Arc<Dispatch> {
+        let id = self.dispatches.known(dispatch).unwrap_or_else(|| {
+            let known = read(tables).known_dispatch(dispatch);
+            known.unwrap_or_else(|| write(tables).number_dispatch(dispatch))
+        });
+        self.dispatches.own(id, dispatch)
     }
 
     /// The state `packed` names, from its own copies, reading the tables for
