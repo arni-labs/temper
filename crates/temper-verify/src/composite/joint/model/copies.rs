@@ -246,9 +246,9 @@ impl JointModel {
             return;
         }
         for (name, record, armed) in holds {
-            state.records.insert(name.into(), record);
+            state.records.insert(name, record);
             match armed {
-                Some(by) => state.armed.insert(name.into(), by),
+                Some(by) => state.armed.insert(name, by),
                 None => state.armed.remove(name),
             };
         }
@@ -273,14 +273,14 @@ impl JointModel {
                     dispatch.via = Some(via);
                 }
                 if let Some(to) = to {
-                    dispatch.to = to.to_string();
+                    dispatch.to = to.into();
                 }
             }
         }
         state.inflight.sort();
         for call in &mut state.calls {
             if let Some(to) = renamed(&call.to) {
-                std::sync::Arc::make_mut(call).to = to.to_string();
+                std::sync::Arc::make_mut(call).to = to.into();
             }
         }
         state.calls.sort();
@@ -303,7 +303,7 @@ fn compare(
             .strings
             .iter()
             .filter(|(field, _)| field.as_str() != ID)
-            .map(|(field, value)| (field.clone(), plain(value).then(|| value.clone())))
+            .map(|(field, value)| (*field, plain(value).then_some(*value)))
             .collect::<Vec<_>>()
     };
     a.status

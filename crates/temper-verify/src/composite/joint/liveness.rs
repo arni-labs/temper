@@ -369,7 +369,11 @@ pub(super) fn settle(
         .copied()
         .filter(|&index| {
             let state = explored.state(index);
-            let statuses: Vec<String> = state.records.values().map(|r| r.status.clone()).collect();
+            let statuses: Vec<String> = state
+                .records
+                .values()
+                .map(|r| r.status.to_string())
+                .collect();
             state.settled() && seen.insert(statuses)
         })
         .collect();

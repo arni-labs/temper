@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::Fields;
 
 fn kinds() -> BTreeMap<String, VarKind> {
     [
@@ -14,11 +15,11 @@ fn kinds() -> BTreeMap<String, VarKind> {
 
 fn state(status: &str) -> TemperModelState {
     TemperModelState {
-        status: status.to_string(),
-        counters: BTreeMap::new(),
-        booleans: BTreeMap::new(),
-        lists: BTreeMap::new(),
-        strings: BTreeMap::new(),
+        status: status.into(),
+        counters: Fields::new(),
+        booleans: Fields::new(),
+        lists: Fields::new(),
+        strings: Fields::new(),
     }
 }
 
@@ -38,9 +39,9 @@ fn declared_variables_missing_from_state_read_as_zero_values() {
 #[test]
 fn evaluates_modeled_state() {
     let mut s = state("Draft");
-    s.counters.insert("items".into(), 2);
-    s.booleans.insert("ready".into(), true);
-    s.lists.insert("tags".into(), vec!["vip".into()]);
+    s.counters.insert("items", 2);
+    s.booleans.insert("ready", true);
+    s.lists.insert("tags", vec!["vip".into()]);
     let k = kinds();
     assert!(evaluate_guard(
         &g("status == 'Draft' && items >= 2 && ready && 'vip' in tags"),
@@ -126,9 +127,9 @@ fn fresh_parameters_can_differ_from_each_other() {
 
 #[test]
 fn concrete_hash_literals_are_never_renamed_or_equal_to_symbols() {
-    let mut values = BTreeMap::from([
-        ("literal".into(), ModelString::from("#2")),
-        ("symbol".into(), ModelString::Symbol(2)),
+    let mut values = Fields::from([
+        ("literal", ModelString::from("#2")),
+        ("symbol", ModelString::Symbol(2)),
     ]);
     canonical_strings(&mut [&mut values]);
     assert_eq!(values["literal"], ModelString::from("#2"));
@@ -213,7 +214,7 @@ assert = "a == b || a != b"
         successors(&model, t, &initial).is_empty(),
         "different fields admit no value for p"
     );
-    initial.strings.insert("a".into(), "b".into());
+    initial.strings.insert("a", "b".into());
     let allowed = successors(&model, t, &initial);
     assert_eq!(allowed.len(), 1);
     assert_eq!(allowed[0].0["p"], ParamValue::Str("b".into()));
@@ -267,7 +268,7 @@ assert = "a == '' || a != ''"
             (" b ", true),
             ("b", true),
         ] {
-            initial.strings.insert("a".into(), value.into());
+            initial.strings.insert("a", value.into());
             let next = successors(&model, t, &initial);
             assert_eq!(next.len(), usize::from(allowed), "{name} = {value:?}");
             assert_eq!(
@@ -312,9 +313,9 @@ fn unconstrained_strings_include_distinct_nonempty_blank_values() {
 #[test]
 fn field_and_list_symbols_share_one_canonical_scope() {
     let mut s = state("Ready");
-    s.strings.insert("goal".into(), ModelString::Symbol(9));
+    s.strings.insert("goal", ModelString::Symbol(9));
     s.lists.insert(
-        "tags".into(),
+        "tags",
         vec![ModelString::Symbol(9), ModelString::Symbol(4), "#1".into()],
     );
     canonical_state(&mut s);
@@ -366,10 +367,9 @@ fn string_choices_and_successor_states_count_against_the_room() {
 
     // The input choices fit, but copying this record for each choice does not.
     let mut large = initial;
-    large.lists.insert(
-        "payload".into(),
-        vec![ModelString::from("x".repeat(32 << 10))],
-    );
+    large
+        .lists
+        .insert("payload", vec![ModelString::from("x".repeat(32 << 10))]);
     budget.allow(64 << 10);
     successors_budgeted(
         &model,

@@ -72,14 +72,14 @@ impl JointModel {
             .and_then(|outside| outside.made.clone());
         vec![
             ReactionStep {
-                entity_type: String::new(),
-                action: format!("{entity}.{action}"),
+                entity_type: "".into(),
+                action: format!("{entity}.{action}").into(),
                 generated_for: None,
             },
             ReactionStep {
-                entity_type: entity.to_string(),
-                action: action.to_string(),
-                generated_for: made,
+                entity_type: entity.into(),
+                action: action.into(),
+                generated_for: made.map(Into::into),
             },
         ]
     }
@@ -101,7 +101,7 @@ impl JointModel {
                     .is_some_and(|outside| {
                         outside
                             .before
-                            .contains(&(step.entity_type.clone(), step.action.clone()))
+                            .contains(&(step.entity_type.to_string(), step.action.to_string()))
                     });
                 continue;
             }
@@ -143,8 +143,8 @@ impl JointModel {
         {
             for &by in &senders {
                 let action = TemperModelAction {
-                    name: t.name.clone(),
-                    target_state: t.to_state.clone(),
+                    name: t.name,
+                    target_state: t.to_state,
                     params: params.clone(),
                 };
                 if !self.keep_move(out, Move::Reaction(entity.to_string(), action, by)) {
@@ -179,7 +179,7 @@ impl JointModel {
         if self.action_reads_related(entity, &action.name) {
             let mut next = state.clone();
             let mut dispatch = sent(entity, action, by);
-            dispatch.chain = chain;
+            dispatch.chain = chain.into();
             add(&mut next, dispatch);
             return vec![(next, format!("{text} sent"), Certainty::Unsure)];
         }

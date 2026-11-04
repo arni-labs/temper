@@ -93,21 +93,22 @@ impl Expansion {
         true
     }
 
-    /// Charge a cloned map and its added entry before cloning either.
-    pub(crate) fn with_entry<K: Ord + Clone + Heap, V: Clone + Heap>(
+    /// Charge a copied list and its added entry before copying it.
+    pub(crate) fn with_entry<V: Clone + Heap>(
         &self,
-        map: &std::collections::BTreeMap<K, V>,
-        key: &K,
+        map: &super::fields::Fields<V>,
+        key: impl Into<super::fields::Sym>,
         value: &V,
-    ) -> Option<std::collections::BTreeMap<K, V>> {
-        use super::heap::tree_bytes;
-        let nodes = tree_bytes::<K, V>(map.len() + 1);
-        let entries = map.iter().map(|(k, v)| k.heap() + v.heap()).sum::<usize>();
-        if !self.hold(nodes + entries + key.heap() + value.heap()) {
+    ) -> Option<super::fields::Fields<V>> {
+        let bytes = block(
+            (map.len() + 1) * (size_of::<super::fields::Sym>() + size_of::<V>())
+                + 4 * size_of::<usize>(),
+        );
+        if !self.hold(bytes + value.heap()) {
             return None;
         }
         let mut next = map.clone();
-        next.insert(key.clone(), value.clone());
+        next.insert(key, value.clone());
         Some(next)
     }
 

@@ -6,7 +6,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::model::semantics::canonical_names;
-use crate::model::{ModelString, ParamValue, TemperModelAction, TemperModelState};
+use crate::model::{Fields, ModelString, ParamValue, Sym, TemperModelAction, TemperModelState};
 
 /// The records in scope, one per type, and the dispatches and module calls
 /// on their way. A move changes one record or two and the rest stay as they
@@ -15,7 +15,7 @@ use crate::model::{ModelString, ParamValue, TemperModelAction, TemperModelState}
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct JointState {
     /// Each type's record.
-    pub records: BTreeMap<Arc<str>, Arc<TemperModelState>>,
+    pub records: Fields<Arc<TemperModelState>>,
     /// Dispatches sent and not yet taken, sorted; the same dispatch may be
     /// in flight twice.
     pub inflight: Vec<Arc<Dispatch>>,
@@ -25,7 +25,7 @@ pub struct JointState {
     /// Who armed each record's state timer, by sender number, for the
     /// records whose timer is still armed. Presence tracks arming even when
     /// sender identity does not affect any reaction.
-    pub armed: BTreeMap<Arc<str>, u32>,
+    pub armed: Fields<u32>,
 }
 
 impl JointState {
@@ -40,19 +40,19 @@ impl JointState {
 pub struct Call {
     /// The entity type whose record's trigger started it; the answer goes
     /// back to that record.
-    pub to: String,
+    pub to: Sym,
     /// The module.
-    pub module: String,
+    pub module: Sym,
     /// The trigger's declared answers; empty when it names none.
-    pub on_success: Vec<String>,
+    pub on_success: Arc<[Sym]>,
     /// The action sent when the call fails, if any.
-    pub on_failure: Option<String>,
+    pub on_failure: Option<Sym>,
     /// Who its answer runs as, by sender number: whoever sent the move
     /// that called the module.
     pub by: u32,
     /// The tracked fields its answers are tied to, as the record held them
     /// when the call started: the module answers about that record.
-    pub asked: BTreeMap<String, ModelString>,
+    pub asked: Fields<ModelString>,
 }
 
 impl fmt::Display for Call {
@@ -69,19 +69,19 @@ impl fmt::Display for Call {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Dispatch {
     /// The target entity type.
-    pub to: String,
+    pub to: Sym,
     /// The action.
-    pub action: String,
+    pub action: Sym,
     /// The transition's target status, when the sender chose one.
-    pub target_state: Option<String>,
+    pub target_state: Option<Sym>,
     /// The parameters sent; a reaction's are its `args` as the source
     /// committed them.
-    pub params: BTreeMap<String, ParamValue>,
+    pub params: Fields<ParamValue>,
     /// Whether the dispatch path has read the related records it needs.
     pub read: bool,
     /// The steps this reaction chain has admitted, including this dispatch.
     /// Empty for a request that starts a new chain.
-    pub chain: Vec<ReactionStep>,
+    pub chain: Arc<[ReactionStep]>,
     /// The reaction that sent it, by its place among the model's reactions;
     /// `None` for a request from outside.
     pub via: Option<usize>,
@@ -108,31 +108,31 @@ impl Dispatch {
 pub struct Committed {
     /// The source's status after its move, when the guard reads it. Holding
     /// one it doesn't read would split a state by a value nothing can see.
-    pub status: Option<String>,
+    pub status: Option<Sym>,
     /// The fields the guard reads, by name.
-    pub fields: BTreeMap<String, ParamValue>,
+    pub fields: Fields<ParamValue>,
 }
 
 impl Committed {
     /// The source record as the guard reads it.
     pub(super) fn record(&self) -> TemperModelState {
         let mut record = TemperModelState {
-            status: self.status.clone().unwrap_or_default(),
-            counters: BTreeMap::new(),
-            booleans: BTreeMap::new(),
-            lists: BTreeMap::new(),
-            strings: BTreeMap::new(),
+            status: self.status.unwrap_or_else(|| Sym::new("")),
+            counters: Fields::new(),
+            booleans: Fields::new(),
+            lists: Fields::new(),
+            strings: Fields::new(),
         };
         for (field, value) in &self.fields {
             match value {
                 ParamValue::Count(count) => {
-                    record.counters.insert(field.clone(), *count);
+                    record.counters.insert(*field, *count);
                 }
                 ParamValue::Bool(value) => {
-                    record.booleans.insert(field.clone(), *value);
+                    record.booleans.insert(*field, *value);
                 }
                 ParamValue::Str(text) => {
-                    record.strings.insert(field.clone(), text.clone());
+                    record.strings.insert(*field, *text);
                 }
                 ParamValue::Fresh => {}
             }
@@ -144,7 +144,7 @@ impl Committed {
 impl fmt::Display for Dispatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let action = TemperModelAction {
-            name: self.action.clone(),
+            name: self.action,
             target_state: None,
             params: self.params.clone(),
         };
@@ -256,15 +256,15 @@ fn strings<'a>(
 
 /// One admitted reaction step. The model holds one record per type, but
 /// distinguishes an entity the chain found from one it made.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ReactionStep {
     /// The entity type the action runs on.
-    pub entity_type: String,
+    pub entity_type: Sym,
     /// The action.
-    pub action: String,
+    pub action: Sym,
     /// The type for which this id was generated; `same_id` keeps its origin
     /// even through other types. `None` means the chain read the id.
-    pub generated_for: Option<String>,
+    pub generated_for: Option<Sym>,
 }
 
 impl ReactionStep {

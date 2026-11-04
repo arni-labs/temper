@@ -3,7 +3,7 @@
 use super::step::Move;
 #[cfg(test)]
 use crate::model::TemperModelAction;
-use crate::model::{ModelString, ParamValue};
+use crate::model::{Fields, ModelString, ParamValue};
 use std::collections::BTreeMap;
 
 /// Render the move with renamed symbol parameters, preserving concrete literals.
@@ -12,12 +12,12 @@ pub(super) fn rename_label(
     mv: &Move,
     renamed: &BTreeMap<ModelString, ModelString>,
 ) -> String {
-    let rename_params = |params: &mut BTreeMap<String, ParamValue>| {
+    let rename_params = |params: &mut Fields<ParamValue>| {
         for value in params.values_mut() {
             if let ParamValue::Str(s) = value
                 && let Some(new) = renamed.get(s)
             {
-                *s = new.clone();
+                *s = *new;
             }
         }
     };
@@ -62,9 +62,9 @@ mod tests {
         let action = TemperModelAction {
             name: "Set".into(),
             target_state: None,
-            params: BTreeMap::from([
-                ("a".into(), ParamValue::Str(ModelString::from("#2"))),
-                ("b".into(), ParamValue::Str(ModelString::Symbol(2))),
+            params: Fields::from([
+                ("a", ParamValue::Str(ModelString::from("#2"))),
+                ("b", ParamValue::Str(ModelString::Symbol(2))),
             ]),
         };
         let text = format!("T.{action} sent");

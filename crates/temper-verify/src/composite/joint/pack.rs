@@ -2,13 +2,14 @@
 //! next in a record or two, so each distinct record, dispatch and call is kept
 //! once in a table and a walked state is a short run of numbers into them.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
+
 use std::hash::Hash;
 use std::sync::Arc;
 
 use super::room::{Heap, block, map_bytes};
 use super::state::{Call, Dispatch, JointState};
-use crate::model::TemperModelState;
+use crate::model::{Sym, TemperModelState};
 
 /// A packed joint state, shared by the walk's list and its index.
 pub(super) type Packed = Arc<[u32]>;
@@ -76,7 +77,7 @@ trait Numbers {
     fn record(&mut self, record: &Arc<TemperModelState>) -> Option<u32>;
     fn dispatch(&mut self, dispatch: &Arc<Dispatch>) -> Option<u32>;
     fn call(&mut self, call: &Arc<Call>) -> Option<u32>;
-    fn armed(&mut self, entity: &Arc<str>) -> Option<u32>;
+    fn armed(&mut self, entity: Sym) -> Option<u32>;
 }
 
 /// Numbers known already, and none for a value that is new.
@@ -90,8 +91,8 @@ impl Numbers for &Packer {
     fn call(&mut self, call: &Arc<Call>) -> Option<u32> {
         self.calls.known(call)
     }
-    fn armed(&mut self, entity: &Arc<str>) -> Option<u32> {
-        self.armed.get(entity).copied()
+    fn armed(&mut self, entity: Sym) -> Option<u32> {
+        self.armed.get(&entity).copied()
     }
 }
 
@@ -106,11 +107,11 @@ impl Numbers for Packer {
     fn call(&mut self, call: &Arc<Call>) -> Option<u32> {
         Some(self.calls.id(call))
     }
-    fn armed(&mut self, entity: &Arc<str>) -> Option<u32> {
+    fn armed(&mut self, entity: Sym) -> Option<u32> {
         let next = u32::try_from(self.armed_types.len()).expect("fewer than 2^32 types");
-        let id = *self.armed.entry(entity.clone()).or_insert(next);
+        let id = *self.armed.entry(entity).or_insert(next);
         if id == next {
-            self.armed_types.push(entity.clone());
+            self.armed_types.push(entity);
         }
         Some(id)
     }
@@ -135,7 +136,7 @@ fn words(state: &JointState, numbers: &mut impl Numbers) -> Option<Packed> {
     }
     out.push(u32::try_from(state.armed.len()).expect("one timer to a record"));
     for (entity, by) in &state.armed {
-        out.push(numbers.armed(entity)?);
+        out.push(numbers.armed(*entity)?);
         out.push(*by);
     }
     Some(out.into())
@@ -150,10 +151,10 @@ pub(super) struct Packer {
     heap: usize,
     /// The types of the records every state of the walk holds, in order. A
     /// move replaces a record and never adds one.
-    types: Vec<Arc<str>>,
+    types: Vec<Sym>,
     /// The types armed timers name.
-    armed: HashMap<Arc<str>, u32>,
-    armed_types: Vec<Arc<str>>,
+    armed: HashMap<Sym, u32>,
+    armed_types: Vec<Sym>,
     records: Table<TemperModelState>,
     dispatches: Table<Dispatch>,
     calls: Table<Call>,
@@ -163,7 +164,7 @@ impl Packer {
     /// `state` packed, its new values added to the tables.
     pub(super) fn pack(&mut self, state: &JointState) -> Packed {
         if self.types.is_empty() {
-            self.types.extend(state.records.keys().cloned());
+            self.types.extend(state.records.keys().copied());
         }
         words(state, self).expect("a packer adds what it does not know")
     }
@@ -191,7 +192,7 @@ impl Packer {
         let records = self
             .types
             .iter()
-            .map(|entity| (entity.clone(), self.records.items[next()].clone()))
+            .map(|entity| (*entity, self.records.items[next()].clone()))
             .collect();
         let inflight = (0..next())
             .map(|_| self.dispatches.items[next()].clone())
@@ -200,8 +201,8 @@ impl Packer {
             .map(|_| self.calls.items[next()].clone())
             .collect();
         let armed = (0..next())
-            .map(|_| (self.armed_types[next()].clone(), next() as u32))
-            .collect::<BTreeMap<_, _>>();
+            .map(|_| (self.armed_types[next()], next() as u32))
+            .collect();
         JointState {
             records,
             inflight,
@@ -241,26 +242,26 @@ impl Packer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ModelString;
+    use crate::model::{Fields, ModelString};
 
     #[test]
     fn packed_call_snapshots_keep_literals_distinct_from_symbols() {
         let state = JointState {
-            records: BTreeMap::new(),
+            records: Fields::new(),
             inflight: Vec::new(),
             calls: vec![Arc::new(Call {
                 to: "T".into(),
                 module: "worker".into(),
-                on_success: Vec::new(),
+                on_success: std::sync::Arc::new([]),
                 on_failure: None,
                 by: 0,
-                asked: BTreeMap::from([
-                    ("literal".into(), ModelString::from("#1")),
-                    ("fresh".into(), ModelString::Symbol(1)),
-                    ("blank".into(), ModelString::BlankSymbol(2)),
+                asked: Fields::from([
+                    ("literal", ModelString::from("#1")),
+                    ("fresh", ModelString::Symbol(1)),
+                    ("blank", ModelString::BlankSymbol(2)),
                 ]),
             })],
-            armed: BTreeMap::new(),
+            armed: Fields::new(),
         };
         let mut packer = Packer::default();
         let packed = packer.pack(&state);

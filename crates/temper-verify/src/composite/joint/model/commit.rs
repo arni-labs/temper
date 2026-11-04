@@ -2,6 +2,7 @@
 //! or refuses it, the state timer that arms, and what the record does next.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use temper_spec::predicate::{Expr, Name, Truth, eval};
 
@@ -13,7 +14,7 @@ use super::react::Sent;
 use super::step::Certainty;
 use crate::model::semantics::{rule_for, step, successors_budgeted, within_bounds};
 use crate::model::{
-    ParamValue, ResolvedTransition, StringParam, TemperModelAction, TemperModelState,
+    Fields, ParamValue, ResolvedTransition, StringParam, Sym, TemperModelAction, TemperModelState,
 };
 
 impl JointModel {
@@ -29,12 +30,12 @@ impl JointModel {
         by: u32,
     ) -> Vec<(JointState, String, Certainty)> {
         let dispatch = Dispatch {
-            to: entity.to_string(),
-            action: name.to_string(),
+            to: entity.into(),
+            action: name.into(),
             target_state: None,
-            params: BTreeMap::new(),
+            params: Fields::new(),
             read: !self.action_reads_related(entity, name),
-            chain: Vec::new(),
+            chain: Arc::new([]),
             via: None,
             by,
             unread_guard: None,
@@ -188,7 +189,7 @@ impl JointModel {
         let timeout = self.timeout(entity, &moved.status);
         match timeout {
             Some(timeout) if entered || timeout.reset_on.iter().any(|a| a == action) => {
-                state.armed.insert(entity.into(), self.armer(entity, by));
+                state.armed.insert(entity, self.armer(entity, by));
             }
             Some(_) => {}
             None => {
@@ -196,7 +197,7 @@ impl JointModel {
             }
         }
         if let Some(record) = state.records.get_mut(entity) {
-            *record = std::sync::Arc::new(moved);
+            *record = Arc::new(moved);
         }
     }
 
@@ -214,7 +215,7 @@ impl JointModel {
     /// transition, with what the model knows of that. The actor checks its
     /// own state; the related records were read on the dispatch path.
     pub(super) fn arrive(&self, state: &JointState, dispatch: &Dispatch) -> Arrival {
-        let model = &self.models[&dispatch.to];
+        let model = &self.models[dispatch.to.as_str()];
         let target = &state.records[dispatch.to.as_str()];
         let enabled: Vec<&ResolvedTransition> = self
             .transitions_for(dispatch)
@@ -235,7 +236,7 @@ impl JointModel {
         // carry: the first choice, as the composite check takes. A string
         // parameter it does not carry leaves the field as it is.
         let values = self.values(state);
-        let mut params: BTreeMap<String, ParamValue> =
+        let mut params: Fields<ParamValue> =
             successors_budgeted(model, t, target, &values, &self.expansion)
                 .into_iter()
                 .next()
@@ -248,7 +249,7 @@ impl JointModel {
             .params
             .keys()
             .any(|name| !dispatch.params.contains_key(name));
-        params.extend(dispatch.params.clone());
+        params.extend(dispatch.params.iter().map(|(name, value)| (*name, *value)));
         let newer = self.order.holds(&dispatch.to, &t.name, &params, target);
         if !constraints_hold(&t.string_params, target, &params) || newer == Truth::False {
             return Arrival::Refused;
@@ -309,7 +310,7 @@ impl JointModel {
             };
         Arrival::Took {
             moved,
-            action: t.name.clone(),
+            action: t.name,
             certainty,
         }
     }
@@ -323,7 +324,7 @@ impl JointModel {
         entity: &str,
         t: &ResolvedTransition,
         state: &JointState,
-        params: &BTreeMap<String, ParamValue>,
+        params: &Fields<ParamValue>,
     ) -> bool {
         let env = JointEnv {
             params: Some(params),
@@ -343,7 +344,7 @@ impl JointModel {
         &self,
         entity: &str,
         action: &str,
-        params: &BTreeMap<String, ParamValue>,
+        params: &Fields<ParamValue>,
         record: &TemperModelState,
     ) -> Truth {
         let mut truth = Truth::True;
@@ -364,7 +365,7 @@ impl JointModel {
         &'a self,
         dispatch: &'a Dispatch,
     ) -> impl Iterator<Item = &'a ResolvedTransition> + 'a {
-        self.models[&dispatch.to]
+        self.models[dispatch.to.as_str()]
             .transitions
             .iter()
             .filter(move |t| {
@@ -388,7 +389,7 @@ pub(super) enum Arrival {
         /// The record after it.
         moved: TemperModelState,
         /// The transition's action.
-        action: String,
+        action: Sym,
         /// Sure, or one of taking and refusing, or unsure.
         certainty: Certainty,
     },
@@ -432,7 +433,7 @@ pub(super) fn add(state: &mut JointState, dispatch: Dispatch) {
 fn constraints_hold(
     string_params: &[StringParam],
     target: &TemperModelState,
-    params: &BTreeMap<String, ParamValue>,
+    params: &Fields<ParamValue>,
 ) -> bool {
     string_params.iter().all(|param| {
         // A string parameter nobody passed is absent, which any constraint
@@ -440,7 +441,7 @@ fn constraints_hold(
         let Some(ParamValue::Str(value)) = params.get(&param.name) else {
             return !param.nonempty && param.equals.is_empty() && param.not_equals.is_empty();
         };
-        let tracked = |var: &String| target.strings.get(var);
+        let tracked = |var: &Sym| target.strings.get(var);
         !(param.nonempty && value.is_blank())
             && param.equals.iter().filter_map(tracked).all(|v| v == value)
             && param

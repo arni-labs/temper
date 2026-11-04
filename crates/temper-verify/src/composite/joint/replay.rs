@@ -8,7 +8,7 @@ use temper_spec::predicate::{Expr, Truth, eval};
 use super::JointStep;
 use super::model::{JointModel, Move, Sending};
 use super::state::{Dispatch, render};
-use crate::model::{ModelString, ParamValue};
+use crate::model::{Fields, ModelString, ParamValue};
 
 /// One move of a trace: an entity's action with the string parameters it
 /// was sent. Values are names for this trace only: equal names are equal
@@ -82,7 +82,7 @@ pub fn replay_joint_invariants(
     }];
     for (i, wanted) in trace.iter().enumerate() {
         loop {
-            let fits = |params: &BTreeMap<String, ParamValue>| {
+            let fits = |params: &Fields<ParamValue>| {
                 let mut bindings = names.clone();
                 let mut used = model.values(&state);
                 wanted.params.iter().all(|(param, name)| {
@@ -94,8 +94,8 @@ pub fn replay_joint_invariants(
                         Some(bound) => value == bound,
                         None if name.is_empty() => value.is_empty(),
                         None if value.symbol_id().is_some() && !used.contains(value) => {
-                            bindings.insert(name.clone(), value.clone());
-                            used.insert(value.clone());
+                            bindings.insert(name.clone(), *value);
+                            used.insert(*value);
                             true
                         }
                         None => false,
@@ -146,7 +146,7 @@ pub fn replay_joint_invariants(
                     if let Some(ParamValue::Str(value)) = action.params.get(param)
                         && !name.is_empty()
                     {
-                        names.entry(name.clone()).or_insert_with(|| value.clone());
+                        names.entry(name.clone()).or_insert_with(|| *value);
                     }
                 }
             }
@@ -166,7 +166,7 @@ pub fn replay_joint_invariants(
             names = names
                 .into_iter()
                 .filter_map(|(name, value)| match next.renamed.get(&value) {
-                    Some(new) => Some((name, new.clone())),
+                    Some(new) => Some((name, *new)),
                     None if matches!(value, ModelString::Literal(_)) => Some((name, value)),
                     None => None,
                 })

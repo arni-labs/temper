@@ -57,7 +57,7 @@ use super::env::ID;
 use super::model::Classes;
 use super::room::Heap;
 use super::state::JointState;
-use crate::model::ModelString;
+use crate::model::{Fields, ModelString};
 use table::reread;
 
 mod build;
@@ -135,8 +135,8 @@ type Question = (
     String,
     Option<ModelString>,
     Option<ModelString>,
-    BTreeMap<String, ModelString>,
-    BTreeMap<String, bool>,
+    Fields<ModelString>,
+    Fields<bool>,
 );
 
 impl Senders {
@@ -328,7 +328,7 @@ impl Senders {
             .chain(service_source_id)
             .chain(target.strings.values())
             .filter_map(|value| match value {
-                ModelString::Literal(text) if !text.is_empty() => Some(text.clone()),
+                ModelString::Literal(text) if !text.is_empty() => Some(text.to_string()),
                 _ => None,
             })
             .collect();
@@ -360,7 +360,7 @@ impl Senders {
         let booleans = target
             .booleans
             .iter()
-            .map(|(field, value)| (field.clone(), Attr::Value(Value::Bool(*value))));
+            .map(|(field, value)| (field.to_string(), Attr::Value(Value::Bool(*value))));
         let record = strings.chain(booleans).collect();
         let may = policies.may(&asker, action, entity, &record, Some(&cause));
         let entry = super::room::map_bytes::<Question, May>(1)
@@ -458,7 +458,7 @@ fn symbol(value: &ModelString, literals: &BTreeSet<String>) -> Attr {
             name: value.to_string(),
             unlike: literals.clone(),
         },
-        ModelString::Literal(text) => Attr::Value(Value::String(text.clone())),
+        ModelString::Literal(text) => Attr::Value(Value::String(text.to_string())),
     }
 }
 

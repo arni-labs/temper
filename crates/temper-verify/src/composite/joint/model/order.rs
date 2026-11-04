@@ -24,7 +24,7 @@ use temper_spec::predicate::{Arg, Expr, Literal, Name, Truth};
 
 use super::super::{Dispatch, JointState};
 use super::Reaction;
-use crate::model::{ModelEffect, ParamValue, TemperModel, TemperModelState};
+use crate::model::{Fields, ModelEffect, ParamValue, TemperModel, TemperModelState};
 
 mod fan;
 
@@ -134,7 +134,7 @@ impl Order {
                             var,
                             value: Arg::Param(param),
                         } if var == field => compared
-                            .get(&(entity.clone(), t.name.clone()))
+                            .get(&(entity.clone(), t.name.to_string()))
                             .is_some_and(|pairs| pairs.contains(&(param.clone(), field.clone()))),
                         _ => true,
                     })
@@ -193,7 +193,7 @@ impl Order {
         &self,
         entity: &str,
         action: &str,
-        params: &BTreeMap<String, ParamValue>,
+        params: &Fields<ParamValue>,
         target: &TemperModelState,
     ) -> Truth {
         let Some(pairs) = self.compared.get(&(entity.to_string(), action.to_string())) else {
@@ -219,7 +219,7 @@ impl Order {
             let ModelEffect::AddCounter { var, .. } = effect else {
                 return true;
             };
-            let key = (entity.to_string(), var.clone());
+            let key = (entity.to_string(), var.to_string());
             self.families
                 .iter()
                 .filter(|family| family.fields.contains(&key))
@@ -238,10 +238,12 @@ impl Order {
     /// carries a count not greater than a field that never goes down, and
     /// the model knows that (not both [`BEHIND`] or further behind).
     fn doomed(&self, dispatch: &Dispatch, target: &TemperModelState) -> bool {
-        let key = (dispatch.to.clone(), dispatch.action.clone());
+        let key = (dispatch.to.to_string(), dispatch.action.to_string());
         self.compared.get(&key).is_some_and(|pairs| {
             pairs.iter().any(|(param, field)| {
-                let rising = self.rising.contains(&(dispatch.to.clone(), field.clone()));
+                let rising = self
+                    .rising
+                    .contains(&(dispatch.to.to_string(), field.to_string()));
                 let held = target.counters.get(field).copied();
                 match (held, dispatch.params.get(param)) {
                     (Some(held), Some(ParamValue::Count(sent))) => {
@@ -362,9 +364,11 @@ fn grow(
                             var,
                             value: Arg::Param(param),
                         } if var == &field => {
-                            family
-                                .params
-                                .insert((entity.clone(), t.name.clone(), param.clone()));
+                            family.params.insert((
+                                entity.clone(),
+                                t.name.to_string(),
+                                param.clone(),
+                            ));
                         }
                         ModelEffect::SetCounter { var, .. }
                         | ModelEffect::AddCounter { var, .. }

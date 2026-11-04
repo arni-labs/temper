@@ -35,7 +35,9 @@ use super::senders::{OUTSIDE, Senders};
 use super::slice::slice;
 use super::state::canonical;
 use crate::model::semantics::{Expansion, rule_for, string_values};
-use crate::model::{ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState};
+use crate::model::{
+    Fields, ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState,
+};
 
 pub(super) use classes::Classes;
 pub use drops::DroppedReaction;
@@ -369,7 +371,7 @@ impl JointModel {
                 if let ParamValue::Str(text) = value
                     && !text.is_empty()
                 {
-                    values.insert(text.clone());
+                    values.insert(*text);
                 }
             }
         }
@@ -413,7 +415,7 @@ impl JointModel {
         t: &ResolvedTransition,
         state: &JointState,
         blind: Blind,
-        params: Option<&BTreeMap<String, ParamValue>>,
+        params: Option<&Fields<ParamValue>>,
     ) -> bool {
         // The rule the runtime takes for this action in the record's status
         // (`rule_for`); another with the same name never fires from there.

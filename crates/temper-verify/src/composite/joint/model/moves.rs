@@ -100,8 +100,8 @@ impl JointModel {
                 let reads = self.reads_related(t);
                 for (params, _) in successors_budgeted(model, t, local, &values, &self.expansion) {
                     let action = TemperModelAction {
-                        name: t.name.clone(),
-                        target_state: t.to_state.clone(),
+                        name: t.name,
+                        target_state: t.to_state,
                         params,
                     };
                     for &by in senders.iter() {
@@ -182,14 +182,14 @@ impl JointModel {
         values: &BTreeSet<ModelString>,
         out: &mut Vec<Move>,
     ) -> bool {
-        let model = &self.models[&call.to];
+        let model = &self.models[call.to.as_str()];
         let local = &state.records[call.to.as_str()];
         for t in &model.transitions {
             let answers = if call.on_success.is_empty() {
                 self.kernel
                     .internal
-                    .get(&call.to)
-                    .is_some_and(|names| names.contains(&t.name))
+                    .get(call.to.as_str())
+                    .is_some_and(|names| names.contains(t.name.as_str()))
                     || self.only_a_module_may(&call.to, &t.name)
             } else {
                 call.on_success.contains(&t.name)
@@ -202,15 +202,15 @@ impl JointModel {
                 // A parameter tied to a field carries it as the call found it.
                 for param in &t.string_params {
                     if let Some(value) = param.equals.iter().find_map(|f| call.asked.get(f)) {
-                        params.insert(param.name.clone(), ParamValue::Str(value.clone()));
+                        params.insert(param.name, ParamValue::Str(*value));
                     }
                 }
                 if !seen.insert(params.clone()) {
                     continue;
                 }
                 let action = TemperModelAction {
-                    name: t.name.clone(),
-                    target_state: t.to_state.clone(),
+                    name: t.name,
+                    target_state: t.to_state,
                     params,
                 };
                 if !self.keep_move(out, Move::Answer(call.clone(), action)) {

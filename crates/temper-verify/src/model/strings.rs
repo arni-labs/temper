@@ -3,7 +3,7 @@
 use super::expansion::Expansion;
 use super::heap::{Heap, whole};
 use super::types::{
-    ModelString, ParamValue, ResolvedTransition, StringParam, TemperModel, TemperModelState,
+    Fields, ModelString, ParamValue, ResolvedTransition, StringParam, TemperModel, TemperModelState,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,7 +15,7 @@ pub fn string_values<'a>(
         .into_iter()
         .flat_map(|state| state.strings.values().chain(state.lists.values().flatten()))
         .filter(|value| !value.is_empty())
-        .cloned()
+        .copied()
         .collect()
 }
 
@@ -40,7 +40,7 @@ fn string_candidates(
     state: &TemperModelState,
     values: &BTreeSet<ModelString>,
 ) -> Vec<ModelString> {
-    let tracked = |var: &str| state.strings.get(var).cloned();
+    let tracked = |var: &str| state.strings.get(var).copied();
     let mut candidates: BTreeSet<ModelString> =
         match param.equals.iter().find_map(|var| tracked(var)) {
             Some(value) => BTreeSet::from([value]),
@@ -49,8 +49,8 @@ fn string_candidates(
                 all.insert("".into());
                 all.insert(fresh_string(values, false));
                 all.insert(fresh_string(values, true));
-                if let Some(literals) = model.string_literals.get(&param.name) {
-                    all.extend(literals.iter().cloned().map(ModelString::from));
+                if let Some(literals) = model.string_literals.get(param.name.as_str()) {
+                    all.extend(literals.iter().map(|text| ModelString::from(text.as_str())));
                 }
                 all
             }
@@ -80,9 +80,9 @@ pub(super) fn string_assignments(
     state: &TemperModelState,
     values: &BTreeSet<ModelString>,
     budget: &Expansion,
-) -> Vec<BTreeMap<String, ModelString>> {
+) -> Vec<Fields<ModelString>> {
     let mut assignments = Vec::new();
-    if !budget.push(&mut assignments, BTreeMap::new()) {
+    if !budget.push(&mut assignments, Fields::new()) {
         return assignments;
     }
     for param in &t.string_params {
@@ -97,8 +97,8 @@ pub(super) fn string_assignments(
                 return Vec::new();
             }
             let mut scope = values.clone();
-            scope.extend(assignment.values().cloned());
-            let literals = model.string_literals.get(&param.name);
+            scope.extend(assignment.values().copied());
+            let literals = model.string_literals.get(param.name.as_str());
             let candidate_room = scope.heap()
                 + literals.map_or(0, Heap::heap)
                 + super::heap::tree_bytes::<ModelString, ()>(
@@ -113,8 +113,8 @@ pub(super) fn string_assignments(
             // A parameter neither effects nor guard reads leads to the same
             // move with any value its constraints allow: one is enough.
             if !param.writes
-                && !t.params.contains_key(&param.name)
-                && !t.guard.params_read().contains(&param.name)
+                && !t.params.contains_key(param.name.as_str())
+                && !t.guard.params_read().iter().any(|p| *p == param.name)
             {
                 candidates.truncate(1);
             }
@@ -122,7 +122,7 @@ pub(super) fn string_assignments(
                 if !budget.take() {
                     return Vec::new();
                 }
-                let Some(next) = budget.with_entry(&assignment, &param.name, &value) else {
+                let Some(next) = budget.with_entry(&assignment, param.name, &value) else {
                     return Vec::new();
                 };
                 if !budget.reserve(&mut more) {
@@ -144,11 +144,11 @@ pub(super) fn string_assignments(
 pub fn apply_string_params(
     string_params: &[StringParam],
     state: &mut TemperModelState,
-    params: &BTreeMap<String, ParamValue>,
+    params: &Fields<ParamValue>,
 ) {
     for param in string_params.iter().filter(|p| p.writes) {
         if let Some(ParamValue::Str(value)) = params.get(&param.name) {
-            state.strings.insert(param.name.clone(), value.clone());
+            state.strings.insert(param.name, *value);
         }
     }
 }
@@ -158,7 +158,7 @@ pub fn apply_string_params(
 /// between values and their blank classification are preserved.
 /// Returns each value's new name.
 pub fn canonical_strings(
-    maps: &mut [&mut BTreeMap<String, ModelString>],
+    maps: &mut [&mut Fields<ModelString>],
 ) -> BTreeMap<ModelString, ModelString> {
     canonical_values(maps.iter_mut().flat_map(|map| map.values_mut()))
 }
@@ -181,7 +181,7 @@ pub fn canonical_values<'a>(
     let renamed = canonical_names(values.iter().map(|value| &**value));
     for value in values {
         if let Some(name) = renamed.get(value) {
-            value.clone_from(name);
+            *value = *name;
         }
     }
     renamed
@@ -200,7 +200,7 @@ pub fn canonical_names<'a>(
             ModelString::Symbol(_) => ModelString::Symbol(id),
             ModelString::BlankSymbol(_) => ModelString::BlankSymbol(id),
         };
-        renamed.entry(value.clone()).or_insert(name);
+        renamed.entry(*value).or_insert(name);
     }
     renamed
 }

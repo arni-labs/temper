@@ -2,14 +2,16 @@
 
 use std::fmt;
 
+use super::Sym;
+
 /// A concrete spec string or a fresh equality symbol. Symbols never equal
 /// literals, including literals whose spelling is `#1`.
 #[derive(
-    Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+    Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub enum SymbolicString {
     /// A string from a spec or a concrete input.
-    Literal(String),
+    Literal(Sym),
     /// An arbitrary nonblank value absent from the spec's literals.
     Symbol(usize),
     /// An arbitrary nonempty whitespace-only value absent from the spec's literals.
@@ -40,14 +42,14 @@ impl SymbolicString {
     /// Its value for predicate evaluation.
     pub fn val(&self) -> super::eval::Val<'_> {
         match self {
-            Self::Literal(s) => super::eval::Val::Str(s),
+            Self::Literal(s) => super::eval::Val::Str(s.as_str()),
             Self::Symbol(n) | Self::BlankSymbol(n) => super::eval::Val::Symbol(*n),
         }
     }
 }
 impl From<String> for SymbolicString {
     fn from(s: String) -> Self {
-        Self::Literal(s)
+        Self::Literal(s.into())
     }
 }
 impl From<&str> for SymbolicString {

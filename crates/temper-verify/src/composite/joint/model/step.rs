@@ -404,7 +404,7 @@ impl JointModel {
         let strings = &state.records[call.to.as_str()].strings;
         self.unchecked
             .equals
-            .get(&(call.to.clone(), action.to_string()))
+            .get(&(call.to.to_string(), action.to_string()))
             .is_some_and(|fields| {
                 fields
                     .iter()
@@ -453,12 +453,12 @@ impl JointModel {
 /// dispatch path read the related records and they allowed it.
 pub(super) fn sent(entity: &str, action: &TemperModelAction, by: u32) -> Dispatch {
     Dispatch {
-        to: entity.to_string(),
-        action: action.name.clone(),
-        target_state: action.target_state.clone(),
+        to: entity.into(),
+        action: action.name,
+        target_state: action.target_state,
         params: action.params.clone(),
         read: true,
-        chain: Vec::new(),
+        chain: std::sync::Arc::new([]),
         via: None,
         by,
         unread_guard: None,

@@ -4,7 +4,7 @@ use super::*;
 
 impl JointModel {
     /// The records as they start, without their ids.
-    pub(super) fn blank(&self) -> BTreeMap<std::sync::Arc<str>, std::sync::Arc<TemperModelState>> {
+    pub(super) fn blank(&self) -> Fields<std::sync::Arc<TemperModelState>> {
         self.models
             .iter()
             .map(|(entity, model)| {
@@ -12,7 +12,7 @@ impl JointModel {
                     .into_iter()
                     .next()
                     .expect("a model has one initial state");
-                (entity.as_str().into(), std::sync::Arc::new(init))
+                (entity.as_str(), std::sync::Arc::new(init))
             })
             .collect()
     }
@@ -26,29 +26,27 @@ impl JointModel {
     ) -> (JointState, BTreeMap<String, ModelString>) {
         let mut names: BTreeMap<String, ModelString> = BTreeMap::new();
         let mut records = self.blank();
-        for (entity, record) in &mut records {
+        for (entity, record) in records.iter_mut() {
             let name = ids
-                .get(&**entity)
+                .get(entity.as_str())
                 .cloned()
                 .unwrap_or_else(|| format!("{entity}#id"));
             let next = ModelString::Symbol(names.len() + 1);
-            let value = names.entry(name).or_insert(next).clone();
-            std::sync::Arc::make_mut(record)
-                .strings
-                .insert(ID.to_string(), value);
+            let value = *names.entry(name).or_insert(next);
+            std::sync::Arc::make_mut(record).strings.insert(ID, value);
         }
         let mut state = JointState {
             records,
             inflight: Vec::new(),
             calls: Vec::new(),
-            armed: BTreeMap::new(),
+            armed: Fields::new(),
         };
         self.arm_at_start(&mut state);
         self.order.normalize(&mut state);
         let renamed = canonical(&mut state);
         for value in names.values_mut() {
             if let Some(new) = renamed.get(value) {
-                *value = new.clone();
+                *value = *new;
             }
         }
         (state, names)
@@ -59,7 +57,7 @@ impl JointModel {
     pub(super) fn arm_at_start(&self, state: &mut JointState) {
         for (entity, record) in &state.records {
             if self.timeout(entity, &record.status).is_some() {
-                state.armed.insert(entity.clone(), OUTSIDE);
+                state.armed.insert(*entity, OUTSIDE);
             }
         }
     }
@@ -74,7 +72,7 @@ impl JointModel {
                 records: blank,
                 inflight: Vec::new(),
                 calls: Vec::new(),
-                armed: BTreeMap::new(),
+                armed: Fields::new(),
             }));
         }
         // Every type's id literals, in one order; each record may take only
@@ -113,15 +111,13 @@ impl JointModel {
                 .map(move |ids| {
                     let mut records = blank.clone();
                     for (record, id) in records.values_mut().zip(ids) {
-                        std::sync::Arc::make_mut(record)
-                            .strings
-                            .insert(ID.to_string(), id);
+                        std::sync::Arc::make_mut(record).strings.insert(ID, id);
                     }
                     let mut state = JointState {
                         records,
                         inflight: Vec::new(),
                         calls: Vec::new(),
-                        armed: BTreeMap::new(),
+                        armed: Fields::new(),
                     };
                     self.arm_at_start(&mut state);
                     self.order.normalize(&mut state);
@@ -244,16 +240,8 @@ mod tests {
         assert_eq!(
             id_values(vec![0, 1, 2], literals.clone()).collect::<Vec<_>>(),
             vec![
-                vec![
-                    literals[0].clone(),
-                    literals[1].clone(),
-                    ModelString::Symbol(1)
-                ],
-                vec![
-                    literals[0].clone(),
-                    literals[1].clone(),
-                    ModelString::BlankSymbol(1)
-                ],
+                vec![literals[0], literals[1], ModelString::Symbol(1)],
+                vec![literals[0], literals[1], ModelString::BlankSymbol(1)],
             ],
         );
         assert_eq!(

@@ -288,16 +288,16 @@ fn changes(read: &BTreeMap<String, BTreeSet<String>>, from: &JointState, to: &Jo
 /// action or module.
 fn kind(mv: &Move) -> (u8, String, String) {
     match mv {
-        Move::Take(entity, action, _) => (0, entity.clone(), action.name.clone()),
-        Move::Send(entity, action, _) => (1, entity.clone(), action.name.clone()),
+        Move::Take(entity, action, _) => (0, entity.to_string(), action.name.to_string()),
+        Move::Send(entity, action, _) => (1, entity.to_string(), action.name.to_string()),
         Move::Timer(entity, action) => (2, entity.clone(), action.clone()),
-        Move::Answer(call, action) => (3, call.to.clone(), action.name.clone()),
-        Move::Fail(call) => (4, call.to.clone(), call.module.clone()),
-        Move::Lost(call) => (5, call.to.clone(), call.module.clone()),
-        Move::Read(dispatch) => (6, dispatch.to.clone(), dispatch.action.clone()),
-        Move::Arrive(dispatch) => (7, dispatch.to.clone(), dispatch.action.clone()),
-        Move::Reaction(entity, action, _) => (8, entity.clone(), action.name.clone()),
-        Move::Silent(call) => (9, call.to.clone(), call.module.clone()),
+        Move::Answer(call, action) => (3, call.to.to_string(), action.name.to_string()),
+        Move::Fail(call) => (4, call.to.to_string(), call.module.to_string()),
+        Move::Lost(call) => (5, call.to.to_string(), call.module.to_string()),
+        Move::Read(dispatch) => (6, dispatch.to.to_string(), dispatch.action.to_string()),
+        Move::Arrive(dispatch) => (7, dispatch.to.to_string(), dispatch.action.to_string()),
+        Move::Reaction(entity, action, _) => (8, entity.to_string(), action.name.to_string()),
+        Move::Silent(call) => (9, call.to.to_string(), call.module.to_string()),
     }
 }
 

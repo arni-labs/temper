@@ -1,8 +1,6 @@
 //! What a record's commit sets off: its reactions, as dispatches, and the
 //! module calls its triggers start.
 
-use std::collections::BTreeMap;
-
 use temper_spec::automaton::TargetResolver;
 use temper_spec::predicate::{Arg, Expr, Literal, Name, ParamKind, Truth, VarKind, eval};
 
@@ -16,7 +14,7 @@ use super::copies::base;
 use super::read::Reaction;
 use super::step::Certainty;
 use super::{Delivery, JointModel};
-use crate::model::ParamValue;
+use crate::model::{Fields, ParamValue, Sym};
 
 /// Who made a move, as what follows it reads.
 #[derive(Clone, Copy)]
@@ -24,7 +22,7 @@ pub(super) struct Sent<'a> {
     /// The chain it came in; empty when it starts one.
     pub(super) chain: &'a [ReactionStep],
     pub(super) by: u32,
-    pub(super) params: &'a BTreeMap<String, ParamValue>,
+    pub(super) params: &'a Fields<ParamValue>,
     /// Whether it is a request, whose sender chose all its parameters.
     pub(super) request: bool,
 }
@@ -46,8 +44,8 @@ impl JointModel {
         self.store_outside_spawns(&mut state, source, action);
         // Outside actions and detached work start a fresh chain.
         let root = [ReactionStep {
-            entity_type: base(source).to_string(),
-            action: action.to_string(),
+            entity_type: base(source).into(),
+            action: action.into(),
             generated_for: None,
         }];
         let chain = if chain.is_empty() { &root } else { chain };
@@ -99,13 +97,13 @@ impl JointModel {
                     return Vec::new();
                 }
                 let call = Call {
-                    to: source.to_string(),
-                    module: spec.module.clone(),
-                    on_success: spec.on_success.clone(),
-                    on_failure: spec.on_failure.clone(),
+                    to: source.into(),
+                    module: spec.module.as_str().into(),
+                    on_success: spec.on_success.iter().map(Sym::from).collect(),
+                    on_failure: spec.on_failure.as_ref().map(Sym::from),
                     by: answer_as,
                     asked: asked_entries()
-                        .map(|(field, value)| (field.clone(), value.clone()))
+                        .map(|(field, value)| (field.clone(), *value))
                         .collect(),
                 };
                 let at = outcome.calls.partition_point(|c| **c < call);
@@ -232,7 +230,7 @@ impl JointModel {
                     return Vec::new();
                 }
                 let generated_for = match &reaction.resolve {
-                    Some(TargetResolver::Create) => Some(base(&reaction.to).to_string()),
+                    Some(TargetResolver::Create) => Some(Sym::new(base(&reaction.to))),
                     Some(TargetResolver::CreateIfMissing { id_field }) => {
                         if state.records[source]
                             .strings
@@ -241,17 +239,17 @@ impl JointModel {
                         {
                             None
                         } else {
-                            Some(base(&reaction.to).to_string())
+                            Some(Sym::new(base(&reaction.to)))
                         }
                     }
                     Some(TargetResolver::SameId) => {
-                        chain.last().and_then(|step| step.generated_for.clone())
+                        chain.last().and_then(|step| step.generated_for)
                     }
                     _ => None,
                 };
                 let step = ReactionStep {
-                    entity_type: base(&reaction.to).to_string(),
-                    action: reaction.target_action.clone(),
+                    entity_type: base(&reaction.to).into(),
+                    action: reaction.target_action.as_str().into(),
                     generated_for,
                 };
                 // The runtime stops a step its chain already holds. A chain
@@ -271,12 +269,12 @@ impl JointModel {
                 }
                 let (via, chain) = self.sent_as(index, chain, step);
                 let dispatch = Dispatch {
-                    to: reaction.to.clone(),
-                    action: reaction.target_action.clone(),
+                    to: reaction.to.as_str().into(),
+                    action: reaction.target_action.as_str().into(),
                     target_state: None,
                     params: self.args(&state, source, reaction),
                     read: !self.action_reads_related(&reaction.to, &reaction.target_action),
-                    chain,
+                    chain: chain.into(),
                     via: Some(via),
                     unread_guard,
                     by: self.senders.reaction(
@@ -336,7 +334,7 @@ impl JointModel {
         if eval(guard, &env) == Truth::Unknown {
             return None;
         }
-        let mut fields = BTreeMap::new();
+        let mut fields = Fields::new();
         let mut lists = false;
         let mut reads_status = false;
         let mut keep = |field: &str| {
@@ -360,7 +358,7 @@ impl JointModel {
             };
             if let Some(value) = value {
                 let field = if field == "id" { ID } else { field };
-                fields.insert(field.to_string(), value);
+                fields.insert(field, value);
             }
         };
         guard.for_each_name(&mut |name| match name {
@@ -372,10 +370,10 @@ impl JointModel {
             Name::Param(_) => {}
         });
         if let Some(id) = record.strings.get(ID) {
-            fields.insert(ID.to_string(), ParamValue::Str(id.clone()));
+            fields.insert(ID, ParamValue::Str(*id));
         }
         (!lists).then(|| Committed {
-            status: reads_status.then(|| record.status.clone()),
+            status: reads_status.then_some(record.status),
             fields,
         })
     }
@@ -405,7 +403,7 @@ impl JointModel {
         state: &JointState,
         source: &str,
         reaction: &Reaction,
-    ) -> BTreeMap<String, ParamValue> {
+    ) -> Fields<ParamValue> {
         let source_state = &state.records[source];
         let target = &self.models[&reaction.to];
         let nonempty = self
@@ -421,7 +419,7 @@ impl JointModel {
                 {
                     let Arg::Var(field) = arg else { return None };
                     let count = source_state.counters.get(field).copied()?;
-                    return Some((param.clone(), ParamValue::Count(count)));
+                    return Some((param.as_str(), ParamValue::Count(count)));
                 }
                 if self.reads_count(reaction, param) {
                     // Sent only when the source holds it as a value, not as
@@ -431,7 +429,7 @@ impl JointModel {
                         return None;
                     }
                     let count = source_state.counters.get(field).copied()?;
-                    return Some((param.clone(), ParamValue::Count(count)));
+                    return Some((param.as_str(), ParamValue::Count(count)));
                 }
                 if !target.models_string(&reaction.target_action, param)
                     && !nonempty.contains(param)
@@ -440,11 +438,11 @@ impl JointModel {
                 }
                 let value = match arg {
                     Arg::Var(field) => source_state.strings.get(field).cloned(),
-                    Arg::Lit(Literal::Str(text)) => Some(text.clone().into()),
+                    Arg::Lit(Literal::Str(text)) => Some(text.as_str().into()),
                     Arg::Lit(Literal::Null) => Some("".into()),
                     _ => None,
                 }?;
-                Some((param.clone(), ParamValue::Str(value)))
+                Some((param.as_str(), ParamValue::Str(value)))
             })
             .collect()
     }

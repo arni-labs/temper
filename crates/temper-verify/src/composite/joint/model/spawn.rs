@@ -24,7 +24,7 @@ use super::JointModel;
 use super::commit::add;
 use super::read::Reaction;
 use super::step::Certainty;
-use crate::model::{ModelString, ParamValue, TemperModelState, fresh_string};
+use crate::model::{Fields, ModelString, ParamValue, TemperModelState, fresh_string};
 
 /// What a [`Reaction`] that stands for a spawn does beyond sending an action.
 #[derive(Debug, Clone)]
@@ -140,8 +140,8 @@ impl JointModel {
     pub(super) fn first_records(&self) -> &BTreeMap<String, TemperModelState> {
         self.first.get_or_init(|| {
             self.blank()
-                .into_iter()
-                .map(|(entity, record)| (entity.to_string(), (*record).clone()))
+                .iter()
+                .map(|(entity, record)| (entity.to_string(), (**record).clone()))
                 .collect()
         })
     }
@@ -170,7 +170,7 @@ impl JointModel {
         (index, reaction, spawn): (usize, &Reaction, &Spawn),
         chain: &[ReactionStep],
         by: u32,
-        params: &BTreeMap<String, ParamValue>,
+        params: &Fields<ParamValue>,
     ) -> Vec<(JointState, Certainty)> {
         let child = reaction.to.as_str();
         // A record that makes another of its own type: the model holds one
@@ -185,9 +185,9 @@ impl JointModel {
         }
         let child_type = super::copies::base(child);
         let step = ReactionStep {
-            entity_type: child_type.to_string(),
-            action: reaction.target_action.clone(),
-            generated_for: Some(child_type.to_string()),
+            entity_type: child_type.into(),
+            action: reaction.target_action.as_str().into(),
+            generated_for: Some(child_type.into()),
         };
         // A first action its chain already holds is a loop: no child, and
         // the field goes back.
@@ -214,18 +214,18 @@ impl JointModel {
                 if target.models_string(&reaction.target_action, param)
                     && !spawn.parent.iter().any(|(name, _)| name == param)
                 {
-                    sent.insert(param.clone(), value.clone());
+                    sent.insert(*param, *value);
                 }
             }
             add(
                 &mut next,
                 Dispatch {
-                    to: child.to_string(),
-                    action: reaction.target_action.clone(),
+                    to: child.into(),
+                    action: reaction.target_action.as_str().into(),
                     target_state: None,
                     params: sent,
                     read: !self.action_reads_related(child, &reaction.target_action),
-                    chain: next_chain.clone(),
+                    chain: next_chain.as_slice().into(),
                     via: Some(index),
                     unread_guard: None,
                     by: self.senders.reaction(None, by, false),
@@ -299,9 +299,7 @@ impl JointModel {
                 self.take_back_id(state, &reaction.from, spawn);
             }
         } else if self.timeout(child, &record.status).is_some() {
-            state
-                .armed
-                .insert(child.into(), self.armer(child, dispatch.by));
+            state.armed.insert(child, self.armer(child, dispatch.by));
         }
     }
 
@@ -325,7 +323,7 @@ impl JointModel {
         let record = &state.records[child];
         self.unstarted(child, record)
             || (!state.armed.contains_key(child)
-                && self.settled_statuses()[child].contains(&record.status))
+                && self.settled_statuses()[child].contains(record.status.as_str()))
     }
 
     /// Put a new record with `id` in place of what `state` holds of `child`.
@@ -335,7 +333,7 @@ impl JointModel {
         if self.records == Records::ById {
             record.strings.insert(ID.to_string(), id);
         }
-        state.records.insert(child.into(), record.into());
+        state.records.insert(child, record.into());
         state.armed.remove(child);
         state.inflight.retain(|d| d.to != child);
         state.calls.retain(|c| c.to != child);
@@ -362,11 +360,11 @@ impl JointModel {
     pub(super) fn named_id(
         &self,
         spawn: &Spawn,
-        params: &BTreeMap<String, ParamValue>,
+        params: &Fields<ParamValue>,
     ) -> Option<ModelString> {
         match spawn.id.as_ref()? {
             Arg::Param(param) => match params.get(param) {
-                Some(ParamValue::Str(value)) => Some(value.clone()),
+                Some(ParamValue::Str(value)) => Some(*value),
                 _ => None,
             },
             Arg::Lit(Literal::Str(text)) => Some(ModelString::from(text.as_str())),
@@ -436,14 +434,14 @@ pub(super) fn settled_statuses(model: &JointModel) -> BTreeMap<String, BTreeSet<
             .collect();
         for t in &automaton.transitions {
             if sends(&t.name) {
-                live.extend(t.from_states.iter().map(String::as_str));
+                live.extend(t.from_states.iter().map(|s| s.as_str()));
             }
         }
         loop {
             let before = live.len();
             for t in &automaton.transitions {
                 if t.to_state.as_deref().is_some_and(|to| live.contains(to)) {
-                    live.extend(t.from_states.iter().map(String::as_str));
+                    live.extend(t.from_states.iter().map(|s| s.as_str()));
                 }
             }
             if live.len() == before {

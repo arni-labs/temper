@@ -106,7 +106,7 @@ impl JointModel {
                             .kernel
                             .internal
                             .get(entity)
-                            .is_some_and(|names| names.contains(&t.name));
+                            .is_some_and(|names| names.contains(t.name.as_str()));
                         if internal || self.only_a_module_may(entity, &t.name) {
                             follows((entity, t.name.as_str()));
                         }

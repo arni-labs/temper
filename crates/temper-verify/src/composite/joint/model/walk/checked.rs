@@ -355,6 +355,6 @@ fn note_outside(outside: &mut BTreeMap<u32, (String, String)>, label: u32, mv: &
     if let Move::Reaction(entity, action, _) = mv {
         outside
             .entry(label)
-            .or_insert_with(|| (entity.clone(), action.name.clone()));
+            .or_insert_with(|| (entity.clone(), action.name.to_string()));
     }
 }
