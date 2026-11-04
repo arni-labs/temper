@@ -129,12 +129,19 @@ fn check(sources: &[String], policies: Option<&str>) -> JointInvariantResult {
 
 #[test]
 fn literals_no_id_or_field_meets_do_not_multiply_the_walk() {
-    // No action reaches Gone: the rule holds, and the whole walk is made.
+    // No action reaches Gone, but the holder may name another note, so the
+    // rule says NOT CHECKED, and the whole walk is made.
     let rule = "Note[holder].status != 'Gone'";
     let few = check(&note_and_box(1, rule), None);
     let many = check(&note_and_box(12, rule), None);
-    assert!(matches!(few.outcome, JointOutcome::Holds), "{few}");
-    assert!(matches!(many.outcome, JointOutcome::Holds), "{many}");
+    assert!(
+        matches!(few.outcome, JointOutcome::Incomplete { .. }),
+        "{few}"
+    );
+    assert!(
+        matches!(many.outcome, JointOutcome::Incomplete { .. }),
+        "{many}"
+    );
     // The messages are neither ids nor the box's holder or tag: eleven more
     // of them start and walk no more states.
     assert_eq!(few.states, many.states, "{few}\n{many}");

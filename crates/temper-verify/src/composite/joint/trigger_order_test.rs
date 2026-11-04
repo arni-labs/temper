@@ -68,7 +68,7 @@ to = "Noted"
 
 [[invariant]]
 name = "rule"
-assert = "status == 'Went' => B[Id].status == 'Open'"
+assert = "status == 'Went' => B[Id].status != 'Shut'"
 "#;
 
 const SHUT: &str = r#"
