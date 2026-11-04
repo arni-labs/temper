@@ -5,7 +5,7 @@ use super::heap::{Heap, whole};
 use super::types::{
     Fields, ModelString, ParamValue, ResolvedTransition, StringParam, TemperModel, TemperModelState,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 /// The scalar strings and list members held by `states`, `''` left out.
 pub fn string_values<'a>(
@@ -157,9 +157,7 @@ pub fn apply_string_params(
 /// that differ only in which new values they made up are one state. Equality
 /// between values and their blank classification are preserved.
 /// Returns each value's new name.
-pub fn canonical_strings(
-    maps: &mut [&mut Fields<ModelString>],
-) -> BTreeMap<ModelString, ModelString> {
+pub fn canonical_strings(maps: &mut [&mut Fields<ModelString>]) -> Renames {
     canonical_values(maps.iter_mut().flat_map(|map| map.values_mut()))
 }
 
@@ -174,9 +172,7 @@ pub fn canonical_state(state: &mut TemperModelState) {
 }
 
 /// Renumber a sequence of values, retaining each equality class.
-pub fn canonical_values<'a>(
-    values: impl IntoIterator<Item = &'a mut ModelString>,
-) -> BTreeMap<ModelString, ModelString> {
+pub fn canonical_values<'a>(values: impl IntoIterator<Item = &'a mut ModelString>) -> Renames {
     let values: Vec<&mut ModelString> = values.into_iter().collect();
     let renamed = canonical_names(values.iter().map(|value| &**value));
     for value in values {
@@ -189,18 +185,57 @@ pub fn canonical_values<'a>(
 
 /// The new name of each symbol among `values`, numbered in order of first
 /// use. Literals keep their names and are left out.
-pub fn canonical_names<'a>(
-    values: impl IntoIterator<Item = &'a ModelString>,
-) -> BTreeMap<ModelString, ModelString> {
-    let mut renamed = BTreeMap::new();
+pub fn canonical_names<'a>(values: impl IntoIterator<Item = &'a ModelString>) -> Renames {
+    let mut renamed = Renames::default();
     for value in values {
-        let id = renamed.len() + 1;
+        let id = renamed.0.len() + 1;
         let name = match value {
             ModelString::Literal(_) => continue,
             ModelString::Symbol(_) => ModelString::Symbol(id),
             ModelString::BlankSymbol(_) => ModelString::BlankSymbol(id),
         };
-        renamed.entry(*value).or_insert(name);
+        if renamed.get(value).is_none() {
+            renamed.0.push((*value, name));
+        }
     }
     renamed
+}
+
+/// The new name of each symbol a state holds: as many as the state's distinct
+/// made-up values, so few that a list is the quickest way to look one up.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Renames(Vec<(ModelString, ModelString)>);
+
+impl Renames {
+    /// The new name of `value`, when it is a symbol the state holds.
+    pub fn get(&self, value: &ModelString) -> Option<&ModelString> {
+        self.0
+            .iter()
+            .find(|(old, _)| old == value)
+            .map(|(_, new)| new)
+    }
+
+    /// Whether a symbol changes its name.
+    pub fn any_moved(&self) -> bool {
+        self.0.iter().any(|(old, new)| old != new)
+    }
+
+    /// Each symbol and its new name, in order of first use.
+    pub fn iter(&self) -> impl Iterator<Item = (&ModelString, &ModelString)> {
+        self.0.iter().map(|(old, new)| (old, new))
+    }
+
+    /// A list from symbols and their new names.
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (ModelString, ModelString)>) -> Self {
+        Self(pairs.into_iter().collect())
+    }
+}
+
+impl Heap for Renames {
+    fn heap(&self) -> usize {
+        match self.0.capacity() * size_of::<(ModelString, ModelString)>() {
+            0 => 0,
+            bytes => super::heap::block(bytes),
+        }
+    }
 }

@@ -2,6 +2,7 @@
 //! next in a record or two, so each distinct record, dispatch and call is kept
 //! once in a table and a walked state is a short run of numbers into them.
 
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 
 use std::hash::Hash;
@@ -17,11 +18,11 @@ pub(super) type Packed = Arc<[u32]>;
 /// Each distinct value once.
 struct Table<T> {
     items: Vec<Arc<T>>,
-    ids: HashMap<Arc<T>, u32>,
+    ids: FxHashMap<Arc<T>, u32>,
     /// The values `items` holds, by where they are. Those `items` keeps stay
     /// where they are, and a state unpacked holds these same ones, so most
     /// values packed are found here without being read.
-    at: HashMap<usize, u32>,
+    at: FxHashMap<usize, u32>,
     /// Bytes the values take on the heap, each with its count of holders.
     heap: usize,
 }
@@ -30,8 +31,8 @@ impl<T> Default for Table<T> {
     fn default() -> Self {
         Self {
             items: Vec::new(),
-            ids: HashMap::new(),
-            at: HashMap::new(),
+            ids: FxHashMap::default(),
+            at: FxHashMap::default(),
             heap: 0,
         }
     }

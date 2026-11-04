@@ -70,7 +70,7 @@ impl JointModel {
             return explored;
         }
         let threads = bound.room.threads().max(1);
-        let seen = DashMap::new();
+        let seen = DashMap::with_hasher(rustc_hash::FxBuildHasher);
         let mut states = 0;
         // One start per way the records' ids can be equal: many records start
         // in millions of ways, so the starts take their memory from the room

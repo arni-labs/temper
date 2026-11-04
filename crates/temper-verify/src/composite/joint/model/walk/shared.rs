@@ -47,7 +47,7 @@ pub(super) struct Trail {
 pub(super) struct Shared {
     pub(super) trail: RwLock<Trail>,
     pub(super) packer: RwLock<Packer>,
-    pub(super) seen: DashMap<Packed, Seen>,
+    pub(super) seen: DashMap<Packed, Seen, rustc_hash::FxBuildHasher>,
     /// The walk is over: a visit said so, or the room said no.
     pub(super) stop: AtomicBool,
     pub(super) held_back: AtomicBool,

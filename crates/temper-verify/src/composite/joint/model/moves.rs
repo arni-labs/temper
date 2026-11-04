@@ -3,7 +3,7 @@
 use super::super::env::Blind;
 use super::super::{Call, Dispatch, JointState};
 use super::{Delivery, JointModel};
-use crate::model::semantics::successors_budgeted;
+use crate::model::semantics::inputs_within_bounds;
 use crate::model::{ModelString, ParamValue, TemperModelAction};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -98,7 +98,7 @@ impl JointModel {
                     continue;
                 }
                 let reads = self.reads_related(t);
-                for (params, _) in successors_budgeted(model, t, local, &values, &self.expansion) {
+                for params in inputs_within_bounds(model, t, local, &values, &self.expansion) {
                     let action = TemperModelAction {
                         name: t.name,
                         target_state: t.to_state,
@@ -198,7 +198,7 @@ impl JointModel {
                 continue;
             }
             let mut seen = BTreeSet::new();
-            for (mut params, _) in successors_budgeted(model, t, local, values, &self.expansion) {
+            for mut params in inputs_within_bounds(model, t, local, values, &self.expansion) {
                 // A parameter tied to a field carries it as the call found it.
                 for param in &t.string_params {
                     if let Some(value) = param.equals.iter().find_map(|f| call.asked.get(f)) {

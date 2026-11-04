@@ -13,6 +13,7 @@ temper-authz = { workspace = true }
 stateright = { workspace = true }
 dashmap = "6.1"
 thread_local = "1.1"
+rustc-hash = "2.1"
 proptest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

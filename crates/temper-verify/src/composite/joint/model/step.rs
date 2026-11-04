@@ -2,7 +2,7 @@
 //! from outside, state timers, module answers, dispatches read on the
 //! dispatch path, and dispatches their records take or refuse.
 
-use std::collections::BTreeMap;
+use crate::model::Renames;
 
 use temper_authz::May;
 use temper_spec::predicate::{Truth, eval};
@@ -14,7 +14,7 @@ use super::super::{Call, Dispatch, JointState};
 use super::commit::add;
 use super::labels::rename_label;
 use super::{Delivery, JointModel, MAX_IN_FLIGHT};
-use crate::model::{ModelString, TemperModelAction};
+use crate::model::TemperModelAction;
 
 #[path = "guard.rs"]
 mod guard;
@@ -54,7 +54,7 @@ impl Certainty {
 pub(in crate::composite::joint) struct Next {
     pub(in crate::composite::joint) state: JointState,
     /// The new names of the values the old state held.
-    pub(in crate::composite::joint) renamed: BTreeMap<ModelString, ModelString>,
+    pub(in crate::composite::joint) renamed: Renames,
     /// The move, named as in the new state.
     pub(in crate::composite::joint) label: String,
     /// What the model knows of the move leading here.

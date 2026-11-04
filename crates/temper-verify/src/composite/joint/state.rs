@@ -1,10 +1,10 @@
 //! A joint state: the records in scope, and the dispatches and module calls
 //! on their way.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::model::Renames;
 use crate::model::semantics::canonical_names;
 use crate::model::{Fields, ModelString, ParamValue, Sym, TemperModelAction, TemperModelState};
 
@@ -180,7 +180,7 @@ pub(super) fn render(state: &JointState) -> String {
 /// Renumber new strings over the whole joint state, records first, then
 /// the dispatches in flight; returns each value's new name. What a renaming
 /// leaves as it was stays shared with the states that hold it.
-pub(super) fn canonical(state: &mut JointState) -> BTreeMap<ModelString, ModelString> {
+pub(super) fn canonical(state: &mut JointState) -> Renames {
     let renamed = canonical_names(
         state
             .records
@@ -202,7 +202,7 @@ pub(super) fn canonical(state: &mut JointState) -> BTreeMap<ModelString, ModelSt
     let moved = |value: &ModelString| renamed.get(value).is_some_and(|name| name != value);
     let rewrite = |value: &mut ModelString| {
         if let Some(name) = renamed.get(value) {
-            value.clone_from(name);
+            *value = *name;
         }
     };
     let rewrite_param = |value: &mut ParamValue| {
@@ -210,7 +210,7 @@ pub(super) fn canonical(state: &mut JointState) -> BTreeMap<ModelString, ModelSt
             rewrite(text);
         }
     };
-    if renamed.iter().any(|(value, name)| value != name) {
+    if renamed.any_moved() {
         for record in state.records.values_mut() {
             let touched = record
                 .strings

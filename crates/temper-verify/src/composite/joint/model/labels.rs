@@ -2,16 +2,13 @@
 
 use super::step::Move;
 #[cfg(test)]
+use crate::model::ModelString;
+#[cfg(test)]
 use crate::model::TemperModelAction;
-use crate::model::{Fields, ModelString, ParamValue};
-use std::collections::BTreeMap;
+use crate::model::{Fields, ParamValue, Renames};
 
 /// Render the move with renamed symbol parameters, preserving concrete literals.
-pub(super) fn rename_label(
-    text: &str,
-    mv: &Move,
-    renamed: &BTreeMap<ModelString, ModelString>,
-) -> String {
+pub(super) fn rename_label(text: &str, mv: &Move, renamed: &Renames) -> String {
     let rename_params = |params: &mut Fields<ParamValue>| {
         for value in params.values_mut() {
             if let ParamValue::Str(s) = value
@@ -71,7 +68,7 @@ mod tests {
         let label = rename_label(
             &text,
             &Move::Send("T".into(), action, 0),
-            &BTreeMap::from([(ModelString::Symbol(2), ModelString::Symbol(1))]),
+            &Renames::from_pairs([(ModelString::Symbol(2), ModelString::Symbol(1))]),
         );
         assert_eq!(label, "T.Set(a='#2', b='#1') sent");
     }

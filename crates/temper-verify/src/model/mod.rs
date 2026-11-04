@@ -31,6 +31,7 @@ pub use builder::{build_model_from_automaton, build_model_from_ioa, build_model_
 pub(crate) use entry::{broken_by_action, entry_broken};
 pub use fields::{FieldKey, Fields, Sym};
 pub(crate) use stateright_impl::ENTRY_RULES;
+pub use strings::Renames;
 pub(crate) use strings::fresh_string;
 pub(crate) use types::ExploreLimit;
 pub use types::{

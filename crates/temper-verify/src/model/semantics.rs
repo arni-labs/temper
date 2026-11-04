@@ -142,6 +142,45 @@ pub(crate) fn successors_budgeted(
     successors_with(model, t, state, values, budget, |_| {})
 }
 
+/// The inputs [`successors_budgeted`] would make a step of, without the steps.
+/// Only a step that grows a counter or list can go past a bound, so only such
+/// a step needs building to tell.
+pub(crate) fn inputs_within_bounds(
+    model: &TemperModel,
+    t: &ResolvedTransition,
+    state: &TemperModelState,
+    values: &BTreeSet<ModelString>,
+    budget: &Expansion,
+) -> Vec<Fields<ParamValue>> {
+    let grows = t.effects.iter().any(|effect| {
+        matches!(
+            effect,
+            ModelEffect::SetCounter { .. }
+                | ModelEffect::AddCounter { .. }
+                | ModelEffect::ListAppend { .. }
+        )
+    });
+    if grows {
+        return successors_budgeted(model, t, state, values, budget)
+            .into_iter()
+            .map(|(params, _)| params)
+            .collect();
+    }
+    let mut out = Vec::new();
+    any_inputs(model, t, state, values, budget, |params| {
+        if checks_inputs(model, t) && !inputs_allow(model, t, state, &params) {
+            budget.give(params.heap());
+            return false;
+        }
+        if !budget.reserve(&mut out) {
+            return true;
+        }
+        out.push(params);
+        false
+    });
+    out
+}
+
 /// [`successors`], adding to `cut` each counter and list a step it leaves
 /// out would take past its bound, with that bound, and each count parameter
 /// whose range was widened, with the largest value tried.
