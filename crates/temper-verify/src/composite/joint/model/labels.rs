@@ -1,5 +1,17 @@
 //! Move labels with symbol parameters renamed without changing literals.
 
+/// A move's words, built only on a thread that wants them: a walk names its
+/// moves when it prints them, not for each of the states it passes through.
+macro_rules! words {
+    ($model:expr, $($text:tt)*) => {
+        if $model.expansion.words() {
+            format!($($text)*)
+        } else {
+            String::new()
+        }
+    };
+}
+
 use super::step::Move;
 #[cfg(test)]
 use crate::model::ModelString;

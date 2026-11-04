@@ -1,17 +1,8 @@
 //! The joint model: the records in scope, their reactions, the dispatches
 //! and module calls on their way, who may send what, and the walk.
 
-/// A move's words, built only on a thread that wants them: a walk names its
-/// moves when it prints them, not for each of the states it passes through.
-macro_rules! words {
-    ($model:expr, $($text:tt)*) => {
-        if $model.expansion.words() {
-            format!($($text)*)
-        } else {
-            String::new()
-        }
-    };
-}
+#[macro_use]
+mod labels;
 
 mod alike;
 mod chosen;
@@ -24,7 +15,6 @@ mod from_outside;
 mod guided;
 mod held;
 mod initial;
-mod labels;
 mod moves;
 mod order;
 mod outside;
@@ -46,10 +36,11 @@ use super::env::{Blind, ID, JointEnv, Records};
 use super::senders::{OUTSIDE, Senders};
 use super::slice::slice;
 use super::state::canonical;
-use crate::model::semantics::{Expansion, rule_for, string_values};
+use crate::model::semantics::{rule_for, string_values};
 use crate::model::{
     Fields, ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState,
 };
+use held::PerThread;
 
 pub(super) use classes::Classes;
 pub use drops::DroppedReaction;
@@ -489,24 +480,4 @@ fn deciding(automaton: &Automaton, reactions: &[Reaction], entity: &str) -> BTre
         });
     }
     fields
-}
-
-/// A walk's accounting for what one state's expansion builds, one to a
-/// thread, since a walk's threads each expand their own state.
-#[derive(Default)]
-struct PerThread(thread_local::ThreadLocal<Expansion>);
-
-impl std::ops::Deref for PerThread {
-    type Target = Expansion;
-
-    fn deref(&self) -> &Expansion {
-        self.0.get_or_default()
-    }
-}
-
-/// Only the name, as [`Expansion`]'s own says: it is no part of the model.
-impl std::fmt::Debug for PerThread {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Expansion")
-    }
 }
