@@ -209,3 +209,115 @@ permit(principal, action == Action::"Fill", resource is Room) when {
 "#,
     );
 }
+
+/// A room whose `Fill` unlocks its door as `triggers` say. `extra` is more of
+/// the room's spec.
+fn room_with(fill: &str, extra: &str) -> String {
+    format!(
+        r#"
+[automaton]
+name = "Room"
+states = ["Empty", "Full"]
+initial = "Empty"
+
+[[state]]
+name = "kind"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Fill"
+kind = "input"
+from = ["Empty"]
+to = "Full"
+{fill}
+
+[[invariant]]
+name = "FullBehindAnOpenDoor"
+assert = "status == 'Empty' || Door[Id].status == 'Open'"
+{extra}
+"#
+    )
+}
+
+fn unlock_when(guard: &str, name: &str) -> String {
+    format!(
+        r#"
+[[action.triggers]]
+name = "{name}"
+kind = "entity"
+target_entity = "Door"
+target_action = "Unlock"
+guard = "{guard}"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+"#
+    )
+}
+
+const OWNER_AND_UNLOCK: &str = r#"
+permit(principal is Customer, action, resource) when { principal.id == "owner" };
+permit(principal, action == Action::"Unlock", resource is Door) when { context.via == "reaction" };
+"#;
+
+#[test]
+fn a_trigger_guard_on_the_requests_own_parameter_is_the_senders_choice() {
+    // The model holds no `kind`, yet the owner may send any: a fill that is
+    // not urgent leaves the door shut, as surely as anything a sender chooses.
+    let fill = format!(
+        "params = [\"kind\"]\n{}",
+        unlock_when("kind == 'urgent'", "urgent")
+    );
+    let result = check(&[&room_with(&fill, ""), DOOR], OWNER_AND_UNLOCK);
+    let JointOutcome::Broken { path } = &result.outcome else {
+        panic!("expected broken, got {result}");
+    };
+    assert!(takes(path, "Room.Fill"), "{result}");
+}
+
+#[test]
+fn a_trigger_guard_on_a_field_an_earlier_move_set_stays_unsure() {
+    // Whoever filled did not choose `kind` on this move, and the model does
+    // not hold what `Mark` left there.
+    let extra = r#"
+[[action]]
+name = "Mark"
+kind = "input"
+from = ["Empty"]
+params = ["kind"]
+"#;
+    let fill = unlock_when("kind == 'urgent'", "urgent");
+    stays_not_checked_with(&room_with(&fill, extra));
+}
+
+#[test]
+fn two_trigger_guards_on_one_parameter_are_not_two_choices() {
+    // One of them always fires, so the door always unlocks. Taking each as
+    // its own choice would make up a fill that unlocks nothing.
+    let fill = format!(
+        "params = [\"kind\"]\n{}{}",
+        unlock_when("kind == 'urgent'", "urgent"),
+        unlock_when("kind != 'urgent'", "calm"),
+    );
+    stays_not_checked_with(&room_with(&fill, ""));
+}
+
+#[test]
+fn a_trigger_guard_the_sender_can_only_make_hold_is_no_choice() {
+    // `kind` may not be empty, so the guard always holds and the door always
+    // unlocks. The sender cannot leave it shut.
+    let fill = format!(
+        "params = [\"kind\"]\n{}\n[[action.constraints]]\nkind = \"param_nonempty\"\nparam = \"kind\"\n",
+        unlock_when("kind != ''", "any"),
+    );
+    stays_not_checked_with(&room_with(&fill, ""));
+}
+
+fn stays_not_checked_with(room: &str) {
+    let result = check(&[room, DOOR], OWNER_AND_UNLOCK);
+    let JointOutcome::Incomplete { reason } = &result.outcome else {
+        panic!("expected not checked, got {result}");
+    };
+    assert!(reason.contains("Room.Fill"), "{result}");
+}
