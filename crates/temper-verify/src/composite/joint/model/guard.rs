@@ -2,12 +2,12 @@
 //! read: the runtime evaluates it after its source commits, on the related
 //! records as they are then.
 
-use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use temper_spec::predicate::{Truth, eval};
 
 use super::super::super::env::Blind;
-use super::super::super::{Call, Dispatch, JointState, ReactionStep};
+use super::super::super::{Call, Dispatch, JointState};
 use super::super::JointModel;
 use super::super::commit::add;
 use super::{Certainty, MAX_IN_FLIGHT, remove};
@@ -70,33 +70,50 @@ impl JointModel {
     /// runtime reads them one trigger at a time for that commit
     /// (`temper-server` `trigger::dispatcher`). Copies of one commit's
     /// waiting reactions count as the most copies of any one of them.
-    pub(in crate::composite::joint) fn fits(&self, state: &JointState) -> bool {
+    pub(in crate::composite::joint) fn fits<'a>(&'a self, state: &'a JointState) -> bool {
         // A commit's waiting reactions count at most one each.
         if state.calls.len() + state.inflight.len() <= MAX_IN_FLIGHT {
             return true;
         }
-        let mut busy = state.calls.len();
-        let mut waiting: BTreeMap<(&[ReactionStep], &str, &str, usize), usize> = BTreeMap::new();
-        for dispatch in &state.inflight {
-            match (
-                &dispatch.unread_guard,
-                dispatch.via,
-                dispatch.chain.split_last(),
-            ) {
-                (Some(_), Some(index), Some((_, parent))) => {
-                    let reaction = &self.reactions[index];
-                    let key = (parent, &*reaction.from, &*reaction.source_action, index);
-                    *waiting.entry(key).or_default() += 1;
-                }
-                _ => busy += 1,
+        let waiting = |dispatch: &'a Arc<Dispatch>| match (
+            &dispatch.unread_guard,
+            dispatch.via,
+            dispatch.chain.split_last(),
+        ) {
+            (Some(_), Some(index), Some((_, parent))) => {
+                let reaction = &self.reactions[index];
+                Some(((parent, &reaction.from, &reaction.source_action), index))
             }
+            _ => None,
+        };
+        let inflight = &state.inflight;
+        let mut busy = state.calls.len();
+        for (at, dispatch) in inflight.iter().enumerate() {
+            let Some((commit, _)) = waiting(dispatch) else {
+                busy += 1;
+                continue;
+            };
+            // A commit counts once, when first met: as the most dispatches
+            // any one of its reactions has waiting.
+            if inflight[..at]
+                .iter()
+                .any(|earlier| waiting(earlier).is_some_and(|(other, _)| other == commit))
+            {
+                continue;
+            }
+            let of_commit = || {
+                inflight[at..]
+                    .iter()
+                    .filter_map(&waiting)
+                    .filter(|(other, _)| *other == commit)
+                    .map(|(_, index)| index)
+            };
+            busy += of_commit()
+                .map(|index| of_commit().filter(|other| *other == index).count())
+                .max()
+                .unwrap_or(0);
         }
-        let mut commits: BTreeMap<(&[ReactionStep], &str, &str), usize> = BTreeMap::new();
-        for ((parent, from, action, _), copies) in waiting {
-            let most = commits.entry((parent, from, action)).or_default();
-            *most = (*most).max(copies);
-        }
-        busy + commits.into_values().sum::<usize>() <= MAX_IN_FLIGHT
+        busy <= MAX_IN_FLIGHT
     }
 
     /// Whether reading or landing `dispatch` now may come before an earlier
