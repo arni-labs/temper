@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use temper_authz::Read;
-use temper_spec::automaton::{Automaton, Initial, TargetResolver, TriggerKind};
+use temper_spec::automaton::{ActionConstraint, Automaton, Initial, TargetResolver, TriggerKind};
 use temper_spec::predicate::{Arg, Effect, Expr, Literal, Operand, Set};
 
 use super::super::JointState;
@@ -96,6 +96,8 @@ type Term = (String, Slot);
 pub(in crate::composite::joint) struct Classes {
     parent: BTreeMap<Term, Term>,
     held: BTreeMap<Term, BTreeSet<String>>,
+    /// The parameters a `param_nonempty` constraint refuses a blank value in.
+    reads_blank: BTreeSet<Term>,
 }
 
 impl Classes {
@@ -156,6 +158,11 @@ impl Classes {
     /// one in each class merges only states nothing can tell apart.
     pub(in crate::composite::joint) fn number(&self, models: &mut BTreeMap<String, TemperModel>) {
         let mut numbers: BTreeMap<Term, usize> = BTreeMap::new();
+        let reads_blank: BTreeSet<Term> = self
+            .reads_blank
+            .iter()
+            .map(|term| self.root(term))
+            .collect();
         for (entity, model) in models.iter_mut() {
             let params = model.transitions.iter().flat_map(|t| &t.string_params);
             let names: BTreeSet<String> = model
@@ -168,6 +175,10 @@ impl Classes {
             for name in names {
                 let root = self.root(&(entity.clone(), Slot::named(&name)));
                 let next = numbers.len() + 1;
+                if !reads_blank.contains(&root) {
+                    let class = numbers.get(&root).copied().unwrap_or(next);
+                    model.never_blank.insert(class);
+                }
                 let class = *numbers.entry(root).or_insert(next);
                 model.string_classes.insert(name, class);
             }
@@ -206,6 +217,9 @@ impl Classes {
         for action in &a.actions {
             self.visit(entity, &action.guard);
             for constraint in &action.constraints {
+                if matches!(constraint, ActionConstraint::ParamNonempty { .. }) {
+                    self.reads_blank.insert(term(constraint.param()));
+                }
                 if let Some(field) = constraint.field() {
                     self.link(&term(constraint.param()), &term(field));
                 }

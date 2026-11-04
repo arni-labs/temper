@@ -313,6 +313,9 @@ pub struct TemperModel {
     /// The class of made-up values each string field and parameter takes,
     /// in a walk that numbers them by class. A field left out takes class 0.
     pub(crate) string_classes: BTreeMap<String, usize>,
+    /// The classes nothing reads a blank value in: no `param_nonempty` on a
+    /// parameter of theirs, so a blank made-up value is just a made-up value.
+    pub(crate) never_blank: BTreeSet<usize>,
     /// Per-counter upper bounds for bounded exploration.
     pub(crate) counter_bounds: BTreeMap<String, usize>,
     /// Default upper bound for counters not in counter_bounds.
@@ -394,6 +397,7 @@ impl fmt::Debug for TemperModel {
             tracked_strings,
             string_literals,
             string_classes: _,
+            never_blank: _,
             counter_bounds,
             default_max_counter,
             list_bounds,
@@ -427,6 +431,11 @@ impl TemperModel {
     /// The class of made-up values a string field or parameter takes.
     pub(crate) fn string_class(&self, name: &str) -> usize {
         self.string_classes.get(name).copied().unwrap_or(0)
+    }
+
+    /// Whether anything tells a blank made-up value of `class` from another.
+    pub(crate) fn blank_read(&self, class: usize) -> bool {
+        !self.never_blank.contains(&class)
     }
 
     /// Whether the model holds a value for the counter, boolean or list

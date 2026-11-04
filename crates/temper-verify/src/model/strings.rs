@@ -56,7 +56,9 @@ fn string_candidates(
                     .collect();
                 all.insert("".into());
                 all.insert(fresh_string(values, class, false));
-                all.insert(fresh_string(values, class, true));
+                if model.blank_read(class) {
+                    all.insert(fresh_string(values, class, true));
+                }
                 if let Some(literals) = model.string_literals.get(param.name.as_str()) {
                     all.extend(literals.iter().map(|text| ModelString::from(text.as_str())));
                 }

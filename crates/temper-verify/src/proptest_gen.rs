@@ -473,6 +473,7 @@ mod tests {
             tracked_strings: Default::default(),
             string_literals: BTreeMap::new(),
             string_classes: BTreeMap::new(),
+            never_blank: std::collections::BTreeSet::new(),
             limit: None,
         }
     }
