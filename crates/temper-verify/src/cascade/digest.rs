@@ -75,12 +75,14 @@ impl VerificationCascade {
     /// apps, whose types differ only by the app's prefix, has one digest.
     ///
     /// `None` when the cascade reads more than its models (an actor
-    /// simulation, path extraction or a composite scope), or the spec does
-    /// not parse.
+    /// simulation, path extraction or a composite scope), the spec does
+    /// not parse, or an install would refuse it: a verdict kept before that
+    /// refusal existed must not answer for it.
     pub fn kept_key(&self) -> Option<KeptKey> {
         if self.actor_sim_runner.is_some()
             || self.path_extraction_config.is_some()
             || self.composite_scope.is_some()
+            || super::models::install_refusal(&self.ioa_source).is_some()
         {
             return None;
         }
