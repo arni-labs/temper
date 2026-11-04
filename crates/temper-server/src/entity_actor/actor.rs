@@ -1522,7 +1522,7 @@ impl Actor for EntityActor {
         ctx: &mut ActorContext<Self>,
     ) -> Result<(), ActorError> {
         let message = msg.name().to_owned();
-        let handled = super::watchdog::watched(
+        let handled = super::watchdog::limited(
             self.watched_record(),
             &message,
             self.action_dispatch_timeout,
@@ -1872,8 +1872,8 @@ impl EntityActor {
                             caller.as_deref(),
                         )
                         .await;
-                    // A machine's move that leaves its record as it was writes
-                    // nothing (`unrecorded`); its triggers still run.
+                    // A move that leaves its record as it was writes nothing
+                    // (`unrecorded`); its triggers still run.
                     let fires_timer_once = super::timer_fire::fires_once(
                         caller.as_deref(),
                         &self.tenant,
@@ -1890,7 +1890,7 @@ impl EntityActor {
                         .get(&name)
                         .is_some_and(|contract| contract.fire_now_in.contains(&state.status));
                     if !brings_timer_forward
-                        && super::unrecorded::made_by_machine(&event.origin)
+                        && super::unrecorded::record_holds_what_it_says(&event, state)
                         && super::unrecorded::leaves_record_unchanged(
                             &state_before,
                             state,

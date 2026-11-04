@@ -174,6 +174,8 @@ pub(super) fn step_room(
     use super::fields::Sym;
     use super::types::ModelString;
     let additions = t.effects.len() + t.string_params.len();
+    // A push doubles a full list, and starts an empty one at four.
+    let list = |len: usize| block(len.max(4) * size_of::<ModelString>());
     let entries = |len: usize, entry: usize| block((len + additions) * (size_of::<Sym>() + entry));
     entries(state.counters.len(), size_of::<usize>())
         + entries(state.booleans.len(), size_of::<bool>())
@@ -182,6 +184,8 @@ pub(super) fn step_room(
         + state
             .lists
             .values()
-            .map(|items| block((items.len() + additions) * size_of::<ModelString>()))
+            .map(|items| list((items.len() + additions) * 2))
             .sum::<usize>()
+        // An effect can start a list the record doesn't hold yet.
+        + additions * list(additions * 2)
 }

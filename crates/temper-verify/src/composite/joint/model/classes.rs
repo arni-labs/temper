@@ -19,55 +19,25 @@
 //! everywhere: a state that holds such a literal is a renaming of one the
 //! walk still reaches, and every guard, rule and liveness verdict is the
 //! same on both.
+//!
+//! Literals of one class are one value to the walk when every read of the
+//! class treats them alike. A read that compares the class with one literal,
+//! or with a list, tells apart only the literals it names; a reaction's or
+//! effect's copying tells nothing, and neither does `empty`. So two literals
+//! named by exactly the same reads give every guard, rule and liveness goal
+//! the same answer, and the walk offers one of them
+//! ([`Classes::one_of_each_kind`]). A class whose value itself is read keeps
+//! all its literals: it holds an id, which finds a record, or a status, or a
+//! list, which counts what it holds, or two of its terms are compared.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use temper_authz::Read;
 use temper_spec::automaton::{ActionConstraint, Automaton, Initial, TargetResolver, TriggerKind};
 use temper_spec::predicate::{Arg, CmpOp, Effect, Expr, Literal, Operand, Set};
 
-use super::super::JointState;
-use super::super::env::ID;
-use super::JointModel;
-use crate::model::{ModelString, ParamValue, TemperModel};
+use crate::model::TemperModel;
 
-impl JointModel {
-    /// A made-up value of `state` outside the class of the field or parameter
-    /// holding it, which would mean something copied or compared it that
-    /// [`Classes`] did not read. Checked steps look for one.
-    pub(in crate::composite::joint) fn value_out_of_class(
-        &self,
-        state: &JointState,
-    ) -> Option<String> {
-        let stray = |entity: &str, field: &str, value: &ModelString| {
-            let class = self.models.get(entity)?.string_classes.get(field)?;
-            value
-                .class()
-                .is_some_and(|of| of != *class)
-                .then(|| format!("{entity}.{field} holds {value} of another class than {class}"))
-        };
-        let in_records = state.records.iter().flat_map(|(entity, record)| {
-            let strings = record.strings.iter().map(|(f, v)| (*f, v));
-            let lists = record
-                .lists
-                .iter()
-                .flat_map(|(f, list)| list.iter().map(|v| (*f, v)));
-            strings
-                .chain(lists)
-                .filter_map(move |(f, v)| stray(entity.as_str(), f.as_str(), v))
-        });
-        let on_their_way = state.inflight.iter().flat_map(|dispatch| {
-            dispatch
-                .params
-                .iter()
-                .filter_map(|(param, value)| match value {
-                    ParamValue::Str(value) => stray(dispatch.to.as_str(), param.as_str(), value),
-                    _ => None,
-                })
-        });
-        in_records.chain(on_their_way).next()
-    }
-}
+mod numbers;
 
 /// What in a record a value sits in.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -101,6 +71,10 @@ pub(in crate::composite::joint) struct Classes {
     /// Terms read other than against a record's id, or that a record's id can
     /// come from ([`Self::number`]).
     apart: BTreeSet<Term>,
+    /// The literals each read that names some of them names.
+    reads: Vec<(Term, BTreeSet<String>)>,
+    /// Terms whose value itself is read: their classes keep every literal.
+    exact: Vec<Term>,
 }
 
 impl Classes {
@@ -129,80 +103,78 @@ impl Classes {
         literals
     }
 
-    /// Link what a policy compares (`resource.a == resource.b`, say), for
-    /// each type in `scope`: `compared` is each comparison's reads that can
-    /// hold a made-up value. A context key that can holds some type's id.
-    pub(in crate::composite::joint) fn read_policies(
-        &mut self,
-        compared: &[Vec<Read>],
-        scope: &BTreeSet<String>,
+    /// Leave each field and parameter of `models` only the literals something
+    /// that reads it compares or copies there. A value Cedar reads (`cedar`)
+    /// is told apart by whatever the policy says of it.
+    pub(in crate::composite::joint) fn narrow(
+        &self,
+        models: &mut BTreeMap<String, TemperModel>,
+        cedar: impl Fn(&str) -> bool,
     ) {
-        for reads in compared {
-            for entity in scope {
-                let terms: Vec<Term> = reads
-                    .iter()
-                    .flat_map(|read| match read {
-                        Read::Resource(field) => vec![(entity.clone(), Slot::named(field))],
-                        Read::Context(_) => scope.iter().map(|t| (t.clone(), Slot::Id)).collect(),
-                    })
-                    .collect();
-                for pair in terms.windows(2) {
-                    self.compared(&pair[0], &pair[1]);
+        for (entity, model) in models {
+            let parameters = model.transitions.iter().flat_map(|t| &t.string_params);
+            let names: BTreeSet<String> = parameters
+                .map(|param| param.name.to_string())
+                .chain(model.tracked_strings.iter().cloned())
+                .collect();
+            for name in names {
+                let literals = model.string_literals.entry(name.clone()).or_default();
+                literals.extend(self.literals(entity, &name));
+                if !cedar(&name) {
+                    *literals = self.one_of_each_kind(entity, &name, literals);
                 }
             }
+            model.literals_by_class = true;
         }
     }
 
-    /// Tell each of `models` the class of its string fields and parameters.
-    ///
-    /// Nothing can tell whether values of two classes are equal: everything
-    /// that compares or copies one value into another links their terms, so
-    /// a walk that keeps the values of each class apart and numbers them from
-    /// one in each class merges only states nothing can tell apart.
-    ///
-    /// A class whose values are only ever read against a record's id goes
-    /// further, and its class number is odd ([`crate::model::names_no_record`]). Reading a
-    /// value that names no record finds no record, whichever value it is, and
-    /// no such value can become an id, so they are all one value. The record
-    /// ids stay numbered.
-    pub(in crate::composite::joint) fn number(&self, models: &mut BTreeMap<String, TemperModel>) {
-        let mut numbers: BTreeMap<Term, usize> = BTreeMap::new();
-        let reads_blank: BTreeSet<Term> = self
-            .reads_blank
+    /// `literals`, which `entity`'s field `field` may be offered, without
+    /// those its class doesn't hold and with one of each kind the reads of
+    /// its class can tell apart. `''` stays.
+    pub(in crate::composite::joint) fn one_of_each_kind(
+        &self,
+        entity: &str,
+        field: &str,
+        literals: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let root = self.root(&(entity.to_string(), Slot::named(field)));
+        // A model offers its inputs the literals of each other's classes.
+        let none = BTreeSet::new();
+        let held = self.held.get(&root).unwrap_or(&none);
+        let literals = literals
             .iter()
-            .map(|term| self.root(term))
-            .collect();
-        let apart: BTreeSet<Term> = self.apart.iter().map(|term| self.root(term)).collect();
-        for (entity, model) in models.iter_mut() {
-            let params = model.transitions.iter().flat_map(|t| &t.string_params);
-            let names: BTreeSet<String> = model
-                .tracked_strings
-                .iter()
-                .cloned()
-                .chain(params.map(|param| param.name.to_string()))
-                .chain([ID.to_string()])
-                .collect();
-            for name in names {
-                let root = self.root(&(entity.clone(), Slot::named(&name)));
-                let next = (numbers.len() + 1) * 2 + usize::from(!apart.contains(&root));
-                let blank = reads_blank.contains(&root);
-                let class = *numbers.entry(root).or_insert(next);
-                if !blank {
-                    model.never_blank.insert(class);
-                }
-                model.string_classes.insert(name, class);
-            }
+            .filter(|literal| literal.is_empty() || held.contains(*literal));
+        if self.exact.iter().any(|term| self.root(term) == root) {
+            return literals.cloned().collect();
         }
+        let reads: Vec<&BTreeSet<String>> = self
+            .reads
+            .iter()
+            .filter(|(term, _)| self.root(term) == root)
+            .map(|(_, named)| named)
+            .collect();
+        let mut kinds = BTreeSet::new();
+        literals
+            .filter(|literal| {
+                let kind: Vec<bool> = reads.iter().map(|named| named.contains(*literal)).collect();
+                literal.is_empty() || kinds.insert(kind)
+            })
+            .cloned()
+            .collect()
     }
 
     fn declare(&mut self, entity: &str, a: &Automaton) {
         let term = |name: &str| (entity.to_string(), Slot::named(name));
         let own = (entity.to_string(), Slot::Status);
         self.hold_all(&own, a.automaton.states.iter().cloned());
+        self.exact.extend([own, term("Id")]);
         for sv in &a.state {
             match &sv.initial {
                 Initial::String(value) => self.hold(&term(&sv.name), value),
-                Initial::List(items) => self.hold_all(&term(&sv.name), items.iter().cloned()),
+                Initial::List(items) => {
+                    self.exact.push(term(&sv.name));
+                    self.hold_all(&term(&sv.name), items.iter().cloned());
+                }
                 _ => {}
             }
         }
@@ -232,14 +204,14 @@ impl Classes {
                 }
                 if let Some(field) = constraint.field() {
                     self.compared(&term(constraint.param()), &term(field));
+                    self.exact.push(term(field));
                 }
             }
             for effect in &action.effect {
                 match effect {
                     Effect::Assign { var, value, .. } => self.copy(&term(var), entity, value),
-                    Effect::Append { list, value } => self.copy(&term(list), entity, value),
-                    // Removing compares the value with each of the list's.
-                    Effect::Remove { list, value } => {
+                    Effect::Append { list, value } | Effect::Remove { list, value } => {
+                        self.exact.push(term(list));
                         self.copy(&term(list), entity, value);
                         self.apart.insert(term(list));
                     }
@@ -251,6 +223,7 @@ impl Classes {
                         ..
                     } => {
                         let child = |name: &str| (entity_type.clone(), Slot::named(name));
+                        self.exact.push(child("Id"));
                         if let Some(field) = store_id_in {
                             self.link(&term(field), &child("Id"));
                         }
@@ -280,6 +253,7 @@ impl Classes {
                     continue;
                 };
                 let target = |name: &str| (to.clone(), Slot::named(name));
+                self.exact.push(target("Id"));
                 for (param, arg) in &trigger.args {
                     self.copy(&target(param), entity, arg);
                 }
@@ -323,6 +297,7 @@ impl Classes {
     fn term(&mut self, owner: &str, operand: &Operand) -> Option<Term> {
         let mut related = |entity_type: &str, id_field: &str, slot: Slot| {
             let id = (entity_type.to_string(), Slot::Id);
+            self.exact.push(id.clone());
             self.link(&(owner.to_string(), Slot::named(id_field)), &id);
             Some((entity_type.to_string(), slot))
         };
@@ -354,9 +329,10 @@ impl Classes {
                 self.visit(owner, a);
                 self.visit(owner, b);
             }
-            Expr::Compare { lhs, rhs, op } => {
+            Expr::Compare { lhs, op, rhs } => {
                 match (self.term(owner, lhs), self.term(owner, rhs), lhs, rhs) {
                     (Some(a), Some(b), _, _) => {
+                        self.exact.push(a.clone());
                         self.compared(&a, &b);
                         // An order reads more than whether they are equal.
                         if !matches!(op, CmpOp::Eq | CmpOp::Ne) {
@@ -366,6 +342,11 @@ impl Classes {
                     (Some(t), None, _, Operand::Lit(Literal::Str(text)))
                     | (None, Some(t), Operand::Lit(Literal::Str(text)), _) => {
                         self.hold(&t, text);
+                        if matches!(op, CmpOp::Eq | CmpOp::Ne) {
+                            self.reads.push((t, BTreeSet::from([text.clone()])));
+                        } else {
+                            self.exact.push(t);
+                        }
                     }
                     _ => {}
                 }
@@ -374,17 +355,23 @@ impl Classes {
                 let value_term = self.term(owner, value);
                 match (value_term, set, value) {
                     (Some(t), Set::List(items), _) => {
+                        let mut named = BTreeSet::new();
                         for item in items {
                             if let Literal::Str(text) = item {
                                 self.hold(&t, text);
+                                named.insert(text.clone());
                             }
                         }
+                        self.reads.push((t, named));
                     }
                     (Some(t), Set::Var(list), _) => {
+                        self.exact.push(t.clone());
                         self.compared(&t, &(owner.to_string(), Slot::named(list)));
                     }
                     (None, Set::Var(list), Operand::Lit(Literal::Str(text))) => {
-                        self.hold(&(owner.to_string(), Slot::named(list)), text);
+                        let list = (owner.to_string(), Slot::named(list));
+                        self.exact.push(list.clone());
+                        self.hold(&list, text);
                     }
                     _ => {}
                 }

@@ -165,6 +165,7 @@ pub fn build_model_tracking(
         string_literals: string_literals(automaton, &string_inputs),
         string_classes: BTreeMap::new(),
         never_blank: BTreeSet::new(),
+        literals_by_class: false,
         initial_strings: initial_strings.into(),
         tracked_strings,
         counter_bounds,

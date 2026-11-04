@@ -316,6 +316,9 @@ pub struct TemperModel {
     /// The classes nothing reads a blank value in: no `param_nonempty` on a
     /// parameter of theirs, so a blank made-up value is just a made-up value.
     pub(crate) never_blank: BTreeSet<usize>,
+    /// Whether `string_literals` is all a parameter can meet: a literal held
+    /// elsewhere is a value like any made-up one to whatever reads it.
+    pub(crate) literals_by_class: bool,
     /// Per-counter upper bounds for bounded exploration.
     pub(crate) counter_bounds: BTreeMap<String, usize>,
     /// Default upper bound for counters not in counter_bounds.
@@ -398,6 +401,7 @@ impl fmt::Debug for TemperModel {
             string_literals,
             string_classes: _,
             never_blank: _,
+            literals_by_class,
             counter_bounds,
             default_max_counter,
             list_bounds,
@@ -419,6 +423,7 @@ impl fmt::Debug for TemperModel {
             .field("initial_strings", initial_strings)
             .field("tracked_strings", tracked_strings)
             .field("string_literals", string_literals)
+            .field("literals_by_class", literals_by_class)
             .field("counter_bounds", counter_bounds)
             .field("default_max_counter", default_max_counter)
             .field("list_bounds", list_bounds)

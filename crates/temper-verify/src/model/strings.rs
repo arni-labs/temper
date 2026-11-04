@@ -60,6 +60,15 @@ fn string_candidates(
                     .filter(|value| value.class().is_none_or(|of| of == class))
                     .copied()
                     .collect();
+                if model.literals_by_class {
+                    let own = model.string_literals.get(param.name.as_str());
+                    all.retain(|value| match value {
+                        ModelString::Literal(text) => {
+                            own.is_some_and(|own| own.contains(text.as_str()))
+                        }
+                        _ => true,
+                    });
+                }
                 all.insert("".into());
                 let fresh = |blank| {
                     if names_no_record(class) {

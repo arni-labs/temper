@@ -474,6 +474,7 @@ mod tests {
             string_literals: BTreeMap::new(),
             string_classes: BTreeMap::new(),
             never_blank: std::collections::BTreeSet::new(),
+            literals_by_class: false,
             limit: None,
         }
     }
