@@ -280,6 +280,9 @@ impl<'a> Request<'a> {
                         .any(|member| same(member, &item)),
                 ),
                 (Val::Error, _) | (_, Val::Error) => ERROR,
+                (set @ Val::Known(_), item) if matches!(&set, Val::Known(json) if json.is_array()) => {
+                    self.within(&item, &set)
+                }
                 _ => ANY,
             },
             "if-then-else" => {
