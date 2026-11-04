@@ -11,12 +11,19 @@
 
 use std::collections::BTreeMap;
 
+use std::future::IntoFuture;
+use std::time::Duration;
+
 use anyhow::Result;
 use axum::Router;
+use axum::extract::{Request, State};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 use temper_platform::state::PlatformState;
+use temper_server::ServerState;
 use temper_server::registry::SpecRegistry;
 use temper_server::storage::StorageStack;
 
@@ -108,18 +115,66 @@ pub(super) async fn start_serving(state: &PlatformState, later: Later) {
     state.server.mark_serving();
 }
 
-/// Serve `router` on `listener` in the background, once [`start_serving`]
-/// has ended. The server is starting until then.
+/// Serve `router` on `listener` in the background from now on. The server is
+/// starting until [`start_serving`] ends: `/healthz` answers at once and says
+/// so, naming the boot step it is in, and every other request waits until
+/// then, with no deadline, as it waited for the listener before. A boot step
+/// still running is reported meanwhile ([`report_while_starting`]).
 pub(super) fn serve(
     state: &PlatformState,
     listener: TcpListener,
     router: Router,
 ) -> JoinHandle<std::io::Result<()>> {
     state.server.mark_starting();
-    let server = state.server.clone();
+    // determinism-ok: the boot's report runs beside the boot, in this process only.
+    tokio::spawn(report_while_starting(state.server.clone()));
+    let router = router.layer(middleware::from_fn_with_state(
+        state.server.clone(),
+        wait_for_boot,
+    ));
     // determinism-ok: the listener's task, as `axum::serve` was in `temper serve`.
-    tokio::spawn(async move {
+    tokio::spawn(axum::serve(listener, router).into_future())
+}
+
+/// Hold every request but `/healthz` until the server serves.
+async fn wait_for_boot(
+    State(server): State<ServerState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.uri().path() != "/healthz" {
         server.until_serving().await;
-        axum::serve(listener, router).await
-    })
+    }
+    next.run(request).await
+}
+
+/// How often a boot still starting says which step it is in. No boot step has
+/// a limit outside this code (a provider's, or the store's) to report at, so
+/// each is reported once a minute, as a record's message still running is
+/// (temper-server's `entity_actor::watchdog`). It reports; it never ends the
+/// boot.
+const REPORT_EVERY: Duration = Duration::from_secs(60);
+
+/// Log `boot step still running` with the step, its tenant and how long it
+/// has run, each [`REPORT_EVERY`] until the server serves. A log line, not a
+/// span: a span is exported only when it closes, and a step that never ends
+/// never closes one.
+async fn report_while_starting(server: ServerState) {
+    let mut every =
+        tokio::time::interval_at(tokio::time::Instant::now() + REPORT_EVERY, REPORT_EVERY);
+    loop {
+        tokio::select! {
+            () = server.until_serving() => return,
+            _ = every.tick() => {}
+        }
+        match server.boot_steps.current() {
+            Some(step) => tracing::warn!(
+                step = %step.step,
+                tenant = step.tenant.as_deref().unwrap_or(""),
+                since_secs = step.since_secs,
+                "boot step still running"
+            ),
+            None => tracing::warn!("boot step still running"),
+        }
+    }
 }

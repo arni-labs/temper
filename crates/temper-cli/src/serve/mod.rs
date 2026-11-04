@@ -35,7 +35,7 @@ use anyhow::{Context, Result};
 
 use temper_evolution::PostgresRecordStore;
 use temper_observe::ClickHouseStore;
-use temper_observe::otel::init_observability;
+use temper_observe::otel::init_observability_with;
 use temper_platform::optimization::run_optimization_cycle;
 use temper_platform::router::build_platform_routes;
 use temper_platform::state::PlatformState;
@@ -83,7 +83,9 @@ pub async fn run(
     discord_bot_token: Option<String>,
     tenant: String,
 ) -> Result<()> {
-    let otel_guard = init_observability("temper-platform");
+    // The boot spans open now, for /healthz to name while the server starts.
+    let boot_steps = temper_server::boot_steps::BootSteps::default();
+    let otel_guard = init_observability_with("temper-platform", Some(Box::new(boot_steps.clone())));
     temper_authz::init_metrics();
     temper_store_postgres::init_metrics();
     temper_store_turso::init_metrics();
@@ -112,6 +114,7 @@ pub async fn run(
 
     // Assemble platform state
     let mut state = PlatformState::with_registry(registry, api_key);
+    state.server.boot_steps = boot_steps;
     let mut pg_actor_runtime_cancel = None;
     state.api_token = std::env::var("TEMPER_API_KEY").ok();
     if state.api_token.is_some() {
