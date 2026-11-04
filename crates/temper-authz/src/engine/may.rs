@@ -166,31 +166,41 @@ impl SendAnalysis {
         record: &BTreeMap<String, Attr>,
         cause: Option<&Cause>,
     ) -> May {
-        let profiles = match asker {
-            Asker::OutsideAs(kind) => &kind.0[..],
-            _ => std::slice::from_ref(&UNKNOWN),
+        let request = |profile| Request {
+            asker,
+            profile,
+            action,
+            resource_type,
+            record,
+            cause,
         };
-        // A kind may be any of its profiles.
-        let mut answers = profiles.iter().map(|profile| {
-            let request = Request {
-                asker,
-                profile,
-                action,
-                resource_type,
-                record,
-                cause,
-            };
+        let answer = |policies: &[&(Effect, Json)], profile| {
+            let request = request(profile);
             decide(
-                self.policies
+                policies
                     .iter()
                     .map(|(effect, policy)| (*effect, request.applies(policy))),
             )
-        });
-        let first = answers.next().unwrap_or(May::No);
-        answers.fold(
-            first,
-            |sofar, next| if sofar == next { sofar } else { May::Maybe },
-        )
+        };
+        // Knowing more of the sender only rules policies out, so what cannot
+        // apply to someone unknown applies to none of a kind's profiles.
+        let unknown = request(&UNKNOWN);
+        let policies: Vec<&(Effect, Json)> = self
+            .policies
+            .iter()
+            .filter(|(_, policy)| unknown.applies(policy).can(TRUE))
+            .collect();
+        let Asker::OutsideAs(kind) = asker else {
+            return answer(&policies, &UNKNOWN);
+        };
+        // A kind may be any of its profiles: where they differ, either way.
+        let mut profiles = kind.0.iter().map(|profile| answer(&policies, profile));
+        let first = profiles.next().unwrap_or(May::No);
+        if profiles.all(|next| next == first) {
+            first
+        } else {
+            May::Maybe
+        }
     }
 
     /// The policies that may apply when `asker` sends `action` to a
