@@ -27,8 +27,14 @@ const OPERATOR_KEY: &str = "tmpr_tenant-delete-storage";
 
 /// A server in routed mode: one local database file per tenant.
 async fn routed_state(dir: &Path) -> PlatformState {
+    routed_state_with_registry(dir, "platform.db").await
+}
+
+/// A server in routed mode whose tenant registry is `registry`, beside the
+/// tenant databases in `dir/tenants`.
+async fn routed_state_with_registry(dir: &Path, registry: &str) -> PlatformState {
     let router = TenantStoreRouter::new(
-        &format!("file:{}", dir.join("platform.db").display()),
+        &format!("file:{}", dir.join(registry).display()),
         None,
         Some(dir.join("tenants").display().to_string()),
     )
@@ -68,7 +74,12 @@ fn as_tenant(method: Method, uri: &str, body: serde_json::Value, tenant: &str) -
 }
 
 async fn create_tenant(state: &PlatformState) -> StatusCode {
-    tenant_api_router()
+    create_tenant_answer(state).await.0
+}
+
+/// Create the tenant: its status and what it said.
+async fn create_tenant_answer(state: &PlatformState) -> (StatusCode, String) {
+    let created = tenant_api_router()
         .with_state(state.clone())
         .oneshot(as_tenant(
             Method::POST,
@@ -77,8 +88,12 @@ async fn create_tenant(state: &PlatformState) -> StatusCode {
             "default",
         ))
         .await
-        .expect("create runs")
-        .status()
+        .expect("create runs");
+    let status = created.status();
+    let body = axum::body::to_bytes(created.into_body(), 64 * 1024)
+        .await
+        .expect("create answer");
+    (status, String::from_utf8_lossy(&body).into_owned())
 }
 
 /// Delete the tenant as itself: its status and what it said.
@@ -267,4 +282,56 @@ async fn deleting_a_tenant_removes_its_objects_and_a_refused_removal_keeps_the_i
         "1,001 objects take two DeleteObjects calls"
     );
     assert_eq!(create_tenant(&state).await, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn a_tenant_id_whose_database_was_left_behind_is_refused_rather_than_reopened() {
+    let dir = tempfile::tempdir().expect("data dir");
+    // The tenant's database stays in the tenants directory while no registry
+    // names it, as a delete that removed only the registry row left it.
+    {
+        let earlier = routed_state_with_registry(dir.path(), "earlier.db").await;
+        assert_eq!(create_tenant(&earlier).await, StatusCode::CREATED);
+        bootstrap_operator_credential(&earlier, OPERATOR_KEY, TENANT)
+            .await
+            .expect("the tenant's credential and its type are written");
+    }
+    let left_behind = dir.path().join("tenants").join(format!("{TENANT}.db"));
+    assert!(left_behind.exists());
+
+    let state = routed_state(dir.path()).await;
+    let (status, said) = create_tenant_answer(&state).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{said}");
+    assert!(
+        said.contains(&format!("{TENANT}.db")),
+        "names what is left: {said}"
+    );
+    assert!(left_behind.exists(), "what is left is not removed");
+    assert!(
+        IdentityResolver::new()
+            .resolve(&state.server, &TenantId::new(TENANT), OPERATOR_KEY)
+            .await
+            .is_err(),
+        "nothing left behind signs in"
+    );
+    let (status, said) = create_tenant_answer(&state).await;
+    assert_eq!(status, StatusCode::CONFLICT, "refused again: {said}");
+}
+
+#[tokio::test]
+async fn a_tenant_id_whose_objects_were_left_behind_is_refused() {
+    let dir = tempfile::tempdir().expect("data dir");
+    let state = routed_state(dir.path()).await;
+    let objects = ObjectStore::default();
+    let server = objects.serve().await;
+    let left_behind = format!("{}field-overflow/0001", object_namespace(TENANT));
+    objects.put(&left_behind);
+    let vault = state.server.secrets_vault.as_ref().expect("vault");
+    vault.cache_platform_secret("blob_endpoint", server.uri());
+    vault.cache_platform_secret("blob_bucket", BUCKET.to_string());
+
+    let (status, said) = create_tenant_answer(&state).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{said}");
+    assert!(said.contains(&left_behind), "names what is left: {said}");
+    assert!(objects.holds(&left_behind), "what is left is not removed");
 }
