@@ -6,7 +6,6 @@
 //! most a step, and one thread stops where it stopped the last time: the same
 //! specs in the same room give the same walk.
 
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -39,7 +38,6 @@ pub(super) struct Trail {
     pub(super) nodes: Vec<Node>,
     pub(super) made: Vec<Made>,
     pub(super) edges: Vec<Edge>,
-    pub(super) outside: BTreeMap<u32, (String, String)>,
     /// Bytes the packed states take.
     pub(super) states: usize,
 }

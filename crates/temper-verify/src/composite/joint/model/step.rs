@@ -132,9 +132,13 @@ impl JointModel {
                 let armed = state.armed.get(entity.as_str()).copied().unwrap_or(OUTSIDE);
                 let by = self.senders.timer(armed);
                 let text = if self.sender_matters.contains(entity) {
-                    format!("{entity}.{name} (timer, as {})", self.senders.name(by))
+                    words!(
+                        self,
+                        "{entity}.{name} (timer, as {})",
+                        self.senders.name(by)
+                    )
                 } else {
-                    format!("{entity}.{name} (timer)")
+                    words!(self, "{entity}.{name} (timer)")
                 };
                 let mut next = state.clone();
                 next.armed.remove(entity.as_str());
@@ -147,7 +151,8 @@ impl JointModel {
             Move::Answer(call, action) => {
                 let mut next = state.clone();
                 remove_call(&mut next, call);
-                let text = format!(
+                let text = words!(
+                    self,
                     "{}.{action} (answer from {}, as {})",
                     call.to,
                     call.module,
@@ -162,7 +167,7 @@ impl JointModel {
                         &mut outcomes,
                         (
                             next,
-                            format!("{text} sent"),
+                            words!(self, "{text} sent"),
                             Certainty::unless(known, Unsure),
                         ),
                     ) {
@@ -181,7 +186,7 @@ impl JointModel {
                     // does not exceed the counter it must.
                     if !self.expansion.push(
                         &mut outcomes,
-                        (next, format!("{text} refused by its record"), Sure),
+                        (next, words!(self, "{text} refused by its record"), Sure),
                     ) {
                         return (Vec::new(), false);
                     };
@@ -199,7 +204,7 @@ impl JointModel {
                         && self.unchecked.meets(&call.to, &action.name)
                         && self.exact(&call.to, &action.name, state);
                     if !known {
-                        let refused = format!("{text} refused by its record");
+                        let refused = words!(self, "{text} refused by its record");
                         if !self
                             .expansion
                             .push(&mut outcomes, (next.clone(), refused, OneOf))
@@ -221,7 +226,7 @@ impl JointModel {
             Move::Fail(call) => {
                 let mut next = state.clone();
                 remove_call(&mut next, call);
-                let text = format!("{call} fails");
+                let text = words!(self, "{call} fails");
                 for outcome in self.end_call(next, call, text, call.by) {
                     if !self.expansion.push(&mut outcomes, outcome) {
                         return (Vec::new(), false);
@@ -236,7 +241,7 @@ impl JointModel {
                 // that move, starting a timer's chain.
                 let mut next = state.clone();
                 remove_call(&mut next, call);
-                let text = format!("{call} is lost: the server restarts");
+                let text = words!(self, "{call} is lost: the server restarts");
                 let by = self.senders.timer(Senders::armer(call.by));
                 for outcome in self.end_call(next, call, text, by) {
                     if !self.expansion.push(&mut outcomes, outcome) {
@@ -247,7 +252,7 @@ impl JointModel {
             Move::Silent(call) => {
                 let mut next = state.clone();
                 remove_call(&mut next, call);
-                let text = format!("{call} ends with no answer");
+                let text = words!(self, "{call} ends with no answer");
                 if !self.expansion.push(&mut outcomes, (next, text, Sure)) {
                     return (Vec::new(), false);
                 }
@@ -264,7 +269,7 @@ impl JointModel {
                 remove(&mut next, dispatch);
                 let allows = self.read_allows(dispatch, state);
                 if allows != Truth::True {
-                    let refused = format!("{dispatch} refused when read");
+                    let refused = words!(self, "{dispatch} refused when read");
                     let certainty = Certainty::unless(allows == Truth::False, OneOf);
                     let mut stays = next.clone();
                     self.spawn_refused(&mut stays, dispatch);
@@ -279,7 +284,7 @@ impl JointModel {
                     let mut read = (**dispatch).clone();
                     read.read = true;
                     add(&mut next, read);
-                    let text = format!("{dispatch}: related records read");
+                    let text = words!(self, "{dispatch}: related records read");
                     if !self.expansion.push(
                         &mut outcomes,
                         (next, text, Certainty::unless(allows == Truth::True, OneOf)),
@@ -307,7 +312,8 @@ impl JointModel {
                     May::Yes
                 };
                 if may != May::Yes {
-                    let text = format!(
+                    let text = words!(
+                        self,
                         "{dispatch} refused by Cedar for {}",
                         self.senders.name(dispatch.by)
                     );
@@ -325,7 +331,7 @@ impl JointModel {
                 if may != May::No {
                     let cedar = Certainty::unless(may == May::Yes, Either);
                     for outcome in self
-                        .deliver(next, dispatch, &dispatch.to_string())
+                        .deliver(next, dispatch, &words!(self, "{dispatch}"))
                         .into_iter()
                         .map(|(s, t, then)| (s, t, cedar.then(then)))
                     {
@@ -354,7 +360,11 @@ impl JointModel {
             self.in_one_order(&mut outcome);
             let renamed = canonical(&mut outcome);
             let next = Next {
-                label: rename_label(&text, mv, &renamed),
+                label: if self.expansion.words() {
+                    rename_label(&text, mv, &renamed)
+                } else {
+                    String::new()
+                },
                 state: outcome,
                 renamed,
                 certainty,

@@ -43,7 +43,7 @@ impl JointModel {
         if !dispatch.read {
             let mut next = state;
             add(&mut next, dispatch);
-            return vec![(next, format!("{text} sent"), Certainty::Sure)];
+            return vec![(next, words!(self, "{text} sent"), Certainty::Sure)];
         }
         self.deliver(state, &dispatch, text)
     }
@@ -64,7 +64,7 @@ impl JointModel {
                 next,
                 &call.to,
                 name,
-                &format!("{text}: {}.{name}", call.to),
+                &words!(self, "{text}: {}.{name}", call.to),
                 by,
             ),
             None => vec![(next, text, Certainty::Sure)],
@@ -79,7 +79,7 @@ impl JointModel {
         dispatch: &Dispatch,
         text: &str,
     ) -> Vec<(JointState, String, Certainty)> {
-        let refused = format!("{text} refused by its record");
+        let refused = words!(self, "{text} refused by its record");
         let (moved, action, certainty) = match self.arrive(&state, dispatch) {
             Arrival::Refused => {
                 self.spawn_refused(&mut state, dispatch);
@@ -91,7 +91,7 @@ impl JointModel {
                 // or as a covered move in the liveness graph.
                 return vec![(
                     state,
-                    format!("{text}: outcome beyond exploration bounds"),
+                    words!(self, "{text}: outcome beyond exploration bounds"),
                     Certainty::Unsure,
                 )];
             }
@@ -108,7 +108,7 @@ impl JointModel {
             self.spawn_refused(&mut stays, dispatch);
             outcomes.push((stays, refused, certainty));
         }
-        let text = format!("{text} arrives -> {}", moved.status);
+        let text = words!(self, "{text} arrives -> {}", moved.status);
         self.place(&mut state, &dispatch.to, moved, &action, dispatch.by);
         let sent = Sent {
             chain: &dispatch.chain,

@@ -24,7 +24,7 @@ impl JointModel {
         remove(&mut next, dispatch);
         let holds = self.trigger_guard(dispatch, state);
         if holds != Truth::True {
-            let text = format!("{dispatch}: its trigger's guard does not hold");
+            let text = words!(self, "{dispatch}: its trigger's guard does not hold");
             let certainty = Certainty::unless(holds == Truth::False, Certainty::OneOf);
             outcomes.push((next.clone(), text, certainty));
         }
@@ -32,7 +32,7 @@ impl JointModel {
             let mut sent = dispatch.clone();
             sent.unread_guard = None;
             add(&mut next, sent);
-            let text = format!("{dispatch}: its trigger's guard holds");
+            let text = words!(self, "{dispatch}: its trigger's guard holds");
             let certainty = Certainty::unless(holds == Truth::True, Certainty::OneOf);
             outcomes.push((next, text, certainty));
         }

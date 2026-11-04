@@ -177,11 +177,6 @@ impl Packer {
         words(state, &mut known)
     }
 
-    /// The number of `name`, when the tables hold it.
-    pub(super) fn known_id(&self, name: &str) -> Option<u32> {
-        self.ids.get(name).copied()
-    }
-
     pub(super) fn unpack(&self, packed: &[u32]) -> JointState {
         let mut input = packed.iter().map(|&word| word as usize);
         let mut next = || {

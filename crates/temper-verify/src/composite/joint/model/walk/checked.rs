@@ -8,7 +8,6 @@
 //! of the number can only ever lose a state, which [`JointModel::walk_with`]
 //! notices and says.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -18,10 +17,10 @@ use stateright::{Model, Property};
 use super::super::super::JointState;
 use super::super::super::pack::Packed;
 use super::super::JointModel;
-use super::super::step::{Certainty, Move};
+use super::super::step::Certainty;
 use super::levels::deeper;
 use super::shared::{Seen, Shared, Trail, read, state_bytes, write};
-use super::{Edge, Keep, Made, Node};
+use super::{Edge, Keep, Made, Node, Via};
 
 /// What a walk sees each state with: the model, its number, the state, and
 /// whether sure moves alone reach it. True stops the walk.
@@ -53,12 +52,10 @@ enum To {
     /// sure moves alone may now reach it.
     Check {
         packed: Packed,
-        /// The move, a name in the packer.
-        label: u32,
+        /// The way it is reached.
+        via: Via,
         /// Sure moves alone reach it this way.
         surely: bool,
-        /// The move, an index into the state's moves.
-        by: u32,
     },
 }
 
@@ -166,7 +163,7 @@ impl Walker {
             }
             let made = batch.made.len().saturating_sub(1) as u32;
             let depth = deeper(job.depth);
-            for next in &nexts {
+            for (outcome, next) in nexts.iter().enumerate() {
                 let packed = self.pack(&next.state);
                 let surely = sure && next.certainty == Certainty::Sure;
                 let found = shared.seen.get(&packed).map(|seen| *seen);
@@ -182,9 +179,11 @@ impl Walker {
                     }
                     _ => To::Check {
                         packed,
-                        label: self.label(&next.label),
+                        via: Via {
+                            by: by as u32,
+                            outcome: outcome as u32,
+                        },
                         surely,
-                        by: by as u32,
                     },
                 };
                 batch.ways.push(Way {
@@ -194,10 +193,10 @@ impl Walker {
                 });
             }
             if batch.ways.len() >= BATCH {
-                self.add(job, &mut batch, &moves, jobs);
+                self.add(job, &mut batch, jobs);
             }
         }
-        let states = self.add(job, &mut batch, &moves, jobs);
+        let states = self.add(job, &mut batch, jobs);
         if states >= shared.count_at.load(Ordering::Acquire) {
             shared.wait(|| shared.count_at.load(Ordering::Acquire) > states);
         }
@@ -209,12 +208,6 @@ impl Walker {
         known.unwrap_or_else(|| write(&self.shared.packer).pack(state))
     }
 
-    /// The name of a move in the packer.
-    fn label(&self, label: &str) -> u32 {
-        let known = read(&self.shared.packer).known_id(label);
-        known.unwrap_or_else(|| write(&self.shared.packer).id(label))
-    }
-
     /// Run `build` in the room an expansion may build in, asking the calling
     /// thread for more until it fits. None when the room has no more.
     fn built<T>(&self, build: impl Fn() -> T) -> Option<T> {
@@ -223,7 +216,9 @@ impl Walker {
         loop {
             let room = shared.build_room.load(Ordering::Acquire);
             expansion.allow(room);
+            expansion.name_moves(false);
             let built = build();
+            expansion.name_moves(true);
             let short = expansion.short();
             expansion.allow(usize::MAX);
             if !short {
@@ -242,13 +237,7 @@ impl Walker {
 
     /// Add what walking the state `from` found to the trail, and say how many
     /// states the walk has.
-    fn add(
-        &self,
-        from: Walked,
-        batch: &mut Batch,
-        moves: &[Move],
-        jobs: &mut Vec<Walked>,
-    ) -> usize {
+    fn add(&self, from: Walked, batch: &mut Batch, jobs: &mut Vec<Walked>) -> usize {
         let shared = &*self.shared;
         let before = jobs.len();
         let states = {
@@ -261,18 +250,9 @@ impl Walker {
                     To::Known(at) => at,
                     To::Check {
                         packed,
-                        label,
+                        via,
                         surely,
-                        by,
-                    } => self.check(
-                        trail,
-                        packed,
-                        from,
-                        label,
-                        surely,
-                        &moves[by as usize],
-                        jobs,
-                    ),
+                    } => self.check(trail, packed, from, via, surely, jobs),
                 };
                 if self.keep == Keep::Edges {
                     trail.edges.push(Edge {
@@ -290,22 +270,20 @@ impl Walker {
         states
     }
 
-    /// The number of the state `packed`, which `mv` (named `label`) leads to
-    /// from the state `from`: a new one when the walk does not have it. A job
-    /// follows when it is new, or when sure moves alone now reach it and it
-    /// does not wait to be walked.
-    #[allow(clippy::too_many_arguments)]
+    /// The number of the state `packed`, which `via` leads to from the state
+    /// `from`: a new one when the walk does not have it. A job follows when
+    /// it is new, or when sure moves alone now reach it and it does not wait
+    /// to be walked.
     fn check(
         &self,
         trail: &mut Trail,
         packed: Packed,
         from: Walked,
-        label: u32,
+        via: Via,
         surely: bool,
-        mv: &Move,
         jobs: &mut Vec<Walked>,
     ) -> u32 {
-        let parent = (from.at, label);
+        let parent = (from.at, via);
         let depth = deeper(from.depth);
         match self.shared.seen.entry(packed.clone()) {
             Entry::Occupied(mut found) => {
@@ -313,7 +291,6 @@ impl Walker {
                 self.shared.levels.found_again(found.get().depth, depth);
                 if self.keep == Keep::Sure && surely && !found.get().sure {
                     found.get_mut().sure = true;
-                    note_outside(&mut trail.outside, parent.1, mv);
                     let node = &mut trail.nodes[at as usize];
                     node.parent = Some(parent);
                     if node.found_sure() {
@@ -328,7 +305,6 @@ impl Walker {
             }
             Entry::Vacant(free) => {
                 let at = u32::try_from(trail.nodes.len()).expect("fewer than 2^32 states");
-                note_outside(&mut trail.outside, parent.1, mv);
                 trail.states += state_bytes(&packed);
                 free.insert(Seen {
                     at,
@@ -346,15 +322,5 @@ impl Walker {
                 at
             }
         }
-    }
-}
-
-/// Remember that `label` names `mv`, when it is a reaction from a type
-/// outside the scope.
-fn note_outside(outside: &mut BTreeMap<u32, (String, String)>, label: u32, mv: &Move) {
-    if let Move::Reaction(entity, action, _) = mv {
-        outside
-            .entry(label)
-            .or_insert_with(|| (entity.clone(), action.name.to_string()));
     }
 }

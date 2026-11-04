@@ -346,7 +346,7 @@ pub(super) fn settle(
         let Some((index, path)) = on_a_way else {
             return (
                 LivenessOutcome::Incomplete {
-                    reason: unsure_reason(explored, &good, &out),
+                    reason: unsure_reason(model, explored, &good, &out),
                 },
                 met,
             );

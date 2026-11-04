@@ -157,10 +157,10 @@ impl JointModel {
         then: &str,
     ) -> String {
         if by == OUTSIDE {
-            format!("{entity}.{action}{then}")
+            words!(self, "{entity}.{action}{then}")
         } else {
             let sender = self.senders.name_asking(by, entity, &action.name);
-            format!("{entity}.{action}{then} as {sender}")
+            words!(self, "{entity}.{action}{then} as {sender}")
         }
     }
 }

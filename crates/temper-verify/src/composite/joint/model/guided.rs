@@ -625,7 +625,7 @@ impl<'m, 'a> Engine<'m, 'a> {
 /// The breadth-first walk's states guided walks start from, each with the
 /// path to it, repacked in `packer`: its first few starting states, and its
 /// deepest states, one per set of record statuses, deepest first.
-fn seeds(explored: &Explored<'_>, packer: &mut Packer) -> Vec<Vec<Step>> {
+fn seeds(model: &JointModel, explored: &Explored<'_>, packer: &mut Packer) -> Vec<Vec<Step>> {
     let count = explored.len();
     let mut chosen: Vec<usize> = Vec::new();
     let mut kinds = BTreeSet::new();
@@ -649,7 +649,7 @@ fn seeds(explored: &Explored<'_>, packer: &mut Packer) -> Vec<Vec<Step>> {
             loop {
                 let node = &explored.nodes[index];
                 let (parent, sure) = (node.parent, node.sure());
-                let label = parent.map(|(_, label)| packer.id(explored.packer.name(label)));
+                let label = explored.label(model, index).map(|label| packer.id(&label));
                 path.push((label, packer.pack(&explored.state(index)), sure));
                 match parent {
                     Some((from, _)) => index = from as usize,
@@ -712,7 +712,7 @@ impl JointModel {
             return (outcomes, Stats::default());
         }
         let mut engine = Engine::new(self, bound, reads(owner, invariants), budget.steps);
-        let seeds = seeds(&explored, &mut engine.packer);
+        let seeds = seeds(self, &explored, &mut engine.packer);
         // The breadth-first walk's memory goes back to the room first.
         drop(explored);
         let mut broken: Vec<Option<Vec<JointStep>>> = vec![None; invariants.len()];

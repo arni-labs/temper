@@ -174,14 +174,14 @@ impl JointModel {
                     .collect::<Vec<_>>()
                     .join(" or ")
             });
-        let text = format!("{entity}.{action} (a reaction from {from})");
+        let text = words!(self, "{entity}.{action} (a reaction from {from})");
         let chain = self.outside_chain(entity, &action.name);
         if self.action_reads_related(entity, &action.name) {
             let mut next = state.clone();
             let mut dispatch = sent(entity, action, by);
             dispatch.chain = chain.into();
             add(&mut next, dispatch);
-            return vec![(next, format!("{text} sent"), Certainty::Unsure)];
+            return vec![(next, words!(self, "{text} sent"), Certainty::Unsure)];
         }
         self.commit(state.clone(), entity, action, &chain, by)
             .into_iter()

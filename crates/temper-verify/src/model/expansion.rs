@@ -15,6 +15,9 @@ pub(crate) struct Expansion {
     room: std::cell::Cell<usize>,
     /// The expansion needed more than `room` and stopped short.
     short: std::cell::Cell<bool>,
+    /// Moves are named in words. A walk turns this off while it expands
+    /// states, since nearly every move it makes leads somewhere it has been.
+    words: std::cell::Cell<bool>,
 }
 /// Only the name: the allowance is a walk's own accounting, not part of the
 /// model, so a model's digest (`JointProof::digest`) leaves it out.
@@ -32,6 +35,7 @@ impl Default for Expansion {
             exhausted: std::cell::Cell::new(false),
             room: std::cell::Cell::new(usize::MAX),
             short: std::cell::Cell::new(false),
+            words: std::cell::Cell::new(true),
         }
     }
 }
@@ -49,6 +53,36 @@ impl Expansion {
             .set(time.and_then(|t| std::time::Instant::now().checked_add(t)));
         self.exhausted.set(false);
         self.allow(usize::MAX);
+    }
+
+    /// Whether moves are named in words on this thread.
+    pub(crate) fn words(&self) -> bool {
+        self.words.get()
+    }
+
+    /// Name moves in words on this thread, or not.
+    pub(crate) fn name_moves(&self, words: bool) {
+        self.words.set(words);
+    }
+
+    /// Run `build` with no bound and moves named in words, leaving the
+    /// expansion's own count, clock and room as they were: naming a move a
+    /// walk already made is no work of the walk's.
+    pub(crate) fn outside_the_count<T>(&self, build: impl FnOnce() -> T) -> T {
+        let remaining = self.remaining.replace(usize::MAX);
+        let until = self.until.replace(None);
+        let exhausted = self.exhausted.replace(false);
+        let room = self.room.replace(usize::MAX);
+        let short = self.short.replace(false);
+        let words = self.words.replace(true);
+        let built = build();
+        self.remaining.set(remaining);
+        self.until.set(until);
+        self.exhausted.set(exhausted);
+        self.room.set(room);
+        self.short.set(short);
+        self.words.set(words);
+        built
     }
 
     /// Let what the expansion builds from now on take `bytes`.

@@ -1,6 +1,5 @@
 //! Running a walk: its starts, the checker's threads, and what they found.
 
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
@@ -46,7 +45,6 @@ impl JointModel {
             edges: Vec::new(),
             stopped: None,
             held_back: false,
-            outside: BTreeMap::new(),
             covered: 0,
             reached: 0,
             held: Held::new(bound),
@@ -115,7 +113,6 @@ impl JointModel {
                 nodes: std::mem::take(&mut explored.nodes),
                 made: Vec::new(),
                 edges: Vec::new(),
-                outside: BTreeMap::new(),
                 states,
             }),
             packer: RwLock::new(std::mem::take(&mut explored.packer)),
@@ -155,7 +152,6 @@ impl JointModel {
         explored.nodes = trail.nodes;
         explored.made = trail.made;
         explored.edges = trail.edges;
-        explored.outside = trail.outside;
         explored.packer = shared.packer.into_inner().expect("a walk thread panicked");
         explored.held_back = shared.held_back.load(Ordering::Relaxed);
         let tables = trail.states
