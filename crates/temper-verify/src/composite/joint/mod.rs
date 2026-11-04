@@ -430,6 +430,10 @@ mod guided_tests;
 mod sure_tests;
 
 #[cfg(test)]
+#[path = "someone_test.rs"]
+mod someone_tests;
+
+#[cfg(test)]
 #[path = "outside_test.rs"]
 mod outside_tests;
 
