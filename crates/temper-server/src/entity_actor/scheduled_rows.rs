@@ -21,6 +21,13 @@
 //! whose two chains then never merge. Arms in one commit are not beside each
 //! other: one move may arm the same action twice on purpose.
 //!
+//! A fire that changes nothing and arms only its own action, for a time after
+//! it, is a poll: it writes nothing and goes on under the row it fired from
+//! ([`ScheduledRows::rearms_own_fire`], `entity_actor::unrecorded`). That row's
+//! due time is then behind the loop's, which lives in this process; a restart
+//! finds the row past due and looks once at once. A re-arm that does not wait
+//! has no commit left to pace it, so it is written as before.
+//!
 //! The same event writes the deadline row of each background module call it
 //! starts that names an `on_failure` (`request_context::calls`), with the id
 //! `<seq>.call:<integration>`; the call's answer removes it in its commit.
@@ -45,6 +52,9 @@ pub(super) struct ScheduledRows {
     pub(super) armed: Vec<ScheduledActionRecord>,
     /// The arm id of this record's scheduled action it fires.
     pub(super) fired: Option<String>,
+    /// The move is that action's own fire, and all it arms is the same action
+    /// again, for a time after this move.
+    pub(super) rearms_own_fire: bool,
 }
 
 impl EntityActor {
@@ -144,7 +154,24 @@ impl EntityActor {
         if let Some(caller) = caller {
             armed.extend(self.call_deadlines(sequence, state, event, custom_effects, caller));
         }
-        ScheduledRows { armed, fired }
+        let fires_own_row = caller
+            .and_then(|caller| caller.fires_scheduled_action.as_ref())
+            .is_some_and(|fire| fired.as_ref() == Some(&fire.arm_id))
+            && fired
+                .as_deref()
+                .is_some_and(|arm_id| called_integration(arm_id).is_none());
+        let rearms_own_fire = fires_own_row
+            && armed.len() == 1
+            && matches!(
+                scheduled.as_slice(),
+                [next] if next.action == event.action
+                    && next.due_at.is_some_and(|due| due > event.timestamp)
+            );
+        ScheduledRows {
+            armed,
+            fired,
+            rearms_own_fire,
+        }
     }
 
     /// The deadline rows of the background calls `custom_effects` start that

@@ -1901,7 +1901,7 @@ impl EntityActor {
                         )
                     {
                         *state = state_before;
-                        let response = self.answer_unrecorded(state, result, &event);
+                        let response = self.answer_unrecorded(state, result, &event, &scheduled);
                         if let (Some(key), Some(request), Some(cache)) = (
                             idempotency_key.as_ref(),
                             request.as_ref(),

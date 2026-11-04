@@ -26,6 +26,14 @@
 //! such as a caller who cannot make the move: every try would be answered
 //! the same, so it is logged once and its row removed, not retried.
 //!
+//! A fire that changes nothing and arms only itself writes no event, so its
+//! row stays and the same task's successor waits for the next due time
+//! ([`ScheduledTimer::goes_on`]), which only this process knows. Each such fire
+//! has an idempotency key of its own, with its due time in it: answers are kept
+//! by key, and the next fire of the row must run, not be answered by this one.
+//! A restart arms the row, past due, so the loop looks once at once and keeps
+//! the pace from there.
+//!
 //! A fire whose action has no transition from the record's status when it
 //! comes due has lapsed ([`scheduled_fire_lapsed`]): the record left the
 //! states it was armed for, as a timer whose state was left does not fire.
@@ -56,6 +64,7 @@ use super::state_timer_follow::BootTimers;
 use super::timer_standing::{Standing, TimerFire};
 use super::{DispatchError, DispatchExtOptions};
 use crate::entity_actor::EntityResponse;
+use crate::idempotency::IdempotencyKey;
 use crate::request_context::{AgentContext, ScheduledFire};
 use crate::state::ServerState;
 use crate::wake::{Armed, TimerRef};
@@ -72,6 +81,8 @@ struct ScheduledTimer {
     due_at: DateTime<Utc>,
     /// Who armed it; it fires as them.
     agent_ctx: AgentContext,
+    /// It goes on from an earlier fire of the same row, which wrote nothing.
+    goes_on_from_fire: bool,
 }
 
 impl ScheduledTimer {
@@ -83,6 +94,40 @@ impl ScheduledTimer {
             entity_id: self.entity_id.clone(),
             arm_id: self.arm_id.clone(),
         }
+    }
+
+    /// The key every attempt of this fire is made under.
+    fn fire_key(&self) -> IdempotencyKey {
+        let key = self
+            .agent_ctx
+            .idempotency_key
+            .clone()
+            .unwrap_or_else(|| IdempotencyKey::Request(format!("schedule:{}", self.arm_id)));
+        if !self.goes_on_from_fire {
+            return key;
+        }
+        let due = self.due_at.to_rfc3339();
+        match key {
+            IdempotencyKey::Request(key) => IdempotencyKey::Request(format!("{key}@{due}")),
+            IdempotencyKey::FollowUp(key) => IdempotencyKey::FollowUp(format!("{key}@{due}")),
+        }
+    }
+
+    /// The next fire of this row, when `response` answers a fire that wrote
+    /// nothing and armed only itself (`EntityActor::answer_unrecorded`).
+    fn goes_on(&self, response: &EntityResponse) -> Option<Self> {
+        response.unrecorded_at?;
+        let next = response.scheduled_actions.first()?;
+        Some(Self {
+            tenant: self.tenant.clone(),
+            entity_type: self.entity_type.clone(),
+            entity_id: self.entity_id.clone(),
+            arm_id: self.arm_id.clone(),
+            action: self.action.clone(),
+            due_at: next.due_at.unwrap_or(DateTime::<Utc>::MAX_UTC),
+            agent_ctx: self.agent_ctx.clone(),
+            goes_on_from_fire: true,
+        })
     }
 }
 
@@ -102,6 +147,10 @@ impl ServerState {
         ctx: &PostDispatchContext<'_>,
         response: &EntityResponse,
     ) {
+        // A fire that wrote nothing has no row to arm: its own task goes on.
+        if response.unrecorded_at.is_some() {
+            return;
+        }
         for (index, scheduled) in response.scheduled_actions.iter().enumerate() {
             // A record with no journal keeps no row: its action is due its
             // delay from now. One past the end of the calendar never is.
@@ -124,6 +173,7 @@ impl ServerState {
                     index,
                     scheduled.delay_millis,
                 ),
+                goes_on_from_fire: false,
             };
             self.spawn_scheduled_action(timer, None);
         }
@@ -253,20 +303,25 @@ impl ServerState {
                 entity_type = %timer.entity_type,
                 entity_id = %timer.entity_id,
             );
-            server
+            let next = server
                 .fire_scheduled_action(&timer, gate, &due)
                 .instrument(span)
                 .await;
             server.due_times.end(&due);
-            let mut armed = server
-                .scheduled_armed
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(live) = armed.get_mut(&row) {
-                *live -= 1;
-                if *live == 0 {
-                    armed.remove(&row);
+            {
+                let mut armed = server
+                    .scheduled_armed
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(live) = armed.get_mut(&row) {
+                    *live -= 1;
+                    if *live == 0 {
+                        armed.remove(&row);
+                    }
                 }
+            }
+            if let Some(next) = next {
+                server.spawn_scheduled_action(next, None);
             }
         };
         tokio::spawn(fire); // determinism-ok: timer delivery is a background side-effect
@@ -278,16 +333,15 @@ impl ServerState {
     /// commit removed the row itself. A fire whose setter may no longer read
     /// the record is refused the same way (`timer_standing`): nothing arms a
     /// scheduled action again without its row. Between tries it is due again
-    /// when it next tries, by the wall clock.
+    /// when it next tries, by the wall clock. The answer is the row's next
+    /// fire, when this one wrote nothing and armed only itself.
     async fn fire_scheduled_action(
         &self,
         timer: &ScheduledTimer,
         gate: Option<Arc<Semaphore>>,
         due: &Armed,
-    ) {
-        let key = timer.agent_ctx.idempotency_key.clone().unwrap_or_else(|| {
-            crate::idempotency::IdempotencyKey::Request(format!("schedule:{}", timer.arm_id))
-        });
+    ) -> Option<ScheduledTimer> {
+        let key = timer.fire_key();
         let mut agent = timer.agent_ctx.clone();
         // The same action every attempt, so a retry of a fire that landed is
         // answered as it.
@@ -391,13 +445,13 @@ impl ServerState {
                         &timer.arm_id,
                     )
                     .await;
-                    return;
+                    return None;
                 }
                 Ok(response) if response.success => {
                     if retried {
                         self.arm_fired_rows_retrying(timer, key.as_str()).await;
                     }
-                    return;
+                    return timer.goes_on(&response);
                 }
                 Ok(response) if response.refused => (
                     response
@@ -423,7 +477,7 @@ impl ServerState {
                     &timer.arm_id,
                 )
                 .await;
-                return;
+                return None;
             }
             tracing::warn!(tenant = %timer.tenant, entity_type = %timer.entity_type,
                 entity_id = %timer.entity_id, action = %timer.action, arm_id = %timer.arm_id,

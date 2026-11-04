@@ -13,7 +13,8 @@
 //!
 //! A timer's own fire goes on under the row it fired from, so it writes no row
 //! either; a reset by anyone else writes one, so a restart keeps it
-//! (`arm_state_timeouts_if_needed`).
+//! (`arm_state_timeouts_if_needed`). A scheduled action that arms only itself
+//! does the same (`scheduled_rows`).
 
 use super::EventVia;
 use super::actor::EntityActor;
@@ -68,12 +69,14 @@ pub(super) fn leaves_record_unchanged(
         && before.spawn_reservations == after.spawn_reservations;
     // What the move writes beside the record, in its event's commit or after
     // it: children, scheduled actions and their rows (a scheduled action's
-    // fire removes its row with its event), and field-overflow blobs.
+    // fire removes its row with its event), and field-overflow blobs. A fire
+    // that arms only itself keeps its row instead of swapping it.
     let writes_beside = !result.spawn_requests.is_empty()
-        || !result.scheduled_actions.is_empty()
         || !result.overflow_blobs.is_empty()
-        || !scheduled.armed.is_empty()
-        || scheduled.fired.is_some();
+        || (!scheduled.rearms_own_fire
+            && (!result.scheduled_actions.is_empty()
+                || !scheduled.armed.is_empty()
+                || scheduled.fired.is_some()));
     // What only its event would say: that a timer which fires once has fired
     // (the status clock's entry for its action), that a move naming someone
     // came after a timer stopped for want of one (`timer_needs_person`), and
@@ -91,12 +94,15 @@ pub(super) fn leaves_record_unchanged(
 
 impl EntityActor {
     /// The answer to a move that writes nothing: the record as it was, the
-    /// move's custom effects for its triggers, and the move's own time.
+    /// move's custom effects for its triggers, the move's own time, and the
+    /// next fire of a scheduled action that arms only itself, under the row it
+    /// fired from, for the fire's task to arm.
     pub(super) fn answer_unrecorded(
         &self,
         state: &EntityState,
         result: ProcessResult,
         event: &EntityEvent,
+        scheduled: &ScheduledRows,
     ) -> EntityResponse {
         debug_assert!(
             result.success && result.spawn_requests.is_empty(),
@@ -121,13 +127,19 @@ impl EntityActor {
             seq = state.sequence_nr,
             "move left its record unchanged; nothing written"
         );
+        let mut scheduled_actions = result.scheduled_actions;
+        if let Some(fired) = &scheduled.fired {
+            for next in &mut scheduled_actions {
+                next.arm_id.clone_from(fired);
+            }
+        }
         EntityResponse {
             success: true,
             refusal: None,
             state: state.clone(),
             error: None,
             custom_effects: result.custom_effects,
-            scheduled_actions: Vec::new(),
+            scheduled_actions,
             spawn_requests: Vec::new(),
             spec_governed: true,
             refused: false,
