@@ -393,7 +393,7 @@ fn a_reaction_from_outside_the_scope_makes_neither_verdict() {
 /// The walk takes the rule's word for what it relies on, so the verdict says so.
 #[test]
 fn a_verdict_names_what_its_rule_relies_on() {
-    let result = check(model!("loop_weak"));
+    let result = check(model!("loop_strong"));
     assert_holds(&result);
     let verdict = result.fair.as_ref().expect("the rule asks for fairness");
     assert!(
