@@ -1,5 +1,7 @@
 //! A stored spec in the old predicate syntax is converted once, at the first
-//! boot that reads it, and written back; no later boot converts it again.
+//! boot that reads it, and written back; no later boot converts it again. The
+//! text it was stored with is kept beside it, byte for byte, so the
+//! conversion can be undone.
 //!
 //! A server with many tenants restored thousands of stored specs on every
 //! boot, and converted each old-syntax one in memory each time without
@@ -48,6 +50,11 @@ guard = [{ type = "is_true", var = "ready" }]
 "#;
 
 const TENANT: &str = "default";
+
+/// `Draft`: the same old-syntax spec under another name.
+fn legacy_draft_ioa() -> String {
+    LEGACY_TASK_IOA.replace("name = \"Task\"", "name = \"Draft\"")
+}
 
 /// A CSDL for `entity_type` that declares `Id`, a name the kernel owns.
 fn csdl_xml_for(entity_type: &str, set_name: &str) -> String {
@@ -138,13 +145,24 @@ impl Store {
             .map(|row| (row.entity_type, row.ioa_source))
             .collect()
     }
+
+    /// The source each converted type was stored with before its conversion.
+    async fn originals(&self) -> BTreeMap<String, String> {
+        self.platform()
+            .load_spec_originals()
+            .await
+            .expect("load the kept originals")
+            .into_iter()
+            .map(|row| (row.entity_type, row.ioa_source))
+            .collect()
+    }
 }
 
 /// Store `Order` in the current syntax, and `Task` (verified) and `Draft`
 /// (not verified) in the old one, all committed.
 async fn seed(store: &Store) {
     let order_ioa = include_str!("../../../test-fixtures/specs/order.ioa.toml");
-    let draft_ioa = LEGACY_TASK_IOA.replace("name = \"Task\"", "name = \"Draft\"");
+    let draft_ioa = legacy_draft_ioa();
     let platform = store.platform();
     for (entity_type, ioa, set) in [
         ("Order", order_ioa, "Orders"),
@@ -231,6 +249,22 @@ async fn boots_convert_a_stored_spec_once(store: Store) {
         );
     }
     assert!(verified(&first, "Task") && !verified(&first, "Draft"));
+    let kept = store.originals().await;
+    for (entity_type, stored) in [
+        ("Task", LEGACY_TASK_IOA.to_string()),
+        ("Draft", legacy_draft_ioa()),
+    ] {
+        assert_eq!(
+            kept.get(entity_type),
+            Some(&stored),
+            "the first boot converted {entity_type} and did not keep the text it was \
+             stored with, byte for byte, so the conversion cannot be undone"
+        );
+    }
+    assert!(
+        !kept.contains_key("Order"),
+        "a spec stored in the current syntax keeps nothing extra"
+    );
     warnings.take();
 
     let second = store.boot().await;
@@ -239,6 +273,11 @@ async fn boots_convert_a_stored_spec_once(store: Store) {
         store.sources().await,
         after_first,
         "a later boot leaves the stored specs as the first left them"
+    );
+    assert_eq!(
+        store.originals().await,
+        kept,
+        "a later boot leaves the kept originals as the first left them"
     );
     assert!(
         verified(&second, "Task"),
@@ -257,6 +296,18 @@ async fn boots_convert_a_stored_spec_once(store: Store) {
         logged, 0,
         "restoring stored specs logs nothing at warn: an install already reported \
          what a stored spec lacks"
+    );
+
+    // Only the first original is kept: a later one changes nothing.
+    store
+        .platform()
+        .keep_spec_original(TENANT, "Task", &after_first["Task"])
+        .await
+        .expect("keep an original again");
+    assert_eq!(
+        store.originals().await,
+        kept,
+        "a kept original is never replaced"
     );
 }
 
