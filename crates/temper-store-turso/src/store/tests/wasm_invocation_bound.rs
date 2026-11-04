@@ -153,3 +153,26 @@ async fn a_journal_append_can_land_between_log_cleanup_batches() {
     assert_eq!(rows.len() as i64, WASM_INVOCATIONS_KEPT_PER_TENANT);
     assert!(rows.iter().any(|row| row.entity_id == "newest"));
 }
+
+/// Recording an invocation sits on the module call's path to the shared
+/// writer, so it only inserts: trimming the log is a separate call.
+#[tokio::test]
+async fn recording_an_invocation_deletes_nothing() {
+    let store = make_store("wasm-invocation-insert-only").await;
+    let inserted = WASM_INVOCATIONS_KEPT_PER_TENANT + 50;
+    for n in 0..inserted {
+        store
+            .persist_wasm_invocation(&invocation("busy", &format!("e-{n}")))
+            .await
+            .unwrap();
+    }
+    let rows = store
+        .load_recent_wasm_invocations("busy", 2 * inserted)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len() as i64,
+        inserted,
+        "every recorded invocation is still there until the log is trimmed"
+    );
+}
