@@ -100,6 +100,7 @@ impl JointModel {
         self.unchecked.fan(&copies);
         self.order.fan(&copies);
         self.fan_reactions(&copies);
+        self.several_copies = copies.values().any(|names| names.len() > 1);
         self.copies = copies;
         self
     }
@@ -219,6 +220,9 @@ impl JointModel {
     /// by it become one. Records that compare equal here keep their order, so
     /// not every such state is caught, which only costs walking a state twice.
     pub(super) fn in_one_order(&self, state: &mut JointState) {
+        if !self.several_copies {
+            return;
+        }
         let mut moved: BTreeMap<&str, &str> = BTreeMap::new();
         let mut holds: Vec<(&str, std::sync::Arc<TemperModelState>, Option<u32>)> = Vec::new();
         for names in self.copies.values().filter(|names| names.len() > 1) {

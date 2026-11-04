@@ -120,6 +120,8 @@ pub(super) struct JointModel {
     reactions: Vec<Reaction>,
     /// The names of each type's records ([`copies`]).
     copies: BTreeMap<String, Vec<String>>,
+    /// Whether a type has more than one record, so that their order can differ.
+    several_copies: bool,
     /// Each reaction's place among the reactions as the specs say them.
     first_reaction: Vec<usize>,
     /// The reaction each goes out as ([`alike`]); itself, when this is empty.
@@ -325,6 +327,7 @@ impl JointModel {
             models,
             chosen_guards: chosen::chosen_guards(by_name, &reactions),
             reactions,
+            several_copies: false,
             copies,
             first_reaction: Vec::new(),
             alike: Vec::new(),

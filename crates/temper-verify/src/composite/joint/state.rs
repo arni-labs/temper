@@ -214,6 +214,31 @@ fn strings_on_their_way(state: &JointState) -> impl Iterator<Item = &ModelString
         .chain(state.calls.iter().flat_map(|c| c.asked.values()))
 }
 
+/// Whether `holds` holds of each string [`strings_on_their_way`] gives, asked
+/// in that order, with no iterator to build for the many states that hold few.
+fn all_on_their_way(state: &JointState, mut holds: impl FnMut(&ModelString) -> bool) -> bool {
+    let mut param = |value: &ParamValue| match value {
+        ParamValue::Str(text) => holds(text),
+        _ => true,
+    };
+    for dispatch in &state.inflight {
+        if !dispatch.params.values().all(&mut param) {
+            return false;
+        }
+    }
+    for dispatch in &state.inflight {
+        if let Some(committed) = &dispatch.unread_guard
+            && !committed.fields.values().all(&mut param)
+        {
+            return false;
+        }
+    }
+    state
+        .calls
+        .iter()
+        .all(|call| call.asked.values().all(&mut holds))
+}
+
 fn rewrite(renamed: &Renames, value: &mut ModelString) {
     if let Some(name) = renamed.get(value) {
         *value = *name;
@@ -322,7 +347,7 @@ impl RecordNames {
         }
         if self.moved {
             state.records.clone_from(&self.records);
-            if strings_on_their_way(state).next().is_none() {
+            if all_on_their_way(state, |value| matches!(value, ModelString::Literal(_))) {
                 if rewrote {
                     state.inflight.sort();
                 }
@@ -384,7 +409,7 @@ impl InOrder {
 
     /// Whether what `state` has on its way carries the numbering on.
     fn holds_rest_of(mut self, state: &JointState) -> bool {
-        strings_on_their_way(state).all(|value| self.fits(value))
+        all_on_their_way(state, |value| self.fits(value))
     }
 }
 
