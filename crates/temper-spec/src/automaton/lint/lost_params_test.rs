@@ -72,6 +72,13 @@ fn storing_or_reading_the_param_keeps_it() {
 }
 
 #[test]
+fn a_constraint_on_the_param_reads_it() {
+    let compare =
+        r#"constraints = [{ kind = "param_equals_field", param = "flag", field = "flag" }]"#;
+    assert!(lost(true, "counter", compare, "").is_empty());
+}
+
+#[test]
 fn an_effect_that_ignores_the_param_still_loses_it() {
     let found = lost(true, "counter", r#"effect = ["flag += 1"]"#, "");
     assert_eq!(found.len(), 1, "{found:?}");

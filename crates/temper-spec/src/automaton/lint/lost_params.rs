@@ -67,8 +67,8 @@ fn writes(effect: &Effect, name: &str) -> bool {
 }
 
 /// Whether the action uses the value it was sent: through `params.name` in its
-/// guard, an effect or a trigger, or by a spawn, which hands the child every
-/// param.
+/// guard, an effect or a trigger, in a constraint, or by a spawn, which hands
+/// the child every param.
 fn reads_param(action: &Action, name: &str) -> bool {
     let is_param = |arg: &Arg| matches!(arg, Arg::Param(param) if param == name);
     let in_effect = |effect: &Effect| match effect {
@@ -80,6 +80,7 @@ fn reads_param(action: &Action, name: &str) -> bool {
         Effect::Schedule { .. } | Effect::ScheduleAt { .. } => false,
     };
     action.guard.params_read().iter().any(|p| p == name)
+        || action.constraints.iter().any(|c| c.param() == name)
         || action.effect.iter().any(in_effect)
         || action.triggers.iter().any(|trigger| {
             trigger.args.values().any(is_param)
