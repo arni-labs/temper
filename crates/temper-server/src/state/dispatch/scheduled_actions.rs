@@ -30,9 +30,12 @@
 //! row stays and the same task's successor waits for the next due time
 //! ([`ScheduledTimer::goes_on`]), which only this process knows. Each such fire
 //! has an idempotency key of its own, with its due time in it: answers are kept
-//! by key, and the next fire of the row must run, not be answered by this one.
-//! A restart arms the row, past due, so the loop looks once at once and keeps
-//! the pace from there.
+//! by key, and the next fire of the row must run, not be answered by this one,
+//! nor the moves it sets off by those of the first. A restart arms the row,
+//! past due, so the loop looks once at once, under a key with the boot's time
+//! in it, and keeps the pace from there. Only a row whose fire never landed is
+//! left past due, as a landed fire removes its row in its commit, so such a key
+//! answers no retry of a move that was made.
 //!
 //! A fire whose action has no transition from the record's status when it
 //! comes due has lapsed ([`scheduled_fire_lapsed`]): the record left the
@@ -46,8 +49,10 @@
 //! with its `on_failure`, and lapses like any fire on a record moved on.
 
 mod recovery;
+mod timer;
 
 use recovery::scheduled_timer;
+use timer::ScheduledTimer;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -64,72 +69,9 @@ use super::state_timer_follow::BootTimers;
 use super::timer_standing::{Standing, TimerFire};
 use super::{DispatchError, DispatchExtOptions};
 use crate::entity_actor::EntityResponse;
-use crate::idempotency::IdempotencyKey;
 use crate::request_context::{AgentContext, ScheduledFire};
 use crate::state::ServerState;
 use crate::wake::{Armed, TimerRef};
-
-/// A scheduled action armed in this process.
-struct ScheduledTimer {
-    tenant: TenantId,
-    entity_type: String,
-    entity_id: String,
-    /// The row's id: the arming event's sequence and the action's index.
-    arm_id: String,
-    action: String,
-    /// When it is due, as its row says.
-    due_at: DateTime<Utc>,
-    /// Who armed it; it fires as them.
-    agent_ctx: AgentContext,
-    /// It goes on from an earlier fire of the same row, which wrote nothing.
-    goes_on_from_fire: bool,
-}
-
-impl ScheduledTimer {
-    /// The row this timer fires.
-    fn row(&self) -> ScheduledFire {
-        ScheduledFire {
-            tenant: self.tenant.as_str().to_string(),
-            entity_type: self.entity_type.clone(),
-            entity_id: self.entity_id.clone(),
-            arm_id: self.arm_id.clone(),
-        }
-    }
-
-    /// The key every attempt of this fire is made under.
-    fn fire_key(&self) -> IdempotencyKey {
-        let key = self
-            .agent_ctx
-            .idempotency_key
-            .clone()
-            .unwrap_or_else(|| IdempotencyKey::Request(format!("schedule:{}", self.arm_id)));
-        if !self.goes_on_from_fire {
-            return key;
-        }
-        let due = self.due_at.to_rfc3339();
-        match key {
-            IdempotencyKey::Request(key) => IdempotencyKey::Request(format!("{key}@{due}")),
-            IdempotencyKey::FollowUp(key) => IdempotencyKey::FollowUp(format!("{key}@{due}")),
-        }
-    }
-
-    /// The next fire of this row, when `response` answers a fire that wrote
-    /// nothing and armed only itself (`EntityActor::answer_unrecorded`).
-    fn goes_on(&self, response: &EntityResponse) -> Option<Self> {
-        response.unrecorded_at?;
-        let next = response.scheduled_actions.first()?;
-        Some(Self {
-            tenant: self.tenant.clone(),
-            entity_type: self.entity_type.clone(),
-            entity_id: self.entity_id.clone(),
-            arm_id: self.arm_id.clone(),
-            action: self.action.clone(),
-            due_at: next.due_at.unwrap_or(DateTime::<Utc>::MAX_UTC),
-            agent_ctx: self.agent_ctx.clone(),
-            goes_on_from_fire: true,
-        })
-    }
-}
 
 impl ServerState {
     /// The scheduled actions armed in this process: each row's live timers.
@@ -173,7 +115,7 @@ impl ServerState {
                     index,
                     scheduled.delay_millis,
                 ),
-                goes_on_from_fire: false,
+                key_at: None,
             };
             self.spawn_scheduled_action(timer, None);
         }
@@ -237,11 +179,16 @@ impl ServerState {
             .list_scheduled_actions(tenant.as_str())
             .await
             .map_err(|error| error.to_string())?;
+        let now = sim_now();
         for row in rows {
             if self.skip_call_recovery(tenant, &row) {
                 continue;
             }
             let timer = match scheduled_timer(tenant, &row) {
+                Ok(armed) if armed.due_at < now => ScheduledTimer {
+                    key_at: Some(now),
+                    ..armed
+                },
                 Ok(armed) => armed,
                 Err(reason) => {
                     tracing::warn!(tenant = %tenant, entity_type = %row.entity_type,

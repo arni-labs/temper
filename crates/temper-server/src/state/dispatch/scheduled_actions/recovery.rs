@@ -122,7 +122,7 @@ pub(super) fn scheduled_timer(
         action: row.action.clone(),
         due_at,
         agent_ctx,
-        goes_on_from_fire: false,
+        key_at: None,
     };
     Ok(timer)
 }

@@ -34,6 +34,11 @@ name = "reports"
 type = "counter"
 initial = 0
 
+[[state]]
+name = "ticks"
+type = "counter"
+initial = 0
+
 [[action]]
 name = "Start"
 from = ["Idle"]
@@ -53,10 +58,13 @@ from = ["Idle"]
 to = "Active"
 effect = ["schedule('Tick', 600)"]
 
+# Counts, so each fire writes an event and its next row: the chain this DST
+# faults is a written one. A chain that changes nothing writes nothing
+# (`state_timer_restart::schedule_loop`).
 [[action]]
 name = "Tick"
 from = ["Active"]
-effect = ["schedule('Tick', 600)"]
+effect = ["ticks += 1", "schedule('Tick', 600)"]
 
 [[action]]
 name = "Fire"
