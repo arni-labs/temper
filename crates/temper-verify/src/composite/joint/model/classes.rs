@@ -147,11 +147,16 @@ impl Classes {
 
     /// Have each reaction in `reactions` send, for a literal, the one of its
     /// kind the walk offers: to every read of its class they are one value.
+    /// It keeps the literal it really sends, for its words and for replay.
     pub(super) fn send_one_of_each_kind(&self, reactions: &mut [Reaction]) {
         for reaction in reactions {
             for (param, arg) in &mut reaction.args {
                 if let Arg::Lit(Literal::Str(text)) = arg {
-                    *text = self.one_like(&reaction.to, param, text);
+                    let like = self.one_like(&reaction.to, param, text);
+                    if like != *text {
+                        let real = std::mem::replace(text, like);
+                        reaction.sent.insert(param.clone(), real);
+                    }
                 }
             }
         }

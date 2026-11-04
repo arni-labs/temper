@@ -106,6 +106,7 @@ pub(super) fn spawn_reactions(
                     parent,
                     strict: by_name[to.as_str()].automaton.strict_action_params,
                 }),
+                sent: BTreeMap::new(),
             }
         })
         .collect()

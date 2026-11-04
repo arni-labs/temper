@@ -284,6 +284,8 @@ mod both_ways_tests;
 mod chain_test;
 #[cfg(test)]
 mod copies_test;
+#[cfg(test)]
+mod sent_test;
 
 #[cfg(test)]
 #[path = "literals_test.rs"]

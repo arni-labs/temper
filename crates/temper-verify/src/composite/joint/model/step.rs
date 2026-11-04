@@ -387,7 +387,7 @@ impl JointModel {
             let renamed = canonical(&mut outcome);
             let next = Next {
                 label: if self.expansion.words() {
-                    rename_label(&text, mv, &renamed)
+                    rename_label(&text, mv, &renamed, &self.reactions)
                 } else {
                     String::new()
                 },

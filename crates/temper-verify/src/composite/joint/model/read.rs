@@ -41,6 +41,9 @@ pub(super) struct Reaction {
     pub(super) may_drop: bool,
     /// What it does as a spawn, when it stands for one.
     pub(super) spawn: Option<super::spawn::Spawn>,
+    /// The literals it really sends, by parameter, where the walk sends
+    /// another of the same kind in their place.
+    pub(super) sent: BTreeMap<String, String>,
 }
 
 /// Whether `automaton` refuses `action` with `param` empty.
@@ -328,6 +331,7 @@ fn reactions_in(by_name: &BTreeMap<&str, &Automaton>, scope: &BTreeSet<String>) 
                     may_drop: trigger.drop_ok
                         || matches!(trigger.resolve_target, Some(TargetResolver::Create)),
                     spawn: None,
+                    sent: BTreeMap::new(),
                 });
             }
         }

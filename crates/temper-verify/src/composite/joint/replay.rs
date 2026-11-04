@@ -13,7 +13,9 @@ use crate::model::{Fields, ModelString, ParamValue};
 /// One move of a trace: an entity's action with the string parameters it
 /// was sent. Values are names for this trace only: equal names are equal
 /// values, `''` is the empty string, and a name not seen before is a value
-/// nothing holds yet. A parameter the model does not track is not checked.
+/// nothing holds yet. A name in single quotes is that literal, as a check's
+/// trace prints it: a reaction's dispatch fits only the literal it really
+/// sends. A parameter the model does not track is not checked.
 #[derive(Debug, Clone)]
 pub struct TraceMove {
     /// The entity type.
@@ -82,7 +84,7 @@ pub fn replay_joint_invariants(
     }];
     for (i, wanted) in trace.iter().enumerate() {
         loop {
-            let fits = |params: &Fields<ParamValue>| {
+            let fits = |params: &Fields<ParamValue>, via: Option<&Dispatch>| {
                 let mut bindings = names.clone();
                 let mut used = model.values(&state);
                 wanted.params.iter().all(|(param, name)| {
@@ -90,6 +92,13 @@ pub fn replay_joint_invariants(
                     let Some(ParamValue::Str(value)) = params.get(param) else {
                         return true;
                     };
+                    if let Some(literal) = quoted(name) {
+                        let carried = ModelString::from(literal);
+                        return match via.and_then(|d| model.really_sent(d, param)) {
+                            Some(real) => real == literal,
+                            None => *value == carried || literal.is_empty() && value.is_empty(),
+                        };
+                    }
                     let name = (model.class_of(&wanted.entity, param), name.clone());
                     match bindings.get(&name) {
                         Some(bound) => value == bound,
@@ -107,7 +116,7 @@ pub fn replay_joint_invariants(
                 })
             };
             let wanted_dispatch = |d: &Dispatch| {
-                d.to == wanted.entity && d.action == wanted.action && fits(&d.params)
+                d.to == wanted.entity && d.action == wanted.action && fits(&d.params, Some(d))
             };
             let moves = model.moves(&state);
             let named = moves
@@ -121,7 +130,7 @@ pub fn replay_joint_invariants(
                         Move::Take(e, action, _) | Move::Send(e, action, _) => {
                             e == &wanted.entity
                                 && action.name == wanted.action
-                                && fits(&action.params)
+                                && fits(&action.params, None)
                         }
                         _ => false,
                     })
@@ -194,4 +203,9 @@ pub fn replay_joint_invariants(
         .map(|inv| inv.name.clone())
         .collect();
     Ok(JointReplay { steps, broken })
+}
+
+/// The literal a trace's name in single quotes stands for.
+fn quoted(name: &str) -> Option<&str> {
+    name.strip_prefix('\'')?.strip_suffix('\'')
 }
