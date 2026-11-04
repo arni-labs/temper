@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use temper_spec::predicate::{Env, Val, VarKind};
 
 use super::JointState;
+use super::model::OneNames;
 use crate::model::{TemperModel, TemperModelState};
 
 /// The key under which each record keeps its own id among its strings.
@@ -46,8 +47,10 @@ pub(super) enum Records {
 pub(super) enum Found {
     /// The id field holds the related record's id.
     Yes,
-    /// It holds another id, or none: no such record.
-    Missing,
+    /// It holds no id: no such record.
+    NoId,
+    /// It holds another id: a record the model does not hold, if there is one.
+    Other,
     /// The model does not track the id field.
     Unknown,
 }
@@ -99,7 +102,8 @@ fn resolve_from(
     };
     match (id, target.strings.get(ID)) {
         (Some(id), Some(target_id)) if id == target_id => Found::Yes,
-        (Some(_), Some(_)) => Found::Missing,
+        (Some(id), Some(_)) if id.is_empty() => Found::NoId,
+        (Some(_), Some(_)) => Found::Other,
         _ => Found::Unknown,
     }
 }
@@ -120,9 +124,8 @@ pub(super) struct JointEnv<'a> {
     /// The owner's record as this evaluation reads it, when not as the
     /// joint state holds it now: a trigger's source as it committed.
     pub(super) own: Option<&'a TemperModelState>,
-    /// A reference whose id field names another record than the one the
-    /// model holds of its type reads as unknown, not as no record.
-    pub(super) unheld_unknown: bool,
+    /// The references that read "no such record" when they name another id.
+    pub(super) one_names: &'a OneNames,
 }
 
 fn var_of<'a>(model: &TemperModel, state: &'a TemperModelState, name: &str) -> Val<'a> {
@@ -166,9 +169,9 @@ impl JointEnv<'_> {
             entity_type,
         ) {
             Found::Yes => Some(self.state.records.get(entity_type)),
-            Found::Missing if self.unheld_unknown => None,
-            Found::Missing => Some(None),
-            Found::Unknown => None,
+            Found::NoId => Some(None),
+            Found::Other if self.one_names.has(self.owner, id_field, entity_type) => Some(None),
+            Found::Other | Found::Unknown => None,
         }
     }
 }

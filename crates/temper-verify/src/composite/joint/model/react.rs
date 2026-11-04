@@ -170,7 +170,13 @@ impl JointModel {
                     ),
                     _ => Found::Unknown,
                 };
-                if reaches == Found::Missing {
+                if matches!(reaches, Found::NoId | Found::Other) {
+                    // It names another record, in the runtime it lands there,
+                    // and what that sets off may come back into scope.
+                    let known = known.then(Certainty::unless(
+                        reaches == Found::NoId || !self.reacts_into_scope(&reaction.to),
+                        Certainty::Unsure,
+                    ));
                     if !self.keep(&mut after, state, known) {
                         return Vec::new();
                     }
@@ -272,6 +278,16 @@ impl JointModel {
         ways
     }
 
+    /// Whether another record of `entity` can set off a reaction on a record
+    /// in scope. One that keeps to its own record stays away from the one
+    /// the model holds.
+    fn reacts_into_scope(&self, entity: &str) -> bool {
+        self.reactions.iter().any(|r| {
+            r.from == entity
+                && !(r.to == entity && matches!(r.resolve, Some(TargetResolver::SameId)))
+        })
+    }
+
     /// What `guard`, a trigger's guard on `source`, reads of `source` as it
     /// holds it in `state`, when the related records in scope decide it: the
     /// guard is then read later, on those records as they are then. `None`
@@ -281,9 +297,7 @@ impl JointModel {
     fn committed(&self, guard: &Expr, source: &str, state: &JointState) -> Option<Committed> {
         let model = &self.models[source];
         let record = &state.records[source];
-        let mut env = self.env(source, state);
-        env.unheld_unknown = true;
-        if eval(guard, &env) == Truth::Unknown {
+        if eval(guard, &self.env(source, state)) == Truth::Unknown {
             return None;
         }
         let mut fields = BTreeMap::new();

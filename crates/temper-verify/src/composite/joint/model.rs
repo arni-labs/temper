@@ -10,6 +10,7 @@ mod held;
 mod initial;
 mod labels;
 mod moves;
+mod one_name;
 mod order;
 mod outside;
 mod react;
@@ -37,6 +38,7 @@ pub use drops::DroppedReaction;
 pub(crate) use drops::dropped_reactions;
 use from_outside::{Outside, outside_reactions};
 pub use guided::{Candidate, Guide, GuidedSearch, STEPS as GUIDED_STEPS, guided_search, plain};
+pub(super) use one_name::OneNames;
 use order::{Order, Specs};
 pub(super) use read::Timeout;
 use read::{Kernel, Reaction, Unchecked, named_literals, tracked, unchecked_constraints};
@@ -119,6 +121,7 @@ pub(super) struct JointModel {
     id_literals: BTreeMap<String, BTreeSet<String>>,
     models: BTreeMap<String, TemperModel>,
     reactions: Vec<Reaction>,
+    one_names: OneNames,
     records: Records,
     /// With one record of a type, each entity's id fields that references
     /// use: each holds that record's id.
@@ -213,6 +216,7 @@ impl JointModel {
         cut: bool,
     ) -> Self {
         let classes = Classes::read(by_name, scope);
+        let one_names = OneNames::read(by_name, scope, &reactions);
         let id_literals = scope
             .iter()
             .map(|entity| (entity.clone(), classes.literals(entity, ID)))
@@ -303,6 +307,7 @@ impl JointModel {
             id_literals,
             models,
             reactions,
+            one_names,
             records: Records::ById,
             refs: BTreeMap::new(),
             delivery: Delivery::Any,
@@ -463,7 +468,7 @@ impl JointModel {
             owner,
             blind,
             own: None,
-            unheld_unknown: false,
+            one_names: &self.one_names,
         }
     }
 }
