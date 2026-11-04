@@ -6,6 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 description = "Model checking and property-based testing for Temper specifications"
 
+[features]
+# Check every step a walk remembers against the move made afresh.
+check-every-remembered-step = []
+
 [dependencies]
 temper-runtime = { workspace = true }
 temper-spec = { workspace = true }

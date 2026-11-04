@@ -40,7 +40,7 @@ type Param = (String, String, String);
 /// The families of counts kept as sequence numbers.
 #[derive(Debug, Default)]
 pub(super) struct Order {
-    families: Vec<Family>,
+    pub(super) families: Vec<Family>,
     /// Each (entity, action)'s `param_greater_than_field` constraints the
     /// model decides, as (parameter, field).
     compared: BTreeMap<(String, String), Vec<(String, String)>>,
@@ -50,7 +50,7 @@ pub(super) struct Order {
 }
 
 #[derive(Debug, Default, Clone)]
-struct Family {
+pub(super) struct Family {
     fields: BTreeSet<Field>,
     params: BTreeSet<Param>,
     /// The most a move adds to one of its fields.
@@ -297,7 +297,7 @@ impl Order {
 }
 
 /// The values `family` holds in `state`, in records and in flight.
-fn values(family: &Family, state: &JointState) -> BTreeSet<usize> {
+pub(super) fn values(family: &Family, state: &JointState) -> BTreeSet<usize> {
     let mut values = BTreeSet::new();
     for (entity, field) in &family.fields {
         if let Some(value) = state

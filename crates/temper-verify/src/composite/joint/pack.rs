@@ -118,12 +118,10 @@ impl Numbers for Packer {
     }
 }
 
-/// `state` as a short run of numbers, or none when `numbers` has none for a
-/// value in it.
-fn words(state: &JointState, numbers: &mut impl Numbers) -> Option<Packed> {
-    let mut out = Vec::with_capacity(
-        state.records.len() + 3 + state.inflight.len() + state.calls.len() + 2 * state.armed.len(),
-    );
+/// `state` as a short run of numbers, written to `out`, or false when
+/// `numbers` has none for a value in it.
+fn words(state: &JointState, numbers: &mut impl Numbers, out: &mut Vec<u32>) -> Option<()> {
+    out.clear();
     for record in state.records.values() {
         out.push(numbers.record(record)?);
     }
@@ -140,7 +138,16 @@ fn words(state: &JointState, numbers: &mut impl Numbers) -> Option<Packed> {
         out.push(numbers.armed(*entity)?);
         out.push(*by);
     }
-    Some(out.into())
+    Some(())
+}
+
+/// A packed state's parts: its records, what is in flight, its calls and its
+/// timers armed.
+pub(super) fn parts(packed: &[u32], records: usize) -> (&[u32], &[u32], &[u32], &[u32]) {
+    let (held, rest) = packed.split_at(records);
+    let (flying, rest) = rest[1..].split_at(rest[0] as usize);
+    let (calls, rest) = rest[1..].split_at(rest[0] as usize);
+    (held, flying, calls, &rest[1..])
 }
 
 /// The tables packed states refer to.
@@ -164,18 +171,41 @@ pub(super) struct Packer {
 impl Packer {
     /// `state` packed, its new values added to the tables.
     pub(super) fn pack(&mut self, state: &JointState) -> Packed {
+        let mut out = Vec::new();
+        self.pack_into(state, &mut out);
+        out.into()
+    }
+
+    /// `state` packed into `out`, its new values added to the tables.
+    pub(super) fn pack_into(&mut self, state: &JointState, out: &mut Vec<u32>) {
         if self.types.is_empty() {
             self.types.extend(state.records.keys().copied());
         }
-        words(state, self).expect("a packer adds what it does not know")
+        words(state, self, out).expect("a packer adds what it does not know");
     }
 
-    /// `state` packed, when the tables hold everything in it already. A
-    /// walk's threads read the tables together and take them alone only for
-    /// the few values none has seen.
-    pub(super) fn known(&self, state: &JointState) -> Option<Packed> {
+    /// `state` packed into `out`, when the tables hold everything in it
+    /// already. A walk's threads read the tables together and take them alone
+    /// only for the few values none has seen.
+    pub(super) fn known_into(&self, state: &JointState, out: &mut Vec<u32>) -> bool {
         let mut known = self;
-        words(state, &mut known)
+        words(state, &mut known, out).is_some()
+    }
+
+    /// The record the tables hold equal to `record`, if they do: holding that
+    /// one, a state is packed without its record being read.
+    pub(super) fn held_record(
+        &self,
+        record: &Arc<TemperModelState>,
+    ) -> Option<Arc<TemperModelState>> {
+        let id = self.records.known(record)?;
+        Some(self.records.items[id as usize].clone())
+    }
+
+    /// The dispatch the tables hold equal to `dispatch`, if they do.
+    pub(super) fn held_dispatch(&self, dispatch: &Arc<Dispatch>) -> Option<Arc<Dispatch>> {
+        let id = self.dispatches.known(dispatch)?;
+        Some(self.dispatches.items[id as usize].clone())
     }
 
     pub(super) fn unpack(&self, packed: &[u32]) -> JointState {

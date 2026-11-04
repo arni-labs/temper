@@ -176,6 +176,7 @@ impl JointModel {
         by: u32,
         params: &Fields<ParamValue>,
     ) -> Vec<(JointState, Certainty)> {
+        self.expansion.note_flight_read();
         let child = reaction.to.as_str();
         // A record that makes another of its own type: the model holds one
         // of a type, so the new one is not held and its moves are not walked.
@@ -287,6 +288,7 @@ impl JointModel {
         let Some(spawn) = &reaction.spawn else {
             return;
         };
+        self.expansion.note_flight_read();
         let child = dispatch.to.as_str();
         let record = &state.records[child];
         if !self.unstarted(child, record) {
@@ -319,6 +321,7 @@ impl JointModel {
     /// `child` with nothing lost: it has not started, or it can send nothing
     /// more, with nothing on its way to it.
     pub(super) fn replaces_cleanly(&self, state: &JointState, child: &str) -> bool {
+        self.expansion.note_flight_read();
         let working = state.inflight.iter().any(|d| d.to == child)
             || state.calls.iter().any(|c| c.to == child);
         if working {

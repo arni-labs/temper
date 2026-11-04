@@ -318,6 +318,7 @@ impl JointModel {
             if self.fits(state) {
                 return true;
             }
+            self.expansion.note_flight_read();
             !std::mem::replace(&mut over, true)
         });
         self.expansion.give(before.saturating_sub(ways.heap()));

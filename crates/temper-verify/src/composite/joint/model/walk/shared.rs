@@ -57,6 +57,8 @@ pub(super) struct Shared {
     pub(super) wanted: AtomicUsize,
     /// Jobs given to the checker and not yet taken.
     pub(super) waiting: AtomicUsize,
+    /// Bytes what the threads remember of moves they made takes.
+    pub(super) remembered: AtomicUsize,
     /// What the walk has covered, by how many moves from a start.
     pub(super) levels: Levels,
     /// How many states the walk may have before it is counted again.
@@ -167,6 +169,7 @@ impl Shared {
     fn tables(&self) -> usize {
         let trail = read(&self.trail);
         trail.states
+            + self.remembered.load(Ordering::Relaxed)
             + read(&self.packer).bytes()
             + bytes(&trail.nodes)
             + bytes(&trail.made)

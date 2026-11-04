@@ -8,17 +8,22 @@
 //! of the number can only ever lose a state, which [`JointModel::walk_with`]
 //! notices and says.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use dashmap::mapref::entry::Entry;
 use stateright::{Model, Property};
+use thread_local::ThreadLocal;
 
 use super::super::super::JointState;
-use super::super::super::pack::Packed;
+use super::super::super::pack::{Packed, parts};
+use super::super::super::state::render;
 use super::super::JointModel;
-use super::super::step::Certainty;
+use super::super::moves::dispatch_move;
+use super::super::step::{Certainty, Next};
 use super::levels::deeper;
+use super::memo::{Group, Memo, check_step};
 use super::shared::{Seen, Shared, Trail, read, state_bytes, write};
 use super::{Edge, Keep, Made, Node, Via};
 
@@ -76,6 +81,22 @@ pub(super) struct Walker {
     pub(super) keep: Keep,
     pub(super) visit: Visit,
     pub(super) starts: u32,
+    /// What each thread remembers of the moves it has made.
+    pub(super) memos: ThreadLocal<RefCell<Memo>>,
+}
+
+/// A state being walked, and what its moves have found.
+struct Walking<'a> {
+    job: Walked,
+    sure: bool,
+    state: &'a JointState,
+    /// How many moves of the state came before.
+    by: u32,
+    batch: Batch,
+    /// How many steps the thread has made from what it remembers.
+    steps: &'a mut u64,
+    /// Where a state a move leads to is packed.
+    packed: &'a mut Vec<u32>,
 }
 
 impl Model for Walker {
@@ -134,18 +155,114 @@ impl Walker {
             shared.stop.store(true, Ordering::Relaxed);
             return;
         }
-        let Some(moves) = self.built(|| self.model.moves(&state)) else {
-            return;
+        let mut memo = self
+            .memos
+            .get_or_default()
+            .try_borrow_mut()
+            .expect("a thread walks one state at a time");
+        let Memo {
+            places,
+            steps,
+            packed: buffer,
+        } = &mut *memo;
+        let mut walking = Walking {
+            job,
+            sure,
+            state: &state,
+            by: 0,
+            batch: Batch::default(),
+            steps,
+            packed: buffer,
         };
-        let edges = self.keep == Keep::Edges;
-        let mut batch = Batch::default();
-        for (by, mv) in moves.iter().enumerate() {
-            if !self.model.expansion.take() {
-                break;
+        if self
+            .walk_groups(places, &packed, &mut walking, jobs)
+            .is_none()
+        {
+            return;
+        }
+        let states = self.add(job, &mut walking.batch, jobs);
+        if states >= shared.count_at.load(Ordering::Acquire) {
+            shared.wait(|| shared.count_at.load(Ordering::Acquire) > states);
+        }
+    }
+
+    /// Make each of the state's moves: the records', each call's, each
+    /// dispatch's, in the order [`JointModel::moves`] names them. None when
+    /// the walk ended first.
+    fn walk_groups(
+        &self,
+        places: &mut super::memo::Places,
+        packed: &[u32],
+        walking: &mut Walking<'_>,
+        jobs: &mut Vec<Walked>,
+    ) -> Option<()> {
+        let model = &*self.model;
+        let state = walking.state;
+        let (held, flying, calls, armed) = parts(packed, state.records.len());
+        let strings = model.values(state);
+        let (place, bytes) = places.place(model, (held, armed), state, &strings);
+        self.remember(bytes);
+        if model.asked(state) {
+            let group = &mut place.records;
+            if !group.filled() {
+                let moves = self.built(|| {
+                    let mut out = Vec::new();
+                    model.record_moves(state, &strings, &mut out);
+                    out
+                })?;
+                self.remember(group.fill(moves));
             }
-            let Some((nexts, held)) = self.built(|| self.model.next(&state, mv)) else {
-                return;
-            };
+            self.walk_moves(group, walking, jobs)?;
+        }
+        for (at, &id) in calls.iter().enumerate() {
+            if at > 0 && calls[at - 1] == id {
+                continue;
+            }
+            let group = place.calls.entry(id).or_default();
+            if !group.filled() {
+                let moves = self.built(|| {
+                    let mut out = Vec::new();
+                    model.call_moves(state, &state.calls[at], &strings, &mut out);
+                    out
+                })?;
+                self.remember(group.fill(moves));
+            }
+            self.walk_moves(group, walking, jobs)?;
+        }
+        for (at, &id) in flying.iter().enumerate() {
+            if at > 0 && flying[at - 1] == id {
+                continue;
+            }
+            let group = place.dispatches.entry(id).or_default();
+            if !group.filled() {
+                self.remember(group.fill(vec![dispatch_move(&state.inflight[at])]));
+            }
+            self.walk_moves(group, walking, jobs)?;
+        }
+        Some(())
+    }
+
+    /// Count `bytes` more of what the threads remember.
+    fn remember(&self, bytes: usize) {
+        self.shared.remembered.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Make `group`'s moves from the state. None when the walk ended first.
+    fn walk_moves(
+        &self,
+        group: &mut Group,
+        walking: &mut Walking<'_>,
+        jobs: &mut Vec<Walked>,
+    ) -> Option<()> {
+        let shared = &*self.shared;
+        let edges = self.keep == Keep::Edges;
+        let job = walking.job;
+        for at in 0..group.moves.len() {
+            let (nexts, held) = self.step(group, at, walking)?;
+            let mv = &group.moves[at];
+            let by = walking.by;
+            walking.by += 1;
+            let batch = &mut walking.batch;
             if held {
                 shared.held_back.store(true, Ordering::Relaxed);
             }
@@ -164,9 +281,9 @@ impl Walker {
             let made = batch.made.len().saturating_sub(1) as u32;
             let depth = deeper(job.depth);
             for (outcome, next) in nexts.iter().enumerate() {
-                let packed = self.pack(&next.state);
-                let surely = sure && next.certainty == Certainty::Sure;
-                let found = shared.seen.get(&packed).map(|seen| *seen);
+                self.pack(&next.state, walking.packed);
+                let surely = walking.sure && next.certainty == Certainty::Sure;
+                let found = shared.seen.get(walking.packed.as_slice()).map(|seen| *seen);
                 if let Some(seen) = found {
                     shared.levels.found_again(seen.depth, depth);
                 }
@@ -178,9 +295,9 @@ impl Walker {
                         To::Known(seen.at)
                     }
                     _ => To::Check {
-                        packed,
+                        packed: walking.packed.as_slice().into(),
                         via: Via {
-                            by: by as u32,
+                            by,
                             outcome: outcome as u32,
                         },
                         surely,
@@ -193,19 +310,59 @@ impl Walker {
                 });
             }
             if batch.ways.len() >= BATCH {
-                self.add(job, &mut batch, jobs);
+                self.add(job, batch, jobs);
             }
         }
-        let states = self.add(job, &mut batch, jobs);
-        if states >= shared.count_at.load(Ordering::Acquire) {
-            shared.wait(|| shared.count_at.load(Ordering::Acquire) > states);
-        }
+        Some(())
     }
 
-    /// `state` packed, adding what the tables do not hold yet.
-    fn pack(&self, state: &JointState) -> Packed {
-        let known = read(&self.shared.packer).known(state);
-        known.unwrap_or_else(|| write(&self.shared.packer).pack(state))
+    /// Where move `at` of `group` leads from the state: from what the thread
+    /// remembers of it, or made now and remembered unless it read what is in
+    /// flight. None when the walk ended first.
+    fn step(
+        &self,
+        group: &mut Group,
+        at: usize,
+        walking: &mut Walking<'_>,
+    ) -> Option<(Vec<Next>, bool)> {
+        let model = &*self.model;
+        let state = walking.state;
+        if group.remembers(at) {
+            let group = &*group;
+            let mv = &group.moves[at];
+            let made = self.built(|| {
+                let outcomes = group.outcomes(at, state).expect("it remembers this move");
+                model.finished(state, mv, outcomes)
+            })?;
+            *walking.steps += 1;
+            if check_step(*walking.steps) {
+                let fresh = self.built(|| model.next(state, mv))?;
+                assert!(
+                    same_steps(&made, &fresh),
+                    "a remembered move differs from the move made afresh: {mv:?} from {}",
+                    render(state)
+                );
+            }
+            return Some(made);
+        }
+        model.expansion.flight_was_read();
+        let outcomes = self.built(|| model.outcomes(state, &group.moves[at]))?;
+        let Some(outcomes) = outcomes else {
+            return Some((Vec::new(), false));
+        };
+        if !model.expansion.flight_was_read() {
+            let bytes = group.keep(at, state, &outcomes, &read(&self.shared.packer));
+            self.remember(bytes);
+        }
+        let mv = &group.moves[at];
+        self.built(|| model.finished(state, mv, outcomes.clone()))
+    }
+
+    /// `state` packed into `out`, adding what the tables do not hold yet.
+    fn pack(&self, state: &JointState, out: &mut Vec<u32>) {
+        if !read(&self.shared.packer).known_into(state, out) {
+            write(&self.shared.packer).pack_into(state, out);
+        }
     }
 
     /// Run `build` in the room an expansion may build in, asking the calling
@@ -323,4 +480,14 @@ impl Walker {
             }
         }
     }
+}
+
+/// Whether two steps found the same states, known alike.
+fn same_steps(a: &(Vec<Next>, bool), b: &(Vec<Next>, bool)) -> bool {
+    a.1 == b.1
+        && a.0.len() == b.0.len()
+        && a.0
+            .iter()
+            .zip(&b.0)
+            .all(|(a, b)| a.state == b.state && a.certainty == b.certainty)
 }

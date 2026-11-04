@@ -18,6 +18,9 @@ pub(crate) struct Expansion {
     /// Moves are named in words. A walk turns this off while it expands
     /// states, since nearly every move it makes leads somewhere it has been.
     words: std::cell::Cell<bool>,
+    /// What was built read what is in flight, beyond what a walk remembers a
+    /// move by, so it holds for this state alone.
+    read_flight: std::cell::Cell<bool>,
 }
 /// Only the name: the allowance is a walk's own accounting, not part of the
 /// model, so a model's digest (`JointProof::digest`) leaves it out.
@@ -36,6 +39,7 @@ impl Default for Expansion {
             room: std::cell::Cell::new(usize::MAX),
             short: std::cell::Cell::new(false),
             words: std::cell::Cell::new(true),
+            read_flight: std::cell::Cell::new(false),
         }
     }
 }
@@ -63,6 +67,16 @@ impl Expansion {
     /// Name moves in words on this thread, or not.
     pub(crate) fn name_moves(&self, words: bool) {
         self.words.set(words);
+    }
+
+    /// What is being built read what is in flight.
+    pub(crate) fn note_flight_read(&self) {
+        self.read_flight.set(true);
+    }
+
+    /// Whether what was built since the last asking read what is in flight.
+    pub(crate) fn flight_was_read(&self) -> bool {
+        self.read_flight.replace(false)
     }
 
     /// Run `build` with no bound and moves named in words, leaving the
