@@ -61,7 +61,7 @@ pub fn joint_proofs<'room>(
     policies: Option<&SendAnalysis>,
     room: &'room dyn Room,
 ) -> Vec<JointProof<'room>> {
-    invariant_proofs(automatons, policies, room)
+    invariant_proofs_holding(automatons, policies, room, RECORDS_HELD)
         .into_iter()
         .map(JointProof::Invariants)
         .chain(
@@ -198,13 +198,14 @@ pub const RECORDS_HELD: usize = 2;
 /// its invariants name. `policies` decide each move as its sender, as for
 /// liveness; without them every sender may send everything. `room` bounds
 /// sender construction and retains its charge until each proof is dropped.
-/// Each model holds [`RECORDS_HELD`] records of each type.
+/// Each model holds one record of each type; an install holds
+/// [`RECORDS_HELD`] ([`joint_proofs`]).
 pub fn invariant_proofs<'room>(
     automatons: &[&Automaton],
     policies: Option<&SendAnalysis>,
     room: &'room dyn Room,
 ) -> Vec<InvariantProof<'room>> {
-    invariant_proofs_holding(automatons, policies, room, RECORDS_HELD)
+    invariant_proofs_holding(automatons, policies, room, 1)
 }
 
 /// [`invariant_proofs`] on models holding `records` records of each type.

@@ -399,11 +399,27 @@ impl JointModel {
         state: &JointState,
         blind: Blind,
     ) -> bool {
+        self.enabled_carrying(entity, t, state, blind, None)
+    }
+
+    /// [`Self::enabled`] for a dispatch carrying `params`.
+    fn enabled_carrying(
+        &self,
+        entity: &str,
+        t: &ResolvedTransition,
+        state: &JointState,
+        blind: Blind,
+        params: Option<&BTreeMap<String, ParamValue>>,
+    ) -> bool {
         // The rule the runtime takes for this action in the record's status
         // (`rule_for`); another with the same name never fires from there.
         let taken = rule_for(&self.models[entity], &t.name, &state.records[entity].status)
             .is_some_and(|rule| std::ptr::eq(rule, t));
-        taken && eval(&t.guard, &self.env_blind(entity, state, blind)).may_hold()
+        let env = JointEnv {
+            params,
+            ..self.env_blind(entity, state, blind)
+        };
+        taken && eval(&t.guard, &env).may_hold()
     }
 
     pub(super) fn env<'a>(&'a self, owner: &'a str, state: &'a JointState) -> JointEnv<'a> {
@@ -426,6 +442,7 @@ impl JointModel {
             blind,
             own: None,
             unheld_unknown: false,
+            params: None,
         }
     }
 }
