@@ -28,7 +28,6 @@ mod sync_copy;
 mod unavailable_tenant_tests;
 
 use std::collections::{BTreeMap, HashMap};
-use std::future::IntoFuture;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::{path::Path, sync::Arc};
 
@@ -275,6 +274,7 @@ pub async fn run(
         .context("Failed to get listener local address")?
         .port();
     let _ = state.server.listen_port.set(actual_port);
+    let mut serving = boot::serve(&state, listener, router);
 
     if observe {
         observe_ui::spawn(bind, actual_port);
@@ -355,8 +355,8 @@ pub async fn run(
     // write it still owes and holds only in memory, and telemetry is flushed
     // so those reports leave the process before it exits.
     tokio::select! {
-        served = axum::serve(listener, router).into_future() => served.context("Server error")?,
-        () = stop_signal() => {}
+        served = &mut serving => served.context("Server task ended")?.context("Server error")?,
+        () = stop_signal() => serving.abort(),
     }
     state.server.report_owed_writes_at_shutdown();
     if let Some(guard) = otel_guard {

@@ -557,6 +557,9 @@ pub struct ServerState {
     pub tenant_restore: Arc<crate::tenant_restore::TenantRestore>,
     /// Set once [`Self::start_runtime`] has run in this process.
     pub(crate) runtime_started: Arc<std::sync::atomic::AtomicBool>,
+    /// True while an embedder that answers before its boot ends is still
+    /// booting ([`Self::mark_starting`]); false otherwise.
+    pub(crate) starting: Arc<tokio::sync::watch::Sender<bool>>,
     /// Held by each carry pass, so a pass derives its carries only after
     /// the one before it has made its own (see `spec_change::carry_pass`).
     pub(crate) carry_pass: Arc<tokio::sync::Mutex<()>>,
@@ -864,6 +867,7 @@ impl ServerState {
             timer_recovery_complete: Arc::default(),
             tenant_restore: Arc::default(),
             runtime_started: Arc::default(),
+            starting: Arc::new(tokio::sync::watch::Sender::new(false)),
             carry_pass: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
@@ -1150,6 +1154,7 @@ impl ServerState {
             timer_recovery_complete: Arc::default(),
             tenant_restore: Arc::default(),
             runtime_started: Arc::default(),
+            starting: Arc::new(tokio::sync::watch::Sender::new(false)),
             carry_pass: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
