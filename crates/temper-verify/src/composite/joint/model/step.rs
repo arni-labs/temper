@@ -13,7 +13,7 @@ use super::super::state::canonical;
 use super::super::{Call, Dispatch, JointState};
 use super::commit::add;
 use super::labels::rename_label;
-use super::{Delivery, JointModel, MAX_IN_FLIGHT};
+use super::{Delivery, JointModel};
 use crate::model::{ModelString, TemperModelAction};
 
 #[path = "guard.rs"]
@@ -64,7 +64,7 @@ pub(in crate::composite::joint) struct Next {
 impl JointModel {
     /// The states `mv` leads to from `state`, each with what the model knows
     /// of it, and whether a state was held back because it would put more
-    /// than [`MAX_IN_FLIGHT`] dispatches in flight.
+    /// than [`super::MAX_IN_FLIGHT`] dispatches in flight.
     pub(in crate::composite::joint) fn next(
         &self,
         state: &JointState,

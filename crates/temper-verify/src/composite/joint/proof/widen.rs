@@ -120,7 +120,12 @@ impl<'room> Wider<'room> {
         };
         let exprs: Vec<&Expr> = proof.invariants.iter().map(|inv| &inv.assert).collect();
         let walk = model.walk(&proof.entity, &exprs, bound);
-        for ((found, from), outcome) in results.iter_mut().zip(outside).zip(&walk.outcomes) {
+        for (((found, from), outcome), broken) in results
+            .iter_mut()
+            .zip(outside)
+            .zip(&walk.outcomes)
+            .zip(&walk.broken)
+        {
             if from.is_empty() {
                 continue;
             }
@@ -130,8 +135,8 @@ impl<'room> Wider<'room> {
             let why = match outcome {
                 JointOutcome::Broken { path } => {
                     found.scope = self.scope.iter().cloned().collect();
-                    found.states = walk.states;
-                    found.in_flight_bound = walk.held_back.then_some(model::MAX_IN_FLIGHT);
+                    found.states = broken.map_or(walk.states, |at| at.states);
+                    found.in_flight_bound = broken.map(|at| at.in_flight);
                     found.outcome = JointOutcome::Broken { path: path.clone() };
                     continue;
                 }

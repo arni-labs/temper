@@ -110,7 +110,8 @@ pub struct JointInvariantResult {
     /// When the walk held a move back because it would have put more than
     /// this many dispatches in flight: what it found holds only up to that.
     /// A commit whose reactions wait for their guards to be read counts as
-    /// one, however many wait.
+    /// one, however many wait. For a break, how much the walk that found it
+    /// let be in flight.
     pub in_flight_bound: Option<usize>,
     /// Holds, broken (with a shortest path), or not fully checked.
     pub outcome: JointOutcome,
@@ -204,12 +205,15 @@ impl fmt::Display for JointInvariantResult {
             JointOutcome::Broken { path } => {
                 writeln!(
                     f,
-                    "{}.{} BROKEN{} after {} moves ({scope}, {} joint states walked): {}",
+                    "{}.{} BROKEN{} after {} moves ({scope}, {} joint states walked{}): {}",
                     self.entity,
                     self.invariant,
                     condition(path),
                     path.len().saturating_sub(1),
                     self.states,
+                    self.in_flight_bound
+                        .map(|bound| format!(", at most {bound} in flight"))
+                        .unwrap_or_default(),
                     self.assert
                 )?;
                 for step in path {
@@ -479,3 +483,7 @@ mod trigger_guard_tests;
 #[cfg(test)]
 #[path = "trigger_order_test.rs"]
 mod trigger_order_tests;
+
+#[cfg(test)]
+#[path = "in_flight_test.rs"]
+mod in_flight_test;
