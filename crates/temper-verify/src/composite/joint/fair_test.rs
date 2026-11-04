@@ -124,6 +124,16 @@ fn the_kernel_owes_a_call_its_end_and_not_its_success() {
 }
 
 #[test]
+fn a_call_that_ends_with_no_answer_needs_something_else_to_move_its_record() {
+    let result = check(model!("silent_call"));
+    assert!(
+        matches!(fair(&result), FairOutcome::Broken { .. }),
+        "{result}"
+    );
+    assert_holds(&check(model!("silent_call_timer")));
+}
+
+#[test]
 fn strong_fairness_leaves_the_inner_cycle_that_avoids_its_move() {
     let result = check(model!("rings_one_strong"));
     let (_, cycle) = broken_cycle(&result);
