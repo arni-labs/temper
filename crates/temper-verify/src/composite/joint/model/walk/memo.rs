@@ -16,10 +16,11 @@ use rustc_hash::FxHashMap;
 
 use super::super::super::pack::Packer;
 use super::super::super::room::{Heap, block};
+use super::super::super::state::canonical_quietly;
 use super::super::super::{Call, Dispatch, JointState};
-use super::super::JointModel;
 use super::super::order::values;
 use super::super::step::{Certainty, Move, Outcome};
+use super::super::{Delivery, JointModel};
 use crate::model::{Fields, ModelString, TemperModelState};
 
 /// How many steps a thread checks before it starts to skip most of them.
@@ -62,20 +63,21 @@ impl<T: Ord> Change<T> {
         }
     }
 
-    /// `list`, sorted, with this change made.
-    fn on(&self, list: &[Arc<T>]) -> Vec<Arc<T>> {
-        let mut out = Vec::with_capacity(list.len() + self.gained.len());
-        out.extend_from_slice(list);
-        for lost in &self.lost {
-            if let Some(at) = out.iter().position(|held| held == lost) {
-                out.remove(at);
+    /// `list`, sorted, with this change made, written to `out`.
+    fn on(&self, list: &[Arc<T>], out: &mut Vec<Arc<T>>) {
+        out.clear();
+        let mut lost = self.lost.iter().peekable();
+        for held in list {
+            if lost.peek().is_some_and(|gone| *gone == held) {
+                lost.next();
+            } else {
+                out.push(held.clone());
             }
         }
         for gained in &self.gained {
             let at = out.partition_point(|held| held < gained);
             out.insert(at, gained.clone());
         }
-        out
     }
 
     fn bytes(&self) -> usize {
@@ -121,15 +123,12 @@ impl Way {
         }
     }
 
-    /// Where this way goes from `state`.
-    fn from(&self, state: &JointState) -> Outcome {
-        let next = JointState {
-            records: self.records.clone(),
-            inflight: self.inflight.on(&state.inflight),
-            calls: self.calls.on(&state.calls),
-            armed: self.armed.clone(),
-        };
-        (next, String::new(), self.certainty)
+    /// Where this way goes from `state`, written to `out`.
+    fn on(&self, state: &JointState, out: &mut JointState) {
+        out.records.clone_from(&self.records);
+        out.armed.clone_from(&self.armed);
+        self.inflight.on(&state.inflight, &mut out.inflight);
+        self.calls.on(&state.calls, &mut out.calls);
     }
 
     /// Bytes it holds that nothing else does: the records that are new to
@@ -144,6 +143,20 @@ impl Way {
             .sum::<usize>();
         let gained = self.inflight.gained.iter().map(|d| d.heap()).sum::<usize>();
         block(size_of::<Self>() + self.inflight.bytes() + self.calls.bytes()) + new_records + gained
+    }
+}
+
+impl JointModel {
+    /// `state`, which a move left, in its one form, unless it would put more
+    /// in flight than the walk keeps: as [`Self::finished`] leaves it.
+    pub(super) fn settled_quietly(&self, state: &mut JointState) -> bool {
+        if self.delivery != Delivery::BeforeNextRequest && !self.fits(state) {
+            return false;
+        }
+        let rewrote = self.order.normalize(state);
+        self.in_one_order(state);
+        canonical_quietly(state, rewrote);
+        true
     }
 }
 
@@ -177,10 +190,23 @@ impl Group {
         self.ways[at].is_some()
     }
 
-    /// Where move `at` goes from `state`, if it has been made from this place.
-    pub(super) fn outcomes(&self, at: usize, state: &JointState) -> Option<Vec<Outcome>> {
-        let ways = self.ways[at].as_ref()?;
-        Some(ways.iter().map(|way| way.from(state)).collect())
+    /// How many ways move `at` goes, as this place remembers it.
+    pub(super) fn way_count(&self, at: usize) -> usize {
+        self.ways[at].as_ref().map_or(0, |ways| ways.len())
+    }
+
+    /// Where way `way` of move `at` goes from `state`, written to `out`, and
+    /// what the model knows of it.
+    pub(super) fn way(
+        &self,
+        at: usize,
+        way: usize,
+        state: &JointState,
+        out: &mut JointState,
+    ) -> Certainty {
+        let way = &self.ways[at].as_ref().expect("it remembers this move")[way];
+        way.on(state, out);
+        way.certainty
     }
 
     /// Keep `outcomes` as where move `at` goes from this place, and say how
@@ -219,6 +245,8 @@ pub(super) struct Memo {
     pub(super) steps: u64,
     /// Where a state a move leads to is packed as it is looked up.
     pub(super) packed: Vec<u32>,
+    /// Where a state a move leads to is written as it is worked out.
+    pub(super) scratch: JointState,
 }
 
 /// Each place a thread has been, by what names it.

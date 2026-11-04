@@ -14,6 +14,7 @@ mod checked;
 mod conditions;
 mod invariants;
 mod levels;
+mod making;
 mod memo;
 mod run;
 mod shared;

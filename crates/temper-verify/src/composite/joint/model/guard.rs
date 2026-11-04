@@ -6,10 +6,12 @@ use std::collections::BTreeMap;
 
 use temper_spec::predicate::{Truth, eval};
 
-use super::super::super::{Dispatch, JointState, ReactionStep};
+use super::super::super::env::Blind;
+use super::super::super::{Call, Dispatch, JointState, ReactionStep};
 use super::super::JointModel;
 use super::super::commit::add;
 use super::{Certainty, MAX_IN_FLIGHT, remove};
+use crate::model::TemperModelAction;
 
 impl JointModel {
     /// The states reading `dispatch`'s trigger guard leads to: dropped when
@@ -69,6 +71,10 @@ impl JointModel {
     /// (`temper-server` `trigger::dispatcher`). Copies of one commit's
     /// waiting reactions count as the most copies of any one of them.
     pub(in crate::composite::joint) fn fits(&self, state: &JointState) -> bool {
+        // A commit's waiting reactions count at most one each.
+        if state.calls.len() + state.inflight.len() <= MAX_IN_FLIGHT {
+            return true;
+        }
         let mut busy = state.calls.len();
         let mut waiting: BTreeMap<(&[ReactionStep], &str, &str, usize), usize> = BTreeMap::new();
         for dispatch in &state.inflight {
@@ -141,5 +147,101 @@ impl JointModel {
                     ),
                 }
         })
+    }
+
+    /// Whether the dispatch path lets `dispatch` through: the related
+    /// records its guard reads allow it, for one of the transitions it may
+    /// take. Its own record is read later, by its actor. True when a guard
+    /// holds outright, false when the related records refuse every one, and
+    /// unknown when the model cannot tell.
+    pub(in crate::composite::joint) fn read_allows(
+        &self,
+        dispatch: &Dispatch,
+        state: &JointState,
+    ) -> Truth {
+        let full = self.env(&dispatch.to, state);
+        let related = self.env_blind(&dispatch.to, state, Blind::Own);
+        let mut refused = true;
+        for t in self.transitions_for(dispatch) {
+            if eval(&t.guard, &full) == Truth::True {
+                return Truth::True;
+            }
+            refused &= eval(&t.guard, &related) == Truth::False;
+        }
+        if refused {
+            Truth::False
+        } else {
+            Truth::Unknown
+        }
+    }
+
+    /// Whether the counts kept as sequence numbers stay exact when `entity`
+    /// takes `action` in `state`.
+    pub(in crate::composite::joint) fn exact(
+        &self,
+        entity: &str,
+        action: &str,
+        state: &JointState,
+    ) -> bool {
+        self.models[entity]
+            .transitions
+            .iter()
+            .filter(|t| t.name == action)
+            .all(|t| self.order.exact(entity, &t.effects, state))
+    }
+
+    /// Whether a field `action` ties a parameter to has changed since `call`
+    /// started, so its record refuses the module's answer.
+    pub(super) fn stale(&self, call: &Call, action: &str, state: &JointState) -> bool {
+        let strings = &state.records[call.to.as_str()].strings;
+        self.unchecked
+            .equals
+            .get(pair!(&call.to, action))
+            .is_some_and(|fields| {
+                fields
+                    .iter()
+                    .any(|field| call.asked.get(field) != strings.get(field))
+            })
+    }
+
+    /// Whether the guard of the transition `action` names holds on `state`,
+    /// as far as the model knows.
+    /// Whether all that is open of an outside move in `state` is what Cedar
+    /// answers, or a guard on its own record's fields, which a sender can
+    /// meet either way.
+    pub(in crate::composite::joint) fn take_rests_on_cedar_or_own_guard(
+        &self,
+        entity: &str,
+        action: &TemperModelAction,
+        state: &JointState,
+    ) -> bool {
+        let guard = match self.truth(entity, action, state) {
+            Truth::True => true,
+            Truth::False => false,
+            Truth::Unknown => !self.action_reads_related(entity, &action.name),
+        };
+        guard
+            && self.exceeds(entity, &action.name, &action.params, &state.records[entity])
+                == Truth::True
+            && self.unchecked.meets(entity, &action.name)
+            && self.exact(entity, &action.name, state)
+    }
+
+    pub(super) fn truth(
+        &self,
+        entity: &str,
+        action: &TemperModelAction,
+        state: &JointState,
+    ) -> Truth {
+        let status = &state.records[entity].status;
+        self.models[entity]
+            .transitions
+            .iter()
+            .find(|t| {
+                t.name == action.name
+                    && t.to_state == action.target_state
+                    && (t.from_states.is_empty() || t.from_states.contains(status))
+            })
+            .map_or(Truth::Unknown, |t| eval(&t.guard, &self.env(entity, state)))
     }
 }

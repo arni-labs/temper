@@ -18,12 +18,10 @@ use thread_local::ThreadLocal;
 
 use super::super::super::JointState;
 use super::super::super::pack::{Packed, parts};
-use super::super::super::state::render;
 use super::super::JointModel;
 use super::super::moves::dispatch_move;
-use super::super::step::{Certainty, Next};
 use super::levels::deeper;
-use super::memo::{Group, Memo, check_step};
+use super::memo::Memo;
 use super::shared::{Seen, Shared, Trail, read, state_bytes, write};
 use super::{Edge, Keep, Made, Node, Via};
 
@@ -34,23 +32,23 @@ pub(super) type Visit = Box<dyn Fn(&JointModel, usize, &JointState, bool) -> boo
 /// A state to walk, by number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct Walked {
-    at: u32,
+    pub(super) at: u32,
     /// Sure moves alone have come to reach it since it was first walked. It
     /// happens to a state once, so this and the number name one job.
     again: bool,
     /// How many moves from a start it was found.
-    depth: u16,
+    pub(super) depth: u16,
 }
 
 /// One way a move leads, waiting to be added to the trail.
-struct Way {
+pub(super) struct Way {
     /// The move, an index into the batch's `made`.
-    made: u32,
-    to: To,
-    sure: bool,
+    pub(super) made: u32,
+    pub(super) to: To,
+    pub(super) sure: bool,
 }
 
-enum To {
+pub(super) enum To {
     /// A state the walk has, that this way tells it nothing new about.
     Known(u32),
     /// A state to look for again with the trail held: it may be new, or
@@ -66,14 +64,14 @@ enum To {
 
 /// What walking one state found so far.
 #[derive(Default)]
-struct Batch {
-    made: Vec<Made>,
-    ways: Vec<Way>,
+pub(super) struct Batch {
+    pub(super) made: Vec<Made>,
+    pub(super) ways: Vec<Way>,
 }
 
 /// Ways a thread keeps before adding them to the trail, so what it holds
 /// aside stays small next to what the walk holds.
-const BATCH: usize = 4096;
+pub(super) const BATCH: usize = 4096;
 
 pub(super) struct Walker {
     pub(super) model: Arc<JointModel>,
@@ -86,17 +84,19 @@ pub(super) struct Walker {
 }
 
 /// A state being walked, and what its moves have found.
-struct Walking<'a> {
-    job: Walked,
-    sure: bool,
-    state: &'a JointState,
+pub(super) struct Walking<'a> {
+    pub(super) job: Walked,
+    pub(super) sure: bool,
+    pub(super) state: &'a JointState,
     /// How many moves of the state came before.
-    by: u32,
-    batch: Batch,
+    pub(super) by: u32,
+    pub(super) batch: Batch,
     /// How many steps the thread has made from what it remembers.
-    steps: &'a mut u64,
+    pub(super) steps: &'a mut u64,
     /// Where a state a move leads to is packed.
-    packed: &'a mut Vec<u32>,
+    pub(super) packed: &'a mut Vec<u32>,
+    /// Where a state a move leads to is worked out.
+    pub(super) scratch: &'a mut JointState,
 }
 
 impl Model for Walker {
@@ -164,6 +164,7 @@ impl Walker {
             places,
             steps,
             packed: buffer,
+            scratch,
         } = &mut *memo;
         let mut walking = Walking {
             job,
@@ -173,6 +174,7 @@ impl Walker {
             batch: Batch::default(),
             steps,
             packed: buffer,
+            scratch,
         };
         if self
             .walk_groups(places, &packed, &mut walking, jobs)
@@ -243,131 +245,13 @@ impl Walker {
     }
 
     /// Count `bytes` more of what the threads remember.
-    fn remember(&self, bytes: usize) {
+    pub(super) fn remember(&self, bytes: usize) {
         self.shared.remembered.fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    /// Make `group`'s moves from the state. None when the walk ended first.
-    fn walk_moves(
-        &self,
-        group: &mut Group,
-        walking: &mut Walking<'_>,
-        jobs: &mut Vec<Walked>,
-    ) -> Option<()> {
-        let shared = &*self.shared;
-        let edges = self.keep == Keep::Edges;
-        let job = walking.job;
-        for at in 0..group.moves.len() {
-            let (nexts, held) = self.step(group, at, walking)?;
-            let mv = &group.moves[at];
-            let by = walking.by;
-            walking.by += 1;
-            let batch = &mut walking.batch;
-            if held {
-                shared.held_back.store(true, Ordering::Relaxed);
-            }
-            if edges {
-                batch.made.push(Made {
-                    from: job.at,
-                    by_system: mv.by_system(),
-                    relied: self.model.relies(mv),
-                    outside: mv.is_outside_reaction(),
-                    covered: !held
-                        && !nexts.is_empty()
-                        && nexts.iter().all(|n| n.certainty != Certainty::Unsure),
-                    held,
-                });
-            }
-            let made = batch.made.len().saturating_sub(1) as u32;
-            let depth = deeper(job.depth);
-            for (outcome, next) in nexts.iter().enumerate() {
-                self.pack(&next.state, walking.packed);
-                let surely = walking.sure && next.certainty == Certainty::Sure;
-                let found = shared.seen.get(walking.packed.as_slice()).map(|seen| *seen);
-                if let Some(seen) = found {
-                    shared.levels.found_again(seen.depth, depth);
-                }
-                let to = match found {
-                    Some(seen) if self.keep != Keep::Sure || !surely || seen.sure => {
-                        if !edges {
-                            continue;
-                        }
-                        To::Known(seen.at)
-                    }
-                    _ => To::Check {
-                        packed: walking.packed.as_slice().into(),
-                        via: Via {
-                            by,
-                            outcome: outcome as u32,
-                        },
-                        surely,
-                    },
-                };
-                batch.ways.push(Way {
-                    made,
-                    to,
-                    sure: next.certainty == Certainty::Sure,
-                });
-            }
-            if batch.ways.len() >= BATCH {
-                self.add(job, batch, jobs);
-            }
-        }
-        Some(())
-    }
-
-    /// Where move `at` of `group` leads from the state: from what the thread
-    /// remembers of it, or made now and remembered unless it read what is in
-    /// flight. None when the walk ended first.
-    fn step(
-        &self,
-        group: &mut Group,
-        at: usize,
-        walking: &mut Walking<'_>,
-    ) -> Option<(Vec<Next>, bool)> {
-        let model = &*self.model;
-        let state = walking.state;
-        if group.remembers(at) {
-            let group = &*group;
-            let mv = &group.moves[at];
-            let made = self.built(|| {
-                let outcomes = group.outcomes(at, state).expect("it remembers this move");
-                model.finished(state, mv, outcomes)
-            })?;
-            *walking.steps += 1;
-            if check_step(*walking.steps) {
-                let fresh = self.built(|| model.next(state, mv))?;
-                assert!(
-                    same_steps(&made, &fresh),
-                    "a remembered move differs from the move made afresh: {mv:?} from {}",
-                    render(state)
-                );
-            }
-            return Some(made);
-        }
-        model.expansion.flight_was_read();
-        let outcomes = self.built(|| model.outcomes(state, &group.moves[at]))?;
-        let Some(outcomes) = outcomes else {
-            return Some((Vec::new(), false));
-        };
-        if !model.expansion.flight_was_read() {
-            let bytes = group.keep(at, state, &outcomes, &read(&self.shared.packer));
-            self.remember(bytes);
-        }
-        let mv = &group.moves[at];
-        self.built(|| model.finished(state, mv, outcomes.clone()))
-    }
-
-    /// `state` packed into `out`, adding what the tables do not hold yet.
-    fn pack(&self, state: &JointState, out: &mut Vec<u32>) {
-        if !read(&self.shared.packer).known_into(state, out) {
-            write(&self.shared.packer).pack_into(state, out);
-        }
     }
 
     /// Run `build` in the room an expansion may build in, asking the calling
     /// thread for more until it fits. None when the room has no more.
-    fn built<T>(&self, build: impl Fn() -> T) -> Option<T> {
+    pub(super) fn built<T>(&self, build: impl Fn() -> T) -> Option<T> {
         let shared = &*self.shared;
         let expansion = &self.model.expansion;
         loop {
@@ -394,7 +278,7 @@ impl Walker {
 
     /// Add what walking the state `from` found to the trail, and say how many
     /// states the walk has.
-    fn add(&self, from: Walked, batch: &mut Batch, jobs: &mut Vec<Walked>) -> usize {
+    pub(super) fn add(&self, from: Walked, batch: &mut Batch, jobs: &mut Vec<Walked>) -> usize {
         let shared = &*self.shared;
         let before = jobs.len();
         let states = {
@@ -480,14 +364,4 @@ impl Walker {
             }
         }
     }
-}
-
-/// Whether two steps found the same states, known alike.
-fn same_steps(a: &(Vec<Next>, bool), b: &(Vec<Next>, bool)) -> bool {
-    a.1 == b.1
-        && a.0.len() == b.0.len()
-        && a.0
-            .iter()
-            .zip(&b.0)
-            .all(|(a, b)| a.state == b.state && a.certainty == b.certainty)
 }

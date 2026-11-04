@@ -12,7 +12,7 @@ use crate::model::{Fields, ModelString, ParamValue, Sym, TemperModelAction, Temp
 /// on their way. A move changes one record or two and the rest stay as they
 /// were, so states share their records, dispatches and calls; a walk's states
 /// differ only in which ones they hold.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct JointState {
     /// Each type's record.
     pub records: Fields<Arc<TemperModelState>>,
@@ -242,6 +242,68 @@ pub(super) fn canonical(state: &mut JointState) -> Renames {
     state.inflight.sort();
     state.calls.sort();
     renamed
+}
+
+/// [`canonical`] when nothing needs to know what changed its name, which is
+/// nothing for most states: their names are already in order. What is in
+/// flight is sorted already, unless `rewrote` says a dispatch was rewritten.
+pub(super) fn canonical_quietly(state: &mut JointState, rewrote: bool) {
+    if !numbered_in_order(state) {
+        canonical(state);
+    } else if rewrote {
+        state.inflight.sort();
+    }
+}
+
+/// Whether the state's symbols are numbered as [`canonical`] would number
+/// them: one, two, three, as each is first used, and each number with one
+/// meaning. False too for more symbols than this keeps track of.
+fn numbered_in_order(state: &JointState) -> bool {
+    let mut count = 0;
+    let mut blanks = 0_u64;
+    let mut fits = |value: &ModelString| {
+        let (id, blank) = match value {
+            ModelString::Literal(_) => return true,
+            ModelString::Symbol(id) => (*id, false),
+            ModelString::BlankSymbol(id) => (*id, true),
+        };
+        if id >= u64::BITS as usize {
+            return false;
+        }
+        let is_blank = blanks >> id & 1 == 1;
+        if id == count + 1 {
+            count = id;
+            blanks |= u64::from(blank) << id;
+            true
+        } else {
+            id != 0 && id <= count && is_blank == blank
+        }
+    };
+    for record in state.records.values() {
+        if !record.strings.values().all(&mut fits)
+            || !record.lists.values().flatten().all(&mut fits)
+        {
+            return false;
+        }
+    }
+    let mut param = |value: &ParamValue| match value {
+        ParamValue::Str(text) => fits(text),
+        _ => true,
+    };
+    state
+        .inflight
+        .iter()
+        .all(|dispatch| dispatch.params.values().all(&mut param))
+        && state.inflight.iter().all(|dispatch| {
+            dispatch
+                .unread_guard
+                .iter()
+                .all(|committed| committed.fields.values().all(&mut param))
+        })
+        && state
+            .calls
+            .iter()
+            .all(|call| call.asked.values().all(&mut fits))
 }
 
 /// The strings among `values`.
