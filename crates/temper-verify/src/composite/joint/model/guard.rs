@@ -109,7 +109,11 @@ impl JointModel {
     /// reaction is. Deeper in a chain that runs through the same steps, a
     /// dispatch whose next step an earlier trigger of the same source action
     /// takes may be in that reaction's cascade.
-    pub(super) fn overtakes(&self, state: &JointState, dispatch: &Dispatch) -> bool {
+    pub(in crate::composite::joint) fn overtakes(
+        &self,
+        state: &JointState,
+        dispatch: &Dispatch,
+    ) -> bool {
         let (Some(index), Some((_, parent))) = (dispatch.via, dispatch.chain.split_last()) else {
             return false;
         };

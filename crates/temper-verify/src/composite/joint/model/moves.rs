@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// One move of the walk.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(in crate::composite::joint) enum Move {
     /// An action whose guard and constraints read only its own record, sent
     /// from outside by a sender: its actor checks them as it writes, so

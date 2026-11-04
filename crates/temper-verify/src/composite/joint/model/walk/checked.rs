@@ -18,10 +18,12 @@ use thread_local::ThreadLocal;
 
 use super::super::super::JointState;
 use super::super::super::pack::{Packed, parts};
+use super::super::super::state::render;
 use super::super::JointModel;
-use super::super::moves::dispatch_move;
+use super::super::moves::{Move, dispatch_move};
 use super::levels::deeper;
-use super::memo::Memo;
+use super::making::Target;
+use super::memo::{Holder, Memo, check_step};
 use super::shared::{Seen, Shared, Trail, read, state_bytes, write};
 use super::{Edge, Keep, Made, Node, Via};
 
@@ -91,12 +93,10 @@ pub(super) struct Walking<'a> {
     /// How many moves of the state came before.
     pub(super) by: u32,
     pub(super) batch: Batch,
-    /// How many steps the thread has made from what it remembers.
-    pub(super) steps: &'a mut u64,
-    /// Where a state a move leads to is packed.
-    pub(super) packed: &'a mut Vec<u32>,
-    /// Where a state a move leads to is worked out.
-    pub(super) scratch: &'a mut JointState,
+    /// What the thread remembers.
+    pub(super) memo: &'a mut Memo,
+    /// The state's moves as remembered, when they are being checked.
+    pub(super) checked_moves: Option<Vec<Move>>,
 }
 
 impl Model for Walker {
@@ -160,27 +160,27 @@ impl Walker {
             .get_or_default()
             .try_borrow_mut()
             .expect("a thread walks one state at a time");
-        let Memo {
-            places,
-            steps,
-            packed: buffer,
-            scratch,
-        } = &mut *memo;
         let mut walking = Walking {
             job,
             sure,
             state: &state,
             by: 0,
             batch: Batch::default(),
-            steps,
-            packed: buffer,
-            scratch,
+            checked_moves: check_step(memo.steps).then(Vec::new),
+            memo: &mut memo,
         };
-        if self
-            .walk_groups(places, &packed, &mut walking, jobs)
-            .is_none()
-        {
+        if self.walk_groups(&packed, &mut walking, jobs).is_none() {
             return;
+        }
+        if let Some(remembered) = &walking.checked_moves {
+            let Some(fresh) = self.built(|| self.model.moves(&state)) else {
+                return;
+            };
+            assert!(
+                *remembered == fresh,
+                "a state's remembered moves differ from its moves: {remembered:?} and {fresh:?} from {}",
+                render(&state)
+            );
         }
         let states = self.add(job, &mut walking.batch, jobs);
         if states >= shared.count_at.load(Ordering::Acquire) {
@@ -193,7 +193,6 @@ impl Walker {
     /// the walk ended first.
     fn walk_groups(
         &self,
-        places: &mut super::memo::Places,
         packed: &[u32],
         walking: &mut Walking<'_>,
         jobs: &mut Vec<Walked>,
@@ -202,44 +201,42 @@ impl Walker {
         let state = walking.state;
         let (held, flying, calls, armed) = parts(packed, state.records.len());
         let strings = model.values(state);
-        let (place, bytes) = places.place(model, (held, armed), state, &strings);
-        self.remember(bytes);
+        let place = walking.memo.place(model, (held, armed), state, &strings);
         if model.asked(state) {
-            let group = &mut place.records;
-            if !group.filled() {
+            if walking.memo.move_count(place, Holder::Records).is_none() {
                 let moves = self.built(|| {
                     let mut out = Vec::new();
                     model.record_moves(state, &strings, &mut out);
                     out
                 })?;
-                self.remember(group.fill(moves));
+                walking.memo.keep_moves(place, Holder::Records, moves);
             }
-            self.walk_moves(group, walking, jobs)?;
+            self.walk_moves(place, Holder::Records, walking, jobs)?;
         }
         for (at, &id) in calls.iter().enumerate() {
             if at > 0 && calls[at - 1] == id {
                 continue;
             }
-            let group = place.calls.entry(id).or_default();
-            if !group.filled() {
+            let holder = Holder::Call(id);
+            if walking.memo.move_count(place, holder).is_none() {
                 let moves = self.built(|| {
                     let mut out = Vec::new();
                     model.call_moves(state, &state.calls[at], &strings, &mut out);
                     out
                 })?;
-                self.remember(group.fill(moves));
+                walking.memo.keep_moves(place, holder, moves);
             }
-            self.walk_moves(group, walking, jobs)?;
+            self.walk_moves(place, holder, walking, jobs)?;
         }
         for (at, &id) in flying.iter().enumerate() {
             if at > 0 && flying[at - 1] == id {
                 continue;
             }
-            let group = place.dispatches.entry(id).or_default();
-            if !group.filled() {
-                self.remember(group.fill(vec![dispatch_move(&state.inflight[at])]));
+            let dispatch = &state.inflight[at];
+            if let Some(checked) = &mut walking.checked_moves {
+                checked.push(dispatch_move(dispatch));
             }
-            self.walk_moves(group, walking, jobs)?;
+            self.walk_one(Target::Dispatch(place, id, dispatch), walking, jobs)?;
         }
         Some(())
     }
