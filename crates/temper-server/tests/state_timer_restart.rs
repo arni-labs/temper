@@ -19,6 +19,8 @@ mod boot_walk;
 mod process_clock;
 #[path = "state_timer_restart/recovery.rs"]
 mod recovery;
+#[path = "state_timer_restart/schedule_loop.rs"]
+mod schedule_loop;
 #[path = "state_timer_restart/server.rs"]
 mod server;
 #[path = "state_timer_restart/unrecorded.rs"]
@@ -206,6 +208,73 @@ on_timeout = "Poll"
 reset_on = ["Poll"]
 "#;
 
+/// A watcher that polls through `schedule`: each `Poll` arms the next, 15 s on,
+/// and changes nothing, only setting off its trigger as `POLLER_IOA`'s does.
+/// `Tick` is the same loop on a counter, so each fire changes the record.
+const LOOPER_IOA: &str = r#"
+[automaton]
+name = "Looper"
+states = ["Idle", "Watching", "Ticking"]
+initial = "Idle"
+allow_indefinite_states = ["Idle", "Watching", "Ticking"]
+strict_action_params = true
+
+[[state]]
+name = "notes"
+type = "counter"
+initial = 0
+
+[[state]]
+name = "ticks"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Watch"
+from = ["Idle"]
+to = "Watching"
+params = []
+effect = ["schedule('Poll', 15)"]
+
+[[action]]
+name = "Poll"
+from = ["Watching"]
+params = []
+effect = ["schedule('Poll', 15)"]
+
+[[action.triggers]]
+name = "relays"
+kind = "entity"
+target_entity = "Relay"
+target_action = "Pass"
+resolve_target = { kind = "same_id" }
+
+[[action]]
+name = "Note"
+from = ["Watching"]
+params = []
+effect = ["notes += 1"]
+
+[[action]]
+name = "Stop"
+from = ["Watching"]
+to = "Idle"
+params = []
+
+[[action]]
+name = "StartTicking"
+from = ["Idle"]
+to = "Ticking"
+params = []
+effect = ["schedule('Tick', 15)"]
+
+[[action]]
+name = "Tick"
+from = ["Ticking"]
+params = []
+effect = ["ticks += 1", "schedule('Tick', 15)"]
+"#;
+
 /// A reaction's hop that changes nothing: `Pass` only sets off its own
 /// trigger, a `Count` on the record's tally.
 const RELAY_IOA: &str = r#"
@@ -266,6 +335,9 @@ const CSDL: &str = r#"<?xml version="1.0"?>
 <EntityType Name="CountingPoller"><Key><PropertyRef Name="Id"/></Key>
 <Property Name="Id" Type="Edm.String" Nullable="false"/>
 </EntityType>
+<EntityType Name="Looper"><Key><PropertyRef Name="Id"/></Key>
+<Property Name="Id" Type="Edm.String" Nullable="false"/>
+</EntityType>
 <EntityType Name="Relay"><Key><PropertyRef Name="Id"/></Key>
 <Property Name="Id" Type="Edm.String" Nullable="false"/>
 </EntityType>
@@ -282,6 +354,7 @@ const CSDL: &str = r#"<?xml version="1.0"?>
 <EntitySet Name="Tickers" EntityType="Probe.Ticker"/>
 <EntitySet Name="Pollers" EntityType="Probe.Poller"/>
 <EntitySet Name="CountingPollers" EntityType="Probe.CountingPoller"/>
+<EntitySet Name="Loopers" EntityType="Probe.Looper"/>
 <EntitySet Name="Relays" EntityType="Probe.Relay"/>
 <EntitySet Name="Tallies" EntityType="Probe.Tally"/>
 </EntityContainer>
@@ -459,6 +532,26 @@ fn turso_a_restart_looks_once_then_keeps_the_pace() {
 }
 
 #[test]
+fn turso_a_schedule_loop_that_changes_nothing_writes_nothing_and_keeps_its_pace() {
+    on_turso(schedule_loop::a_loop_that_changes_nothing_writes_nothing_and_keeps_its_pace);
+}
+
+#[test]
+fn turso_a_schedule_loop_that_changes_its_record_is_written() {
+    on_turso(schedule_loop::a_loop_that_changes_its_record_is_written);
+}
+
+#[test]
+fn turso_a_schedule_loop_survives_restarts_and_looks_once_at_each() {
+    on_turso(schedule_loop::a_loop_survives_restarts_and_looks_once_at_each);
+}
+
+#[test]
+fn turso_a_schedule_loop_goes_on_past_other_moves_and_ends_with_its_state() {
+    on_turso(schedule_loop::a_loop_goes_on_past_other_moves_and_ends_with_its_state);
+}
+
+#[test]
 #[ignore = "requires TEMPER_TEST_POSTGRES_URL pointing to disposable PostgreSQL"]
 fn postgres_timers_survive_restart() {
     let url = std::env::var("TEMPER_TEST_POSTGRES_URL").expect("disposable PostgreSQL"); // determinism-ok: integration-test configuration
@@ -483,6 +576,7 @@ fn postgres_timers_survive_restart() {
             repeating_timer_resumes_without_replaying_missed_ticks(&world);
             unrecorded::a_restart_looks_once_then_keeps_the_pace(&world);
             unrecorded::one_shot_reset_survives_reconciliation_and_restart(&world);
+            schedule_loop::a_loop_survives_restarts_and_looks_once_at_each(&world);
         }
         runtime.block_on(async {
             let pool = sqlx::PgPool::connect(&url).await.unwrap();

@@ -35,7 +35,8 @@ use tokio::sync::Notify;
 
 use super::process_clock::ProcessClock;
 use super::{
-    COUNTING_POLLER_IOA, CSDL, PERMIT_ALL, POLLER_IOA, PROBE_IOA, RELAY_IOA, TALLY_IOA, TICKER_IOA,
+    COUNTING_POLLER_IOA, CSDL, LOOPER_IOA, PERMIT_ALL, POLLER_IOA, PROBE_IOA, RELAY_IOA, TALLY_IOA,
+    TICKER_IOA,
 };
 
 /// Simulation time for work already under way to end, such as a boot's
@@ -193,6 +194,7 @@ impl Server {
                     ("Ticker", TICKER_IOA),
                     ("Poller", POLLER_IOA),
                     ("CountingPoller", COUNTING_POLLER_IOA),
+                    ("Looper", LOOPER_IOA),
                     ("Relay", RELAY_IOA),
                     ("Tally", TALLY_IOA),
                 ],
@@ -390,6 +392,20 @@ impl Server {
                 .await
                 .unwrap();
             store.list_state_timers("default").await.unwrap()
+        })
+    }
+
+    /// The ids of the scheduled-action rows waiting on `id`.
+    pub(crate) fn scheduled_arms(&self, id: &str) -> Vec<String> {
+        self.runtime.block_on(async {
+            self.journal
+                .list_scheduled_actions("default")
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.entity_id == id)
+                .map(|row| row.arm_id)
+                .collect()
         })
     }
 
