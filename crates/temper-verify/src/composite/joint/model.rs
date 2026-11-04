@@ -10,8 +10,8 @@ mod held;
 mod initial;
 mod labels;
 mod moves;
-pub(super) mod one_name;
 mod order;
+mod other_records;
 mod outside;
 mod react;
 mod read;
@@ -120,7 +120,7 @@ pub(super) struct JointModel {
     id_literals: BTreeMap<String, BTreeSet<String>>,
     models: BTreeMap<String, TemperModel>,
     reactions: Vec<Reaction>,
-    one_names: one_name::OneNames,
+    pub(super) other_records: other_records::OtherRecords,
     records: Records,
     /// With one record of a type, each entity's id fields that references
     /// use: each holds that record's id.
@@ -304,7 +304,7 @@ impl JointModel {
             expansion: Expansion::default(),
             id_literals,
             models,
-            one_names: one_name::OneNames::read(by_name, scope, &reactions),
+            other_records: other_records::OtherRecords::read(by_name, scope, &reactions),
             reactions,
             records: Records::ById,
             refs: BTreeMap::new(),
@@ -468,7 +468,6 @@ impl JointModel {
             owner,
             blind,
             own: None,
-            one_names: &self.one_names,
         }
     }
 }

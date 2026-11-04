@@ -127,6 +127,12 @@ impl InvariantProof<'_> {
             .iter()
             .zip(walk.outcomes)
             .map(|(inv, outcome)| {
+                let outcome = match (outcome, model.other_records.lands()) {
+                    (JointOutcome::Holds, Some(reason)) => JointOutcome::Incomplete {
+                        reason: reason.to_string(),
+                    },
+                    (outcome, _) => outcome,
+                };
                 let mut found = result(inv, walk.states, outcome);
                 found.in_flight_bound = walk.held_back.then_some(model::MAX_IN_FLIGHT);
                 found
@@ -321,6 +327,13 @@ impl LivenessProof<'_> {
                 model.guided_liveness(&self.entity, &self.goal, explored, reason, bound)
             }
         };
+        if let (LivenessOutcome::Holds, Some(reason)) =
+            (&result.outcome, model.other_records.lands())
+        {
+            result.outcome = LivenessOutcome::Incomplete {
+                reason: reason.to_string(),
+            };
+        }
         result
     }
 }

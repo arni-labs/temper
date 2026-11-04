@@ -178,7 +178,7 @@ impl JointModel {
                     // It names another record, in the runtime it lands there,
                     // and what that sets off may come back into scope.
                     let known = known.then(Certainty::unless(
-                        reaches == Found::NoId || !self.reacts_into_scope(&reaction.to),
+                        reaches == Found::NoId || !self.other_records.reach_scope(&reaction.to),
                         Certainty::Unsure,
                     ));
                     if !self.keep(&mut after, state, known) {
@@ -280,16 +280,6 @@ impl JointModel {
         });
         self.expansion.give(before.saturating_sub(ways.heap()));
         ways
-    }
-
-    /// Whether another record of `entity` can set off a reaction on a record
-    /// in scope. One that keeps to its own record stays away from the one
-    /// the model holds.
-    fn reacts_into_scope(&self, entity: &str) -> bool {
-        self.reactions.iter().any(|r| {
-            r.from == entity
-                && !(r.to == entity && matches!(r.resolve, Some(TargetResolver::SameId)))
-        })
     }
 
     /// What `guard`, a trigger's guard on `source`, reads of `source` as it

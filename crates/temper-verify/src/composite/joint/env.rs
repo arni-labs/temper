@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use temper_spec::predicate::{Env, Val, VarKind};
 
 use super::JointState;
-use super::model::one_name::OneNames;
 use crate::model::{TemperModel, TemperModelState};
 
 /// The key under which each record keeps its own id among its strings.
@@ -124,8 +123,6 @@ pub(super) struct JointEnv<'a> {
     /// The owner's record as this evaluation reads it, when not as the
     /// joint state holds it now: a trigger's source as it committed.
     pub(super) own: Option<&'a TemperModelState>,
-    /// The references that read "no such record" when they name another id.
-    pub(super) one_names: &'a OneNames,
 }
 
 fn var_of<'a>(model: &TemperModel, state: &'a TemperModelState, name: &str) -> Val<'a> {
@@ -171,7 +168,6 @@ impl JointEnv<'_> {
         ) {
             Found::Yes => Some(self.state.records.get(entity_type).map(|record| &**record)),
             Found::NoId => Some(None),
-            Found::Other if self.one_names.has(self.owner, id_field, entity_type) => Some(None),
             Found::Other | Found::Unknown => None,
         }
     }
