@@ -1,6 +1,7 @@
 //! The joint model: the records in scope, their reactions, the dispatches
 //! and module calls on their way, who may send what, and the walk.
 
+mod chosen;
 mod classes;
 mod commit;
 mod drops;
@@ -140,6 +141,8 @@ pub(super) struct JointModel {
     /// Elsewhere who armed a timer or answers a call changes nothing, so the
     /// model does not tell them apart.
     sender_matters: BTreeSet<String>,
+    /// The reactions (by place) whose guard a request's sender decides.
+    chosen_guards: BTreeSet<usize>,
     /// Each entity's transitions (by index) that nothing in the model sends
     /// and a module may answer with: one whose trigger names no
     /// `on_success`, while its call is open. The kernel takes whatever
@@ -311,6 +314,7 @@ impl JointModel {
             expansion: Expansion::default(),
             id_literals,
             models,
+            chosen_guards: chosen::chosen_guards(by_name, &reactions),
             reactions,
             records: Records::ById,
             refs: BTreeMap::new(),

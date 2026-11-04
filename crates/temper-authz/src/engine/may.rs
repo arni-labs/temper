@@ -20,6 +20,7 @@ mod json;
 mod kinds;
 mod profile;
 mod request;
+mod someone;
 
 #[cfg(test)]
 mod tests;
@@ -123,6 +124,9 @@ fn decide(applies: impl Iterator<Item = (Effect, Results)>) -> May {
     }
 }
 
+/// What is worked out once for each (action, resource type), for all proofs.
+type ByRequest<T> = Arc<Mutex<HashMap<(String, String), T>>>;
+
 /// A tenant's policies with the built-in platform policy, read for
 /// [`SendAnalysis::may`].
 #[derive(Debug, Clone)]
@@ -134,7 +138,11 @@ pub struct SendAnalysis {
     /// The policies whose action and resource scopes fit each (action,
     /// resource type): a proof asks about every action of every type for
     /// every sender, and most policies name one type's actions.
-    scoped: Arc<Mutex<HashMap<(String, String), Arc<[usize]>>>>,
+    scoped: ByRequest<Arc<[usize]>>,
+    /// Whether some sender is surely allowed each (action, resource type) as
+    /// a request ([`SendAnalysis::may_request`]): the proofs of one app ask
+    /// the same ones again.
+    someone: ByRequest<bool>,
 }
 
 impl SendAnalysis {
@@ -157,6 +165,7 @@ impl SendAnalysis {
             policies,
             kinds: Arc::default(),
             scoped: Arc::default(),
+            someone: Arc::default(),
         })
     }
 

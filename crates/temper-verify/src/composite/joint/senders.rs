@@ -102,6 +102,8 @@ pub(super) struct Senders {
     /// The senders each (entity, action) is sent as from outside, of those
     /// that may, one for each way what follows can go.
     alike: RefCell<BTreeMap<String, BTreeMap<String, Rc<[u32]>>>>,
+    /// Each sender in the words of a request it makes ([`Self::name_asking`]).
+    asking: RefCell<Asking>,
     /// The bytes `decided` holds, as a walk counts them against its room.
     decided_bytes: std::cell::Cell<usize>,
     /// The policies that may apply to a move whose answer depends on the
@@ -113,6 +115,9 @@ pub(super) struct Senders {
     /// meets, which the model does not offer it.
     meets: BTreeMap<(String, String), BTreeSet<String>>,
 }
+
+/// Each sender's name on the requests named so far, by sender, entity and action.
+type Asking = HashMap<(u32, String, String), String>;
 
 /// What a walk reads of its senders, which a model's digest
 /// ([`JointProof::digest`](super::JointProof::digest)) is of: who sends,

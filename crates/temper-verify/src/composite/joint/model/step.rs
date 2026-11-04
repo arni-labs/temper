@@ -148,8 +148,8 @@ impl JointModel {
                     && self.outside_may(*by, entity, &action.name) == May::Yes
                     && self.unchecked.meets(entity, &action.name)
                     && self.exact(entity, &action.name, state);
-                let text = format!("{entity}.{action}{}", self.as_sender(*by));
-                for (outcome, then) in self.commit(state.clone(), entity, action, &[], *by) {
+                let text = self.request_label(entity, action, *by, "");
+                for (outcome, then) in self.commit_request(state.clone(), entity, action, *by) {
                     let certainty = Certainty::unless(known, Unsure).then(then);
                     if !self
                         .expansion
@@ -167,7 +167,7 @@ impl JointModel {
                     && self.truth(entity, action, state) == Truth::True;
                 let mut next = state.clone();
                 add(&mut next, sent(entity, action, *by));
-                let text = format!("{entity}.{action} sent{}", self.as_sender(*by));
+                let text = self.request_label(entity, action, *by, " sent");
                 if !self.expansion.push(
                     &mut outcomes,
                     (next, text, Certainty::unless(known, Unsure)),
