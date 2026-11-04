@@ -21,10 +21,10 @@ pub fn lint_lost_params(automaton: &Automaton) -> Vec<LintFinding> {
     let mut findings = Vec::new();
     for action in &automaton.actions {
         for param in &action.params {
-            if let Some(kind) = held_kind(automaton, param) {
-                if !reads_param(action, param.name()) {
-                    findings.push(lost(action, param.name(), kind));
-                }
+            if let Some(kind) = held_kind(automaton, param)
+                && !reads_param(action, param.name())
+            {
+                findings.push(lost(action, param.name(), kind));
             }
         }
     }
