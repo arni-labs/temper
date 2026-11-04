@@ -603,7 +603,7 @@ from = ["Open"]
 name = "Hit"
 kind = "input"
 from = ["Open"]
-effect = "increment hits"
+effect = ["hits += 1"]
 
 [[invariant]]
 name = "rule"
