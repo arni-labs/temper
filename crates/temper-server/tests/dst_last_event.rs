@@ -346,7 +346,8 @@ fn dst_history_names_whom_an_agent_acted_for() {
             let forged = json!({"for":"mallory", "agent_type":"forged"});
             request_as(&state, agent(), "POST", start, forged).await;
             let poke = "/tdata/Jobs('job')/Jobs.Poke";
-            request_as(&state, ann(), "POST", poke, json!({})).await;
+            // A value the record does not hold yet, so this move changes it and is written.
+            request_as(&state, ann(), "POST", poke, json!({"note":"hello"})).await;
             tokio::time::advance(Duration::from_secs(180)).await;
             settle().await;
             let history = request(
