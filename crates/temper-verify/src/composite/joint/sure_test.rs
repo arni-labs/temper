@@ -201,7 +201,7 @@ fn a_walk_out_of_room_says_so_even_with_an_undecided_move() {
     // Flags anyone may set make the walk too big for a small room, and the
     // undecided Finish is near the start, so some room sees that move and
     // still stops. The verdict has to name both, the room first.
-    const FLAGS: usize = 8;
+    const FLAGS: usize = 14;
     let reads = (0..FLAGS)
         .map(|i| format!("(b{i} || !b{i})"))
         .collect::<Vec<_>>()
@@ -227,7 +227,7 @@ fn a_walk_out_of_room_says_so_even_with_an_undecided_move() {
         .collect();
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = SendAnalysis::new(&policies).expect("fixture policies parse");
-    let reasons: Vec<String> = (12..26)
+    let reasons: Vec<String> = (23..28)
         .filter_map(|bits| {
             let (room, progress) = (Bytes::new(1 << bits), Progress::default());
             let bound = Bound {
