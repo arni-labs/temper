@@ -76,6 +76,9 @@ mod tests {
         assert_eq!(pruner.next().as_deref(), Some("a"));
         assert_eq!(pruner.next().as_deref(), Some("b"));
         assert_eq!(pruner.next(), None);
-        assert!(pruner.mark("a"), "after the drain ended, a mark restarts it");
+        assert!(
+            pruner.mark("a"),
+            "after the drain ended, a mark restarts it"
+        );
     }
 }
