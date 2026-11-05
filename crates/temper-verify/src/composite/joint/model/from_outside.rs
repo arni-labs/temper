@@ -42,6 +42,9 @@ pub(super) struct Outside {
     /// records it: `None` when no source makes it, the target type when
     /// every source does, and [`MAYBE_MADE`] otherwise.
     made: Option<String>,
+    /// Whether a source spawns it: the kernel starts a spawned record, and
+    /// Cedar never decides that first move.
+    spawned: bool,
     /// The senders it may run as, when they were read.
     by: Option<BTreeSet<u32>>,
     /// Of those, one for each way what follows can go, once worked out.
@@ -190,10 +193,15 @@ impl JointModel {
             let asked = self.asked_after(entity, action);
             let mut ways = BTreeSet::new();
             // Cedar decides the reaction as its sender: one it surely refuses
-            // never arrives.
+            // never arrives. The kernel's start of a spawned record is not
+            // Cedar's to decide.
             by.into_iter()
                 .filter(|&by| {
-                    let may = self.senders.may(by, entity, action);
+                    let may = if outside.spawned {
+                        May::Yes
+                    } else {
+                        self.senders.may(by, entity, action)
+                    };
                     may != May::No && ways.insert(self.way(by, may, &asked))
                 })
                 .collect()
@@ -313,7 +321,7 @@ pub(super) fn outside_reactions(
     let mut makes: BTreeMap<(String, String), BTreeSet<Option<bool>>> = BTreeMap::new();
     for (from, automaton) in by_name.iter().filter(|(name, _)| !scope.contains(**name)) {
         for action in &automaton.actions {
-            let spawned = spawns_of(action).map(|(to, target, ..)| (to, target, &CREATE));
+            let spawned = spawns_of(action).map(|(to, target, ..)| (to, target, &CREATE, true));
             let triggered = action.triggers.iter().filter_map(|trigger| {
                 let (TriggerKind::Entity, Some(to), Some(target)) = (
                     &trigger.kind,
@@ -322,9 +330,9 @@ pub(super) fn outside_reactions(
                 ) else {
                     return None;
                 };
-                Some((to, target, &trigger.resolve_target))
+                Some((to, target, &trigger.resolve_target, false))
             });
-            for (to, target, resolve) in spawned.chain(triggered) {
+            for (to, target, resolve, spawn) in spawned.chain(triggered) {
                 if !scope.contains(to) {
                     continue;
                 }
@@ -333,10 +341,12 @@ pub(super) fn outside_reactions(
                     from: BTreeSet::new(),
                     before: BTreeSet::new(),
                     made: None,
+                    spawned: false,
                     by: None,
                     kept: Kept::default(),
                 });
                 entry.from.insert(from.to_string());
+                entry.spawned |= spawn;
                 // Everything that can come before its source's move, and
                 // that move.
                 let mut queue = vec![(from.to_string(), action.name.clone())];
