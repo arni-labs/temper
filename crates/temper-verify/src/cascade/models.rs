@@ -93,24 +93,25 @@ from = ["Open"]
 to = "Closed"
 "#;
 
-    /// `Open` takes `note`, but the record's own `note` replaces it after
-    /// the move: an install refuses it.
+    /// `Send` takes `urgent`, but a strict record holds its own `urgent` and
+    /// that replaces the param after the move: an install refuses it.
     const LOST_PARAM: &str = r#"
 [automaton]
 name = "Memo"
 states = ["Draft", "Sent"]
 initial = "Draft"
+strict_action_params = true
 
 [[state]]
-name = "note"
-type = "string"
-initial = ""
+name = "urgent"
+type = "bool"
+initial = false
 
 [[action]]
 name = "Send"
 from = ["Draft"]
 to = "Sent"
-params = [{ name = "note", type = "string" }]
+params = [{ name = "urgent", type = "bool" }]
 "#;
 
     #[test]
@@ -119,13 +120,13 @@ params = [{ name = "note", type = "string" }]
             .with_sim_seeds(1)
             .with_prop_test_cases(1)
             .run();
-        assert!(!result.all_passed);
+        assert!(!result.all_passed, "{result:?}");
         assert_eq!(result.levels.len(), 1, "{result:?}");
         let level = &result.levels[0];
         assert!(
             level.summary.contains("an install refuses this spec")
-                && level.summary.contains("'note'")
-                && level.summary.contains("note = params.note"),
+                && level.summary.contains("'urgent'")
+                && level.summary.contains("urgent = params.urgent"),
             "{}",
             level.summary
         );
@@ -137,8 +138,8 @@ params = [{ name = "note", type = "string" }]
         );
 
         let stored = LOST_PARAM.replace(
-            "params = [{ name = \"note\", type = \"string\" }]",
-            "params = [{ name = \"note\", type = \"string\" }]\neffect = [\"note = params.note\"]",
+            "params = [{ name = \"urgent\", type = \"bool\" }]",
+            "params = [{ name = \"urgent\", type = \"bool\" }]\neffect = [\"urgent = params.urgent\"]",
         );
         let result = VerificationCascade::from_ioa(&stored)
             .with_sim_seeds(1)
