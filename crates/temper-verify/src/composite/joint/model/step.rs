@@ -7,7 +7,7 @@ use crate::model::Renames;
 use temper_authz::May;
 use temper_spec::predicate::Truth;
 
-use super::super::senders::{OUTSIDE, Rule, Senders};
+use super::super::senders::{Rule, Senders};
 use super::super::state::canonical;
 use super::super::{Call, Dispatch, JointState};
 use super::commit::add;
@@ -147,20 +147,7 @@ impl JointModel {
                 }
             }
             Move::Timer(entity, name) => {
-                let armed = state.armed.get(entity.as_str()).copied().unwrap_or(OUTSIDE);
-                let by = self.senders.timer(armed);
-                let text = if self.sender_matters.contains(entity) {
-                    words!(
-                        self,
-                        "{entity}.{name} (timer, as {})",
-                        self.senders.name(by)
-                    )
-                } else {
-                    words!(self, "{entity}.{name} (timer)")
-                };
-                let mut next = state.clone();
-                next.armed.remove(entity.as_str());
-                for outcome in self.fire(next, entity, name, &text, by) {
+                for outcome in self.fire_timer(state, entity, name) {
                     if !self.expansion.push(&mut outcomes, outcome) {
                         return None;
                     }

@@ -100,7 +100,7 @@ pub struct Dispatch {
 impl Dispatch {
     /// The values it carries: its parameters and its unread source's fields.
     pub(super) fn values(&self) -> impl Iterator<Item = &ParamValue> {
-        let committed = self.unread_guard.iter().flat_map(|c| c.fields.values());
+        let committed = self.unread_guard.iter().flat_map(Committed::values);
         self.params.values().chain(committed)
     }
 }
@@ -114,9 +114,22 @@ pub struct Committed {
     pub status: Option<Sym>,
     /// The fields the guard reads, by name.
     pub fields: Fields<ParamValue>,
+    /// The values of the source's move the guard reads by name, as the
+    /// runtime copies them into the source's fields.
+    pub params: Fields<ParamValue>,
 }
 
 impl Committed {
+    /// The values it holds: its fields and the move's values.
+    pub(super) fn values(&self) -> impl Iterator<Item = &ParamValue> {
+        self.fields.values().chain(self.params.values())
+    }
+
+    /// The values it holds, to rename.
+    pub(super) fn values_mut(&mut self) -> impl Iterator<Item = &mut ParamValue> {
+        self.fields.values_mut().chain(self.params.values_mut())
+    }
+
     /// The source record as the guard reads it.
     pub(super) fn record(&self) -> TemperModelState {
         let mut record = TemperModelState {
@@ -222,11 +235,12 @@ fn strings_on_their_way(state: &JointState) -> impl Iterator<Item = &ModelString
         .inflight
         .iter()
         .flat_map(|d| strings(d.params.values()))
-        .chain(state.inflight.iter().flat_map(|d| {
-            d.unread_guard
+        .chain(
+            state
+                .inflight
                 .iter()
-                .flat_map(|c| strings(c.fields.values()))
-        }))
+                .flat_map(|d| d.unread_guard.iter().flat_map(|c| strings(c.values()))),
+        )
         .chain(state.calls.iter().flat_map(|c| c.asked.values()))
 }
 
@@ -244,7 +258,7 @@ fn all_on_their_way(state: &JointState, mut holds: impl FnMut(&ModelString) -> b
     }
     for dispatch in &state.inflight {
         if let Some(committed) = &dispatch.unread_guard
-            && !committed.fields.values().all(&mut param)
+            && !committed.values().all(&mut param)
         {
             return false;
         }
@@ -298,7 +312,7 @@ fn rename_on_their_way(state: &mut JointState, renamed: &Renames) {
             let dispatch = Arc::make_mut(dispatch);
             dispatch.params.values_mut().for_each(rewrite_param);
             if let Some(committed) = &mut dispatch.unread_guard {
-                committed.fields.values_mut().for_each(rewrite_param);
+                committed.values_mut().for_each(rewrite_param);
             }
         }
     }

@@ -4,7 +4,7 @@
 use temper_spec::automaton::TargetResolver;
 use temper_spec::predicate::{Arg, Expr, Literal, Name, ParamKind, Truth, VarKind, eval};
 
-use super::super::env::{Blind, Found, ID, resolve};
+use super::super::env::{Blind, Found, ID, JointEnv, resolve};
 use super::super::room::Heap;
 use super::super::senders::Senders;
 use super::super::state::ReactionStep;
@@ -184,7 +184,13 @@ impl JointModel {
                     continue;
                 }
                 let fires = match &reaction.guard {
-                    Some(guard) => eval(guard, &self.env_blind(source, &state, Blind::Related)),
+                    Some(guard) => eval(
+                        guard,
+                        &JointEnv {
+                            params: Some(params),
+                            ..self.env_blind(source, &state, Blind::Related)
+                        },
+                    ),
                     None => Truth::True,
                 };
                 // The runtime reads the related records a trigger's guard
@@ -194,7 +200,7 @@ impl JointModel {
                 // committed; one that reads none the model holds goes both
                 // ways now.
                 let unread_guard = match (&reaction.guard, fires) {
-                    (Some(guard), Truth::Unknown) => self.committed(guard, source, &state),
+                    (Some(guard), Truth::Unknown) => self.committed(guard, source, &state, params),
                     _ => None,
                 };
                 let chosen = sent.request && self.chosen_guards.contains(&index);
@@ -331,15 +337,23 @@ impl JointModel {
     /// when they do not (it reads a record the model does not hold, or a
     /// field it does not track, and would read as unknown then too), or the
     /// guard reads a list of its source.
-    fn committed(&self, guard: &Expr, source: &str, state: &JointState) -> Option<Committed> {
+    fn committed(
+        &self,
+        guard: &Expr,
+        source: &str,
+        state: &JointState,
+        params: &Fields<ParamValue>,
+    ) -> Option<Committed> {
         let model = &self.models[source];
         let record = &state.records[source];
         let mut env = self.env(source, state);
         env.unheld_unknown = true;
+        env.params = Some(params);
         if eval(guard, &env) == Truth::Unknown {
             return None;
         }
         let mut fields = Fields::new();
+        let mut carried = Fields::new();
         let mut lists = false;
         let mut reads_status = false;
         let mut keep = |field: &str| {
@@ -372,7 +386,11 @@ impl JointModel {
                 keep(id_field);
             }
             Name::Status => reads_status = true,
-            Name::Param(_) => {}
+            Name::Param(param) => {
+                if let Some(value) = params.get(param) {
+                    carried.insert(param, *value);
+                }
+            }
         });
         if let Some(id) = record.strings.get(ID) {
             fields.insert(ID, ParamValue::Str(*id));
@@ -380,6 +398,7 @@ impl JointModel {
         (!lists).then(|| Committed {
             status: reads_status.then_some(record.status),
             fields,
+            params: carried,
         })
     }
 
