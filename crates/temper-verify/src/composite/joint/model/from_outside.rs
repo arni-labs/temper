@@ -1,11 +1,14 @@
 //! Reactions from types outside a joint model's scope into types in it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, OnceLock};
 
+use temper_authz::May;
 use temper_spec::automaton::Automaton;
 use temper_spec::predicate::Truth;
 
 use super::super::JointState;
+use super::super::senders::Senders;
 use super::super::state::ReactionStep;
 use super::JointModel;
 use super::commit::add;
@@ -14,14 +17,18 @@ use super::step::{Certainty, Move, sent};
 use crate::model::semantics::successors_budgeted;
 use crate::model::{ModelString, ResolvedTransition, TemperModelAction};
 
+mod sent_as;
+
 /// Reactions from types outside the scope into one action of a type in it.
 ///
 /// The model holds no record of their source, so it cannot tell when one
 /// fires. It sends such a reaction as a move from outside: whenever its
-/// target's guard may let it, with any parameters, as a sender Cedar may
-/// answer either way for ([`super::senders::Senders::unknown`]). That only
-/// adds behaviour, so an invariant that holds here holds in the runtime.
-/// Liveness never counts on one (`liveness.rs`).
+/// target's guard may let it, with any parameters, as each sender that may
+/// send the move that set it off ([`sent_as`]), or, where the model cannot
+/// tell, as a sender Cedar may answer either way for
+/// ([`Senders::unknown`]). That only adds behaviour, so an invariant that
+/// holds here holds in the runtime. Liveness never counts on one
+/// (`liveness.rs`).
 #[derive(Debug, Clone)]
 pub(super) struct Outside {
     /// The types it comes from.
@@ -35,6 +42,21 @@ pub(super) struct Outside {
     /// records it: `None` when no source makes it, the target type when
     /// every source does, and [`MAYBE_MADE`] otherwise.
     made: Option<String>,
+    /// The senders it may run as, when they were read.
+    by: Option<BTreeSet<u32>>,
+    /// Of those, one for each way what follows can go, once worked out.
+    kept: Kept,
+}
+
+/// The senders a reaction from outside is sent as, worked out on first
+/// use: what a walk learns, not what the model is.
+#[derive(Clone, Default)]
+struct Kept(OnceLock<Arc<[u32]>>);
+
+impl std::fmt::Debug for Kept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Kept")
+    }
 }
 
 /// A step's `generated_for` when the model cannot tell whether its chain
@@ -132,16 +154,12 @@ impl JointModel {
         values: &BTreeSet<ModelString>,
         out: &mut Vec<Move>,
     ) -> bool {
-        let unknown = self.senders.unknown();
-        let mut senders = vec![unknown];
-        if self.senders.timer(unknown) != unknown {
-            senders.push(self.senders.timer(unknown));
-        }
+        let senders = self.outside_sent_as(entity, &t.name);
         let local = &state.records[entity];
         for (params, _) in
             successors_budgeted(&self.models[entity], t, local, values, &self.expansion)
         {
-            for &by in &senders {
+            for &by in senders.iter() {
                 let action = TemperModelAction {
                     name: t.name.clone(),
                     target_state: t.to_state.clone(),
@@ -153,6 +171,34 @@ impl JointModel {
             }
         }
         true
+    }
+
+    /// The senders a reaction from outside the scope into `entity`'s
+    /// `action` is sent as: of those that may send what set it off and that
+    /// Cedar may let send it, one for each way what follows can go; the sender the model does not know,
+    /// in either chain, where those were not read.
+    fn outside_sent_as(&self, entity: &str, action: &str) -> Arc<[u32]> {
+        let unknown = || {
+            let unknown = self.senders.unknown();
+            BTreeSet::from([unknown, self.senders.timer(unknown)])
+        };
+        let Some(outside) = self.outside.get(&(entity.to_string(), action.to_string())) else {
+            return unknown().into_iter().collect();
+        };
+        let kept = outside.kept.0.get_or_init(|| {
+            let by = outside.by.clone().unwrap_or_else(unknown);
+            let asked = self.asked_after(entity, action);
+            let mut ways = BTreeSet::new();
+            // Cedar decides the reaction as its sender: one it surely refuses
+            // never arrives.
+            by.into_iter()
+                .filter(|&by| {
+                    let may = self.senders.may(by, entity, action);
+                    may != May::No && ways.insert(self.way(by, may, &asked))
+                })
+                .collect()
+        });
+        kept.clone()
     }
 
     /// The states a reaction from outside the scope into `entity`'s
@@ -174,7 +220,12 @@ impl JointModel {
                     .collect::<Vec<_>>()
                     .join(" or ")
             });
-        let text = format!("{entity}.{action} (a reaction from {from})");
+        let as_whom = if self.outside_sent_as(entity, &action.name).len() > 1 {
+            format!(", as {}", self.senders.name(by))
+        } else {
+            String::new()
+        };
+        let text = format!("{entity}.{action} (a reaction from {from}{as_whom})");
         let chain = self.outside_chain(entity, &action.name);
         if self.action_reads_related(entity, &action.name) {
             let mut next = state.clone();
@@ -194,6 +245,25 @@ impl JointModel {
 static CREATE: Option<temper_spec::automaton::TargetResolver> =
     Some(temper_spec::automaton::TargetResolver::Create);
 
+/// `matters`, the types in `scope` whose reactions run as their sender,
+/// with the types outside `scope` whose moves can set off a reaction into
+/// one of them: whoever may send such a move starts a chain that reaches
+/// them, so the kinds of outside sender are told apart on those requests.
+pub(in crate::composite::joint) fn origins(
+    by_name: &BTreeMap<&str, &Automaton>,
+    scope: &BTreeSet<String>,
+    matters: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut roots = matters.clone();
+    for ((entity, _), outside) in outside_reactions(by_name, scope, None) {
+        if matters.contains(&entity) {
+            let before = outside.before.into_iter().map(|(from, _)| from);
+            roots.extend(before.filter(|from| !scope.contains(from)));
+        }
+    }
+    roots
+}
+
 /// All a model of `scope` reads of the types outside it, as text.
 pub(in crate::composite::joint) fn reads_beyond(
     by_name: &BTreeMap<&str, &Automaton>,
@@ -201,16 +271,19 @@ pub(in crate::composite::joint) fn reads_beyond(
 ) -> String {
     format!(
         "{:?}{:?}",
-        outside_reactions(by_name, scope),
+        outside_reactions(by_name, scope, None),
         super::read::reactions_into(by_name, scope)
     )
 }
 
 /// The reactions from types outside `scope` into actions of types in it
 /// ([`Outside`]), by their target (entity, action).
+/// With `sent` (the senders and the moves outside code is relied on to
+/// send), each also knows whom it may run as.
 pub(super) fn outside_reactions(
     by_name: &BTreeMap<&str, &Automaton>,
     scope: &BTreeSet<String>,
+    sent: Option<(&Senders, &BTreeSet<(String, String)>)>,
 ) -> BTreeMap<(String, String), Outside> {
     use temper_spec::automaton::{TargetResolver, TriggerKind};
     // Each move (entity, action) of the app, with the moves its reactions
@@ -262,6 +335,8 @@ pub(super) fn outside_reactions(
                     from: BTreeSet::new(),
                     before: BTreeSet::new(),
                     made: None,
+                    by: None,
+                    kept: Kept::default(),
                 });
                 entry.from.insert(from.to_string());
                 // Everything that can come before its source's move, and
@@ -295,6 +370,13 @@ pub(super) fn outside_reactions(
                 [Some(true)] => Some(key.0.clone()),
                 _ => Some(MAYBE_MADE.to_string()),
             };
+        }
+    }
+    if let Some((senders, relies_on)) = sent {
+        for (key, by) in sent_as::sent_as(by_name, scope, senders, relies_on) {
+            if let Some(entry) = outside.get_mut(&key) {
+                entry.by = Some(by);
+            }
         }
     }
     outside
