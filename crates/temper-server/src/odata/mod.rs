@@ -1,8 +1,10 @@
 //! OData handler modules.
 
 mod account_verification;
+mod answer_budget;
 mod app_uniqueness;
 pub(crate) mod authz;
+mod batch;
 mod bindings;
 mod blob_media;
 mod common;
@@ -25,6 +27,8 @@ mod unavailable_tenant;
 mod write;
 mod write_key;
 
+pub use answer_budget::{MIN_PUSH_BUDGET, WRITE_ANSWER_BUDGET};
+pub use batch::handle_odata_batch;
 pub(crate) use bindings::check_bound_action;
 pub(crate) use common::resolve_entity_type;
 pub use content_addressed::handle_blob_ingest_raw;

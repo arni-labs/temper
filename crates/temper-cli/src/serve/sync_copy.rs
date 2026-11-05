@@ -2,7 +2,8 @@
 //!
 //! With `TURSO_SYNC_URL` set, the database stays a local file and every
 //! request that can change it is answered only after its changes reach the
-//! remote copy. Requests that finish together share one push. A background
+//! remote copy. Requests that finish together share one push, and a
+//! `$batch` of many writes is one request with one push. A background
 //! loop also pushes changes no request waits for (timers, reactions), trims
 //! the change log the remote has confirmed, keeps the local write-ahead log
 //! short, and checks a file the start could not check. While writes cannot
@@ -16,15 +17,8 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use temper_server::odata::IDEMPOTENCY_KEY;
+use temper_server::odata::{IDEMPOTENCY_KEY, MIN_PUSH_BUDGET, WRITE_ANSWER_BUDGET};
 use temper_store_turso::{CopyState, SyncCopy, TursoEventStore};
-
-/// How long a request that can change data may take, its push included,
-/// before its change is reported as not confirmed.
-const ANSWER_BUDGET: Duration = Duration::from_secs(10);
-
-/// The least time left for the push of a slow request.
-const MIN_PUSH_BUDGET: Duration = Duration::from_secs(1);
 
 /// Default period of the background push.
 const DEFAULT_UPKEEP_INTERVAL: Duration = Duration::from_secs(1);
@@ -82,7 +76,7 @@ async fn push_before_answering(
     }
     let started = Instant::now();
     let response = next.run(request).await;
-    let budget = ANSWER_BUDGET
+    let budget = WRITE_ANSWER_BUDGET
         .saturating_sub(started.elapsed())
         .max(MIN_PUSH_BUDGET);
     match copy.push_committed_within(budget).await {
