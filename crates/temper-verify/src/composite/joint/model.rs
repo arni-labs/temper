@@ -63,8 +63,8 @@ const JOINT_MAX_COUNTER: usize = 3;
 /// Dispatches and module calls in flight at once, as a proof's first walk
 /// holds them. The runtime has no such bound: a person can keep sending
 /// moves whose reactions have not landed, so without one the walk never
-/// ends. A walk that held a move back walks again with one more while it
-/// fits its room (`proof.rs`), and says how many it proved.
+/// ends. A walk that held a move back walks again with twice as many while
+/// it fits its room (`proof/grow.rs`), and says how many it proved.
 pub(super) const FIRST_IN_FLIGHT: usize = 3;
 
 /// When a dispatch lands, against moves from outside.

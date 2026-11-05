@@ -345,11 +345,12 @@ impl LivenessProof<'_> {
         // with the last bound that did.
         while explored.held_back && explored.stopped.is_none() {
             drop(explored);
-            model.hold_one_more();
+            let fitted = model.in_flight();
+            model.hold(fitted * 2);
             explored = walk();
             if explored.stopped.is_some() {
                 drop(explored);
-                model.hold_one_fewer();
+                model.hold(fitted);
                 explored = walk();
                 break;
             }

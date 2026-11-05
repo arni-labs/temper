@@ -69,16 +69,10 @@ impl JointModel {
         self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Let the next walk hold one more in flight than the last.
-    pub(in crate::composite::joint) fn hold_one_more(&self) {
+    /// Let the next walk hold at most `most` in flight.
+    pub(in crate::composite::joint) fn hold(&self, most: usize) {
         self.in_flight
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Let the next walk hold one fewer in flight than the last.
-    pub(in crate::composite::joint) fn hold_one_fewer(&self) {
-        self.in_flight
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            .store(most, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether `state` holds no more in flight than the walk keeps: at most

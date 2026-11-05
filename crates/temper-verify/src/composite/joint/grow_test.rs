@@ -1,5 +1,5 @@
 //! How many dispatches a walk holds in flight: as many as fit its room. A
-//! walk that held a move back walks again with one more.
+//! walk that held a move back walks again with twice as many.
 
 use temper_authz::SendAnalysis;
 use temper_spec::automaton::{Automaton, parse_automaton};
