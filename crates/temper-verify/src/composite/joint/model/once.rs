@@ -13,7 +13,11 @@
 //! while the run holds any. The run's move on the copy it takes, or on the
 //! last to leave, is the walk's move on its one: they are alike, and the
 //! states differ only in copies of it. Its move on any other copy is a
-//! refusal, which changes no record, and the walk waits. So a copy refused
+//! refusal, which changes no record, and the walk waits. A spawn's first
+//! action is the exception: refused, it puts the parent's field back or
+//! arms the child's first timer (`spawn_refused`), so no action a spawn
+//! sends is taken once, whatever the records. No other refusal (by the
+//! record or by Cedar) changes anything. So a copy refused
 //! while its record still takes the action (a guard on another field, a
 //! constraint, Cedar), or refused outside the action's statuses before the
 //! record comes back to them, leaves the walk its copy to land later. The
@@ -43,11 +47,21 @@ use temper_spec::automaton::TargetResolver;
 use super::super::{Dispatch, JointState};
 use super::JointModel;
 use super::copies::base;
+use super::read::Reaction;
 use crate::model::TemperModel;
 
-/// The actions (entity, action) of `models` taken once.
-pub(super) fn taken_once(models: &BTreeMap<String, TemperModel>) -> BTreeSet<(String, String)> {
-    let mut once = BTreeSet::new();
+/// The actions of `models` taken once, by entity, leaving out those a
+/// spawn among `reactions` sends.
+pub(super) fn taken_once(
+    models: &BTreeMap<String, TemperModel>,
+    reactions: &[Reaction],
+) -> BTreeMap<String, BTreeSet<String>> {
+    let spawned: BTreeSet<(&str, &str)> = reactions
+        .iter()
+        .filter(|r| r.spawn.is_some())
+        .map(|r| (base(&r.to), r.target_action.as_str()))
+        .collect();
+    let mut once: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (entity, model) in models {
         let names: BTreeSet<&str> = model.transitions.iter().map(|t| t.name.as_str()).collect();
         for name in names {
@@ -79,8 +93,13 @@ pub(super) fn taken_once(models: &BTreeMap<String, TemperModel>) -> BTreeSet<(St
                 }
                 false
             };
-            if leaves && !ways.iter().filter_map(|t| t.to_state).any(back) {
-                once.insert((entity.clone(), name.to_string()));
+            if leaves
+                && !spawned.contains(&(entity.as_str(), name))
+                && !ways.iter().filter_map(|t| t.to_state).any(back)
+            {
+                once.entry(entity.clone())
+                    .or_default()
+                    .insert(name.to_string());
             }
         }
     }
@@ -95,16 +114,19 @@ impl JointModel {
             && dispatch.unread_guard.is_none()
             && self
                 .taken_once
-                .contains(&(base(&dispatch.to).to_string(), dispatch.action.to_string()))
+                .get(base(&dispatch.to))
+                .is_some_and(|actions| actions.contains(&*dispatch.action))
     }
 
     /// Whether `state` holds a second copy of a dispatch taken once. Copies
-    /// are the same in every field.
+    /// are the same in every field, which is checked last: many alike
+    /// dispatches of other actions can be in flight.
     pub(super) fn holds_a_second_copy(&self, state: &JointState) -> bool {
-        state
-            .inflight
-            .windows(2)
-            .any(|pair| pair[0] == pair[1] && self.once(&pair[0]))
+        !self.taken_once.is_empty()
+            && state
+                .inflight
+                .windows(2)
+                .any(|pair| self.once(&pair[0]) && pair[0] == pair[1])
     }
 
     /// `state` with one copy of each dispatch taken once.
@@ -112,7 +134,7 @@ impl JointModel {
         if self.holds_a_second_copy(state) {
             state
                 .inflight
-                .dedup_by(|later, kept| later == kept && self.once(kept));
+                .dedup_by(|later, kept| self.once(kept) && later == kept);
         }
     }
 
@@ -132,6 +154,6 @@ impl JointModel {
             .map(|r| base(&r.to))
             .collect();
         self.taken_once
-            .retain(|(entity, _)| !made.contains(entity.as_str()));
+            .retain(|entity, _| !made.contains(entity.as_str()));
     }
 }

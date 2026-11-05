@@ -373,3 +373,82 @@ fn a_copy_refused_while_its_record_still_takes_it_leaves_one_to_land() {
         "{result}"
     );
 }
+
+/// Each `Go` spawns the same `Run` with `Start`, storing its id in `run`.
+const SPAWNER: &str = r#"[automaton]
+name = "Job"
+states = ["Empty"]
+initial = "Empty"
+
+[[state]]
+name = "run"
+type = "string"
+initial = ""
+
+[[state]]
+name = "kid"
+type = "string"
+initial = "r1"
+
+[[state]]
+name = "p"
+type = "string"
+initial = "x"
+
+[[action]]
+name = "Go"
+kind = "input"
+from = ["Empty"]
+to = "Empty"
+effect = ["spawn('Run', 'Start', run, 'r1', copy(p))"]
+
+[[invariant]]
+name = "started_is_named"
+assert = "Run[kid].status != 'Going' || run != ''"
+"#;
+
+/// `Start` is taken once, and refused until `Tag` sets the field its
+/// parameter must equal.
+const SPAWNED: &str = r#"[automaton]
+name = "Run"
+states = ["New", "Going"]
+initial = "New"
+
+[[state]]
+name = "tag"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Start"
+kind = "input"
+from = ["New"]
+to = "Going"
+params = [{ name = "p", type = "string" }]
+
+[[action.constraints]]
+kind = "param_equals_field"
+param = "p"
+field = "tag"
+
+[[action]]
+name = "Tag"
+kind = "input"
+from = ["New"]
+to = "New"
+effect = ["tag = 'x'"]
+"#;
+
+const SPAWN_POLICIES: &str =
+    r#"permit(principal, action in [Action::"Go", Action::"Tag"], resource);"#;
+
+#[test]
+fn a_refused_first_action_of_a_spawn_keeps_every_copy() {
+    // Two Go send two Starts; one is refused before Tag, which puts `run`
+    // back, and the other lands after it: the run is Going and unnamed.
+    let result = invariant(&[SPAWNER, SPAWNED], SPAWN_POLICIES);
+    assert!(
+        matches!(result.outcome, JointOutcome::Broken { .. }),
+        "{result}"
+    );
+}
