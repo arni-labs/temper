@@ -3,18 +3,26 @@
 //!
 //! An action is taken once when each of its transitions leaves to a status
 //! from which no transition of its type (any action, any guard) leads back
-//! to a status the action is allowed from. Then, of identical dispatches of
-//! it to one record (the same in every field), at most one is taken: once
-//! one is, the record can never take another, and each other copy lands
-//! refused, which only takes it out of flight. So the walk keeps one copy
-//! and drops a second as it is sent. A run with `k` copies goes where the
-//! walk goes with one, landing its first copy that is taken as the walk
-//! lands its one (both are in flight, on the same record), and refusing the
-//! others in the same state the walk is in, which changes nothing it keeps;
-//! the walk's one copy, refused, stands for the run refusing all of them at
-//! once. So a rule, read where nothing is in flight, finds the same either
-//! way. Dropping the copy, rather than holding back the move that sent it,
-//! keeps the move and the rest of what it does.
+//! to a status the action is allowed from. Of identical dispatches of it to
+//! one record (the same in every field: parameters, sender `by`, the
+//! reaction `via` and chain that sent it, so Cedar answers each alike), at
+//! most one is ever taken, and the walk keeps one copy, dropping a second
+//! as it is sent.
+//!
+//! Why one is enough. A run with any number of copies and the walk with one
+//! keep the same records and the same else in flight. The run's move on the
+//! copy it takes, or, if it takes none, on the last to leave, is the walk's
+//! move on its one: the two are alike and the state reads alike. Its move on
+//! any other copy is a read or a refusal, which changes no record, and the
+//! walk waits. So a copy refused while its record still takes the action
+//! (a guard on another field, a constraint, Cedar) leaves the walk its copy
+//! to land later. Back the other way, the walk's state with the run's other
+//! copies added is the run's: once the walk's copy is taken the record
+//! never takes another, and once it is refused the others can be refused
+//! there too, so the run empties to the walk's records. A rule, read where
+//! nothing is in flight, finds the same. Dropping the copy, rather than
+//! holding back the move that sent it, keeps the move and the rest of what
+//! it does.
 //!
 //! Identical copies come from separate commits: one commit sends each
 //! reaction once, and two of its reactions differ in `via`. A record that

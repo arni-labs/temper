@@ -292,3 +292,84 @@ fn four_different_dispatches_in_flight_still_break_the_rule() {
         "{result}"
     );
 }
+
+/// `Go` may be sent again and again while `A` is idle, each time sending
+/// `B` the same `Propose`; `Stop` sends `B` the `Ready` that `Propose`'s
+/// guard waits for.
+const READIER: &str = r#"[automaton]
+name = "A"
+states = ["Idle", "Shut", "Never"]
+initial = "Idle"
+
+[[action]]
+name = "Go"
+kind = "input"
+from = ["Idle"]
+to = "Idle"
+
+[[action.triggers]]
+name = "propose"
+kind = "entity"
+target_entity = "B"
+target_action = "Propose"
+resolve_target = { kind = "same_id" }
+
+[[action]]
+name = "Stop"
+kind = "input"
+from = ["Idle"]
+to = "Shut"
+
+[[action.triggers]]
+name = "ready"
+kind = "entity"
+target_entity = "B"
+target_action = "Ready"
+resolve_target = { kind = "same_id" }
+"#;
+
+/// `Propose` is taken once, but refused while `ready` is false: a copy that
+/// lands before `Ready` leaves `B` looking, still able to take the next.
+const WAITER: &str = r#"[automaton]
+name = "B"
+states = ["Looking", "Proposed"]
+initial = "Looking"
+
+[[state]]
+name = "ready"
+type = "bool"
+initial = false
+
+[[action]]
+name = "Propose"
+kind = "internal"
+from = ["Looking"]
+to = "Proposed"
+guard = "ready"
+
+[[action]]
+name = "Ready"
+kind = "internal"
+from = ["Looking"]
+to = "Looking"
+effect = ["ready = true"]
+
+[[invariant]]
+name = "never_proposed"
+assert = "status != 'Proposed' || !ready || A[Id].status == 'Never'"
+"#;
+
+const READY_POLICIES: &str = r#"permit(principal, action in [Action::"Go", Action::"Stop"], resource);
+permit(principal, action, resource) when { context has via && context.via != "request" };
+"#;
+
+#[test]
+fn a_copy_refused_while_its_record_still_takes_it_leaves_one_to_land() {
+    // A run may land one copy before Ready, refused, and a second after it,
+    // taken. The walk's one copy waits in flight for Ready and lands then.
+    let result = invariant(&[READIER, WAITER], READY_POLICIES);
+    assert!(
+        matches!(result.outcome, JointOutcome::Broken { .. }),
+        "{result}"
+    );
+}
