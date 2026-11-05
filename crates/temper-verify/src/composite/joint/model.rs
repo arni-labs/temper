@@ -21,6 +21,7 @@ mod read;
 mod silent;
 mod spawn;
 mod step;
+mod timer;
 mod walk;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,7 +32,7 @@ use temper_spec::predicate::{Expr, Name, eval};
 
 use super::JointState;
 use super::env::{Blind, ID, JointEnv, Records};
-use super::senders::{OUTSIDE, Senders};
+use super::senders::{OUTSIDE, Senders, standing};
 use super::slice::slice;
 use super::state::canonical;
 use crate::model::semantics::{Expansion, rule_for, string_values};
@@ -241,16 +242,21 @@ impl JointModel {
         // A reaction that declares no principal runs as whoever sent its
         // source action.
         let inherits = reactions.iter().filter(|r| r.principal.is_none());
-        let sender_matters: BTreeSet<String> = inherits.clone().map(|r| r.from.clone()).collect();
+        let mut sender_matters: BTreeSet<String> =
+            inherits.clone().map(|r| r.from.clone()).collect();
         let inheriting = inherits
             .map(|r| (r.to.clone(), r.target_action.clone()))
             .collect();
+        // A timer whose setter's standing can be lost fires as its setter.
+        let standing = standing(by_name, scope, sending.policies);
+        sender_matters.extend(standing.iter().cloned());
         let senders = Senders::new(
             by_name,
             scope,
             sending.policies,
             &sender_matters,
             &inheriting,
+            &standing,
             sending.reserve,
         );
         classes.narrow(&mut models, |field| senders.reads_field(field));
@@ -351,15 +357,6 @@ impl JointModel {
         }
         memory.set(self.senders.construction_bytes())?;
         Ok(self)
-    }
-
-    /// `entity`'s timer in `status`, when the model makes timers fire.
-    pub(super) fn timeout(&self, entity: &str, status: &str) -> Option<&Timeout> {
-        self.kernel
-            .timers
-            .get(entity)?
-            .iter()
-            .find(|timeout| timeout.state == status)
     }
 
     /// The strings `state` holds, in records and in dispatches.
