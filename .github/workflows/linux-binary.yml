@@ -8,8 +8,9 @@ name: Linux binary
 #
 # Built on ubuntu-22.04 so its glibc is no newer than the sandbox image's. Tagged releases stay with release.yml.
 #
-# Each release also lists every repository file its build read (`temper-x86_64-linux.inputs`: cargo's dep-info for the
-# binary, every Cargo.toml, Cargo.lock, the toolchain file and this workflow). A push that changes none of the files its
+# Each release also lists the repository files its build depends on (`temper-x86_64-linux.inputs`: every file git
+# tracks in each crate cargo's dep-info for the binary names, every Cargo.toml, Cargo.lock, the toolchain file and this
+# workflow). A push that changes none of the files its
 # previous commit's release lists builds nothing: it publishes that release's binary again under its own tag, same
 # bytes and same sha256, so a change that touches no build input (a document) is live as soon as the binary it already
 # runs is named for it. That binary's /version still names the commit it was built from.
@@ -139,13 +140,21 @@ jobs:
             mkdir -p out
             cp target/release/temper out/temper-x86_64-linux
             (cd out && sha256sum temper-x86_64-linux > temper-x86_64-linux.sha256)
-            # Every repository file the build read: cargo's dep-info for the binary, plus what cargo reads before it.
+            # The build's inputs: every file git tracks in each crate cargo's dep-info names a file of, since a crate can
+            # read files cargo does not record (sqlx::migrate! reads its migrations directory), plus what cargo reads first.
             root="$PWD/"
             perl -pe 's/^[^:]*:\s*//; s/\\ /\x01/g; s/\s+/\n/g; s/\x01/ /g' target/release/temper.d |
-              sed -n "s|^$root||p" > out/inputs
-            { cat out/inputs; git ls-files '*Cargo.toml' Cargo.lock rust-toolchain.toml rust-toolchain .cargo .github/workflows/linux-binary.yml; } |
+              sed -n "s|^$root||p" > out/read
+            while IFS= read -r file; do
+              dir="$(dirname "$file")"
+              while [ "$dir" != . ] && [ ! -f "$dir/Cargo.toml" ]; do dir="$(dirname "$dir")"; done
+              [ "$dir" = . ] || echo "$dir"
+            done < out/read | sort -u > out/crates
+            echo "$(wc -l < out/crates) crates"
+            { cat out/read; tr '\n' '\0' < out/crates | xargs -0 -r git ls-files --;
+              git ls-files '*Cargo.toml' Cargo.lock rust-toolchain.toml rust-toolchain .cargo .github/workflows/linux-binary.yml; } |
               sort -u > out/temper-x86_64-linux.inputs
-            rm out/inputs
+            rm out/read out/crates
             echo "$(wc -l < out/temper-x86_64-linux.inputs) build inputs"
             notes="Built from $GITHUB_SHA on ubuntu-22.04 by linux-binary.yml."
           fi
