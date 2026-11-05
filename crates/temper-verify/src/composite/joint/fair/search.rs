@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use temper_spec::automaton::Fairness;
 
-use super::super::model::{Edge, MoveKind};
+use super::super::model::{Edge, HeldBack, MoveKind};
 use super::graph::Graph;
 
 /// One fairness constraint: a set of moves that is taken in the end.
@@ -214,7 +214,7 @@ impl View<'_> {
                 ways.any(|edge| edge.sure && moves(edge))
                     || (made.covered && self.graph.edges_of(row).all(|(_, edge)| moves(edge)))
             }
-            Side::Must => made.held || ways.any(moves),
+            Side::Must => made.held != HeldBack::Nothing || ways.any(moves),
         }
     }
 

@@ -4,10 +4,10 @@
 //! the records to a state where the condition holds. From every reachable
 //! joint state, the moves the system makes (state timers, module answers,
 //! the kernel's dispatches and reactions, and the actions outside code is
-//! relied on to send while the condition is false) can lead to a state with
-//! nothing in flight where it holds. Every reachable state is a start,
-//! because a person's move can lead anywhere and nobody is assumed to come
-//! back and fix it.
+//! relied on to send while the condition is false) can lead to a state where
+//! it holds and nothing in flight can change what it reads. Every reachable
+//! state is a start, because a person's move can lead anywhere and nobody is
+//! assumed to come back and fix it.
 //!
 //! "Can lead" is what is checked: a path of system moves exists. In a finite
 //! model that is what "eventually, as long as each move the system can keep
@@ -84,6 +84,9 @@ pub struct JointLivenessResult {
     /// When the walk held a move back because it would have put more than
     /// this many dispatches and module calls in flight.
     pub in_flight_bound: Option<usize>,
+    /// With a bound: every move held back past it changes nothing the
+    /// condition reads, so what it found holds with more in flight too.
+    pub held_aside: bool,
     /// Settles, stuck (with a shortest path to a state it cannot leave),
     /// proves nothing, or not fully checked.
     pub outcome: LivenessOutcome,
@@ -180,9 +183,12 @@ impl JointLivenessResult {
                 self.relies_on.join(", ")
             )
         };
-        let bound = self.in_flight_bound.map_or(String::new(), |bound| {
-            format!("; with at most {bound} dispatches and calls in flight")
-        });
+        let bound = super::in_flight_words(
+            self.in_flight_bound,
+            self.held_aside,
+            "dispatches and calls",
+        )
+        .map_or(String::new(), |words| format!("; {words}"));
         match &self.outcome {
             LivenessOutcome::Holds => write!(
                 f,
@@ -239,7 +245,9 @@ pub fn verify_joint_liveness(
         .collect()
 }
 
-/// What a rule's condition says of each walked state.
+/// What a rule's condition says of each walked state. "Nothing in flight"
+/// is nothing in flight that can change what the condition reads
+/// ([`JointModel::quiet`]): what else lands leaves it as it is.
 pub(super) struct Marks {
     /// It holds there, with nothing in flight.
     pub(super) done: Vec<bool>,
@@ -273,9 +281,10 @@ pub(super) fn marks(
         if let (false, Some(premise)) = (marks.met, premise) {
             marks.met = eval(premise, &env) != Truth::False;
         }
+        let quiet = model.quiet(&state);
         marks.failing[index] = truth != Truth::True;
-        marks.done[index] = truth == Truth::True && state.settled();
-        marks.maybe_done[index] = truth != Truth::False && state.settled();
+        marks.done[index] = truth == Truth::True && quiet;
+        marks.maybe_done[index] = truth != Truth::False && quiet;
     }
     marks
 }

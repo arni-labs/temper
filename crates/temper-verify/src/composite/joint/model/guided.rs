@@ -441,7 +441,7 @@ impl<'m, 'a> Engine<'m, 'a> {
                 self.too_big.insert(kind);
                 continue;
             };
-            self.stats.held_back |= held_back;
+            self.stats.held_back |= held_back != super::HeldBack::Nothing;
             for next in nexts {
                 let score = if anywhere {
                     0

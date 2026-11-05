@@ -30,7 +30,7 @@ use crate::model::{Fields, ModelString, ParamValue, TemperModelState, fresh_stri
 #[derive(Debug, Clone)]
 pub(super) struct Spawn {
     /// The field of the parent that holds the child's id.
-    store_id_in: Option<String>,
+    pub(super) store_id_in: Option<String>,
     /// The child's id, when the spawn names one and it is present.
     id: Option<Arg>,
     /// What the kernel gives every child about its parent. These win over

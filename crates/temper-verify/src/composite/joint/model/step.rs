@@ -12,7 +12,7 @@ use super::super::state::canonical;
 use super::super::{Call, Dispatch, JointState};
 use super::commit::add;
 use super::labels::rename_label;
-use super::{Delivery, JointModel};
+use super::{Delivery, HeldBack, JointModel};
 use crate::model::TemperModelAction;
 
 #[path = "guard.rs"]
@@ -65,16 +65,16 @@ pub(in crate::composite::joint) struct Next {
 
 impl JointModel {
     /// The states `mv` leads to from `state`, each with what the model knows
-    /// of it, and whether a state was held back because it would put more
-    /// than [`JointModel::in_flight`] dispatches in flight.
+    /// of it, and what it held back because it would put more than
+    /// [`JointModel::in_flight`] dispatches in flight.
     pub(in crate::composite::joint) fn next(
         &self,
         state: &JointState,
         mv: &Move,
-    ) -> (Vec<Next>, bool) {
+    ) -> (Vec<Next>, HeldBack) {
         match self.outcomes(state, mv) {
             Some(outcomes) => self.finished(state, mv, outcomes),
-            None => (Vec::new(), false),
+            None => (Vec::new(), HeldBack::Nothing),
         }
     }
 
@@ -357,16 +357,17 @@ impl JointModel {
         state: &JointState,
         mv: &Move,
         outcomes: Vec<Outcome>,
-    ) -> (Vec<Next>, bool) {
+    ) -> (Vec<Next>, HeldBack) {
         use Certainty::Unsure;
         let unsure = self.unsure(state, mv);
-        let mut held_back = false;
+        let mut held_back = HeldBack::Nothing;
         let mut nexts = Vec::new();
         for (mut outcome, text, certainty) in outcomes {
             let certainty = if unsure { Unsure } else { certainty };
-            let fits = self.delivery == Delivery::BeforeNextRequest || self.fits(&outcome);
-            held_back |= !fits;
-            if !fits {
+            if self.delivery != Delivery::BeforeNextRequest && !self.fits(&outcome) {
+                if held_back != HeldBack::Reaching {
+                    held_back = held_back.max(self.held_back(state, &outcome));
+                }
                 continue;
             }
             self.order.normalize(&mut outcome);

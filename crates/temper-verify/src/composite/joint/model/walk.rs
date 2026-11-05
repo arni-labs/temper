@@ -7,8 +7,8 @@ use super::super::pack::{Packed, Packer};
 use super::super::room::{Held, MB};
 use super::super::state::render;
 use super::super::{JointOutcome, JointState, JointStep};
-use super::JointModel;
 use super::step::Next;
+use super::{HeldBack, JointModel};
 
 mod checked;
 mod conditions;
@@ -27,8 +27,8 @@ pub(in crate::composite::joint) struct Walk {
     pub(in crate::composite::joint) states: usize,
     /// One per invariant.
     pub(in crate::composite::joint) outcomes: Vec<JointOutcome>,
-    /// Whether a move was held back for [`super::JointModel::in_flight`].
-    pub(in crate::composite::joint) held_back: bool,
+    /// What moves held back for [`super::JointModel::in_flight`] held back.
+    pub(in crate::composite::joint) held_back: HeldBack,
     /// Whether it stopped before seeing every state.
     pub(in crate::composite::joint) stopped: bool,
     /// One per invariant: when it is false only where the walk went by a
@@ -49,8 +49,9 @@ pub(in crate::composite::joint) struct Made {
     /// It always ends in one of the states its edges reach: it leads
     /// somewhere, none of its states is unsure, and none was held back.
     pub(in crate::composite::joint) covered: bool,
-    /// The walk held back a way it may go, over the bound on what is in flight.
-    pub(in crate::composite::joint) held: bool,
+    /// What the walk held back of the ways it may go, over the bound on
+    /// what is in flight.
+    pub(in crate::composite::joint) held: HeldBack,
 }
 
 /// A move's way from one walked state to another.
@@ -151,8 +152,8 @@ pub(in crate::composite::joint) struct Explored<'a> {
     pub(in crate::composite::joint) edges: Vec<Edge>,
     /// Why the walk stopped before seeing every state.
     pub(in crate::composite::joint) stopped: Option<String>,
-    /// Whether a move was held back for [`super::JointModel::in_flight`].
-    pub(in crate::composite::joint) held_back: bool,
+    /// What moves held back for [`super::JointModel::in_flight`] held back.
+    pub(in crate::composite::joint) held_back: HeldBack,
     /// How many moves from a start it covered: it walked every state that near.
     pub(in crate::composite::joint) covered: usize,
     /// How many moves it was working at when it ended.

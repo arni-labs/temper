@@ -13,7 +13,8 @@ use temper_spec::predicate::{Expr, Name, Truth, eval};
 
 impl JointModel {
     /// Walk every reachable joint state breadth first, checking `invariants`
-    /// of `owner` in each settled one (nothing in flight). An invariant is
+    /// of `owner` in each settled one: nothing in flight can change what
+    /// they read ([`JointModel::quiet`]). An invariant is
     /// broken only where sure moves alone lead: elsewhere the walk may have
     /// gone a way the runtime never goes, so it cannot tell.
     pub(in crate::composite::joint) fn walk(
@@ -68,7 +69,7 @@ impl JointModel {
             );
             return Walk {
                 states: 0,
-                held_back: false,
+                held_back: super::super::HeldBack::Nothing,
                 stopped: false,
                 outside: vec![BTreeSet::new(); invariants.len()],
                 outcomes: invariants
@@ -88,7 +89,7 @@ impl JointModel {
             let premises: Vec<Option<Expr>> =
                 premises.iter().map(|premise| premise.cloned()).collect();
             self.walk_with(bound, Keep::Sure, move |model, index, state, sure| {
-                if state.settled() {
+                if model.quiet(state) {
                     for (i, inv) in invariants.iter().enumerate() {
                         match model.rule_truth(&owner, inv, state) {
                             Truth::False if sure => found.broken(i, index),
@@ -190,7 +191,8 @@ struct Found {
     /// The state it is false in that sure moves alone may not reach.
     maybe: Vec<AtomicUsize>,
     unknown: Vec<AtomicBool>,
-    /// A settled state met its premise, or it has none.
+    /// A state where nothing in flight can change what it reads met its
+    /// premise, or it has none.
     met: Vec<AtomicBool>,
 }
 

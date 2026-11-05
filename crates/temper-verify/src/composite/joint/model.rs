@@ -8,6 +8,7 @@ mod alike;
 mod chosen;
 mod classes;
 mod commit;
+mod cone;
 pub(in crate::composite::joint) mod copies;
 mod drops;
 mod fair_key;
@@ -44,6 +45,8 @@ use crate::model::{
 use held::PerThread;
 
 pub(super) use classes::Classes;
+use cone::Cone;
+pub(super) use cone::HeldBack;
 pub use drops::DroppedReaction;
 pub(crate) use drops::dropped_reactions;
 pub(super) use fair_key::{FairKey, MoveKind};
@@ -172,6 +175,8 @@ pub(super) struct JointModel {
     idle: std::sync::OnceLock<BTreeSet<(String, String)>>,
     /// How many may be in flight at once in this walk ([`FIRST_IN_FLIGHT`]).
     in_flight: std::sync::atomic::AtomicUsize,
+    /// What its rules read, and which moves can change that.
+    cone: Cone,
 }
 
 impl JointModel {
@@ -226,7 +231,9 @@ impl JointModel {
                     .extend(literals);
             }
         }
-        Self::compose(by_name, scope, (models, reactions), &read, sending, cut)
+        let mut model = Self::compose(by_name, scope, (models, reactions), &read, sending, cut);
+        model.cone = model.cone_of(owner, reads);
+        model
     }
 
     /// The model of `models` and `reactions` over `scope`, one record per
@@ -370,6 +377,7 @@ impl JointModel {
             settled: std::sync::OnceLock::new(),
             idle: std::sync::OnceLock::new(),
             in_flight: FIRST_IN_FLIGHT.into(),
+            cone: Cone::whole(),
         }
     }
 

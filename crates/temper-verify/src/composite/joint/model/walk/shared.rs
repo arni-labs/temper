@@ -6,7 +6,7 @@
 //! most a step, and one thread stops where it stopped the last time: the same
 //! specs in the same room give the same walk.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use dashmap::DashMap;
@@ -50,7 +50,8 @@ pub(super) struct Shared {
     pub(super) seen: DashMap<Packed, Seen, rustc_hash::FxBuildHasher>,
     /// The walk is over: a visit said so, or the room said no.
     pub(super) stop: AtomicBool,
-    pub(super) held_back: AtomicBool,
+    /// The most a move held back, as [`super::super::HeldBack`] numbers it.
+    pub(super) held_back: AtomicU8,
     /// The bytes each thread's expansion may build, as the room allows.
     pub(super) build_room: AtomicUsize,
     /// The bytes an expansion that did not fit asks for.

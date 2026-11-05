@@ -9,7 +9,8 @@ use super::super::{JointState, JointStep};
 
 /// Which walked states any move the system makes may lead to the goal from:
 /// every way it may go counts, sure or not, and so does a move the walk held
-/// a way of back.
+/// a way of back that can change what the goal reads. One that cannot leads
+/// where its state leads already ([`model::HeldBack::Aside`]).
 pub(super) fn may_reach(explored: &Explored, done: &[bool], failing: &[bool]) -> Vec<bool> {
     let usable = |made: &Made| {
         made.by_system || made.outside || (made.relied && failing[made.from as usize])
@@ -25,7 +26,7 @@ pub(super) fn may_reach(explored: &Explored, done: &[bool], failing: &[bool]) ->
     for made in explored
         .made
         .iter()
-        .filter(|made| made.held && usable(made))
+        .filter(|made| made.held == model::HeldBack::Reaching && usable(made))
     {
         good[made.from as usize] = true;
     }

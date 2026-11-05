@@ -10,7 +10,7 @@ use temper_spec::predicate::Expr;
 
 use super::fair::{FairOutcome, FairVerdict, fair_bytes, fair_check};
 use super::liveness::{settle, settle_bytes};
-use super::model::{self, JointModel, Sending};
+use super::model::{self, HeldBack, JointModel, Sending};
 use super::room::{Bound, Construction, MB, Room};
 use super::{JointInvariantResult, JointLivenessResult, JointOutcome, LivenessOutcome};
 
@@ -104,6 +104,7 @@ impl InvariantProof<'_> {
             states,
             records,
             in_flight_bound: None,
+            held_aside: false,
             outcome,
         };
         let model = match &self.model {
@@ -133,7 +134,9 @@ impl InvariantProof<'_> {
             .zip(walk.outcomes)
             .map(|(inv, outcome)| {
                 let mut found = result(inv, walk.states, outcome);
-                found.in_flight_bound = walk.held_back.then_some(model.in_flight());
+                found.in_flight_bound =
+                    (walk.held_back != HeldBack::Nothing).then_some(model.in_flight());
+                found.held_aside = walk.held_back == HeldBack::Aside;
                 found
             })
             .collect();
@@ -314,6 +317,7 @@ impl LivenessProof<'_> {
             scope: self.scope.iter().cloned().collect(),
             states: 0,
             in_flight_bound: None,
+            held_aside: false,
             outcome: LivenessOutcome::Holds,
             fair: None,
         };
@@ -323,6 +327,7 @@ impl LivenessProof<'_> {
                 strong: fairness.strong.clone(),
                 relies_on: self.relies_on.clone(),
                 in_flight_bound: None,
+                held_aside: false,
                 outcome,
             })
         };
@@ -338,25 +343,13 @@ impl LivenessProof<'_> {
                 return result;
             }
         };
-        let walk = || model.walk_with(bound, model::Keep::Edges, |_, _, _, _| false);
-        let mut explored = walk();
-        // As for invariants ([`grow::grown_walk`]); one walk's tables are given back
-        // before the next is made, and one that does not fit is walked again
-        // with the last bound that did.
-        while explored.held_back && explored.stopped.is_none() {
-            drop(explored);
-            let fitted = model.in_flight();
-            model.hold(fitted * 2);
-            explored = walk();
-            if explored.stopped.is_some() {
-                drop(explored);
-                model.hold(fitted);
-                explored = walk();
-                break;
-            }
-        }
+        let mut explored = grow::grown_explored(model, || {
+            model.walk_with(bound, model::Keep::Edges, |_, _, _, _| false)
+        });
         result.states = explored.len();
-        result.in_flight_bound = explored.held_back.then_some(model.in_flight());
+        result.in_flight_bound =
+            (explored.held_back != HeldBack::Nothing).then_some(model.in_flight());
+        result.held_aside = explored.held_back == HeldBack::Aside;
         let settling = settle_bytes(&explored);
         // Past where the walk stops, phase two (`model/guided.rs`).
         if let Some(reason) = explored.stopped.clone() {
@@ -404,6 +397,7 @@ impl LivenessProof<'_> {
             };
             result.fair = verdict(outcome).map(|mut fair| {
                 fair.in_flight_bound = result.in_flight_bound;
+                fair.held_aside = result.held_aside;
                 fair
             });
         }

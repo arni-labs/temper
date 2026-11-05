@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 
 use super::super::super::Dispatch;
 use super::super::super::state::render;
+use super::super::HeldBack;
 use super::super::moves::dispatch_move;
 use super::super::step::{Certainty, Move};
 use super::checked::{BATCH, To, Walked, Walker, Walking, Way};
@@ -103,12 +104,14 @@ impl Walker {
         let check = check_step(walking.memo.steps);
         let mut made_here = Vec::new();
         let made = self.note_move(target, walking);
-        let (mut held, mut covered, mut ways) = (false, true, 0);
+        let (mut held, mut covered, mut ways) = (HeldBack::Nothing, true, 0);
         for way in slot.ways() {
             let (known, list) = walking.memo.way(way, state);
             let known = if unsure { Certainty::Unsure } else { known };
             if !model.settled_quietly(&mut *walking.memo, list, &self.shared.packer) {
-                held = true;
+                if held != HeldBack::Reaching {
+                    held = held.max(model.held_back(state, &walking.memo.scratch));
+                }
                 continue;
             }
             if check {
@@ -169,7 +172,7 @@ impl Walker {
                 }
                 self.built(|| model.finished(state, &mv, outcomes.clone()))?
             }
-            None => (Vec::new(), false),
+            None => (Vec::new(), HeldBack::Nothing),
         };
         let made = self.note_move(target, walking);
         let covered = !nexts.is_empty() && nexts.iter().all(|n| n.certainty != Certainty::Unsure);
@@ -192,21 +195,23 @@ impl Walker {
                 relied: self.model.relies(&mv),
                 outside: mv.is_outside_reaction(),
                 covered: false,
-                held: false,
+                held: HeldBack::Nothing,
             });
         }
         walking.batch.made.len().saturating_sub(1) as u32
     }
 
     /// Say what the move `made` came to.
-    fn settle_move(&self, made: u32, held: bool, covered: bool, walking: &mut Walking<'_>) {
-        if held {
-            self.shared.held_back.store(true, Ordering::Relaxed);
+    fn settle_move(&self, made: u32, held: HeldBack, covered: bool, walking: &mut Walking<'_>) {
+        if held != HeldBack::Nothing {
+            self.shared
+                .held_back
+                .fetch_max(held as u8, Ordering::Relaxed);
         }
         if self.keep == Keep::Edges {
             let made = &mut walking.batch.made[made as usize];
             made.held = held;
-            made.covered = !held && covered;
+            made.covered = held == HeldBack::Nothing && covered;
         }
     }
 

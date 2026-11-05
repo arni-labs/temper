@@ -9,7 +9,7 @@ use temper_authz::SendAnalysis;
 use temper_spec::automaton::Automaton;
 use temper_spec::predicate::Expr;
 
-use super::super::model;
+use super::super::model::{self, HeldBack};
 use super::super::room::{Bound, Construction, Room};
 use super::super::{JointInvariantResult, JointOutcome};
 use super::{InvariantProof, invariant_model};
@@ -173,7 +173,9 @@ impl<'room> Wider<'room> {
                 JointOutcome::Broken { path } => {
                     found.scope = scope.iter().cloned().collect();
                     found.states = walk.states;
-                    found.in_flight_bound = walk.held_back.then_some(model.in_flight());
+                    found.in_flight_bound =
+                        (walk.held_back != HeldBack::Nothing).then_some(model.in_flight());
+                    found.held_aside = walk.held_back == HeldBack::Aside;
                     found.outcome = JointOutcome::Broken { path: path.clone() };
                     continue;
                 }

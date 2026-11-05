@@ -11,10 +11,10 @@ use super::super::super::liveness::{settle, settle_bytes};
 use super::super::super::pack::{Packed, Packer};
 use super::super::super::room::{Bound, Held, block};
 use super::super::super::{JointState, LivenessOutcome, StuckCase};
-use super::super::JointModel;
 use super::super::held::Tables;
 use super::super::step::Certainty;
 use super::super::walk::{Edge, Explored, Made, Node, Via};
+use super::super::{HeldBack, JointModel};
 use super::{Budget, Engine, Look, could_not_start, plain, print, reads, seeds};
 
 /// What a confirming walk found.
@@ -38,7 +38,7 @@ impl Engine<'_, '_> {
             made: Vec::new(),
             edges: Vec::new(),
             stopped: None,
-            held_back: false,
+            held_back: HeldBack::Nothing,
             covered: 0,
             reached: 0,
             held: Held::new(self.bound),
@@ -76,14 +76,14 @@ impl Engine<'_, '_> {
                     }
                     let ((nexts, held), built) =
                         model.within(&mut sub.held, &mut tables, || model.next(&state, mv))?;
-                    sub.held_back |= held;
+                    sub.held_back = sub.held_back.max(held);
                     tables.reserve(&mut sub, &mut seen, &mut queue, true, 0, nexts.len())?;
                     sub.made.push(Made {
                         from: index as u32,
                         by_system: mv.by_system(),
                         relied,
                         outside: mv.is_outside_reaction(),
-                        covered: !held
+                        covered: held == HeldBack::Nothing
                             && !nexts.is_empty()
                             && nexts.iter().all(|n| n.certainty != Certainty::Unsure),
                         held,

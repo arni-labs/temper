@@ -206,6 +206,12 @@ impl Order {
         }
     }
 
+    /// Each family's fields. A family is kept as one, so whatever reads one
+    /// of its fields reads them all.
+    pub(super) fn family_fields(&self) -> impl Iterator<Item = &BTreeSet<Field>> {
+        self.families.iter().map(|family| &family.fields)
+    }
+
     /// The counters of `entity` kept as sequence numbers, each with the largest
     /// value the model gives one.
     pub(super) fn fields<'a>(&'a self, entity: &'a str) -> impl Iterator<Item = (&'a str, usize)> {

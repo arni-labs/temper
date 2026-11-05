@@ -1,6 +1,6 @@
 //! Running a walk: its starts, the checker's threads, and what they found.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
@@ -10,7 +10,7 @@ use stateright::{Checker, Model};
 use super::super::super::JointState;
 use super::super::super::pack::{Packed, Packer};
 use super::super::super::room::{Bound, Held, bytes, grow, map_bytes};
-use super::super::JointModel;
+use super::super::{HeldBack, JointModel};
 use super::checked::Walker;
 use super::levels::Levels;
 use super::nodes::Nodes;
@@ -45,7 +45,7 @@ impl JointModel {
             made: Vec::new(),
             edges: Vec::new(),
             stopped: None,
-            held_back: false,
+            held_back: HeldBack::Nothing,
             covered: 0,
             reached: 0,
             held: Held::new(bound),
@@ -119,7 +119,7 @@ impl JointModel {
             packer: RwLock::new(std::mem::take(&mut explored.packer)),
             seen,
             stop: AtomicBool::new(false),
-            held_back: AtomicBool::new(false),
+            held_back: AtomicU8::new(HeldBack::Nothing as u8),
             build_room: AtomicUsize::new(BUILD_ROOM),
             wanted: AtomicUsize::new(0),
             waiting: AtomicUsize::new(starts as usize),
@@ -156,7 +156,7 @@ impl JointModel {
         explored.made = trail.made;
         explored.edges = trail.edges;
         explored.packer = shared.packer.into_inner().expect("a walk thread panicked");
-        explored.held_back = shared.held_back.load(Ordering::Relaxed);
+        explored.held_back = HeldBack::from_index(shared.held_back.load(Ordering::Relaxed));
         let tables = shared.states.into_inner()
             + explored.packer.bytes()
             + bytes(&explored.nodes)

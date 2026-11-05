@@ -1,15 +1,19 @@
-//! How many in flight a proof's walk holds: as many as fit its room.
+//! How many in flight a proof's walk holds: as many as fit its room, while
+//! what it holds back can change what the rule reads.
 
 use super::JointOutcome;
-use super::model::{self, JointModel};
+use super::model::{self, HeldBack, JointModel};
 
-/// The walk `walk` makes, with as many in flight as fit: while it held a
-/// move back for [`JointModel::in_flight`], saw every state, and a rule
-/// still holds, walked again with twice as many. Doubling keeps the walks
-/// before the last under the last one's cost together, where one more at a
-/// time walks once for each. A walk that does not fit keeps the last that
-/// did, with the breaks it found sure; the bound is then the last one walked
-/// whole.
+/// The walk `walk` makes, with as many in flight as fit: while it held back
+/// a move for [`JointModel::in_flight`] that can change what a rule reads
+/// ([`HeldBack::Reaching`]), saw every state, and a rule still holds, walked
+/// again with twice as many. A walk that held back only moves that cannot
+/// stops there: the cone's argument (`model/cone.rs`) says more in flight
+/// reaches no value of what the rules read that it has not. Doubling keeps
+/// the walks before the last under the last one's cost together, where one
+/// more at a time walks once for each. A walk that does not fit keeps the
+/// last that did, with the breaks it found sure; the bound is then the last
+/// one walked whole.
 pub(super) fn grown_walk(model: &JointModel, walk: impl Fn() -> model::Walk) -> model::Walk {
     let holds = |w: &model::Walk| {
         w.outcomes
@@ -17,7 +21,7 @@ pub(super) fn grown_walk(model: &JointModel, walk: impl Fn() -> model::Walk) -> 
             .any(|o| matches!(o, JointOutcome::Holds | JointOutcome::Vacuous { .. }))
     };
     let mut last = walk();
-    while last.held_back && !last.stopped && holds(&last) {
+    while last.held_back == HeldBack::Reaching && !last.stopped && holds(&last) {
         let fitted = model.in_flight();
         model.hold(fitted * 2);
         let next = walk();
@@ -36,4 +40,27 @@ pub(super) fn grown_walk(model: &JointModel, walk: impl Fn() -> model::Walk) -> 
         break;
     }
     last
+}
+
+/// As [`grown_walk`], for a liveness rule's walk. One walk's tables are given
+/// back before the next is made, and one that does not fit is walked again
+/// with the last bound that did.
+pub(super) fn grown_explored<'a>(
+    model: &JointModel,
+    walk: impl Fn() -> model::Explored<'a>,
+) -> model::Explored<'a> {
+    let mut explored = walk();
+    while explored.held_back == HeldBack::Reaching && explored.stopped.is_none() {
+        drop(explored);
+        let fitted = model.in_flight();
+        model.hold(fitted * 2);
+        explored = walk();
+        if explored.stopped.is_some() {
+            drop(explored);
+            model.hold(fitted);
+            explored = walk();
+            break;
+        }
+    }
+    explored
 }

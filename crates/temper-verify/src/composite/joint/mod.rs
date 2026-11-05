@@ -40,7 +40,8 @@
 //!   comes with the path that breaks it, to read against the spec.
 //!
 //! Records disagree while a dispatch is on its way, so invariants are
-//! checked in settled states: those with nothing in flight. The walk is
+//! checked in settled states: those with nothing in flight that can change
+//! what they read (`model/cone.rs`). The walk is
 //! breadth first, so each broken invariant's path is a shortest one. A walk
 //! that does not fit in the memory its [`Room`] gives it says so and is
 //! never a pass. Guided walks then go on past where it stopped, by the same
@@ -121,6 +122,9 @@ pub struct JointInvariantResult {
     /// A commit whose reactions wait for their guards to be read counts as
     /// one, however many wait.
     pub in_flight_bound: Option<usize>,
+    /// With a bound: every move held back past it changes nothing the
+    /// invariant reads, so what it found holds with more in flight too.
+    pub held_aside: bool,
     /// Holds, broken (with a shortest path), or not fully checked.
     pub outcome: JointOutcome,
 }
@@ -195,6 +199,21 @@ pub(super) fn condition(path: &[JointStep]) -> String {
     }
 }
 
+/// The words for a walk's bound on what it held in flight, when it held a
+/// move back, and for what it held back when none of that can change what
+/// the rule reads.
+fn in_flight_words(bound: Option<usize>, aside: bool, what: &str) -> Option<String> {
+    let bound = bound?;
+    Some(if aside {
+        format!(
+            "with at most {bound} {what} in flight, past which it held back only moves \
+             that cannot change what the rule reads, so more in flight finds the same"
+        )
+    } else {
+        format!("with at most {bound} {what} in flight")
+    })
+}
+
 impl fmt::Display for JointInvariantResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let scope = self.scope.join(" + ");
@@ -209,8 +228,8 @@ impl fmt::Display for JointInvariantResult {
                     "{}.{} HOLDS{upto} over {} joint states ({scope}",
                     self.entity, self.invariant, self.states
                 )?;
-                match self.in_flight_bound {
-                    Some(bound) => write!(f, "; with at most {bound} dispatches in flight)"),
+                match in_flight_words(self.in_flight_bound, self.held_aside, "dispatches") {
+                    Some(words) => write!(f, "; {words})"),
                     None => f.write_str(")"),
                 }
             }
@@ -320,6 +339,10 @@ mod blank_tests;
 #[cfg(test)]
 #[path = "grow_test.rs"]
 mod grow_tests;
+
+#[cfg(test)]
+#[path = "cone_test.rs"]
+mod cone_tests;
 
 #[cfg(test)]
 #[path = "outside_count_test.rs"]

@@ -321,10 +321,10 @@ impl JointModel {
     }
 
     /// `ways` without those holding more in flight than the walk keeps
-    /// ([`Self::fits`]), but one: a later reaction or call only adds to
-    /// them, so the walk would hold each back, and the one kept says that it
-    /// did. Without it, `k` reactions whose guards the
-    /// model cannot decide make `2^k` ways, nearly all held back.
+    /// ([`Self::fits`]), but one, which says the walk held them back: it has
+    /// the most in flight that can change what the rule reads, so it can if
+    /// any can. Without that, `k` reactions whose guards the model cannot
+    /// decide make `2^k` ways, nearly all held back.
     fn within_flight(
         &self,
         mut ways: Vec<(JointState, Certainty)>,
@@ -333,14 +333,14 @@ impl JointModel {
             return ways;
         }
         let before = ways.heap();
-        let mut over = false;
-        ways.retain(|(state, _)| {
-            if self.fits(state) {
-                return true;
-            }
+        let fits: Vec<bool> = ways.iter().map(|(state, _)| self.fits(state)).collect();
+        let over = (0..ways.len()).filter(|&at| !fits[at]);
+        let kept = over.max_by_key(|&at| self.cone.in_flight(&ways[at].0));
+        if kept.is_some() {
             self.expansion.note_flight_read();
-            !std::mem::replace(&mut over, true)
-        });
+        }
+        let mut at = 0..;
+        ways.retain(|_| at.next().is_some_and(|at| fits[at] || kept == Some(at)));
         self.expansion.give(before.saturating_sub(ways.heap()));
         ways
     }
