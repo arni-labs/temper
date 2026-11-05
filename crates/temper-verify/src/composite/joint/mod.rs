@@ -322,6 +322,10 @@ mod blank_tests;
 mod grow_tests;
 
 #[cfg(test)]
+#[path = "once_test.rs"]
+mod once_tests;
+
+#[cfg(test)]
 #[path = "outside_count_test.rs"]
 mod outside_count_tests;
 
