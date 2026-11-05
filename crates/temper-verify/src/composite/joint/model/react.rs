@@ -1,7 +1,6 @@
 //! What a record's commit sets off: its reactions, as dispatches, and the
 //! module calls its triggers start.
 
-use temper_authz::May;
 use temper_spec::automaton::TargetResolver;
 use temper_spec::predicate::{Arg, Expr, Literal, Name, ParamKind, Truth, VarKind, eval};
 
@@ -294,12 +293,7 @@ impl JointModel {
                         matches!(reaction.resolve, Some(TargetResolver::SameId)),
                     ),
                 };
-                // Cedar refuses it to its sender whatever the records hold,
-                // and a refused reaction changes nothing: it lands as if it
-                // were never sent, so it needn't wait in flight.
-                if reaction.spawn.is_none()
-                    && self.senders.may(dispatch.by, &dispatch.to, &dispatch.action) == May::No
-                {
+                if self.lands_as_nothing(reaction, &dispatch) {
                     if !self.keep(&mut after, state, known) {
                         return Vec::new();
                     }
