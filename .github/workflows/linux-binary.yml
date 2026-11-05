@@ -134,7 +134,7 @@ jobs:
           set -euo pipefail
           tag="main-${GITHUB_SHA:0:12}"
           if [ "$KEPT" = true ]; then
-            notes="No file $FROM was built from changed, so this is $FROM's binary, published again for $GITHUB_SHA by linux-binary.yml."
+            notes="Stands for $GITHUB_SHA: no file $FROM was built from changed, so this is $FROM's binary, published again by linux-binary.yml."
           else
             mkdir -p out
             cp target/release/temper out/temper-x86_64-linux
