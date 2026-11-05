@@ -182,7 +182,7 @@ fn an_invariant_a_reaction_from_outside_the_scope_breaks_is_broken() {
 #[test]
 fn an_invariant_that_holds_through_a_reaction_from_outside_the_scope_holds() {
     let rule = "[[invariant]]\nname = \"rule\"\nassert = \"status == 'Done' => Box[Id].status != 'Full'\"\n";
-    let result = invariant(&[&ask(false, rule), BOX, &push(false)], POLICIES);
+    let result = invariant(&[&ask(false, rule), BOX, &push(false)], MEMBERS_DONE);
     assert!(result.holds(), "{result}");
 }
 
