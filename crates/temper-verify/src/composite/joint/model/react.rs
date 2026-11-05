@@ -145,6 +145,15 @@ impl JointModel {
             .enumerate()
             .filter(|(_, r)| r.from == source && r.source_action == action)
         {
+            let as_whom = self.senders.reaction(
+                reaction.principal.as_ref(),
+                by,
+                matches!(reaction.resolve, Some(TargetResolver::SameId)),
+            );
+            // Fired or not, it leaves every way as it was, so it splits none.
+            if self.lands_as_nothing(reaction, as_whom) {
+                continue;
+            }
             let mut after = Vec::new();
             // The ways before this reaction are dropped as the next ones are
             // made; [`Self::keep`] counted each.
@@ -293,12 +302,6 @@ impl JointModel {
                         matches!(reaction.resolve, Some(TargetResolver::SameId)),
                     ),
                 };
-                if self.lands_as_nothing(reaction, &dispatch) {
-                    if !self.keep(&mut after, state, known) {
-                        return Vec::new();
-                    }
-                    continue;
-                }
                 let mut next = state;
                 add(&mut next, dispatch);
                 if !self.keep(&mut after, next, known) {

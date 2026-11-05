@@ -6,7 +6,6 @@ use temper_authz::May;
 use temper_spec::automaton::{Automaton, TargetResolver};
 use temper_spec::predicate::{Arg, Expr, Name, VarKind};
 
-use super::super::state::Dispatch;
 use super::read::{Reaction, reactions_into};
 use super::{Delivery, JointModel};
 
@@ -164,14 +163,14 @@ impl JointModel {
 }
 
 impl JointModel {
-    /// Whether `dispatch`, sent by `reaction`, changes nothing wherever it
-    /// lands, so it needn't wait in flight: the walk reaches the same records
-    /// as if it had landed at once. Cedar refuses it to its sender whatever
+    /// Whether `reaction`, sent as `by`, changes nothing wherever it lands,
+    /// so it needn't wait in flight: the walk reaches the same records as if
+    /// it had landed at once, and whether it fires splits no way. Cedar refuses it to its sender whatever
     /// the records hold, or its move, taken or refused, writes nothing the
     /// model holds and sets nothing off. A reaction that makes its record
     /// is never one, and the drop check, which names the landings a target
     /// refuses, keeps each in flight.
-    pub(super) fn lands_as_nothing(&self, reaction: &Reaction, dispatch: &Dispatch) -> bool {
+    pub(super) fn lands_as_nothing(&self, reaction: &Reaction, by: u32) -> bool {
         if reaction.spawn.is_some()
             || matches!(
                 reaction.resolve,
@@ -180,18 +179,14 @@ impl JointModel {
         {
             return false;
         }
-        if self
-            .senders
-            .may(dispatch.by, &dispatch.to, &dispatch.action)
-            == May::No
-        {
+        if self.senders.may(by, &reaction.to, &reaction.target_action) == May::No {
             return true;
         }
         self.delivery == Delivery::Any
             && self
                 .idle
                 .get_or_init(|| self.idle_moves())
-                .contains(&(dispatch.to.to_string(), dispatch.action.to_string()))
+                .contains(&(reaction.to.clone(), reaction.target_action.clone()))
     }
 
     /// The moves (entity, action) that change nothing the model holds,
