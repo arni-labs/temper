@@ -11,6 +11,10 @@ use crate::model::{
     names_no_record,
 };
 
+#[path = "state_rename.rs"]
+mod rename;
+use rename::{rename_on_their_way, rename_records};
+
 /// The records in scope, one per type, and the dispatches and module calls
 /// on their way. A move changes one record or two and the rest stay as they
 /// were, so states share their records, dispatches and calls; a walk's states
@@ -267,63 +271,6 @@ fn all_on_their_way(state: &JointState, mut holds: impl FnMut(&ModelString) -> b
         .calls
         .iter()
         .all(|call| call.asked.values().all(&mut holds))
-}
-
-fn rewrite(renamed: &Renames, value: &mut ModelString) {
-    if let Some(name) = renamed.get(value) {
-        *value = *name;
-    }
-}
-
-fn moved(renamed: &Renames, value: &ModelString) -> bool {
-    renamed.get(value).is_some_and(|name| name != value)
-}
-
-fn rename_records(records: &mut Fields<Arc<TemperModelState>>, renamed: &Renames) {
-    for record in records.values_mut() {
-        let touched = record
-            .strings
-            .values()
-            .chain(record.lists.values().flatten())
-            .any(|value| moved(renamed, value));
-        if touched {
-            let record = Arc::make_mut(record);
-            record
-                .strings
-                .values_mut()
-                .for_each(|value| rewrite(renamed, value));
-            record
-                .lists
-                .values_mut()
-                .flatten()
-                .for_each(|value| rewrite(renamed, value));
-        }
-    }
-}
-
-fn rename_on_their_way(state: &mut JointState, renamed: &Renames) {
-    let rewrite_param = |value: &mut ParamValue| {
-        if let ParamValue::Str(text) = value {
-            rewrite(renamed, text);
-        }
-    };
-    for dispatch in &mut state.inflight {
-        if strings(dispatch.values()).any(|value| moved(renamed, value)) {
-            let dispatch = Arc::make_mut(dispatch);
-            dispatch.params.values_mut().for_each(rewrite_param);
-            if let Some(committed) = &mut dispatch.unread_guard {
-                committed.values_mut().for_each(rewrite_param);
-            }
-        }
-    }
-    for call in &mut state.calls {
-        if call.asked.values().any(|value| moved(renamed, value)) {
-            Arc::make_mut(call)
-                .asked
-                .values_mut()
-                .for_each(|value| rewrite(renamed, value));
-        }
-    }
 }
 
 /// What renumbering comes to for a list of records, which is the same whatever

@@ -377,13 +377,6 @@ impl JointModel {
         Ok(self)
     }
 
-    /// The class of made-up values `entity`'s string field or parameter takes.
-    pub(super) fn class_of(&self, entity: &str, field: &str) -> usize {
-        self.models
-            .get(entity)
-            .map_or(0, |model| model.string_class(field))
-    }
-
     /// The strings `state` holds, in records and in dispatches.
     pub(super) fn values(&self, state: &JointState) -> BTreeSet<ModelString> {
         let mut values = string_values(state.records.values().map(|record| &**record));

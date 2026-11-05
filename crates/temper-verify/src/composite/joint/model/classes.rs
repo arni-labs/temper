@@ -419,3 +419,12 @@ impl Classes {
         self.parent.insert(a, b);
     }
 }
+
+impl super::JointModel {
+    /// The class of made-up values `entity`'s string field or parameter takes.
+    pub(in crate::composite::joint) fn class_of(&self, entity: &str, field: &str) -> usize {
+        self.models
+            .get(entity)
+            .map_or(0, |model| model.string_class(field))
+    }
+}
