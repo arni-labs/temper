@@ -392,11 +392,12 @@ fn string_choices_and_successor_states_count_against_the_room() {
         successors_among(&model, &model.transitions[0], &initial, &values)
     );
 
-    // The input choices fit, but copying this record for each choice does not.
+    // The input choices fit, but copying this record for each choice does
+    // not: its list's slots are copied, while its strings are shared names.
     let mut large = initial;
     large
         .lists
-        .insert("payload", vec![ModelString::from("x".repeat(32 << 10))]);
+        .insert("payload", vec![ModelString::from("x"); 4 << 10]);
     budget.allow(64 << 10);
     successors_budgeted(
         &model,

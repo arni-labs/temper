@@ -40,6 +40,8 @@ const BEHIND: usize = 1;
 type Field = (String, String);
 /// A parameter: (entity, action, parameter).
 type Param = (String, String, String);
+/// Each (entity, action)'s (parameter, field) pairs, by interned name.
+type Refusals = FxHashMap<(Sym, Sym), Box<[(Sym, Sym)]>>;
 
 /// The families of counts kept as sequence numbers.
 #[derive(Debug, Default)]
@@ -52,7 +54,7 @@ pub(super) struct Order {
     compared: BTreeMap<(String, String), Vec<(String, String)>>,
     /// What can refuse a dispatch whenever it lands: each (entity, action)'s
     /// (parameter, field) of `compared` whose field is in `rising`.
-    refusals: FxHashMap<(Sym, Sym), Box<[(Sym, Sym)]>>,
+    refusals: Refusals,
     /// The fields that never go down: each write adds to them, or takes a
     /// count only when it is greater.
     rising: BTreeSet<Field>,
@@ -96,7 +98,7 @@ impl Numbered {
 fn refusals(
     compared: &BTreeMap<(String, String), Vec<(String, String)>>,
     rising: &BTreeSet<Field>,
-) -> FxHashMap<(Sym, Sym), Box<[(Sym, Sym)]>> {
+) -> Refusals {
     compared
         .iter()
         .filter_map(|((entity, action), pairs)| {
