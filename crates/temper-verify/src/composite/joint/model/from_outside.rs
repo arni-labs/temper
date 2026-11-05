@@ -43,10 +43,11 @@ pub(super) struct Outside {
     /// every source does, and [`MAYBE_MADE`] otherwise.
     made: Option<String>,
     /// Whether a source spawns it: the kernel starts a spawned record, and
-    /// Cedar never decides that first move.
+    /// Cedar never decides that first move. Where the senders were read,
+    /// only those that arrive by a spawn skip Cedar ([`sent_as::SentAs`]).
     spawned: bool,
     /// The senders it may run as, when they were read.
-    by: Option<BTreeSet<u32>>,
+    by: Option<sent_as::SentAs>,
     /// Of those, one for each way what follows can go, once worked out.
     kept: Kept,
 }
@@ -187,7 +188,11 @@ impl JointModel {
             return unknown().into_iter().collect();
         };
         let kept = outside.kept.0.get_or_init(|| {
-            let by = outside.by.clone().unwrap_or_else(unknown);
+            let (by, spawned) = match &outside.by {
+                Some(sent) => (sent.by.clone(), sent.spawned.clone()),
+                None if outside.spawned => (unknown(), unknown()),
+                None => (unknown(), BTreeSet::new()),
+            };
             let asked = self.asked_after(entity, action);
             let mut ways = BTreeSet::new();
             // Cedar decides the reaction as its sender: one it surely refuses
@@ -195,7 +200,7 @@ impl JointModel {
             // Cedar's to decide.
             by.into_iter()
                 .filter(|&by| {
-                    let may = if outside.spawned {
+                    let may = if spawned.contains(&by) {
                         May::Yes
                     } else {
                         self.senders.may(by, entity, action)
@@ -266,10 +271,23 @@ pub(in crate::composite::joint) fn starts(
     scope: &BTreeSet<String>,
     matters: &BTreeSet<String>,
 ) -> BTreeSet<(String, String)> {
-    outside_reactions(by_name, scope, None)
+    // A chain may pass through module answers and timers on its way, which
+    // carry its sender on.
+    let earlier = sent_as::set_off_by(by_name);
+    let mut queue: Vec<(String, String)> = outside_reactions(by_name, scope, None)
         .into_iter()
         .filter(|((entity, _), _)| matters.contains(entity))
         .flat_map(|(_, outside)| outside.before)
+        .collect();
+    let mut found = BTreeSet::new();
+    while let Some(step) = queue.pop() {
+        if let Some(before) = earlier.get(&step) {
+            queue.extend(before.iter().filter(|e| !found.contains(*e)).cloned());
+        }
+        found.insert(step);
+    }
+    found
+        .into_iter()
         .filter(|(from, _)| !scope.contains(from))
         .collect()
 }

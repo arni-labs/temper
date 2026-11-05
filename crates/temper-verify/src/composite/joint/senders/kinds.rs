@@ -64,6 +64,9 @@ pub(super) fn outside(
             cause: Cause::request(),
         })
         .collect();
+    // The kinds are told apart on the starts too: two that answer the
+    // chain alike but only one of which may start it are not one kind.
+    let told: Vec<Question<'_>> = questions.iter().chain(&starts).cloned().collect();
     let none = BTreeMap::new();
     let answers = |asker: &Asker, questions: &[Question<'_>]| -> Vec<May> {
         questions
@@ -76,7 +79,7 @@ pub(super) fn outside(
     // whichever of them sent it, so they are one sender.
     let reactions = &questions[requests.len()..];
     let mut kinds: Vec<(Vec<May>, Kind)> = Vec::new();
-    for kind in policies.outside_kinds(&questions, reserve)? {
+    for kind in policies.outside_kinds(&told, reserve)? {
         let asker = Asker::OutsideAs(kind.clone());
         let sends = |questions: &[Question<'_>]| {
             answers(&asker, questions).iter().any(|may| *may != May::No)

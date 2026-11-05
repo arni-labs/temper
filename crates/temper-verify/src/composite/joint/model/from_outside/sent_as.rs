@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use temper_authz::May;
-use temper_spec::automaton::{Action, Automaton, TargetResolver, TriggerKind};
+use temper_spec::automaton::{Action, ActionTrigger, Automaton, TargetResolver, TriggerKind};
 
 use super::super::super::senders::{OUTSIDE, Senders, declared};
 use super::super::read::Kernel;
@@ -17,6 +17,16 @@ use super::super::spawn::spawns_of;
 
 /// Senders by move (entity, action).
 type ByMove = BTreeMap<(String, String), BTreeSet<u32>>;
+
+/// Whom a reaction from outside into one move may run as.
+#[derive(Debug, Clone, Default)]
+pub(super) struct SentAs {
+    /// Every sender it may run as.
+    pub(super) by: BTreeSet<u32>,
+    /// Those that arrive as the start of a record a source spawns, which
+    /// the kernel makes whatever Cedar says of the move.
+    pub(super) spawned: BTreeSet<u32>,
+}
 
 /// The senders each reaction from a type outside `scope` into a move in it
 /// may run as, by that move. `relies_on` names the moves outside code is
@@ -26,7 +36,7 @@ pub(super) fn sent_as(
     scope: &BTreeSet<String>,
     senders: &Senders,
     relies_on: &BTreeSet<(String, String)>,
-) -> ByMove {
+) -> BTreeMap<(String, String), SentAs> {
     let all = by_name.keys().map(|name| name.to_string()).collect();
     let kernel = Kernel::read(by_name, &all);
     let mut sent = ByMove::new();
@@ -66,7 +76,7 @@ pub(super) fn sent_as(
         }
     }
     let unknown = [senders.unknown(), senders.timer(senders.unknown())];
-    let mut into = ByMove::new();
+    let mut into: BTreeMap<(String, String), SentAs> = BTreeMap::new();
     for (entity, automaton) in by_name.iter().filter(|(name, _)| !scope.contains(**name)) {
         for action in &automaton.actions {
             let from = &sent[&(entity.to_string(), action.name.clone())];
@@ -76,11 +86,20 @@ pub(super) fn sent_as(
                 from.iter().copied().collect()
             };
             for by in starts {
-                for (to, next, reaction) in carried(automaton, entity, action, &kernel, senders, by)
-                {
-                    if reaction && scope.contains(&to.0) {
-                        into.entry(to).or_default().insert(next);
+                for (to, next, link) in carried(automaton, entity, action, &kernel, senders, by) {
+                    if !scope.contains(&to.0) {
+                        continue;
                     }
+                    let sent = into.entry(to);
+                    match link {
+                        Link::Trigger(_) => sent.or_default().by.insert(next),
+                        Link::Spawn => {
+                            let sent = sent.or_default();
+                            sent.spawned.insert(next);
+                            sent.by.insert(next)
+                        }
+                        Link::Answer | Link::Timer => false,
+                    };
                 }
             }
         }
@@ -88,17 +107,26 @@ pub(super) fn sent_as(
     into
 }
 
-/// The moves `entity`'s `action`, sent by `by`, sets off, with whom each
-/// runs as, and whether it is a reaction or spawn rather than a module's
-/// answer or a timer.
-fn carried<'a>(
+/// How a move sets off another.
+#[derive(Clone, Copy)]
+enum Link<'a> {
+    /// A trigger's reaction.
+    Trigger(&'a ActionTrigger),
+    /// The start of a record the move spawns: the kernel's to make.
+    Spawn,
+    /// A module's answer to a call the move starts.
+    Answer,
+    /// A state timer the move arms or resets.
+    Timer,
+}
+
+/// The moves `entity`'s `action` sets off, and how.
+fn links<'a>(
     automaton: &'a Automaton,
     entity: &'a str,
     action: &'a Action,
     kernel: &'a Kernel,
-    senders: &'a Senders,
-    by: u32,
-) -> impl Iterator<Item = ((String, String), u32, bool)> + 'a {
+) -> impl Iterator<Item = ((String, String), Link<'a>)> + 'a {
     let triggered = action.triggers.iter().filter_map(move |trigger| {
         let (TriggerKind::Entity, Some(to), Some(target)) = (
             &trigger.kind,
@@ -107,22 +135,10 @@ fn carried<'a>(
         ) else {
             return None;
         };
-        let next = match declared(trigger, entity, &action.name) {
-            Some(service) => senders.declared_as(&service, by),
-            None => {
-                let same_id = matches!(trigger.resolve_target, Some(TargetResolver::SameId));
-                senders.reaction(None, by, same_id)
-            }
-        };
-        Some(((to.clone(), target.clone()), next, true))
+        Some(((to.clone(), target.clone()), Link::Trigger(trigger)))
     });
-    let spawned = spawns_of(action).map(move |(to, target, ..)| {
-        (
-            (to.clone(), target.clone()),
-            senders.reaction(None, by, false),
-            true,
-        )
-    });
+    let spawned =
+        spawns_of(action).map(move |(to, target, ..)| ((to.clone(), target.clone()), Link::Spawn));
     let calls = kernel
         .calls_on
         .get(&(entity.to_string(), action.name.clone()))
@@ -142,7 +158,7 @@ fn carried<'a>(
         };
         names
             .into_iter()
-            .map(move |name| ((entity.to_string(), name.clone()), by, false))
+            .map(move |name| ((entity.to_string(), name.clone()), Link::Answer))
     });
     let timers = kernel.timers.get(entity).into_iter().flatten();
     let fired = timers
@@ -150,9 +166,54 @@ fn carried<'a>(
             action.to.as_deref() == Some(timeout.state.as_str())
                 || timeout.reset_on.contains(&action.name)
         })
-        .map(move |timeout| {
-            let next = senders.timer(Senders::armer(by));
-            ((entity.to_string(), timeout.action.clone()), next, false)
-        });
+        .map(move |timeout| ((entity.to_string(), timeout.action.clone()), Link::Timer));
     triggered.chain(spawned).chain(answers).chain(fired)
+}
+
+/// The moves `entity`'s `action`, sent by `by`, sets off, with whom each
+/// runs as, and how it gets there.
+fn carried<'a>(
+    automaton: &'a Automaton,
+    entity: &'a str,
+    action: &'a Action,
+    kernel: &'a Kernel,
+    senders: &'a Senders,
+    by: u32,
+) -> impl Iterator<Item = ((String, String), u32, Link<'a>)> + 'a {
+    links(automaton, entity, action, kernel).map(move |(to, link)| {
+        let next = match link {
+            Link::Trigger(trigger) => match declared(trigger, entity, &action.name) {
+                Some(service) => senders.declared_as(&service, by),
+                None => {
+                    let same_id = matches!(trigger.resolve_target, Some(TargetResolver::SameId));
+                    senders.reaction(None, by, same_id)
+                }
+            },
+            Link::Spawn => senders.reaction(None, by, false),
+            Link::Answer => by,
+            Link::Timer => senders.timer(Senders::armer(by)),
+        };
+        (to, next, link)
+    })
+}
+
+/// What can set off each move (entity, action) of the app, through any
+/// link: a reaction, a spawn, a module's answer or a timer.
+pub(super) fn set_off_by(
+    by_name: &BTreeMap<&str, &Automaton>,
+) -> BTreeMap<(String, String), BTreeSet<(String, String)>> {
+    let all = by_name.keys().map(|name| name.to_string()).collect();
+    let kernel = Kernel::read(by_name, &all);
+    let mut earlier: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+    for (entity, automaton) in by_name {
+        for action in &automaton.actions {
+            for (to, _) in links(automaton, entity, action, &kernel) {
+                earlier
+                    .entry(to)
+                    .or_default()
+                    .insert((entity.to_string(), action.name.clone()));
+            }
+        }
+    }
+    earlier
 }
