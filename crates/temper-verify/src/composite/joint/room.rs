@@ -68,7 +68,7 @@ impl Bytes {
 
 /// How much [`Bytes::for_tests`] holds.
 #[cfg(test)]
-const TEST_ROOM: usize = 4 << 20;
+const TEST_ROOM: usize = 8 << 20;
 
 impl Room for Bytes {
     fn take(&self, bytes: usize) -> Result<(), String> {
