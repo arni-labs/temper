@@ -146,7 +146,7 @@ fn check_specs_with_policies(app: &str, place: &str, policies: &str) -> JointLiv
         .collect();
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = SendAnalysis::new(policies).expect("fixture policies parse");
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,
@@ -435,7 +435,7 @@ fn oversized_parameter_expansion_is_incomplete() {
          [[liveness]]\nname = 'zero'\neventually = \"{goal}\"\n"
     );
     let automaton = parse_automaton(&source).expect("fixture parses");
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,

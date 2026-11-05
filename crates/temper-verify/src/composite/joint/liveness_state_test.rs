@@ -98,7 +98,7 @@ fn check(specs: [&str; 2], policy_text: &str) -> JointLivenessResult {
         .collect();
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = SendAnalysis::new(policy_text).expect("fixture policies parse");
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,

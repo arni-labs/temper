@@ -68,7 +68,7 @@ when {{ principal has role && principal.role == "member" && resource.open }};
 fn check(opens: bool, moves: &str) -> JointLivenessResult {
     let doc = parse_automaton(&doc(opens)).expect("fixture parses");
     let analysis = SendAnalysis::new(&members(moves)).expect("fixture policies parse");
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,

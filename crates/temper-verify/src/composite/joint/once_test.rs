@@ -19,7 +19,7 @@ fn invariant(sources: &[&str], policies: &str) -> JointInvariantResult {
     let automatons = parsed(sources);
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = SendAnalysis::new(policies).expect("fixture policies parse");
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,
@@ -191,7 +191,7 @@ fn a_dispatch_taken_once_needs_one_copy_in_flight() {
     let automatons = parsed(&[PROPOSER]);
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = SendAnalysis::new(PROPOSE_POLICIES).expect("fixture policies parse");
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,

@@ -51,7 +51,7 @@ fn check_job(answers: &str, timer: &str) -> JointLivenessResult {
     let automaton = parse_automaton(&job(answers, timer)).expect("fixture parses");
     let analysis = SendAnalysis::new(r#"permit(principal, action == Action::"Go", resource);"#)
         .expect("policies parse");
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,
@@ -126,7 +126,7 @@ fn a_named_answer_that_does_not_fit_the_record_ends_with_none() {
     .expect("fixture parses");
     let analysis = SendAnalysis::new(r#"permit(principal, action == Action::"Go", resource);"#)
         .expect("policies parse");
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,

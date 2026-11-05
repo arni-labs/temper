@@ -55,7 +55,7 @@ when { principal has role && principal.role == "visitor" };
 fn check(policies: &str) -> JointLivenessResult {
     let note = parse_automaton(NOTE).expect("fixture parses");
     let analysis = SendAnalysis::new(policies).expect("fixture policies parse");
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,

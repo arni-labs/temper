@@ -29,7 +29,7 @@ fn check((sources, policies): &Model, records: usize) -> JointInvariantResult {
         .collect();
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = SendAnalysis::new(policies).expect("policies parse");
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let proofs = invariant_proofs_holding(&refs, Some(&analysis), &room, records);
     let results = proofs[0].check(Bound {
         room: &room,

@@ -92,7 +92,7 @@ fn check(sources: &[String]) -> JointInvariantResult {
         .collect();
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = SendAnalysis::new(POLICIES).expect("fixture policies parse");
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,

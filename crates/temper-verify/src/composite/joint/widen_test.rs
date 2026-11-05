@@ -17,7 +17,7 @@ fn invariant(sources: &[&str], policies: &str) -> JointInvariantResult {
         .collect();
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = SendAnalysis::new(policies).expect("fixture policies parse");
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,
@@ -180,7 +180,7 @@ fn a_proof_holds_room_for_its_wider_model_only_while_it_walks_it() {
         .collect();
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = SendAnalysis::new(POLICIES).expect("fixture policies parse");
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let proofs = joint_proofs(&refs, Some(&analysis), &room);
     let held = room.held();
     let bound = Bound {

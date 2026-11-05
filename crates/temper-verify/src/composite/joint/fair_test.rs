@@ -16,7 +16,7 @@ macro_rules! model {
 }
 
 fn check(source: &str) -> JointLivenessResult {
-    check_on(source, Bytes::new(1 << 30))
+    check_on(source, Bytes::for_tests())
 }
 
 fn check_on(source: &str, room: Bytes) -> JointLivenessResult {
@@ -191,7 +191,7 @@ permit(principal, action == Action::"Flip", resource) when { context.urgent == t
 "#,
     )
     .expect("its Cedar parses");
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,
@@ -288,7 +288,7 @@ fn two_calls_to_one_module_are_owed_apart() {
     let automaton = parse_automaton(model!("merged_calls")).expect("model parses");
     let cedar = include_str!("../../../tests/fair_models/merged_calls.cedar");
     let analysis = SendAnalysis::new(cedar).expect("its Cedar parses");
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,
@@ -313,7 +313,7 @@ fn a_walk_on_many_threads_gives_the_same_verdicts() {
     ] {
         let one = check(source);
         for _ in 0..8 {
-            let many = check_on(source, Bytes::new(1 << 30).with_threads(4));
+            let many = check_on(source, Bytes::for_tests().with_threads(4));
             assert_eq!(one.states, many.states, "{many}");
             assert_eq!(
                 std::mem::discriminant(fair(&one)),

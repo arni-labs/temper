@@ -91,7 +91,7 @@ resolve_target = {{ kind = "same_id" }}
 
 fn check_feed(choices: &[String]) -> JointLivenessResult {
     let automaton = parse_automaton(&feed(&choices.concat())).expect("fixture parses");
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,

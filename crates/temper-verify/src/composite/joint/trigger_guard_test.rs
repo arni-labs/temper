@@ -17,7 +17,7 @@ fn parsed(sources: &[&str]) -> Vec<Automaton> {
 
 /// Run `check` in a room no fixture here comes near filling.
 fn bounded<T>(check: impl FnOnce(Bound<'_>) -> T) -> T {
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     check(Bound {
         room: &room,
         progress: &progress,

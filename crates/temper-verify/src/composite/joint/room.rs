@@ -53,7 +53,22 @@ impl Bytes {
     pub fn held(&self) -> usize {
         self.held.load(Ordering::Relaxed)
     }
+
+    /// The room a unit test walks in. A walk that held a move back walks
+    /// again with twice as many in flight until one does not fit its room
+    /// (`proof/grow.rs`), so a test whose rule holds while a move is held
+    /// back fills its room: 1 GiB took such tests up to 40 minutes. A test
+    /// proves at the in-flight bound this room allows, and every first walk
+    /// a test makes fits in it.
+    #[cfg(test)]
+    pub(super) fn for_tests() -> Self {
+        Self::new(TEST_ROOM)
+    }
 }
+
+/// How much [`Bytes::for_tests`] holds.
+#[cfg(test)]
+const TEST_ROOM: usize = 4 << 20;
 
 impl Room for Bytes {
     fn take(&self, bytes: usize) -> Result<(), String> {

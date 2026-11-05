@@ -5,7 +5,7 @@ use super::*;
 /// The liveness results for `refs`, with `analysis` deciding each move as its
 /// sender, in the same room as `check_under`.
 fn liveness(refs: &[&Automaton], analysis: &SendAnalysis) -> Vec<JointLivenessResult> {
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,

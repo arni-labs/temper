@@ -110,7 +110,7 @@ fn check_under(sources: &[&str], policies: Option<&str>) -> JointInvariantResult
     let automatons = parse(sources);
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = policies.map(|text| SendAnalysis::new(text).expect("fixture policies parse"));
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,
@@ -267,7 +267,7 @@ fn specs_without_cross_entity_invariants_have_nothing_to_check() {
     let parent = parent(false);
     let automatons = parse(&[&parent, CHILD]);
     let refs: Vec<&Automaton> = automatons.iter().collect();
-    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let (room, progress) = (Bytes::for_tests(), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,
@@ -712,7 +712,7 @@ fn what_one_move_builds_counts_against_the_room() {
     assert_eq!(room.held(), 0, "the walk gives back what it took");
 
     // With room for what the move builds, the rule is checked and holds.
-    let room = Bytes::new(1 << 30);
+    let room = Bytes::for_tests();
     let result = check_in(&sources, &room);
     assert!(matches!(result.outcome, JointOutcome::Holds), "{result}");
     assert_eq!(room.held(), 0, "the walk gives back what it took");
