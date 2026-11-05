@@ -144,7 +144,8 @@ pub(crate) fn successors_budgeted(
 
 /// The inputs [`successors_budgeted`] would make a step of, without the steps.
 /// Only a step that grows a counter or list can go past a bound, so only such
-/// a step needs building to tell.
+/// a step needs building to tell; a step whose triggers read values of their
+/// own is built too, so each way those values decide the triggers is kept.
 pub(crate) fn inputs_within_bounds(
     model: &TemperModel,
     t: &ResolvedTransition,
@@ -160,7 +161,7 @@ pub(crate) fn inputs_within_bounds(
                 | ModelEffect::ListAppend { .. }
         )
     });
-    if grows {
+    if grows || !t.after_params.is_empty() {
         return successors_budgeted(model, t, state, values, budget)
             .into_iter()
             .map(|(params, _)| params)
