@@ -245,23 +245,21 @@ impl JointModel {
 static CREATE: Option<temper_spec::automaton::TargetResolver> =
     Some(temper_spec::automaton::TargetResolver::Create);
 
-/// `matters`, the types in `scope` whose reactions run as their sender,
-/// with the types outside `scope` whose moves can set off a reaction into
-/// one of them: whoever may send such a move starts a chain that reaches
-/// them, so the kinds of outside sender are told apart on those requests.
-pub(in crate::composite::joint) fn origins(
+/// The moves outside `scope` that can set off a reaction into one of
+/// `matters`, the types in it whose reactions run as their sender: whoever
+/// may send such a move starts a chain that reaches them, so a kind of
+/// outside sender that may send one is kept.
+pub(in crate::composite::joint) fn starts(
     by_name: &BTreeMap<&str, &Automaton>,
     scope: &BTreeSet<String>,
     matters: &BTreeSet<String>,
-) -> BTreeSet<String> {
-    let mut roots = matters.clone();
-    for ((entity, _), outside) in outside_reactions(by_name, scope, None) {
-        if matters.contains(&entity) {
-            let before = outside.before.into_iter().map(|(from, _)| from);
-            roots.extend(before.filter(|from| !scope.contains(from)));
-        }
-    }
-    roots
+) -> BTreeSet<(String, String)> {
+    outside_reactions(by_name, scope, None)
+        .into_iter()
+        .filter(|((entity, _), _)| matters.contains(entity))
+        .flat_map(|(_, outside)| outside.before)
+        .filter(|(from, _)| !scope.contains(from))
+        .collect()
 }
 
 /// All a model of `scope` reads of the types outside it, as text.

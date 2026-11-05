@@ -42,8 +42,8 @@ pub(super) use classes::Classes;
 pub use drops::DroppedReaction;
 pub(crate) use drops::dropped_reactions;
 pub(super) use fair_key::{FairKey, MoveKind};
-pub(super) use from_outside::reads_beyond;
 use from_outside::{Outside, outside_reactions};
+pub(super) use from_outside::{reads_beyond, starts};
 pub use guided::{Candidate, Guide, GuidedSearch, STEPS as GUIDED_STEPS, guided_search, plain};
 use order::{Order, Specs};
 pub(super) use read::Timeout;
@@ -254,13 +254,11 @@ impl JointModel {
         // A timer whose setter's standing can be lost fires as its setter.
         let standing = standing(by_name, scope, sending.policies);
         sender_matters.extend(standing.iter().cloned());
-        // Whoever may start a chain outside the scope that reaches one of them is a kind too.
-        let roots = from_outside::origins(by_name, scope, &sender_matters);
         let senders = Senders::new(
             by_name,
             scope,
             sending.policies,
-            &roots,
+            &sender_matters,
             &inheriting,
             &standing,
             sending.reserve,
