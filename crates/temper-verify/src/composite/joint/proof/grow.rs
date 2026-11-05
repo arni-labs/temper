@@ -42,15 +42,19 @@ pub(super) fn grown_walk(model: &JointModel, walk: impl Fn() -> model::Walk) -> 
     last
 }
 
-/// As [`grown_walk`], for a liveness rule's walk. One walk's tables are given
-/// back before the next is made, and one that does not fit is walked again
-/// with the last bound that did.
+/// As [`grown_walk`], for a liveness rule's walk, growing also on moves
+/// held back that cannot change what it reads when `aside_too`. One walk's
+/// tables are given back before the next is made, and one that does not fit
+/// is walked again with the last bound that did.
 pub(super) fn grown_explored<'a>(
     model: &JointModel,
+    aside_too: bool,
     walk: impl Fn() -> model::Explored<'a>,
 ) -> model::Explored<'a> {
+    let grows =
+        |held: HeldBack| held == HeldBack::Reaching || (aside_too && held != HeldBack::Nothing);
     let mut explored = walk();
-    while explored.held_back == HeldBack::Reaching && explored.stopped.is_none() {
+    while grows(explored.held_back) && explored.stopped.is_none() {
         drop(explored);
         let fitted = model.in_flight();
         model.hold(fitted * 2);

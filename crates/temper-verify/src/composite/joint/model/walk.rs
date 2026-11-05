@@ -7,8 +7,8 @@ use super::super::pack::{Packed, Packer};
 use super::super::room::{Held, MB};
 use super::super::state::render;
 use super::super::{JointOutcome, JointState, JointStep};
+use super::JointModel;
 use super::step::Next;
-use super::{HeldBack, JointModel};
 
 mod checked;
 mod conditions;
@@ -20,6 +20,29 @@ mod mirror;
 mod nodes;
 mod run;
 mod shared;
+
+/// What a move held back for [`JointModel::in_flight`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::composite::joint) enum HeldBack {
+    /// Nothing.
+    #[default]
+    Nothing,
+    /// Only ways that change nothing the rule reads (`cone.rs`).
+    Aside,
+    /// A way that can change what it reads.
+    Reaching,
+}
+
+impl HeldBack {
+    /// The one numbered `index` (`as u8`), as an atomic keeps it.
+    pub(in crate::composite::joint) fn from_index(index: u8) -> Self {
+        match index {
+            0 => HeldBack::Nothing,
+            1 => HeldBack::Aside,
+            _ => HeldBack::Reaching,
+        }
+    }
+}
 
 /// What a walk found.
 pub(in crate::composite::joint) struct Walk {

@@ -71,6 +71,7 @@ impl JointModel {
         if records <= 1 {
             return self;
         }
+        self.cone_for_copies();
         self.copies = self
             .models
             .keys()

@@ -8,14 +8,16 @@
 //! past a bound is cut); the guard, arguments and target of each reaction
 //! that sends it; and a whole family of counts kept as sequence numbers
 //! when it holds one of them. The moves that can change it are those that
-//! write it, those whose reactions, module answers or timer resets can lead
-//! to one, and the reactions a commit sends before one of those with all
-//! they lead to: the runtime sends a commit's reactions one trigger at a
-//! time, each with its cascade ([`JointModel::overtakes`]). A dispatch or
-//! call in flight matters when the move it leads to can. Where a rule reads
-//! a record a spawn makes, or a move that spawns can change it, every move
-//! counts: whether a spawn goes on turns on all of that record and on what
-//! is on its way to it (`spawn.rs`).
+//! write it, those whose reactions, module answers (named, or any a module
+//! naming none may give) or timer resets can lead to one, and the reactions
+//! a commit sends before one of those with all they lead to: the runtime
+//! sends a commit's reactions one trigger at a time, each with its cascade
+//! ([`JointModel::overtakes`]). A dispatch or call in flight matters when
+//! the move it leads to can. Where a rule reads a record a spawn makes, or
+//! a move that spawns can change it, or reads a type of several records a
+//! reaction makes one of, every move counts: which record that takes, and
+//! whether a spawn goes on, turn on all of each and on what is on its way
+//! to it (`spawn.rs`, `copies.rs`).
 //!
 //! Why growing only when a held move matters is enough. Take any run, with
 //! as many in flight as it likes, and a walked state that agrees with where
@@ -38,22 +40,33 @@
 //! - A rule is read, and a liveness condition counts as reached, where
 //!   nothing is in flight, and dispatches that cannot reach the cone can
 //!   keep a state from emptying, in the run or in the walk. So both are read
-//!   where nothing in flight can change what they read ([`Cone::quiet`]):
-//!   what is still on its way lands without changing it.
+//!   where nothing in flight can change what they read ([`Cone::quiet`]).
+//!   That finds what reading only empty states finds: from a quiet state
+//!   the system can land all in flight, each landing changing nothing read
+//!   and setting off only more such moves; a call may always end with no
+//!   answer, and the runtime stops a reaction its chain already holds, so
+//!   the landing ends in an empty state that reads the same. Only a fair
+//!   cycle that keeps something in flight forever where the condition holds
+//!   now counts as reaching it.
+//!
+//! A fair cycle counts a delivery held back as one the runtime keeps able to
+//! make, whatever it changes, so a rule with fairness grows on every move
+//! held back (`proof.rs`).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use temper_spec::automaton::TargetResolver;
 use temper_spec::predicate::{Arg, Expr, Name};
 
 use super::super::env::ID;
 use super::super::{Call, Dispatch, JointState};
-use super::JointModel;
 use super::copies::base;
+use super::{HeldBack, JointModel};
 use crate::model::{ModelEffect, ResolvedTransition, TemperModelState};
 
 /// What a rule reads, and the moves that can change it, by type.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(in crate::composite::joint) struct Cone {
     /// Every move counts: a model made for no rule.
     whole: bool,
@@ -74,11 +87,7 @@ impl Cone {
     pub(super) fn whole() -> Self {
         Self {
             whole: true,
-            fields: BTreeMap::new(),
-            statuses: BTreeSet::new(),
-            actions: BTreeMap::new(),
-            timers: BTreeSet::new(),
-            open: BTreeSet::new(),
+            ..Self::default()
         }
     }
 
@@ -220,19 +229,21 @@ impl Cone {
                 return true;
             }
         }
-        let sent = |state: &JointState| {
-            let dispatches = state.inflight.iter().filter(|d| self.sends(d)).cloned();
-            (
-                dispatches.collect::<Vec<_>>(),
-                state
-                    .calls
-                    .iter()
-                    .filter(|c| self.answers(c))
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            )
+        let sent = |s: &JointState| -> Vec<Arc<Dispatch>> {
+            s.inflight
+                .iter()
+                .filter(|d| self.sends(d))
+                .cloned()
+                .collect()
         };
-        sent(before) != sent(after)
+        let asked = |s: &JointState| -> Vec<Arc<Call>> {
+            s.calls
+                .iter()
+                .filter(|c| self.answers(c))
+                .cloned()
+                .collect()
+        };
+        sent(before) != sent(after) || asked(before) != asked(after)
     }
 }
 
@@ -260,29 +271,6 @@ fn effect_of(effect: &ModelEffect) -> (&str, Option<&Arg>, bool) {
     }
 }
 
-/// What a move held back for [`JointModel::in_flight`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub(in crate::composite::joint) enum HeldBack {
-    /// Nothing.
-    #[default]
-    Nothing,
-    /// Only ways that change nothing the rule reads ([`Cone::reaches`]).
-    Aside,
-    /// A way that can change what it reads.
-    Reaching,
-}
-
-impl HeldBack {
-    /// The one numbered `index` (`as u8`), as an atomic keeps it.
-    pub(in crate::composite::joint) fn from_index(index: u8) -> Self {
-        match index {
-            0 => HeldBack::Nothing,
-            1 => HeldBack::Aside,
-            _ => HeldBack::Reaching,
-        }
-    }
-}
-
 impl JointModel {
     /// What holding back `after`, where a move from `before` leads, holds back.
     pub(in crate::composite::joint) fn held_back(
@@ -302,12 +290,22 @@ impl JointModel {
         self.cone.quiet(state)
     }
 
+    /// With several records of a type, a reaction that makes one takes the
+    /// record that all of each one and what is on its way to it choose
+    /// (`copies.rs`). Where a rule reads such a type, every move counts.
+    pub(super) fn cone_for_copies(&mut self) {
+        let makes = |r: &super::read::Reaction| {
+            matches!(
+                r.resolve,
+                Some(TargetResolver::Create | TargetResolver::CreateIfMissing { .. })
+            ) && self.cone.touches(&r.to)
+        };
+        self.cone.whole |= self.reactions.iter().any(makes);
+    }
+
     /// The cone of the rules `reads`, said of `owner`.
     pub(super) fn cone_of(&self, owner: &str, reads: &[&Expr]) -> Cone {
-        let mut cone = Cone {
-            whole: false,
-            ..Cone::whole()
-        };
+        let mut cone = Cone::default();
         for expr in reads {
             cone.read_expr(owner, expr);
         }
@@ -345,8 +343,14 @@ impl JointModel {
         }
         grew |= self.grow_by_reactions(cone);
         for ((entity, action), specs) in &self.kernel.calls_on {
-            let internal = self.kernel.internal.get(entity);
-            let open = internal.is_some_and(|names| names.iter().any(|a| cone.counts(entity, a)));
+            // A module whose trigger names no answer may answer with any
+            // internal action, or any that nothing else can send (`moves.rs`).
+            let internal = self.kernel.internal.get(entity).into_iter().flatten();
+            let unsent = self.unsent.get(entity).into_iter().flatten();
+            let open = internal.map(String::as_str).any(|a| cone.counts(entity, a))
+                || unsent
+                    .map(|&way| self.models[entity].transitions[way].name.as_str())
+                    .any(|a| cone.counts(entity, a));
             if open {
                 grew |= cone.open.insert(entity.clone());
             }

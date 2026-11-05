@@ -46,7 +46,6 @@ use held::PerThread;
 
 pub(super) use classes::Classes;
 use cone::Cone;
-pub(super) use cone::HeldBack;
 pub use drops::DroppedReaction;
 pub(crate) use drops::dropped_reactions;
 pub(super) use fair_key::{FairKey, MoveKind};
@@ -57,6 +56,7 @@ use order::{Order, Specs};
 pub(super) use read::Timeout;
 use read::{Kernel, Reaction, Unchecked, deciding, named_literals, tracked, unchecked_constraints};
 pub(super) use step::{Certainty, Move};
+pub(super) use walk::HeldBack;
 pub(super) use walk::{Edge, Explored, Made};
 pub(super) use walk::{Keep, Walk};
 

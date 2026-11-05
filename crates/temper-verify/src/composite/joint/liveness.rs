@@ -105,7 +105,7 @@ impl JointLivenessResult {
 #[derive(Debug, Clone)]
 pub enum LivenessOutcome {
     /// From every reachable state, the system's moves can reach the
-    /// condition with nothing in flight.
+    /// condition with nothing in flight that can change what it reads.
     Holds,
     /// Reachable states from which no path of system moves reaches it.
     Stuck {

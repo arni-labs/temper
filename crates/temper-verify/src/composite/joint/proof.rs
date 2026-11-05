@@ -327,7 +327,6 @@ impl LivenessProof<'_> {
                 strong: fairness.strong.clone(),
                 relies_on: self.relies_on.clone(),
                 in_flight_bound: None,
-                held_aside: false,
                 outcome,
             })
         };
@@ -343,7 +342,11 @@ impl LivenessProof<'_> {
                 return result;
             }
         };
-        let mut explored = grow::grown_explored(model, || {
+        // A fair cycle counts a delivery held back as one the runtime
+        // keeps able to make (`fair/search.rs`), whatever it changes, so a
+        // rule with fairness grows on every move held back, as before.
+        let aside_too = self.fairness.is_some();
+        let mut explored = grow::grown_explored(model, aside_too, || {
             model.walk_with(bound, model::Keep::Edges, |_, _, _, _| false)
         });
         result.states = explored.len();
@@ -397,7 +400,6 @@ impl LivenessProof<'_> {
             };
             result.fair = verdict(outcome).map(|mut fair| {
                 fair.in_flight_bound = result.in_flight_bound;
-                fair.held_aside = result.held_aside;
                 fair
             });
         }

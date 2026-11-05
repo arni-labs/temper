@@ -185,3 +185,71 @@ fn a_held_move_two_reactions_from_what_the_rule_reads_still_grows() {
         "{result}"
     );
 }
+
+#[test]
+fn a_module_answer_nothing_else_sends_counts_as_reaching_the_rule() {
+    // B's call names no answer, so the module may answer with Halt, which
+    // nothing else may send. Go, held back with three Hits in flight, starts
+    // that call: it can reach the rule, and the walk may not hold it aside.
+    let a = automaton(
+        "A",
+        &["Idle"],
+        "\n[[state]]\nname = \"sent\"\ntype = \"counter\"\ninitial = 0\n\
+         \n[[action]]\nname = \"Send\"\nkind = \"input\"\nfrom = [\"Idle\"]\nto = \"Idle\"\n\
+         guard = \"sent < 3\"\neffect = [\"sent += 1\"]\n\
+         \n[[action.triggers]]\nname = \"hit\"\nkind = \"entity\"\ntarget_entity = \"B\"\n\
+         target_action = \"Hit\"\nresolve_target = { kind = \"same_id\" }\n\
+         \n[[action]]\nname = \"Go\"\nkind = \"input\"\nfrom = [\"Idle\"]\nto = \"Idle\"\n\
+         guard = \"sent == 3\"\n\
+         \n[[action.triggers]]\nname = \"start\"\nkind = \"entity\"\ntarget_entity = \"B\"\n\
+         target_action = \"Start\"\nresolve_target = { kind = \"same_id\" }\n\
+         \n[[invariant]]\nname = \"not_all_refused\"\n\
+         assert = \"sent != 3 || B[Id].hits != 0 || B[Id].status != 'Stop'\"\n",
+    );
+    let b = automaton(
+        "B",
+        &["Run", "Stop"],
+        "\n[[state]]\nname = \"hits\"\ntype = \"counter\"\ninitial = 0\n\
+         \n[[action]]\nname = \"Hit\"\nkind = \"input\"\nfrom = [\"Run\"]\nto = \"Run\"\n\
+         effect = [\"hits += 1\"]\n\
+         \n[[action]]\nname = \"Start\"\nkind = \"input\"\nfrom = [\"Run\"]\nto = \"Run\"\n\
+         \n[[action.triggers]]\nname = \"ask\"\nkind = \"wasm\"\nmodule = \"decider\"\n\
+         \n[[action]]\nname = \"Halt\"\nkind = \"input\"\nfrom = [\"Run\"]\nto = \"Stop\"\n",
+    );
+    let starts = "Action::\"Send\", Action::\"Go\"";
+    let result = invariant(&[a, b], &policies(starts));
+    assert!(!result.holds(), "{result}");
+    assert!(!result.held_aside, "{result}");
+}
+
+#[test]
+fn a_fair_cycle_grows_on_every_move_held_back() {
+    // Each Kick sends four Ticks, whose module answers change nothing the
+    // condition reads. A fair cycle between A and B with Kicks in flight
+    // stays broken: the check counts a delivery held back as one the
+    // runtime keeps able to make, so it may not stop at three in flight.
+    let kick = action("Kick", "internal", ("A", "A"), &[("Loop", "Tick"); 4])
+        .replace("from = [\"A\"]\nto = \"A\"\n", "from = [\"A\", \"B\"]\n");
+    let tick = "\n[[action]]\nname = \"Tick\"\nkind = \"internal\"\nfrom = [\"A\", \"B\"]\n\
+                \n[[action.triggers]]\nname = \"ask\"\nkind = \"wasm\"\nmodule = \"noter\"\n\
+                on_success = \"Noop\"\n\
+                \n[[action]]\nname = \"Noop\"\nkind = \"internal\"\nfrom = [\"A\", \"B\"]\n";
+    let body = action("Begin", "input", ("Idle", "A"), &[("Loop", "Kick")])
+        + &kick
+        + tick
+        + &action("Go", "internal", ("A", "B"), &[])
+        + &action("Back", "internal", ("B", "A"), &[])
+        + &action("Exit", "input", ("A", "Out"), &[])
+        + "\n[[state_timeout]]\nstate = \"A\"\nafter_seconds = 60\non_timeout = \"Go\"\n\
+           \n[[state_timeout]]\nstate = \"B\"\nafter_seconds = 60\non_timeout = \"Back\"\n\
+           \n[[liveness]]\nname = \"GetsOut\"\neventually = \"status == 'Idle' || status == 'Out'\"\n\
+           relies_on = [\"Exit\"]\nfairness = { weak = [\"Exit\"] }\n";
+    let looping = automaton("Loop", &["Idle", "A", "B", "Out"], &body);
+    let starts = "Action::\"Begin\", Action::\"Exit\"";
+    let result = liveness(&[looping], &policies(starts));
+    let fair = result.fair.as_ref().expect("a fairness verdict");
+    assert!(
+        matches!(fair.outcome, FairOutcome::Broken { .. }),
+        "{result}"
+    );
+}

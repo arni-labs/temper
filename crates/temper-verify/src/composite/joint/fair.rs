@@ -106,9 +106,6 @@ pub struct FairVerdict {
     pub relies_on: Vec<String>,
     /// When the walk held a move back, the bound on what was in flight.
     pub in_flight_bound: Option<usize>,
-    /// With a bound: every move held back past it changes nothing the
-    /// condition reads.
-    pub held_aside: bool,
     /// Holds, broken, proves nothing, or not fully checked.
     pub outcome: FairOutcome,
 }
@@ -189,12 +186,8 @@ impl fmt::Display for FairVerdict {
                 self.relies_on.join(", ")
             );
         }
-        if let Some(words) = super::in_flight_words(
-            self.in_flight_bound,
-            self.held_aside,
-            "dispatches and calls",
-        ) {
-            under += &format!(", {words}");
+        if let Some(bound) = self.in_flight_bound {
+            under += &format!(", with at most {bound} dispatches and calls in flight");
         }
         match &self.outcome {
             FairOutcome::Holds {
