@@ -32,7 +32,7 @@ use temper_spec::predicate::{Expr, Name, eval};
 
 use super::JointState;
 use super::env::{Blind, ID, JointEnv, Records};
-use super::senders::{OUTSIDE, Senders, standing};
+use super::senders::{OUTSIDE, Senders, policy_fields, standing};
 use super::slice::slice;
 use super::state::canonical;
 use crate::model::semantics::{Expansion, rule_for, string_values};
@@ -200,6 +200,10 @@ impl JointModel {
                 // A move's parameter is no field of a record.
                 Name::Status | Name::Param(_) => {}
             });
+        }
+        for entity in standing(by_name, scope, sending.policies) {
+            let fields = policy_fields(by_name[entity.as_str()], sending.policies);
+            read.entry(entity).or_default().extend(fields);
         }
         let (mut models, reactions) = tracked(by_name, scope, read.clone(), Records::ById);
         for ((entity, field), literals) in named_literals(owner, reads, &models, &reactions) {

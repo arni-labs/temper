@@ -80,6 +80,20 @@ pub(in crate::composite::joint) fn standing<'a>(
         .collect()
 }
 
+/// The fields of `automaton` the policies read. Whether a timer's setter
+/// may still read its record turns on them, so a type in [`standing`]
+/// tracks them.
+pub(in crate::composite::joint) fn policy_fields(
+    automaton: &Automaton,
+    policies: Option<&SendAnalysis>,
+) -> BTreeSet<String> {
+    let Some(policies) = policies else {
+        return BTreeSet::new();
+    };
+    let fields = automaton.state.iter().map(|s| &s.name);
+    fields.filter(|f| policies.reads_attr(f)).cloned().collect()
+}
+
 impl Senders {
     /// What `by`, setting a timer on `record` of `entity` before its move,
     /// has at stake: nothing when `entity`'s standing cannot change or a

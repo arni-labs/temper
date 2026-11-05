@@ -64,7 +64,7 @@ pub(super) use build::declared;
 mod kinds;
 mod standing;
 mod table;
-pub(super) use standing::{Stake, standing};
+pub(super) use standing::{Stake, policy_fields, standing};
 #[path = "senders_unknown.rs"]
 mod unknown;
 

@@ -91,7 +91,9 @@ fn a_timer_whose_setter_may_no_longer_read_its_record_makes_no_move() {
             .any(|state| state.contains("Doc=Waiting")),
         "{result}"
     );
-    assert!(result.to_string().contains("withheld"), "{result}");
+    let text = result.to_string();
+    assert!(text.contains("withheld"), "{result}");
+    assert!(text.contains("NEVER SETTLES"), "{result}");
 }
 
 #[test]
