@@ -173,9 +173,9 @@ pub(super) struct JointModel {
     idle: std::sync::OnceLock<BTreeSet<(String, String)>>,
     /// How many may be in flight at once in this walk ([`FIRST_IN_FLIGHT`]).
     in_flight: std::sync::atomic::AtomicUsize,
-    /// The actions (entity, action) a record takes only once, of which one
-    /// copy in flight is enough (`once.rs`). None for the drop check's model.
-    taken_once: BTreeSet<(String, String)>,
+    /// The actions a record takes only once, by entity, of which one copy
+    /// in flight is enough (`once.rs`). None for the drop check's model.
+    taken_once: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl JointModel {
@@ -231,7 +231,7 @@ impl JointModel {
             }
         }
         let mut model = Self::compose(by_name, scope, (models, reactions), &read, sending, cut);
-        model.taken_once = once::taken_once(&model.models);
+        model.taken_once = once::taken_once(&model.models, &model.reactions);
         model
     }
 
@@ -376,7 +376,7 @@ impl JointModel {
             settled: std::sync::OnceLock::new(),
             idle: std::sync::OnceLock::new(),
             in_flight: FIRST_IN_FLIGHT.into(),
-            taken_once: BTreeSet::new(),
+            taken_once: BTreeMap::new(),
         }
     }
 
