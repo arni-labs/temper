@@ -19,9 +19,10 @@
 //! it: those specs already run. A refusal is kept only while this process runs,
 //! so a later checker decides it again. A walk that did not fit in its
 //! memory says nothing of the specs, since another host or more room may fit
-//! it, so it is not kept in the blob table either; but walking it again here
-//! would fill the host again for as long and end the same way, so this
-//! process keeps it like a refusal. A walk that stopped without a verdict
+//! it, so it is not kept in the blob table either. Walking it again here
+//! would fill the host for as long again, so this process keeps it like a
+//! refusal: an install of the same model reads it until the process starts
+//! again, even when other walks or processes held the room it ran out of. A walk that stopped without a verdict
 //! (it panicked) is kept only for the install that waited for it
 //! ([`Attempt`]), and the next install walks again.
 
