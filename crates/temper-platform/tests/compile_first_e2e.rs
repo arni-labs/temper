@@ -657,3 +657,82 @@ async fn e2e_compile_first_system_and_user_coexist() {
     let json = body_json(response).await;
     assert_eq!(json["status"], "Building");
 }
+
+// =========================================================================
+// Test 4: The service document and $metadata require a credential
+// =========================================================================
+
+async fn tenant_get(
+    app: &axum::Router,
+    uri: &str,
+    tenant: &str,
+    credential: Option<&str>,
+) -> (StatusCode, String) {
+    let mut request = Request::get(uri).header("X-Tenant-Id", tenant);
+    if let Some(credential) = credential {
+        request = request.header("Authorization", format!("Bearer {credential}"));
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, body_string(response).await)
+}
+
+/// The service document and $metadata of a tenant are read with a credential
+/// for that tenant, the same as one of its records. A caller with none, or
+/// with a credential for another tenant, gets 401 and no type or set name.
+#[tokio::test]
+async fn e2e_service_document_and_metadata_require_a_tenant_credential() {
+    let registry = build_user_registry("alpha", &[("Order", ORDER_IOA)]);
+    let state = PlatformState::with_registry(registry, None);
+    register_test_operator(&state, "alpha", "alpha-operator-key", ORDER_OPERATOR_POLICY).await;
+    register_test_operator(&state, "beta", "beta-operator-key", TASK_OPERATOR_POLICY).await;
+    let app = build_platform_router(state);
+
+    for uri in ["/tdata", "/tdata/", "/tdata/$metadata"] {
+        let (status, body) = tenant_get(&app, uri, "alpha", None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{uri} without a credential"
+        );
+        assert!(
+            !body.contains("Order"),
+            "{uri} without a credential: {body}"
+        );
+
+        let (status, body) = tenant_get(&app, uri, "alpha", Some("beta-operator-key")).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{uri} with another tenant's credential"
+        );
+        assert!(
+            !body.contains("Order"),
+            "{uri} with another tenant's credential: {body}"
+        );
+    }
+
+    let (status, body) = tenant_get(
+        &app,
+        "/tdata/$metadata",
+        "alpha",
+        Some("alpha-operator-key"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "$metadata with alpha's credential");
+    assert!(
+        body.contains("EntityType Name=\"Order\""),
+        "alpha's $metadata names its types: {body}"
+    );
+
+    let (status, body) = tenant_get(&app, "/tdata", "alpha", Some("alpha-operator-key")).await;
+    assert_eq!(status, StatusCode::OK, "/tdata with alpha's credential");
+    assert!(
+        body.contains("\"Orders\""),
+        "alpha's service document lists its sets: {body}"
+    );
+}
