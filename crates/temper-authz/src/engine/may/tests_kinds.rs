@@ -408,3 +408,37 @@ when { principal has role && principal.role == "x" && resource.open == true };
         May::Maybe
     );
 }
+
+#[test]
+fn whether_someone_may_make_a_request_does_not_depend_on_which_split_ran_first() {
+    // Asked with B, the split tells apart senders whose role and alt are
+    // both "x", who surely may A; asked with C, or alone, it leaves A open.
+    let policies = r#"
+permit(principal, action == Action::"A", resource is Note)
+when { principal has role && principal has alt && principal.role == principal.alt };
+permit(principal, action == Action::"B", resource is Note)
+when { principal has role && principal.role == "x" && principal has alt && principal.alt == "x" };
+permit(principal, action == Action::"C", resource is Note)
+when { principal has team && principal.team == "t" };
+"#;
+    let ask = |actions: [&'static str; 2]| {
+        actions.map(|action| Question {
+            action,
+            resource_type: "Note",
+            cause: Cause::request(),
+        })
+    };
+    let unlimited = |_: usize| Ok(());
+    let answer = |splits: &[[&'static str; 2]]| {
+        let analysis = SendAnalysis::new(policies).expect("the policies parse");
+        for split in splits {
+            analysis
+                .outside_kinds(&ask(*split), &unlimited)
+                .expect("nothing limits the room");
+        }
+        analysis.may_request(&Asker::Outside, "A", "Note", &unlimited)
+    };
+    let alone = answer(&[]);
+    assert_eq!(answer(&[["A", "C"], ["A", "B"]]), alone);
+    assert_eq!(answer(&[["A", "B"], ["A", "C"]]), alone);
+}
