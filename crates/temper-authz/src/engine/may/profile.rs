@@ -70,7 +70,9 @@ impl Kind {
 
     /// The profiles that answer `action` on a `resource_type` record for a
     /// move with `cause` as all its senders would: the examples when its
-    /// split asked that, else the others too.
+    /// split asked that, or that with more of the cause known (senders with
+    /// one form have one residual, whatever fills it in), else the others
+    /// too.
     pub(super) fn profiles(
         &self,
         action: &str,
@@ -81,7 +83,7 @@ impl Kind {
             self.asked
                 .get(action)
                 .and_then(|types| types.get(resource_type))
-                .is_some_and(|causes| causes.contains(cause))
+                .is_some_and(|causes| causes.iter().any(|asked| cause.within(asked)))
         });
         let others: &[Profile] = if asked { &[] } else { &self.others };
         self.examples.iter().chain(others)

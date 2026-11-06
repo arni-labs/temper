@@ -30,7 +30,7 @@ permit(principal, action == Action::"Other", resource is Elsewhere)
 when { principal.id == "hook-two" };
 "#;
 
-fn is(value: &str) -> Fact {
+pub(super) fn is(value: &str) -> Fact {
     Fact::Is(Json::from(value))
 }
 
@@ -243,7 +243,7 @@ pub(super) fn described(kinds: &[Kind]) -> Vec<(Vec<Profile>, Vec<Profile>)> {
         .collect()
 }
 
-fn kinds_of(policies: &str, actions: &[&str]) -> Vec<Kind> {
+pub(super) fn kinds_of(policies: &str, actions: &[&str]) -> Vec<Kind> {
     let analysis = SendAnalysis::new(policies).expect("policies parse");
     let questions: Vec<Question<'_>> = actions
         .iter()
@@ -369,76 +369,4 @@ permit(principal, action == Action::"Z", resource) when {{ context.role == "memb
         "every kind refuses A: {kinds:?}"
     );
     assert_eq!(kinds, kinds_of(asked, &["A"]));
-}
-
-/// Asserts each of `senders` (an empty value is an attribute it lacks) is
-/// of some kind of the split on `asked` that answers every one of
-/// `actions` as the sender does, or Maybe.
-fn each_has_a_kind(text: &str, asked: &[&str], actions: &[&str], senders: &[&[(&str, &str)]]) {
-    let analysis = SendAnalysis::new(text).expect("the policies parse");
-    let none = BTreeMap::new();
-    let cause = Cause::request();
-    let answers = |asker: &Asker| -> Vec<May> {
-        actions
-            .iter()
-            .map(|action| analysis.may(asker, action, "Note", &none, Some(&cause)))
-            .collect()
-    };
-    let kinds = kinds_of(text, asked);
-    for sender in senders {
-        let mut profile = Profile::default();
-        for (name, value) in *sender {
-            let fact = if value.is_empty() {
-                Fact::Absent
-            } else {
-                is(value)
-            };
-            profile.attrs.insert((*name).to_string(), fact);
-        }
-        let own = answers(&Asker::OutsideAs(Kind::of(profile)));
-        assert!(
-            kinds.iter().any(|kind| {
-                answers(&Asker::OutsideAs(kind.clone()))
-                    .iter()
-                    .zip(&own)
-                    .all(|(kind, own)| kind == own || *kind == May::Maybe)
-            }),
-            "no kind answers {own:?} as {sender:?} does: {kinds:?}"
-        );
-    }
-}
-
-#[test]
-fn a_kind_asked_what_its_split_did_not_ask_answers_for_every_sender_in_it() {
-    // Asked only A, senders with no role and those with role "admin" answer
-    // alike, so one kind holds both: asked Z, it may not refuse the admins.
-    let text = r#"
-permit(principal, action == Action::"A", resource) when { principal.role == "member" };
-permit(principal, action == Action::"Z", resource) when { principal.role == "admin" };
-"#;
-    each_has_a_kind(
-        text,
-        &["A"],
-        &["A", "Z"],
-        &[&[("role", "admin")], &[("role", "")]],
-    );
-    // A child found answering as a node in another branch is held there:
-    // senders with no a, whom Z refuses, may not be taken for those it lets.
-    let text = r#"
-forbid(principal, action == Action::"A", resource) when { principal.a == "x" };
-forbid(principal, action == Action::"A", resource) when { principal.b == "x" };
-permit(principal, action == Action::"A", resource) when { principal.c == "y" };
-permit(principal, action == Action::"Z", resource) when { principal.a == "x" };
-"#;
-    each_has_a_kind(
-        text,
-        &["A"],
-        &["A", "Z"],
-        &[
-            &[("a", ""), ("b", "x"), ("c", "")],
-            &[("a", ""), ("b", "x"), ("c", "y")],
-            &[("a", "x"), ("b", ""), ("c", "")],
-            &[("a", ""), ("b", ""), ("c", "y")],
-        ],
-    );
 }

@@ -1,188 +1,209 @@
 //! The senders a kind stands for besides its example: those the partition
 //! found answering as some node did and so did not split again.
 
+use super::memory::fact_heap;
 use super::split::facts_mut;
 use super::*;
+
+/// Names, by their place in [`Alike::names`], one bit each.
+type Names = Vec<u64>;
+
+/// A name a split tested, by its place, and the fact it set there.
+type Set = (usize, Option<Fact>);
 
 /// The partition's nodes, and the children it dropped for answering as a
 /// node it kept. Two that answer alike agree on every value a later split
 /// reads (their forms show those values), so a dropped child's senders are
-/// split as the node it answers as is.
+/// split as the node it answers as is. A child's example is its parent's
+/// with one fact set, so a node keeps only that fact, and a dropped child
+/// only the names where its example and the node's differ.
 pub(super) struct Alike {
-    /// Each node kept: the node it was split from and the test (none for
-    /// the root), and its example.
-    nodes: Vec<(usize, Option<Test>, Profile)>,
-    /// Each child dropped: the node it was split from, the test, its
-    /// example, and the node it answers as.
-    dropped: Vec<(usize, Test, Profile, usize)>,
+    /// Each name a split tested: the type, or an attribute or context key.
+    names: Vec<Test>,
+    /// Each node kept: the node it was split from, the name tested there
+    /// and the fact it took (none for the root).
+    nodes: Vec<(usize, Option<Set>)>,
+    /// Each child dropped: the node it was split from, the name tested, the
+    /// names where it and the node it answers as differ, and that node.
+    dropped: Vec<(usize, usize, Names, usize)>,
+    /// What the facts and name sets above hold on the heap.
+    heap: usize,
 }
 
 impl Alike {
-    /// The node every sender starts from.
+    /// The node every sender starts from, whose example knows nothing.
     pub(super) const ROOT: usize = 0;
 
-    pub(super) fn new(root: &Profile) -> Self {
+    pub(super) fn new() -> Self {
         Self {
-            nodes: vec![(Self::ROOT, None, root.clone())],
+            names: Vec::new(),
+            nodes: vec![(Self::ROOT, None)],
             dropped: Vec::new(),
+            heap: 0,
         }
     }
 
     /// A node kept, split from `parent` on `test`.
     pub(super) fn node(&mut self, parent: usize, test: &Test, profile: &Profile) -> usize {
-        self.nodes
-            .push((parent, Some(test.clone()), profile.clone()));
+        let name = self.name(test);
+        let fact = fact_at(profile, &self.names[name]);
+        self.heap += fact.as_ref().map_or(0, fact_heap);
+        self.nodes.push((parent, Some((name, fact))));
         self.nodes.len() - 1
     }
 
     /// A child of `parent` on `test` dropped for answering as the node `like`.
-    pub(super) fn drop(&mut self, parent: usize, test: &Test, profile: Profile, like: usize) {
-        self.dropped.push((parent, test.clone(), profile, like));
+    pub(super) fn drop(&mut self, parent: usize, test: &Test, profile: &Profile, like: usize) {
+        let name = self.name(test);
+        let example = self.example(like);
+        let mut differ = Names::new();
+        for (at, name) in self.names.iter().enumerate() {
+            if fact_at(profile, name) != fact_at(&example, name) {
+                set(&mut differ, at);
+            }
+        }
+        self.heap += differ.capacity() * size_of::<u64>();
+        self.dropped.push((parent, name, differ, like));
     }
 
-    /// What this holds, each entry at most a partition node's worth.
-    pub(super) fn held(&self) -> usize {
-        self.nodes.len() + self.dropped.len()
+    /// The bytes this holds, and what [`Self::blurred`] would make of it.
+    pub(super) fn bytes(&self) -> usize {
+        let names = self.names.capacity() * size_of::<Test>()
+            + self
+                .names
+                .iter()
+                .map(|test| match test {
+                    Test::Named(_, name) => name.capacity(),
+                    _ => 0,
+                })
+                .sum::<usize>();
+        let blurred = self.nodes.len()
+            * (2 * size_of::<Vec<usize>>() + self.names.len().div_ceil(64) * size_of::<u64>())
+            + self.dropped.len() * size_of::<usize>();
+        self.nodes.capacity() * size_of::<(usize, Option<Set>)>()
+            + self.dropped.capacity() * size_of::<(usize, usize, Names, usize)>()
+            + self.heap
+            + names
+            + blurred
     }
 
-    /// What each node's other senders hold, one profile wide enough for
-    /// all: those of the node it was split from, given its value on the
-    /// test, and each child dropped for answering as it, with that child's
-    /// own others. They agree with the node on every value its later splits
-    /// read, so the value a split copies in is theirs. Widening blurs what
-    /// told them apart from the example, which can be what an asked question
-    /// read before it was decided: a kind reads these only for a question
-    /// its split did not ask ([`Kind::profiles`]). A dropped child can answer
-    /// as a node found before or after its parent, so this runs until
-    /// nothing widens; a profile only widens, and only so far, so it ends.
-    pub(super) fn others(&self) -> Vec<Option<Profile>> {
+    /// The names each node's other senders may hold otherwise than its
+    /// example: those of the node it was split from but the one tested
+    /// there, and for each child dropped for answering as it, where that
+    /// child's example differs from the node's and that child's own. They
+    /// agree with the node on every value its later splits read, so a split
+    /// tells them apart as it does the example. A dropped child can answer
+    /// as a node found before or after its parent, so this runs until no set
+    /// grows; sets only grow, within the names, so it ends.
+    pub(super) fn blurred(&self) -> Vec<Names> {
+        let words = self.names.len().div_ceil(64);
         let mut into: Vec<Vec<usize>> = vec![Vec::new(); self.nodes.len()];
         for (at, dropped) in self.dropped.iter().enumerate() {
             into[dropped.3].push(at);
         }
-        let mut others: Vec<Option<Profile>> = vec![None; self.nodes.len()];
+        let mut blurred: Vec<Names> = vec![vec![0; words]; self.nodes.len()];
         let mut changed = true;
         while changed {
             changed = false;
             for at in 0..self.nodes.len() {
-                let (parent, test, own) = &self.nodes[at];
-                let mut found = others[at].clone();
-                let mut add = |profile: &Profile| {
-                    found = Some(match found.take() {
-                        Some(found) => widen(&found, profile),
-                        None => profile.clone(),
-                    });
-                };
-                if let (Some(test), Some(above)) = (test, &others[*parent]) {
-                    let mut above = above.clone();
-                    decided(test, own, &mut above);
-                    add(&above);
+                let mut found = blurred[at].clone();
+                if let (parent, Some((name, _))) = &self.nodes[at] {
+                    add(&mut found, &blurred[*parent], Some(*name));
                 }
                 for &d in &into[at] {
-                    let (from, test, profile, _) = &self.dropped[d];
-                    add(profile);
-                    if let Some(above) = &others[*from] {
-                        let mut above = above.clone();
-                        decided(test, profile, &mut above);
-                        add(&above);
-                    }
+                    let (from, name, differ, _) = &self.dropped[d];
+                    add(&mut found, differ, None);
+                    add(&mut found, &blurred[*from], Some(*name));
                 }
-                if found != others[at] {
-                    others[at] = found;
+                if found != blurred[at] {
+                    blurred[at] = found;
                     changed = true;
                 }
             }
         }
-        others
+        blurred
     }
-}
 
-/// A profile of every sender either describes. A value they hold alike
-/// stays; one they differ on widens to what covers both, or unknown.
-fn widen(one: &Profile, other: &Profile) -> Profile {
-    let facts = |one: &BTreeMap<String, Fact>, other: &BTreeMap<String, Fact>| {
-        one.iter()
-            .filter_map(|(name, fact)| {
-                let wide = either(fact, other.get(name)?)?;
-                Some((name.clone(), wide))
-            })
-            .collect()
-    };
-    Profile {
-        kind: match (&one.kind, &other.kind) {
-            (Some(one), Some(other)) => either(one, other),
-            _ => None,
-        },
-        attrs: facts(&one.attrs, &other.attrs),
-        context: facts(&one.context, &other.context),
-        stand_ins: one.stand_ins.union(&other.stand_ins).cloned().collect(),
-    }
-}
-
-/// A fact holding every value either holds, or None (unknown) when only
-/// that does: a fact cannot say "absent, or some value".
-fn either(one: &Fact, other: &Fact) -> Option<Fact> {
-    let some = |unlike: Vec<Json>, like: BTreeMap<String, bool>, string| Fact::Other {
-        unlike,
-        like,
-        string,
-    };
-    match (one, other) {
-        _ if one == other => Some(one.clone()),
-        (Fact::Absent, _) | (_, Fact::Absent) => None,
-        (Fact::Is(value), Fact::Other { unlike, .. })
-        | (Fact::Other { unlike, .. }, Fact::Is(value)) => {
-            let unlike = unlike
-                .iter()
-                .filter(|other| *other != value)
-                .cloned()
-                .collect();
-            Some(some(unlike, BTreeMap::new(), None))
-        }
-        (Fact::Is(_), Fact::Is(_)) => Some(some(Vec::new(), BTreeMap::new(), None)),
-        (
-            Fact::Other {
-                unlike,
-                like,
-                string,
-            },
-            Fact::Other {
-                unlike: others,
-                like: other_like,
-                string: other_string,
-            },
-        ) => Some(some(
-            unlike
-                .iter()
-                .filter(|value| others.contains(value))
-                .cloned()
-                .collect(),
-            like.iter()
-                .filter(|(pattern, matches)| other_like.get(*pattern) == Some(matches))
-                .map(|(pattern, matches)| (pattern.clone(), *matches))
-                .collect(),
-            if string == other_string {
-                *string
-            } else {
-                None
-            },
-        )),
-    }
-}
-
-/// Gives `onto` what `own` holds where `test` reads.
-fn decided(test: &Test, own: &Profile, onto: &mut Profile) {
-    match test {
-        Test::Kind => onto.kind.clone_from(&own.kind),
-        Test::Named(place, name) | Test::Like(place, name, _) => {
-            match facts(own, *place).get(name) {
-                Some(fact) => {
-                    facts_mut(onto, *place).insert(name.clone(), fact.clone());
-                }
-                None => {
-                    facts_mut(onto, *place).remove(name);
-                }
+    /// A profile of every sender `example` stands for with `blurred` names
+    /// held otherwise, or none when it stands for no others.
+    pub(super) fn others(&self, example: &Profile, blurred: &Names) -> Option<Profile> {
+        let mut others = example.clone();
+        let mut any = false;
+        for (at, name) in self.names.iter().enumerate() {
+            if blurred[at / 64] >> (at % 64) & 1 == 1 {
+                set_at(&mut others, name, None);
+                any = true;
             }
+        }
+        any.then_some(others)
+    }
+
+    /// The name `test` reads, as a place in [`Self::names`].
+    fn name(&mut self, test: &Test) -> usize {
+        let test = match test {
+            Test::Like(place, name, _) => Test::Named(*place, name.clone()),
+            test => test.clone(),
+        };
+        match self.names.iter().position(|known| *known == test) {
+            Some(at) => at,
+            None => {
+                self.names.push(test);
+                self.names.len() - 1
+            }
+        }
+    }
+
+    /// The example of the node `at`: the facts its splits set.
+    fn example(&self, mut at: usize) -> Profile {
+        let mut set: Vec<&Set> = Vec::new();
+        while let (parent, Some(fact)) = &self.nodes[at] {
+            set.push(fact);
+            at = *parent;
+        }
+        let mut example = Profile::default();
+        for (name, fact) in set.into_iter().rev() {
+            set_at(&mut example, &self.names[*name], fact.clone());
+        }
+        example
+    }
+}
+
+/// Adds the names in `from`, but `except`, to `onto`.
+fn add(onto: &mut Names, from: &Names, except: Option<usize>) {
+    for (at, word) in from.iter().enumerate() {
+        let mut word = *word;
+        if let Some(except) = except.filter(|except| except / 64 == at) {
+            word &= !(1 << (except % 64));
+        }
+        onto[at] |= word;
+    }
+}
+
+fn set(names: &mut Names, at: usize) {
+    if names.len() <= at / 64 {
+        names.resize(at / 64 + 1, 0);
+    }
+    names[at / 64] |= 1 << (at % 64);
+}
+
+/// What `profile` holds where `name` reads.
+fn fact_at(profile: &Profile, name: &Test) -> Option<Fact> {
+    match name {
+        Test::Kind => profile.kind.clone(),
+        Test::Named(place, name) | Test::Like(place, name, _) => {
+            facts(profile, *place).get(name).cloned()
+        }
+    }
+}
+
+fn set_at(profile: &mut Profile, name: &Test, fact: Option<Fact>) {
+    match (name, fact) {
+        (Test::Kind, fact) => profile.kind = fact,
+        (Test::Named(place, name) | Test::Like(place, name, _), Some(fact)) => {
+            facts_mut(profile, *place).insert(name.clone(), fact);
+        }
+        (Test::Named(place, name) | Test::Like(place, name, _), None) => {
+            facts_mut(profile, *place).remove(name);
         }
     }
 }

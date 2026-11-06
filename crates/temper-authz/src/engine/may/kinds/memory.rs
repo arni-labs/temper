@@ -168,7 +168,7 @@ fn profile_heap(profile: &Profile) -> usize {
             .sum::<usize>()
 }
 
-fn fact_heap(fact: &Fact) -> usize {
+pub(super) fn fact_heap(fact: &Fact) -> usize {
     match fact {
         Fact::Absent => 0,
         Fact::Is(value) => json_heap(value),

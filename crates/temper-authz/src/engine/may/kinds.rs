@@ -310,15 +310,15 @@ impl SendAnalysis {
         let mut leaves: Vec<(usize, Node)> = Vec::new();
         let mut seen = HashMap::new();
         let first = read(Profile::default(), None);
-        let mut alike = Alike::new(&first.profile);
+        let mut alike = Alike::new();
         seen.insert(first.form.clone(), Alike::ROOT);
         let mut open = vec![(Alike::ROOT, first)];
         while let Some((at, node)) = open.pop() {
             // Include vector spare capacity, reallocation overlap, children,
             // and the result being assembled before allocating.
             memory.reserve(
-                4 * (open.len() + leaves.len() + memory.branches + 1) + alike.held(),
-                forms.bytes() + seen.len() * memory.form,
+                4 * (open.len() + leaves.len() + memory.branches + 1),
+                forms.bytes() + seen.len() * memory.form + 2 * alike.bytes(),
             )?;
             let Some(test) = node.undecided.first() else {
                 leaves.push((at, node));
@@ -345,7 +345,7 @@ impl SendAnalysis {
             for (child, others) in children {
                 let like = match seen.get(&child.form) {
                     Some(&like) => {
-                        alike.drop(at, test, child.profile, like);
+                        alike.drop(at, test, &child.profile, like);
                         like
                     }
                     None => {
@@ -356,21 +356,23 @@ impl SendAnalysis {
                     }
                 };
                 for other in others {
-                    alike.drop(at, test, other, like);
+                    alike.drop(at, test, &other, like);
                 }
             }
         }
-        let mut others = alike.others();
+        // Each leaf's others are at most a node's worth.
         memory.reserve(
-            4 * (leaves.len() + memory.branches + 1) + 2 * alike.held(),
-            forms.bytes() + seen.len() * memory.form,
+            4 * (leaves.len() + memory.branches + 1) + leaves.len(),
+            forms.bytes() + seen.len() * memory.form + alike.bytes(),
         )?;
+        let blurred = alike.blurred();
         let mut kinds: Vec<(Vec<May>, Kind)> = Vec::new();
         let mut held = 0;
         for (at, node) in leaves {
+            let others = alike.others(&node.profile, &blurred[at]);
             let kind = Kind {
                 examples: vec![node.profile],
-                others: others[at].take().into_iter().collect(),
+                others: others.into_iter().collect(),
                 asked: Arc::clone(&asked),
             };
             held += 1 + kind.others.len();
@@ -386,6 +388,7 @@ impl SendAnalysis {
                 None => kinds.push((answers, kind)),
             }
         }
+        std::mem::drop((alike, blurred));
         memory.reserve(
             4 * (kinds.len() + memory.branches + 1) + held,
             forms.bytes()

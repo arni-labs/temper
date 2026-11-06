@@ -27,6 +27,8 @@ mod who;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_alike;
+#[cfg(test)]
 mod tests_kinds;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
