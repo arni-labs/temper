@@ -251,7 +251,7 @@ impl Explored<'_> {
     /// order the threads walked the states in. It gives back what the walk's
     /// moves held and keeps only its sure ways, sorted where they lie, so a
     /// walk that stopped for room has room for it; the walk keeps no moves
-    /// or ways after.
+    /// or ways after, and the room gets back what they took.
     pub(in crate::composite::joint) fn near_sure(
         &mut self,
         depth: usize,
@@ -316,9 +316,10 @@ impl Explored<'_> {
             level = next;
         }
         self.held
-            .sub(bytes(&level) + (count + 1) * size_of::<u32>());
+            .sub(bytes(&level) + (count + 1) * size_of::<u32>() + bytes(&ways));
         drop(first);
-        self.edges = ways;
+        drop(ways);
+        self.held.release();
         Ok(NearSure { parents, near })
     }
 

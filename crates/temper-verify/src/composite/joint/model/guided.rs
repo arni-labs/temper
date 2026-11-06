@@ -183,6 +183,12 @@ pub(in crate::composite::joint) struct Stats {
 impl Stats {
     /// How far it got, in words, after why the breadth-first walk stopped.
     fn describe(&self, why: &str) -> String {
+        if self.walks == 0 && self.candidates > 0 {
+            return format!(
+                "{why}; past it, it walked on from {} states near a start where the condition was false, {} of which it could not finish, and that spent all {} steps",
+                self.candidates, self.unconfirmed, self.steps
+            );
+        }
         let mut text = format!(
             "{why}; past it, {} guided walks made {} steps and reached {} distinct states, at most {} moves from a start, without a break",
             self.walks, self.steps, self.distinct, self.deepest
@@ -213,7 +219,8 @@ enum Look {
     Stop,
 }
 
-/// A fixed hash, so a fingerprint is the same in every run of one build.
+/// A fixed hash: equal values have one fingerprint within a run. A name
+/// hashes by its address, so a state's fingerprint differs between runs.
 fn print<T: Hash + ?Sized>(value: &T) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);

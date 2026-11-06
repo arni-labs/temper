@@ -340,4 +340,5 @@ fn a_state_near_the_start_whose_own_walk_cannot_finish_is_not_judged() {
         panic!("Trap escapes, and no walk could show it, got {result}");
     };
     assert!(reason.contains("does not fit"), "{reason}");
+    assert!(reason.contains("could not finish"), "{reason}");
 }

@@ -150,6 +150,12 @@ impl<'a> Held<'a> {
         self.bytes -= bytes;
     }
 
+    /// Give the room back what it took beyond what is held now.
+    pub(super) fn release(&mut self) {
+        self.bound.room.give(self.taken - self.bytes);
+        self.taken = self.bytes;
+    }
+
     /// Hold `bytes` in all, counted afresh.
     pub(super) fn set(&mut self, bytes: usize) -> Result<(), String> {
         match bytes.checked_sub(self.bytes) {

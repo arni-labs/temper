@@ -10,12 +10,13 @@ use temper_spec::predicate::{Expr, Truth, eval};
 use super::super::super::liveness::{settle, settle_bytes, sure_steps};
 use super::super::super::pack::{Packed, Packer};
 use super::super::super::room::{Bound, Held, block};
+use super::super::super::state::render;
 use super::super::super::{JointState, LivenessOutcome, StuckCase};
 use super::super::JointModel;
 use super::super::held::Tables;
 use super::super::step::Certainty;
 use super::super::walk::{Edge, Explored, Made, NearSure, Node, Via};
-use super::{Budget, Engine, Look, could_not_start, plain, print, reads, seeds};
+use super::{Budget, Engine, Look, Step, could_not_start, plain, print, reads, seeds};
 
 /// What a confirming walk found.
 enum Confirm {
@@ -159,11 +160,13 @@ impl Engine<'_, '_> {
         owner: &str,
         goal: &Expr,
         explored: &mut Explored<'_>,
-    ) -> Vec<Vec<Packed>> {
-        let Ok(NearSure { parents, near }) = explored.near_sure(explored.covered, print) else {
-            return Vec::new();
+    ) -> (Vec<Vec<Packed>>, usize) {
+        // Ordered by what a state reads as, the same in every run.
+        let key = |state: &JointState| print(&render(state));
+        let Ok(NearSure { parents, near }) = explored.near_sure(explored.covered, key) else {
+            return (Vec::new(), 0);
         };
-        let mut chains = Vec::new();
+        let (mut chains, mut held) = (Vec::new(), 0);
         for (index, _) in near {
             if chains.len() == self.left {
                 break;
@@ -176,28 +179,31 @@ impl Engine<'_, '_> {
             let mut at = index as usize;
             loop {
                 let packed = self.packer.pack(&explored.state(at));
-                if self
-                    .held
-                    .add(block(size_of::<Packed>() + 4 * packed.len()))
-                    .is_err()
-                {
-                    return chains;
+                let bytes = 2 * size_of::<Packed>() + block(size_of::<Packed>() + 4 * packed.len());
+                if self.held.add(bytes).is_err() {
+                    return (chains, held);
                 }
+                held += bytes;
                 chain.push(packed);
                 match parents[at] {
                     Some(from) if from as usize != at => at = from as usize,
                     _ => break,
                 }
             }
+            if self.held.add(2 * size_of::<Vec<Packed>>()).is_err() {
+                return (chains, held);
+            }
+            held += 2 * size_of::<Vec<Packed>>();
             chain.reverse();
             chains.push(chain);
         }
-        chains
+        (chains, held)
     }
 
     /// A confirming walk from the last state of each of `chains` in turn,
-    /// while steps are left: NEVER SETTLES, by the chain's sure moves, from
-    /// the first that finds a state that cannot reach the condition.
+    /// while steps are left: NEVER SETTLES, by the chain's sure moves
+    /// replayed, from the first that finds a state that cannot reach the
+    /// condition.
     fn confirm_nearest(
         &mut self,
         owner: &str,
@@ -233,7 +239,21 @@ impl Engine<'_, '_> {
                         .iter()
                         .map(|packed| self.packer.unpack(packed))
                         .collect();
-                    let prefix = sure_steps(self.model, &states);
+                    let trace: Vec<Step> = sure_steps(self.model, &states)
+                        .into_iter()
+                        .zip(chain)
+                        .map(|(step, packed)| {
+                            (
+                                step.action.map(|label| self.packer.id(&label)),
+                                packed,
+                                true,
+                            )
+                        })
+                        .collect();
+                    let Ok(prefix) = self.replay(&trace) else {
+                        self.stats.unconfirmed += 1;
+                        continue;
+                    };
                     let cases = cases
                         .into_iter()
                         .map(|case| StuckCase {
@@ -275,12 +295,13 @@ impl JointModel {
         }
         let mut engine = Engine::new(self, bound, reads(owner, &[goal]), budget.steps);
         let seeds = seeds(self, &explored, &mut engine.packer);
-        let nearest = engine.nearest(owner, goal, &mut explored);
+        let (nearest, chains) = engine.nearest(owner, goal, &mut explored);
         // The confirming walks get the room the walk held.
         drop(explored);
         if let Some(stuck) = engine.confirm_nearest(owner, goal, nearest, budget.confirm) {
             return stuck;
         }
+        engine.held.sub(chains);
         let mut stuck: Option<LivenessOutcome> = None;
         // The condition was false where the walk went by a move it cannot be
         // sure of.
