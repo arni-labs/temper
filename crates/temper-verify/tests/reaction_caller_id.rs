@@ -7,7 +7,8 @@
 use temper_authz::SendAnalysis;
 use temper_spec::automaton::{Automaton, parse_automaton};
 use temper_verify::composite::{
-    Bound, Bytes, LivenessOutcome, Progress, verify_joint_invariants, verify_joint_liveness,
+    Bound, Bytes, JointOutcome, LivenessOutcome, Progress, verify_joint_invariants,
+    verify_joint_liveness,
 };
 
 /// A parent whose Ping makes its child Stamp.
@@ -118,6 +119,13 @@ fn holds(parent: &str, child: &str) -> bool {
 
 /// Whether every joint invariant of `sources` holds under `policies`.
 fn holds_under(sources: &[&str], policies: &str) -> bool {
+    outcomes_under(sources, policies)
+        .iter()
+        .all(|outcome| matches!(outcome, JointOutcome::Holds))
+}
+
+/// The outcome of each joint invariant of `sources` under `policies`.
+fn outcomes_under(sources: &[&str], policies: &str) -> Vec<JointOutcome> {
     let automatons = parsed(sources);
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = SendAnalysis::new(policies).expect("fixture policies parse");
@@ -128,7 +136,7 @@ fn holds_under(sources: &[&str], policies: &str) -> bool {
     };
     let results = verify_joint_invariants(&refs, Some(&analysis), bound);
     assert!(!results.is_empty());
-    results.iter().all(|result| result.holds())
+    results.into_iter().map(|result| result.outcome).collect()
 }
 
 #[test]
@@ -539,3 +547,227 @@ fn two_parameters_bound_to_one_source_hold_one_caller() {
 fn a_modules_answer_binds_the_caller_who_started_its_call() {
     assert!(holds_under(&[STARTED, TOUCHED], &kernel_only("Finish")));
 }
+
+const MARKED: &str = r#"
+[automaton]
+name = "Child"
+states = ["Waiting", "Stamped"]
+initial = "Waiting"
+strict_action_params = true
+[[state]]
+name = "noted"
+type = "string"
+initial = ""
+[[state]]
+name = "zmarked"
+type = "string"
+initial = ""
+[[state]]
+name = "blocked"
+type = "string"
+initial = ""
+[[state]]
+name = "stamped_by"
+type = "string"
+initial = ""
+[[action]]
+name = "Note"
+kind = "input"
+from = ["Waiting"]
+to = "Waiting"
+guard = "noted == ''"
+params = [{ name = "noted", type = "string", source = "authenticated_subject" }]
+[[action]]
+name = "Mark"
+kind = "input"
+from = ["Waiting"]
+to = "Waiting"
+guard = "noted != '' && zmarked == ''"
+params = [{ name = "zmarked", type = "string", source = "authenticated_subject" }]
+[[action.constraints]]
+kind = "param_not_equals_field"
+param = "zmarked"
+field = "noted"
+[[action]]
+name = "Stamp"
+kind = "internal"
+from = ["Waiting"]
+to = "Stamped"
+guard = "noted != ''"
+params = [{ name = "a_who", type = "string", source = "authenticated_subject" }, { name = "stamped_by", type = "string", source = "authenticated_subject" }]
+[[action.constraints]]
+kind = "param_not_equals_field"
+param = "a_who"
+field = "blocked"
+[[invariant]]
+name = "stamper_is_not_marker"
+assert = "status != 'Stamped' || stamped_by != zmarked || Parent[Id].status == 'Open'"
+[[invariant]]
+name = "blocked_stays"
+assert = "blocked == ''"
+"#;
+const PINGED: &str = r#"
+[automaton]
+name = "Parent"
+states = ["Open", "Pinged"]
+initial = "Open"
+[[action]]
+name = "Ping"
+kind = "input"
+from = ["Open"]
+to = "Pinged"
+[[action.triggers]]
+name = "stamp"
+kind = "entity"
+target_entity = "Child"
+target_action = "Stamp"
+[action.triggers.resolve_target]
+kind = "same_id"
+"#;
+const ARMED: &str = r#"
+[automaton]
+name = "Doc"
+states = ["Idle", "Armed", "Running", "Done"]
+initial = "Idle"
+strict_action_params = true
+[[state]]
+name = "armer"
+type = "string"
+initial = ""
+[[state]]
+name = "c"
+type = "string"
+initial = ""
+[[action]]
+name = "Arm"
+kind = "input"
+from = ["Idle"]
+to = "Armed"
+params = [{ name = "armer", type = "string", source = "authenticated_subject" }]
+[[action]]
+name = "Start"
+kind = "internal"
+from = ["Armed"]
+to = "Running"
+[[action.triggers]]
+name = "work"
+kind = "wasm"
+module = "work"
+on_success = "Finish"
+[[action]]
+name = "Finish"
+kind = "internal"
+from = ["Running"]
+to = "Done"
+params = [{ name = "c", type = "string", source = "authenticated_subject" }]
+[[state_timeout]]
+state = "Armed"
+after_seconds = 60
+on_timeout = "Start"
+[[invariant]]
+name = "finisher_is_armer"
+assert = "status != 'Done' || c == armer || Parent[Id].status == 'Closed'"
+"#;
+const ANSWERED: &str = r#"
+[automaton]
+name = "Doc"
+states = ["Idle", "Running", "Done"]
+initial = "Idle"
+strict_action_params = true
+[[state]]
+name = "c"
+type = "string"
+initial = ""
+[[action]]
+name = "Start"
+kind = "input"
+from = ["Idle"]
+to = "Running"
+[[action.triggers]]
+name = "work"
+kind = "wasm"
+module = "work"
+on_success = "Finish"
+[[action]]
+name = "Finish"
+kind = "internal"
+from = ["Running"]
+to = "Done"
+params = [{ name = "c", type = "string", source = "authenticated_subject" }]
+[[action.triggers]]
+name = "mark"
+kind = "entity"
+target_entity = "Parent"
+target_action = "Mark"
+[action.triggers.resolve_target]
+kind = "same_id"
+[[invariant]]
+name = "one_caller"
+assert = "Parent[Id].status != 'Marked' || c == Parent[Id].m"
+"#;
+const MARKS: &str = r#"
+[automaton]
+name = "Parent"
+states = ["Open", "Marked"]
+initial = "Open"
+strict_action_params = true
+[[state]]
+name = "m"
+type = "string"
+initial = ""
+[[action]]
+name = "Mark"
+kind = "internal"
+from = ["Open"]
+to = "Marked"
+params = [{ name = "m", type = "string", source = "authenticated_subject" }]
+"#;
+
+/// A request binds one caller into every parameter bound to one source too.
+#[test]
+fn a_request_binds_one_caller_into_each_parameter_of_a_source() {
+    let requested = TWO_IDS.replace("kind = \"internal\"", "kind = \"input\"");
+    assert!(holds_under(
+        &[PARENT, &requested],
+        "permit(principal is Agent, action, resource);"
+    ));
+}
+
+/// A parameter of a source no rule reads still leaves the source's other
+/// parameters every caller, not the one value it was cut to.
+#[test]
+fn a_parameter_no_one_reads_does_not_fix_its_sources_caller() {
+    assert!(!holds_under(&[PINGED, MARKED], POLICIES_MARKED));
+}
+
+/// A timer's chain is not known to the walk, so a module's answer in it
+/// binds a caller the walk cannot name: it says nothing, never breaks.
+#[test]
+fn an_answer_in_a_chain_the_walk_cannot_name_breaks_nothing() {
+    let outcomes = outcomes_under(&[ARMED, TOUCHED], POLICIES_ARMED);
+    assert!(
+        !outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, JointOutcome::Broken { .. })),
+        "{outcomes:#?}"
+    );
+}
+
+/// What a module's answer binds, the reactions it sets off bind too.
+#[test]
+fn an_answers_binding_carries_on_along_its_chain() {
+    assert!(holds_under(&[ANSWERED, MARKS], POLICIES_ANSWERED));
+}
+
+const POLICIES_MARKED: &str = r#"
+permit(principal is Agent, action, resource) unless { action == Action::"Stamp" };
+permit(principal is Agent, action == Action::"Stamp", resource) when { context has via && context.via != "request" };
+"#;
+const POLICIES_ARMED: &str = r#"
+permit(principal is Agent, action, resource) unless { action in [Action::"Start", Action::"Finish"] };
+permit(principal is Agent, action in [Action::"Start", Action::"Finish"], resource) when { context has via && context.via != "request" };
+"#;
+const POLICIES_ANSWERED: &str = r#"
+permit(principal is Agent, action, resource) unless { action in [Action::"Finish", Action::"Mark"] };
+permit(principal is Agent, action in [Action::"Finish", Action::"Mark"], resource) when { context has via && context.via != "request" };
+"#;
