@@ -1,5 +1,7 @@
 //! What a request leaves of a policy.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use serde_json::Value as Json;
@@ -27,6 +29,7 @@ impl Request<'_> {
         &self,
         policy: &Json,
         reads: &dyn Fn(&Json) -> bool,
+        leaves: &Leaves,
     ) -> Option<String> {
         let object = policy.as_object()?;
         let scope = self
@@ -64,7 +67,7 @@ impl Request<'_> {
         let conditions = object.get("conditions").and_then(Json::as_array)?;
         for (condition, body) in conditions.iter().zip(judged) {
             write!(out, ",{},", at(condition, "kind")).ok()?;
-            self.residual_of(at(condition, "body"), body, reads, &mut out)?;
+            self.residual_of(at(condition, "body"), body, (reads, leaves), &mut out)?;
         }
         out.push(']');
         Some(out)
@@ -131,7 +134,7 @@ impl Request<'_> {
         &self,
         expr: &Json,
         judged: Option<Judged>,
-        reads: &dyn Fn(&Json) -> bool,
+        (reads, leaves): (&dyn Fn(&Json) -> bool, &Leaves),
         out: &mut String,
     ) -> Option<()> {
         let judged = judged.unwrap_or_else(|| self.judge(expr));
@@ -141,7 +144,7 @@ impl Request<'_> {
         }
         let mut parts = judged.parts.into_iter();
         let mut part = |expr: &Json, out: &mut String| {
-            self.residual_of(expr, parts.next().flatten(), reads, out)
+            self.residual_of(expr, parts.next().flatten(), (reads, leaves), out)
         };
         match single(expr) {
             Some((op @ ("&&" | "||"), arg)) => {
@@ -166,9 +169,35 @@ impl Request<'_> {
                 out.push_str("]}");
             }
             _ if reads(expr) => return None,
-            _ => write!(out, "{expr}").ok()?,
+            _ => leaves.write(expr, out),
         }
         Some(())
+    }
+}
+
+/// The JSON text of the parts of policies a residual leaves as they are,
+/// by where they are: one analysis prints the same parts for many senders.
+#[derive(Default)]
+pub(in crate::engine::may) struct Leaves {
+    texts: RefCell<HashMap<*const Json, String>>,
+    bytes: Cell<usize>,
+}
+
+impl Leaves {
+    fn write(&self, expr: &Json, out: &mut String) {
+        let mut texts = self.texts.borrow_mut();
+        let text = texts.entry(std::ptr::from_ref(expr)).or_insert_with(|| {
+            let text = expr.to_string();
+            let entry = std::mem::size_of::<(*const Json, String)>();
+            self.bytes.set(self.bytes.get() + entry + text.capacity());
+            text
+        });
+        out.push_str(text);
+    }
+
+    /// The bytes the texts hold, for a partition's room.
+    pub(in crate::engine::may) fn bytes(&self) -> usize {
+        self.bytes.get()
     }
 }
 
