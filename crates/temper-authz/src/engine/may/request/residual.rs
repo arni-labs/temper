@@ -1,6 +1,6 @@
 //! What a request leaves of a policy.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -178,15 +178,26 @@ impl Request<'_> {
 /// The JSON text of the parts of policies a residual leaves as they are,
 /// by where they are: one analysis prints the same parts for many senders.
 #[derive(Default)]
-pub(in crate::engine::may) struct Leaves(RefCell<HashMap<*const Json, String>>);
+pub(in crate::engine::may) struct Leaves {
+    texts: RefCell<HashMap<*const Json, String>>,
+    bytes: Cell<usize>,
+}
 
 impl Leaves {
     fn write(&self, expr: &Json, out: &mut String) {
-        let mut held = self.0.borrow_mut();
-        out.push_str(
-            held.entry(std::ptr::from_ref(expr))
-                .or_insert_with(|| expr.to_string()),
-        );
+        let mut texts = self.texts.borrow_mut();
+        let text = texts.entry(std::ptr::from_ref(expr)).or_insert_with(|| {
+            let text = expr.to_string();
+            let entry = std::mem::size_of::<(*const Json, String)>();
+            self.bytes.set(self.bytes.get() + entry + text.capacity());
+            text
+        });
+        out.push_str(text);
+    }
+
+    /// The bytes the texts hold, for a partition's room.
+    pub(in crate::engine::may) fn bytes(&self) -> usize {
+        self.bytes.get()
     }
 }
 

@@ -208,7 +208,7 @@ impl SendAnalysis {
         let memory = Memory::new(&tests, &self.policies, &candidates, reserve);
         memory.reserve(4, 0)?;
         let forms = Forms::default();
-        let leaves = Leaves::default();
+        let printed = Leaves::default();
         let mut classes = Classes::read((&self.policies, &self.patterns), questions, &candidates);
         // Questions that leave every candidate in the same class answer
         // alike for every kind and leave the same parts open: one of them
@@ -281,7 +281,7 @@ impl SendAnalysis {
                         };
                         let note = std::cell::RefCell::new(note);
                         let residual =
-                            request.residual(policy, &|expr| (note.borrow_mut())(expr), &leaves);
+                            request.residual(policy, &|expr| (note.borrow_mut())(expr), &printed);
                         reads.extend(tests.scopes[at].iter().cloned());
                         let residual = residual.as_deref().unwrap_or("null");
                         forms.text(&format!("{effect:?}{residual}"))
@@ -322,7 +322,7 @@ impl SendAnalysis {
             // and the result being assembled before allocating.
             memory.reserve(
                 4 * (open.len() + leaves.len() + memory.branches + 1),
-                forms.bytes() + seen.len() * memory.form + 2 * alike.bytes(),
+                forms.bytes() + printed.bytes() + seen.len() * memory.form + 2 * alike.bytes(),
             )?;
             let Some(test) = node.undecided.first() else {
                 leaves.push((at, node));
@@ -367,12 +367,12 @@ impl SendAnalysis {
         // Each leaf's others are at most a node's worth.
         memory.reserve(
             4 * (leaves.len() + memory.branches + 1) + leaves.len(),
-            forms.bytes() + seen.len() * memory.form + alike.bytes(),
+            forms.bytes() + printed.bytes() + seen.len() * memory.form + alike.bytes(),
         )?;
         let others = alike.others(&|bytes| {
             memory.reserve(
                 4 * (leaves.len() + memory.branches + 1) + leaves.len(),
-                forms.bytes() + seen.len() * memory.form + bytes,
+                forms.bytes() + printed.bytes() + seen.len() * memory.form + bytes,
             )
         })?;
         let mut kinds: Vec<(Vec<May>, Kind)> = Vec::new();
@@ -401,6 +401,7 @@ impl SendAnalysis {
         memory.reserve(
             4 * (kinds.len() + memory.branches + 1) + held,
             forms.bytes()
+                + printed.bytes()
                 + seen.len() * memory.form
                 + memory::asked_heap(&asked)
                 + kinds.len() * (size_of::<Answered>() + unknown.len() * size_of::<May>()),
