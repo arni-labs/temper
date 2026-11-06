@@ -77,9 +77,14 @@ impl Alike {
                     _ => 0,
                 })
                 .sum::<usize>();
-        let blurred = self.nodes.len()
-            * (2 * size_of::<Vec<usize>>() + self.names.len().div_ceil(64) * size_of::<u64>())
-            + self.dropped.len() * size_of::<usize>();
+        // A set per node and one more being built; each node's list of the
+        // children dropped into it, which holds at least four once it holds
+        // one and at most twice what it holds.
+        let set = size_of::<Names>() + self.names.len().div_ceil(64) * size_of::<u64>();
+        let into = self.nodes.len() * size_of::<Vec<usize>>()
+            + (4 * self.nodes.len().min(self.dropped.len()) + 2 * self.dropped.len())
+                * size_of::<usize>();
+        let blurred = (self.nodes.len() + 1) * set + into;
         self.nodes.capacity() * size_of::<(usize, Option<Set>)>()
             + self.dropped.capacity() * size_of::<(usize, usize, Names, usize)>()
             + self.heap
