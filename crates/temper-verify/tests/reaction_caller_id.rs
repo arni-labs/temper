@@ -150,26 +150,48 @@ fn a_reaction_that_sends_a_bound_field_or_runs_as_a_service_is_refused() {
     assert!(holds(&sent, CHILD));
 }
 
+/// The liveness outcomes of `source` under `policies`.
+fn liveness(source: &str, policies: &str) -> Vec<LivenessOutcome> {
+    let automatons = parsed(&[source]);
+    let refs: Vec<&Automaton> = automatons.iter().collect();
+    let analysis = SendAnalysis::new(policies).expect("fixture policies parse");
+    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let bound = Bound {
+        room: &room,
+        progress: &progress,
+    };
+    let results = verify_joint_liveness(&refs, Some(&analysis), bound);
+    assert!(!results.is_empty());
+    results.into_iter().map(|result| result.outcome).collect()
+}
+
 /// Nothing reads the bound field here, and the kernel still refuses.
 #[test]
 fn a_move_the_kernel_always_refuses_never_settles() {
     let sent = AS_SERVICE.replace("principal = \"stamper\"", "args = { stamped_by = \"'x'\" }");
     for source in [AS_SERVICE, &sent] {
-        let automatons = parsed(&[source]);
-        let refs: Vec<&Automaton> = automatons.iter().collect();
-        let analysis = SendAnalysis::new("permit(principal, action, resource);")
-            .expect("fixture policies parse");
-        let (room, progress) = (Bytes::new(1 << 30), Progress::default());
-        let bound = Bound {
-            room: &room,
-            progress: &progress,
-        };
-        let results = verify_joint_liveness(&refs, Some(&analysis), bound);
+        let outcomes = liveness(source, "permit(principal, action, resource);");
         assert!(
-            results
+            outcomes
                 .iter()
-                .any(|result| matches!(result.outcome, LivenessOutcome::Stuck { .. })),
-            "{source}: {results:#?}"
+                .any(|outcome| matches!(outcome, LivenessOutcome::Stuck { .. })),
+            "{source}: {outcomes:#?}"
         );
     }
+}
+
+/// A sender that surely names a caller (an agent: only a public endpoint's
+/// anonymous caller names none) has the kernel surely bind, so the move is
+/// surely taken and the rule surely holds.
+#[test]
+fn a_reaction_for_a_sender_who_names_a_caller_surely_binds() {
+    let inherits = AS_SERVICE.replace("principal = \"stamper\"\n", "");
+    assert_ne!(inherits, AS_SERVICE);
+    let outcomes = liveness(&inherits, "permit(principal is Agent, action, resource);");
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, LivenessOutcome::Holds)),
+        "{outcomes:#?}"
+    );
 }

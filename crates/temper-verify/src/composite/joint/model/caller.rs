@@ -5,8 +5,10 @@ use std::collections::BTreeSet;
 
 use super::super::Dispatch;
 use super::JointModel;
+use super::commit::constraints_hold;
 use crate::model::semantics::successors_budgeted;
 use crate::model::{Fields, ModelString, ParamValue, ResolvedTransition, Sym, TemperModelState};
+use temper_authz::May;
 
 impl JointModel {
     /// The values `t`'s tracked bound parameters may take when `dispatch`
@@ -34,7 +36,8 @@ impl JointModel {
             dispatch.params.contains_key(name)
                 || reaction.is_some_and(|reaction| reaction.args.contains_key(name.as_str()))
         };
-        if as_service || t.bound.iter().any(sends) {
+        let named = self.senders.names_a_caller(dispatch.by);
+        if as_service || named == May::No || t.bound.iter().any(sends) {
             return Err(());
         }
         let tracked: Vec<_> = t
@@ -60,13 +63,34 @@ impl JointModel {
         Ok(choices.into_iter().collect())
     }
 
-    /// Whether `entity`'s `action` binds no parameter: when it binds one, the
-    /// kernel refuses it when the chain that makes it names no caller.
-    pub(super) fn binds_nothing(&self, entity: &str, action: &str) -> bool {
-        self.models[entity]
-            .transitions
-            .iter()
-            .filter(|t| t.name == action)
-            .all(|t| t.bound.is_empty())
+    /// Whether the kernel surely binds what `entity`'s `action` binds when
+    /// `by` makes it: it binds nothing, or `by` surely names a caller. The
+    /// kernel refuses the move when the chain names none.
+    pub(super) fn binds_surely(&self, entity: &str, action: &str, by: u32) -> bool {
+        self.senders.names_a_caller(by) == May::Yes
+            || self.models[entity]
+                .transitions
+                .iter()
+                .filter(|t| t.name == action)
+                .all(|t| t.bound.is_empty())
     }
+}
+
+/// `params` with each choice of the kernel's bound values, where `t`'s
+/// constraints hold.
+pub(super) fn with_callers(
+    params: &Fields<ParamValue>,
+    callers: Vec<Fields<ParamValue>>,
+    t: &ResolvedTransition,
+    target: &TemperModelState,
+) -> Vec<Fields<ParamValue>> {
+    callers
+        .into_iter()
+        .map(|caller| {
+            let mut params = params.clone();
+            params.extend(caller.iter().map(|(name, value)| (*name, *value)));
+            params
+        })
+        .filter(|params| constraints_hold(&t.string_params, target, params))
+        .collect()
 }

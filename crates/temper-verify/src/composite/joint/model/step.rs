@@ -208,7 +208,7 @@ impl JointModel {
                         ) == Truth::True
                         && self.unchecked.meets(&call.to, &action.name)
                         && self.exact(&call.to, &action.name, state)
-                        && self.binds_nothing(&call.to, &action.name);
+                        && self.binds_surely(&call.to, &action.name, call.by);
                     if !known {
                         let refused = words!(self, "{text} refused by its record");
                         if !self

@@ -4,12 +4,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use temper_authz::May;
 use temper_spec::predicate::{Expr, Name, Truth, eval};
 
 use super::super::env::{Blind, JointEnv};
 use super::super::state::ReactionStep;
 use super::super::{Call, Dispatch, JointState};
 use super::JointModel;
+use super::caller::with_callers;
 use super::react::Sent;
 use super::step::Certainty;
 use crate::model::semantics::{rule_for, step, successors_budgeted, within_bounds};
@@ -101,12 +103,14 @@ impl JointModel {
                 certainty,
             } => (moved, action, certainty),
         };
-        // A take the model cannot decide may be a refusal instead.
+        // A take the model cannot decide may be a refusal instead. One for a
+        // sender who names no caller needs the anonymous caller of a public
+        // endpoint, which the model does not see, so it says nothing.
         let mut outcomes = Vec::new();
         if certainty != Certainty::Sure {
             let mut stays = state.clone();
             self.spawn_refused(&mut stays, dispatch);
-            outcomes.push((stays, refused, certainty));
+            outcomes.push((stays, refused, certainty.max(Certainty::OneOf)));
         }
         for moved in moved {
             let text = words!(self, "{text} arrives -> {}", moved.status);
@@ -265,15 +269,7 @@ impl JointModel {
         if callers.is_empty() {
             return Arrival::BeyondBounds;
         }
-        let choices: Vec<Fields<ParamValue>> = callers
-            .into_iter()
-            .map(|caller| {
-                let mut params = params.clone();
-                params.extend(caller.iter().map(|(name, value)| (*name, *value)));
-                params
-            })
-            .filter(|params| constraints_hold(&t.string_params, target, params))
-            .collect();
+        let choices = with_callers(&params, callers, t, target);
         let Some(params) = choices.first() else {
             return Arrival::Refused;
         };
@@ -283,7 +279,7 @@ impl JointModel {
         }
         // A count that must equal one of the record's counters, and a
         // string the record does not track that must not be empty: decided
-        // when the dispatch carries it.
+        // when the dispatch carries it and the kernel does not bind it.
         let mut carried = true;
         for (param, field) in self.unchecked.counts(&dispatch.to, &t.name) {
             match (dispatch.params.get(param), target.counters.get(field)) {
@@ -301,6 +297,7 @@ impl JointModel {
         }
         for param in self.unchecked.nonempty(&dispatch.to, &t.name) {
             match dispatch.params.get(param) {
+                _ if t.bound.iter().any(|bound| bound.as_str() == param) => carried = false,
                 Some(ParamValue::Str(sent)) if sent.is_blank() => return Arrival::Refused,
                 Some(ParamValue::Str(_)) => {}
                 // A reaction sends its args and nothing else, and the record
@@ -342,13 +339,17 @@ impl JointModel {
         let decided = guard
             && self.unchecked.decides(&dispatch.to, &t.name)
             && carried
-            && newer == Truth::True
-            && t.bound.is_empty();
+            && newer == Truth::True;
+        // A kind some of whose senders name a caller and some do not: the
+        // kernel binds for the ones that do and refuses the others.
+        let named = t.bound.is_empty() || self.senders.names_a_caller(dispatch.by) == May::Yes;
         let certainty =
             if enabled.len() > 1 || chose || !self.order.exact(&dispatch.to, &t.effects, state) {
                 Certainty::Unsure
+            } else if !decided {
+                Certainty::OneOf
             } else {
-                Certainty::unless(decided, Certainty::OneOf)
+                Certainty::unless(named, Certainty::Either)
             };
         Arrival::Took {
             moved,
@@ -472,7 +473,7 @@ pub(super) fn add(state: &mut JointState, dispatch: Dispatch) {
 
 /// Whether the string parameters `params` passes satisfy the action's
 /// constraints on its own record, which its actor checks as it writes.
-fn constraints_hold(
+pub(super) fn constraints_hold(
     string_params: &[StringParam],
     target: &TemperModelState,
     params: &Fields<ParamValue>,
