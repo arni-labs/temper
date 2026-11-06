@@ -94,29 +94,33 @@ impl Alike {
     /// read, so a split tells them apart as it does the example. A name some
     /// of them hold as the example does takes the example's fact too. A
     /// dropped child can answer as a node found before or after its parent,
-    /// so this runs until no fact widens; facts only widen, so it ends.
+    /// so this runs until no fact widens. Each pass joins what it finds with
+    /// what the last found, so facts only widen, and it ends.
     /// `reserve` is asked for the most this and the lists can hold before
     /// each pass.
     pub(super) fn others(
         &mut self,
         reserve: &dyn Fn(usize) -> Result<(), String>,
     ) -> Result<Vec<Facts>, String> {
+        let entry = size_of::<(u32, u32)>();
+        // Each node's list of children dropped into it and its own list:
+        // every list at its longest.
+        let lists = self.nodes.len() * (size_of::<Vec<usize>>() + size_of::<Facts>())
+            + (4 * self.nodes.len().min(self.dropped.len()) + 2 * self.dropped.len())
+                * size_of::<usize>();
+        let full = self.nodes.len() * self.names.len() * entry;
+        reserve(self.bytes() + lists + full)?;
         let mut into: Vec<Vec<usize>> = vec![Vec::new(); self.nodes.len()];
         for (at, dropped) in self.dropped.iter().enumerate() {
             into[dropped.3].push(at);
         }
-        let entry = size_of::<(u32, u32)>();
-        let lists = self.nodes.len() * (2 * size_of::<Vec<usize>>())
-            + (4 * self.nodes.len().min(self.dropped.len()) + 2 * self.dropped.len())
-                * size_of::<usize>();
-        // A node's sources while they are joined: its parent's, and two for
-        // each child dropped into it.
-        let joining = (1 + 2 * into.iter().map(Vec::len).max().unwrap_or(0))
-            * (size_of::<Facts>() + self.names.len() * entry);
+        // A node's sources while they are joined, with their names: its
+        // parent's, its last, and two for each child dropped into it.
+        let joining = (2 + 2 * into.iter().map(Vec::len).max().unwrap_or(0))
+            * (size_of::<Facts>() + self.names.len() * (entry + size_of::<u32>()));
         let mut others: Vec<Facts> = vec![Vec::new(); self.nodes.len()];
-        // Every list at its longest; the facts a join makes are reserved as
-        // the table fills, twice as many each time.
-        let full = self.nodes.len() * self.names.len() * entry;
+        // The facts a join makes are reserved as the table fills, twice as
+        // many each time.
         let fact = size_of::<Option<Fact>>() + self.widest;
         let mut room = 0;
         let mut changed = true;
@@ -138,7 +142,10 @@ impl Alike {
                     sources.push(over(differ, &without(&others[*from], *name)));
                 }
                 sources.retain(|source| !source.is_empty());
-                let found = self.join(at, &sources);
+                let mut found = self.join(at, &sources);
+                if !others[at].is_empty() {
+                    found = self.join(at, &[others[at].clone(), found]);
+                }
                 if found != others[at] {
                     others[at] = found;
                     changed = true;
@@ -284,14 +291,11 @@ fn either(one: &Fact, other: &Fact) -> Option<Fact> {
         _ if one == other => Some(one.clone()),
         (Fact::Absent, _) | (_, Fact::Absent) => None,
         (Fact::Is(value), Fact::Other { unlike, .. })
-        | (Fact::Other { unlike, .. }, Fact::Is(value)) => {
-            let unlike = unlike
-                .iter()
-                .filter(|other| *other != value)
-                .cloned()
-                .collect();
-            Some(some(unlike, BTreeMap::new(), None))
-        }
+        | (Fact::Other { unlike, .. }, Fact::Is(value)) => Some(some(
+            kept(unlike, |other| other != value),
+            BTreeMap::new(),
+            None,
+        )),
         (Fact::Is(_), Fact::Is(_)) => Some(some(Vec::new(), BTreeMap::new(), None)),
         (
             Fact::Other {
@@ -305,11 +309,7 @@ fn either(one: &Fact, other: &Fact) -> Option<Fact> {
                 string: other_string,
             },
         ) => Some(some(
-            unlike
-                .iter()
-                .filter(|value| others.contains(value))
-                .cloned()
-                .collect(),
+            kept(unlike, |value| others.contains(value)),
             like.iter()
                 .filter(|(pattern, matches)| other_like.get(*pattern) == Some(matches))
                 .map(|(pattern, matches)| (pattern.clone(), *matches))
@@ -321,6 +321,13 @@ fn either(one: &Fact, other: &Fact) -> Option<Fact> {
             },
         )),
     }
+}
+
+/// The values of `unlike` that `keep` keeps, holding no more than it does.
+fn kept(unlike: &[Json], keep: impl Fn(&Json) -> bool) -> Vec<Json> {
+    let mut kept = Vec::with_capacity(unlike.len());
+    kept.extend(unlike.iter().filter(|value| keep(value)).cloned());
+    kept
 }
 
 /// What `profile` holds where `name` reads.
