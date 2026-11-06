@@ -3,7 +3,7 @@
 //! check counts on from it finishes and [`settle`] finds a state there that
 //! cannot reach the condition.
 
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use temper_spec::predicate::{Expr, Truth, eval};
 
@@ -160,26 +160,18 @@ impl Engine<'_, '_> {
         goal: &Expr,
         explored: &mut Explored<'_>,
     ) -> Vec<Vec<Packed>> {
-        let Ok(NearSure { parents, near }) = explored.near_sure(explored.covered) else {
+        let Ok(NearSure { parents, near }) = explored.near_sure(explored.covered, print) else {
             return Vec::new();
         };
-        let most = self.left;
-        let heap = (most + 1) * size_of::<(u32, u64, u32)>();
-        if self.held.add(heap).is_err() {
-            return Vec::new();
-        }
-        let mut best: BinaryHeap<(u32, u64, u32)> = BinaryHeap::with_capacity(most + 1);
-        for (index, depth) in near {
-            let state = explored.state(index as usize);
-            if state.settled() && eval(goal, &self.model.env(owner, &state)) != Truth::True {
-                best.push((depth, print(&state), index));
-                if best.len() > most {
-                    best.pop();
-                }
-            }
-        }
         let mut chains = Vec::new();
-        for (_, _, index) in best.into_sorted_vec() {
+        for (index, _) in near {
+            if chains.len() == self.left {
+                break;
+            }
+            let state = explored.state(index as usize);
+            if !state.settled() || eval(goal, &self.model.env(owner, &state)) == Truth::True {
+                continue;
+            }
             let mut chain = Vec::new();
             let mut at = index as usize;
             loop {
@@ -189,7 +181,6 @@ impl Engine<'_, '_> {
                     .add(block(size_of::<Packed>() + 4 * packed.len()))
                     .is_err()
                 {
-                    self.held.sub(heap);
                     return chains;
                 }
                 chain.push(packed);
@@ -201,7 +192,6 @@ impl Engine<'_, '_> {
             chain.reverse();
             chains.push(chain);
         }
-        self.held.sub(heap);
         chains
     }
 
