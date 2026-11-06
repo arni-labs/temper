@@ -95,8 +95,8 @@ impl Alike {
     /// of them hold as the example does takes the example's fact too. A
     /// dropped child can answer as a node found before or after its parent,
     /// so this runs until no fact widens; facts only widen, so it ends.
-    /// `reserve` is asked for the bytes this and the lists hold before each
-    /// list grows.
+    /// `reserve` is asked for the most this and the lists can hold before
+    /// each pass.
     pub(super) fn others(
         &mut self,
         reserve: &dyn Fn(usize) -> Result<(), String>,
@@ -106,18 +106,28 @@ impl Alike {
             into[dropped.3].push(at);
         }
         let entry = size_of::<(u32, u32)>();
-        let mut held = self.nodes.len() * (2 * size_of::<Vec<usize>>())
+        let lists = self.nodes.len() * (2 * size_of::<Vec<usize>>())
             + (4 * self.nodes.len().min(self.dropped.len()) + 2 * self.dropped.len())
                 * size_of::<usize>();
+        // A node's sources while they are joined: its parent's, and two for
+        // each child dropped into it.
+        let joining = (1 + 2 * into.iter().map(Vec::len).max().unwrap_or(0))
+            * (size_of::<Facts>() + self.names.len() * entry);
         let mut others: Vec<Facts> = vec![Vec::new(); self.nodes.len()];
+        // Every list at its longest; the facts a join makes are reserved as
+        // the table fills, twice as many each time.
+        let full = self.nodes.len() * self.names.len() * entry;
+        let fact = size_of::<Option<Fact>>() + self.widest;
+        let mut room = 0;
         let mut changed = true;
         while changed {
             changed = false;
             for at in 0..self.nodes.len() {
-                // The sources' lists and their join, and a fact per name.
-                let growth = 4 * self.names.len() * (entry + size_of::<Facts>())
-                    + self.names.len() * (size_of::<Option<Fact>>() + self.widest);
-                reserve(self.bytes() + held + growth)?;
+                if self.facts.len() + self.names.len() > room {
+                    room = 2 * (self.facts.len() + self.names.len());
+                    let more = (room - self.facts.len()) * fact;
+                    reserve(self.bytes() + lists + joining + full + more)?;
+                }
                 let mut sources: Vec<Facts> = Vec::new();
                 if let (parent, Some((name, _))) = self.nodes[at] {
                     sources.push(without(&others[parent], name));
@@ -130,7 +140,6 @@ impl Alike {
                 sources.retain(|source| !source.is_empty());
                 let found = self.join(at, &sources);
                 if found != others[at] {
-                    held += found.capacity().saturating_sub(others[at].capacity()) * entry;
                     others[at] = found;
                     changed = true;
                 }
