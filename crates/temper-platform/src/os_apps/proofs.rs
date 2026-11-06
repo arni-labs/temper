@@ -18,8 +18,10 @@
 //! old one's TERM) reads it instead of walking again, whatever checker made
 //! it: those specs already run. A refusal is kept only while this process runs,
 //! so a later checker decides it again. A walk that did not fit in its
-//! memory says nothing of the specs: the install that waited for it reads it
-//! throughout its retries ([`Attempt`]), and the next install walks again.
+//! memory would only fill the host again, keep nothing and make every later
+//! install of the same specs wait as long: it is kept by the model key alone
+//! (in the blob table under [`unfit_key`]), so a change to what it walks, or
+//! a kernel whose models read differently, walks once.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -91,8 +93,8 @@ pub(super) fn digest(
 }
 
 /// The verdicts one install has waited for, by digest, kept across its
-/// retries: a walk that did not fit is kept nowhere else, and the retry must
-/// read it rather than walk again. A later install walks again.
+/// retries: a walk that stopped without a verdict is kept nowhere else, and
+/// the retry must read it rather than walk again.
 #[derive(Default)]
 pub(super) struct Attempt(BTreeMap<String, Verdict>);
 
@@ -147,6 +149,16 @@ fn blob_key(digest: &str) -> String {
     )
 }
 
+/// Where a walk that did not fit is kept, by its model key: apart from
+/// [`blob_key`], whose verdicts are also kept under the source key and so
+/// read by any later kernel.
+fn unfit_key(model: &str) -> String {
+    format!(
+        "{}joint-unfit/{model}",
+        temper_server::blob_store::KERNEL_BLOB_PREFIX
+    )
+}
+
 /// The verdict of the proof `keys` name: one this install already waited
 /// for, kept under either key, or reached by a walk that ended, or the walk
 /// to wait for, started here when none is running. The walk is `walk`, given
@@ -188,9 +200,17 @@ pub(super) async fn proof(
                 }
             }
         }
+        if stored.is_none() {
+            match store.get_blob(&unfit_key(&keys.model)).await {
+                Ok(bytes) => stored = bytes.and_then(|b| serde_json::from_slice(&b).ok()),
+                Err(error) => {
+                    tracing::warn!(tenant, app = %app_name, %error, "a kept proof verdict could not be read");
+                }
+            }
+        }
     }
     let digest = keys.model;
-    // A walk that did not fit is kept only in the install that waited for it.
+    // A walk that stopped is kept only in the install that waited for it.
     if stored.is_none()
         && let Some(verdict) = attempt.0.get(&digest)
     {
@@ -269,13 +289,21 @@ async fn run(
         fit: false,
     });
     reports.abort();
-    if walked.fit
-        && walked.verdict.refused.is_none()
-        && let Some(store) = server.platform_metadata_store()
+    // A walk that stopped (it panicked) is refused with `fit` false: only a
+    // verdict is kept.
+    let unfit = !walked.fit && walked.verdict.refused.is_none();
+    let keys = if walked.fit && walked.verdict.refused.is_none() {
+        vec![blob_key(&digest), blob_key(&source)]
+    } else if unfit {
+        vec![unfit_key(&digest)]
+    } else {
+        Vec::new()
+    };
+    if let Some(store) = server.platform_metadata_store()
         && let Ok(bytes) = serde_json::to_vec(&walked.verdict)
     {
-        for key in [&digest, &source] {
-            if let Err(error) = store.put_blob(&blob_key(key), &bytes).await {
+        for key in keys {
+            if let Err(error) = store.put_blob(&key, &bytes).await {
                 tracing::warn!(%tenant, app = %app_name, %error, "a proof verdict could not be kept");
             }
         }
@@ -303,7 +331,7 @@ async fn run(
     .await;
     let mut proofs = proofs().lock().unwrap_or_else(PoisonError::into_inner);
     proofs.running.remove(&digest);
-    if walked.fit {
+    if walked.fit || unfit {
         proofs.reached.insert(digest, walked.verdict.clone());
     }
     drop(proofs);
