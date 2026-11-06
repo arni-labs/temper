@@ -50,19 +50,12 @@ pub async fn strip_inbound_identity_headers(mut request: Request, next: Next) ->
 ///
 /// This is the single classifier shared by the kernel guard and the outer
 /// platform bearer edge. Keep it exact: webhook ingress is admitted by its
-/// Class B verifier; the remaining routes expose only bootstrap metadata or
-/// immutable static assets.
+/// Class B verifier; the remaining routes serve only immutable static assets.
 pub fn is_public_kernel_request(method: &Method, path: &str) -> bool {
     if method == Method::GET
         && matches!(
             path,
-            "/tdata"
-                | "/tdata/"
-                | "/tdata/$metadata"
-                | "/temper-client.js"
-                | "/static/temper-client.js"
-                | "/genesis"
-                | "/genesis/"
+            "/temper-client.js" | "/static/temper-client.js" | "/genesis" | "/genesis/"
         )
     {
         return true;
@@ -281,9 +274,6 @@ mod tests {
     #[test]
     fn public_route_allowlist_is_exact() {
         for path in [
-            "/tdata",
-            "/tdata/",
-            "/tdata/$metadata",
             "/temper-client.js",
             "/static/temper-client.js",
             "/genesis",
@@ -292,7 +282,12 @@ mod tests {
         ] {
             assert!(is_public_kernel_request(&Method::GET, path), "{path}");
         }
+        // The service document and $metadata name a tenant's types, so they
+        // take the same credential as a read of one of its records.
         for path in [
+            "/tdata",
+            "/tdata/",
+            "/tdata/$metadata",
             "/tdata/Orders",
             "/tdata/$hints",
             "/tdata/$events",
