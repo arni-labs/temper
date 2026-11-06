@@ -146,10 +146,6 @@ async fn deployment_key_has_no_unregistered_fallback() {
 async fn exact_public_routes_do_not_require_credentials() {
     let app = app(PlatformState::new(None));
     for request in [
-        HttpRequest::get("/tdata").body(Body::empty()).unwrap(),
-        HttpRequest::get("/tdata/$metadata")
-            .body(Body::empty())
-            .unwrap(),
         HttpRequest::get("/temper-client.js")
             .body(Body::empty())
             .unwrap(),
@@ -173,16 +169,16 @@ async fn exact_public_routes_do_not_require_credentials() {
 }
 
 #[tokio::test]
-async fn tenant_hints_require_a_credential() {
-    let response = app(PlatformState::new(None))
-        .oneshot(
-            HttpRequest::get("/tdata/$hints")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+async fn tenant_metadata_routes_require_a_credential() {
+    let app = app(PlatformState::new(None));
+    for path in ["/tdata", "/tdata/", "/tdata/$metadata", "/tdata/$hints"] {
+        let response = app
+            .clone()
+            .oneshot(HttpRequest::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
 }
 
 #[tokio::test]

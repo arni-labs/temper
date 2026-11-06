@@ -238,7 +238,7 @@ fn sent(
     match what {
         Asked::List => request(state, tenant, Method::GET, "/tdata/Probes"),
         Asked::Record => request(state, tenant, Method::GET, "/tdata/Probes('p1')"),
-        Asked::Metadata => public_request(tenant, "/tdata/$metadata"),
+        Asked::Metadata => request(state, tenant, Method::GET, "/tdata/$metadata"),
         Asked::Action => request(
             state,
             tenant,

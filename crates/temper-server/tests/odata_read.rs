@@ -500,10 +500,13 @@ async fn service_document_lists_entity_sets() {
 async fn metadata_returns_csdl_xml() {
     let (state, _sim) = build_default_state(46, "odata-read-meta");
     let router = build_router(state);
-    let req = Request::builder()
-        .uri("/tdata/$metadata")
-        .body(Body::empty())
-        .unwrap();
+    let req = authenticate(
+        Request::builder()
+            .uri("/tdata/$metadata")
+            .body(Body::empty())
+            .unwrap(),
+        "test-customer",
+    );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000)
