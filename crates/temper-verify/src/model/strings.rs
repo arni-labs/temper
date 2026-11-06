@@ -146,6 +146,16 @@ pub(super) fn string_assignments(
                 return Vec::new();
             }
             let mut candidates = string_candidates(model, param, state, &scope);
+            // The kernel writes one caller's id (or label) into every
+            // parameter bound to it.
+            if let Some(same) = param.source.and_then(|source| {
+                t.string_params
+                    .iter()
+                    .filter(|other| other.source == Some(source))
+                    .find_map(|other| assignment.get(&other.name))
+            }) {
+                candidates.retain(|value| value == same);
+            }
             // A parameter neither effects nor guard reads leads to the same
             // move with any value its constraints allow: one is enough.
             if !param.writes

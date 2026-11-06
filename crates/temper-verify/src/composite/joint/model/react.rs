@@ -91,7 +91,8 @@ impl JointModel {
                         )
                         + asked_entries()
                             .map(|(k, v)| k.heap() + v.heap())
-                            .sum::<usize>();
+                            .sum::<usize>()
+                        + sent.caller.map_or(0, Heap::heap);
                 if !self.expansion.hold(call_heap) || !self.expansion.reserve(&mut outcome.calls) {
                     return Vec::new();
                 }

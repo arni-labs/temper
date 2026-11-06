@@ -291,7 +291,8 @@ permit(principal is Agent, action == Action::"Stamp", resource) when { context h
 }
 
 /// A constraint on a bound field may refuse the caller the runtime has, so
-/// the move is not sure to be taken.
+/// the move is not sure to be taken. The rule on `owner` makes the walk
+/// track it, so only the constraint leaves the move unsure.
 #[test]
 fn a_constraint_on_a_bound_field_may_refuse_the_move() {
     let constrained = AS_SERVICE.replace("principal = \"stamper\"\n", "").replace(
@@ -305,6 +306,10 @@ initial = "alice"
 kind = "param_equals_field"
 param = "stamped_by"
 field = "owner"
+
+[[invariant]]
+name = "owner_kept"
+assert = "owner == 'alice'"
 
 [[liveness]]"#,
     );
@@ -363,4 +368,174 @@ permit(principal == Customer::"anonymous", action == Action::"Other", resource);
             .any(|outcome| matches!(outcome, LivenessOutcome::Stuck { .. })),
         "{outcomes:#?}"
     );
+}
+
+const VOUCHED: &str = r#"
+[automaton]
+name = "Child"
+states = ["Waiting", "Seconded", "Stamped"]
+initial = "Waiting"
+strict_action_params = true
+[[state]]
+name = "second"
+type = "string"
+initial = ""
+[[state]]
+name = "stamped_by"
+type = "string"
+initial = ""
+[[action]]
+name = "Second"
+kind = "input"
+from = ["Waiting"]
+to = "Seconded"
+params = [{ name = "second", type = "string", source = "authenticated_subject" }]
+[[action]]
+name = "Stamp"
+kind = "internal"
+from = ["Seconded"]
+to = "Stamped"
+params = [{ name = "stamped_by", type = "string", source = "authenticated_subject" }]
+[[invariant]]
+name = "four_eyes"
+assert = "status != 'Stamped' || stamped_by != second || Parent[Id].status == 'Waiting'"
+"#;
+const OPENED: &str = r#"
+[automaton]
+name = "Parent"
+states = ["Waiting", "Opened"]
+initial = "Waiting"
+strict_action_params = true
+[[state]]
+name = "opener"
+type = "string"
+initial = ""
+[[action]]
+name = "Open"
+kind = "input"
+from = ["Waiting"]
+to = "Opened"
+params = [{ name = "opener", type = "string", source = "authenticated_subject" }]
+[[action.triggers]]
+name = "stamp"
+kind = "entity"
+target_entity = "Child"
+target_action = "Stamp"
+[action.triggers.resolve_target]
+kind = "same_id"
+[[invariant]]
+name = "opened_by_someone"
+assert = "status != 'Opened' || opener != ''"
+"#;
+const TWO_IDS: &str = r#"
+[automaton]
+name = "Child"
+states = ["Waiting", "Stamped"]
+initial = "Waiting"
+strict_action_params = true
+[[state]]
+name = "x"
+type = "string"
+initial = ""
+[[state]]
+name = "y"
+type = "string"
+initial = ""
+[[action]]
+name = "Stamp"
+kind = "internal"
+from = ["Waiting"]
+to = "Stamped"
+params = [{ name = "x", type = "string", source = "authenticated_subject" }, { name = "y", type = "string", source = "authenticated_subject" }]
+[[invariant]]
+name = "one_caller"
+assert = "status != 'Stamped' || x == y || Parent[Id].status == 'Open'"
+"#;
+const STARTED: &str = r#"
+[automaton]
+name = "Doc"
+states = ["Idle", "Running", "Done"]
+initial = "Idle"
+strict_action_params = true
+[[state]]
+name = "a"
+type = "string"
+initial = ""
+[[state]]
+name = "c"
+type = "string"
+initial = ""
+[[action]]
+name = "Start"
+kind = "input"
+from = ["Idle"]
+to = "Running"
+params = [{ name = "a", type = "string", source = "authenticated_subject" }]
+[[action.triggers]]
+name = "work"
+kind = "wasm"
+module = "work"
+on_success = "Finish"
+[[action.triggers]]
+name = "touch"
+kind = "entity"
+target_entity = "Parent"
+target_action = "Touch"
+[action.triggers.resolve_target]
+kind = "same_id"
+[[action]]
+name = "Finish"
+kind = "internal"
+from = ["Running"]
+to = "Done"
+params = [{ name = "c", type = "string", source = "authenticated_subject" }]
+[[invariant]]
+name = "finisher_is_starter"
+assert = "status != 'Done' || c == a || Parent[Id].status == 'Closed'"
+"#;
+const TOUCHED: &str = r#"
+[automaton]
+name = "Parent"
+states = ["Open", "Closed"]
+initial = "Open"
+[[action]]
+name = "Touch"
+kind = "input"
+from = ["Open"]
+to = "Open"
+[[action]]
+name = "Close"
+kind = "input"
+from = ["Open"]
+to = "Closed"
+guard = "false"
+"#;
+
+/// Agents only, with a move the kernel makes itself refused to a request.
+fn kernel_only(action: &str) -> String {
+    format!(
+        "permit(principal is Agent, action, resource) unless {{ action == Action::\"{action}\" }};\n\
+         permit(principal is Agent, action == Action::\"{action}\", resource) when {{ context has via && context.via != \"request\" }};"
+    )
+}
+
+/// The caller a chain carries is the one a request of the same agent binds,
+/// whatever else reads the field it was first bound into.
+#[test]
+fn a_caller_carried_along_a_chain_meets_the_same_caller_elsewhere() {
+    assert!(!holds_under(&[OPENED, VOUCHED], &kernel_only("Stamp")));
+}
+
+/// Every parameter bound to one source gets the same caller.
+#[test]
+fn two_parameters_bound_to_one_source_hold_one_caller() {
+    let ping = PARENT;
+    assert!(holds_under(&[ping, TWO_IDS], &kernel_only("Stamp")));
+}
+
+/// A module's answer runs as its call's sender, so it binds the caller who
+/// started the call.
+#[test]
+fn a_modules_answer_binds_the_caller_who_started_its_call() {
+    assert!(holds_under(&[STARTED, TOUCHED], &kernel_only("Finish")));
 }
