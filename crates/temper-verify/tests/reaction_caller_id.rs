@@ -113,9 +113,14 @@ fn parsed(sources: &[&str]) -> Vec<Automaton> {
 
 /// Whether every joint invariant of `parent` and `child` holds.
 fn holds(parent: &str, child: &str) -> bool {
-    let automatons = parsed(&[parent, child]);
+    holds_under(&[parent, child], CEDAR)
+}
+
+/// Whether every joint invariant of `sources` holds under `policies`.
+fn holds_under(sources: &[&str], policies: &str) -> bool {
+    let automatons = parsed(sources);
     let refs: Vec<&Automaton> = automatons.iter().collect();
-    let analysis = SendAnalysis::new(CEDAR).expect("fixture policies parse");
+    let analysis = SendAnalysis::new(policies).expect("fixture policies parse");
     let (room, progress) = (Bytes::new(1 << 30), Progress::default());
     let bound = Bound {
         room: &room,
@@ -192,6 +197,170 @@ fn a_reaction_for_a_sender_who_names_a_caller_surely_binds() {
         outcomes
             .iter()
             .all(|outcome| matches!(outcome, LivenessOutcome::Holds)),
+        "{outcomes:#?}"
+    );
+}
+
+/// A request that binds a field: the sender chose every other parameter,
+/// and the kernel writes the caller's id, never the empty string.
+#[test]
+fn a_request_binds_the_callers_id_too() {
+    let parent = r#"
+[automaton]
+name = "Parent"
+states = ["Open"]
+initial = "Open"
+
+[[action]]
+name = "Touch"
+kind = "input"
+from = ["Open"]
+to = "Open"
+"#;
+    let child = r#"
+[automaton]
+name = "Child"
+states = ["Waiting", "Approved"]
+initial = "Waiting"
+strict_action_params = true
+
+[[state]]
+name = "approved_by"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Approve"
+kind = "input"
+from = ["Waiting"]
+to = "Approved"
+guard = "Parent[Id].status == 'Open'"
+params = [{ name = "approved_by", type = "string", source = "authenticated_subject" }]
+
+[[invariant]]
+name = "approved_by_no_one"
+assert = "status != 'Approved' || approved_by == '' || Parent[Id].status != 'Open'"
+"#;
+    assert!(!holds_under(
+        &[parent, child],
+        "permit(principal is Agent, action, resource);"
+    ));
+}
+
+/// What one move of a chain binds, the next one binds the same: the kernel
+/// takes both from the caller who set the chain off.
+#[test]
+fn a_chain_binds_one_caller_throughout() {
+    let parent = r#"
+[automaton]
+name = "Parent"
+states = ["Waiting", "Opened"]
+initial = "Waiting"
+strict_action_params = true
+
+[[state]]
+name = "opener"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Open"
+kind = "input"
+from = ["Waiting"]
+to = "Opened"
+params = [{ name = "opener", type = "string", source = "authenticated_subject" }]
+
+[[action.triggers]]
+name = "stamp"
+kind = "entity"
+target_entity = "Child"
+target_action = "Stamp"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+"#;
+    let child = CHILD.replace(
+        "stamped_by == '' || Parent[Id].status == 'Open'",
+        "stamped_by == '' || stamped_by == Parent[Id].opener",
+    );
+    let policies = r#"
+permit(principal is Agent, action, resource) unless { action == Action::"Stamp" };
+permit(principal is Agent, action == Action::"Stamp", resource) when { context has via && context.via != "request" };
+"#;
+    assert!(holds_under(&[parent, &child], policies));
+}
+
+/// A constraint on a bound field may refuse the caller the runtime has, so
+/// the move is not sure to be taken.
+#[test]
+fn a_constraint_on_a_bound_field_may_refuse_the_move() {
+    let constrained = AS_SERVICE.replace("principal = \"stamper\"\n", "").replace(
+        "[[liveness]]",
+        r#"[[state]]
+name = "owner"
+type = "string"
+initial = "alice"
+
+[[action.constraints]]
+kind = "param_equals_field"
+param = "stamped_by"
+field = "owner"
+
+[[liveness]]"#,
+    );
+    let outcomes = liveness(
+        &constrained,
+        "permit(principal is Agent, action, resource);",
+    );
+    assert!(
+        !outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, LivenessOutcome::Holds)),
+        "{outcomes:#?}"
+    );
+}
+
+/// A sender the policies tell apart as anonymous names no caller, so a
+/// reaction it sets off that binds is refused and never settles.
+#[test]
+fn an_anonymous_sender_told_apart_by_another_rule_is_refused() {
+    let inherits = AS_SERVICE.replace("principal = \"stamper\"\n", "");
+    let poked = inherits.replace(
+        "states = [\"Waiting\", \"Pinged\", \"Stamped\"]",
+        "states = [\"Waiting\", \"Pinged\", \"Stamped\", \"Poked\", \"Othered\"]",
+    ) + r#"
+[[action]]
+name = "Poke"
+kind = "input"
+from = ["Waiting"]
+to = "Poked"
+
+[[action.triggers]]
+name = "other"
+kind = "entity"
+target_entity = "Child"
+target_action = "Other"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+
+[[action]]
+name = "Other"
+kind = "internal"
+from = ["Poked"]
+to = "Othered"
+"#;
+    let policies = r#"
+permit(principal, action == Action::"Ping", resource);
+permit(principal, action == Action::"Poke", resource);
+permit(principal, action == Action::"Stamp", resource);
+permit(principal == Customer::"anonymous", action == Action::"Other", resource);
+"#;
+    let outcomes = liveness(&poked, policies);
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, LivenessOutcome::Stuck { .. })),
         "{outcomes:#?}"
     );
 }
