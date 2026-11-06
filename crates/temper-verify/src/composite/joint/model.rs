@@ -5,6 +5,7 @@
 mod labels;
 
 mod alike;
+mod caller;
 mod chosen;
 mod classes;
 mod commit;

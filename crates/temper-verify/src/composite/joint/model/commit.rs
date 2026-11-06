@@ -108,20 +108,23 @@ impl JointModel {
             self.spawn_refused(&mut stays, dispatch);
             outcomes.push((stays, refused, certainty));
         }
-        let text = words!(self, "{text} arrives -> {}", moved.status);
-        self.place(&mut state, &dispatch.to, moved, &action, dispatch.by);
-        let sent = Sent {
-            chain: &dispatch.chain,
-            by: dispatch.by,
-            params: &dispatch.params,
-            request: false,
-        };
-        let after = self.after_commit(state, &dispatch.to, &action, sent);
-        outcomes.extend(
-            after
-                .into_iter()
-                .map(|(outcome, then)| (outcome, text.clone(), certainty.then(then))),
-        );
+        for moved in moved {
+            let text = words!(self, "{text} arrives -> {}", moved.status);
+            let mut state = state.clone();
+            self.place(&mut state, &dispatch.to, moved, &action, dispatch.by);
+            let sent = Sent {
+                chain: &dispatch.chain,
+                by: dispatch.by,
+                params: &dispatch.params,
+                request: false,
+            };
+            let after = self.after_commit(state, &dispatch.to, &action, sent);
+            outcomes.extend(
+                after
+                    .into_iter()
+                    .map(|(outcome, then)| (outcome, text.clone(), certainty.then(then))),
+            );
+        }
         outcomes
     }
 
@@ -239,7 +242,8 @@ impl JointModel {
         };
         // Counts and booleans an effect reads and the dispatch does not
         // carry: the first choice, as the composite check takes. A string
-        // parameter it does not carry leaves the field as it is.
+        // parameter it does not carry leaves the field as it is, but for one
+        // the kernel binds to the caller's id ([`JointModel::caller_ids`]).
         let values = self.values(state);
         let mut params: Fields<ParamValue> =
             successors_budgeted(model, t, target, &values, &self.expansion)
@@ -255,8 +259,26 @@ impl JointModel {
             .keys()
             .any(|name| !dispatch.params.contains_key(name));
         params.extend(dispatch.params.iter().map(|(name, value)| (*name, *value)));
-        let newer = self.order.holds(&dispatch.to, &t.name, &params, target);
-        if !constraints_hold(&t.string_params, target, &params) || newer == Truth::False {
+        let Ok(callers) = self.caller_ids(dispatch, t, target, &values) else {
+            return Arrival::Refused;
+        };
+        if callers.is_empty() {
+            return Arrival::BeyondBounds;
+        }
+        let choices: Vec<Fields<ParamValue>> = callers
+            .into_iter()
+            .map(|caller| {
+                let mut params = params.clone();
+                params.extend(caller.iter().map(|(name, value)| (*name, *value)));
+                params
+            })
+            .filter(|params| constraints_hold(&t.string_params, target, params))
+            .collect();
+        let Some(params) = choices.first() else {
+            return Arrival::Refused;
+        };
+        let newer = self.order.holds(&dispatch.to, &t.name, params, target);
+        if newer == Truth::False {
             return Arrival::Refused;
         }
         // A count that must equal one of the record's counters, and a
@@ -292,8 +314,14 @@ impl JointModel {
                 _ => carried = false,
             }
         }
-        let moved = step(t, target, &params);
-        if !within_bounds(model, target, &moved) {
+        let moved: Vec<TemperModelState> = choices
+            .iter()
+            .map(|params| step(t, target, params))
+            .collect();
+        if !moved
+            .iter()
+            .all(|moved| within_bounds(model, target, moved))
+        {
             return Arrival::BeyondBounds;
         }
         // Taken or refused, and nothing else, unless another transition
@@ -314,7 +342,8 @@ impl JointModel {
         let decided = guard
             && self.unchecked.decides(&dispatch.to, &t.name)
             && carried
-            && newer == Truth::True;
+            && newer == Truth::True
+            && !t.string_params.iter().any(|param| param.caller);
         let certainty =
             if enabled.len() > 1 || chose || !self.order.exact(&dispatch.to, &t.effects, state) {
                 Certainty::Unsure
@@ -399,8 +428,8 @@ pub(super) enum Arrival {
     Refused,
     /// It takes a transition.
     Took {
-        /// The record after it.
-        moved: TemperModelState,
+        /// The record after it, one for each value the kernel may write.
+        moved: Vec<TemperModelState>,
         /// The transition's action.
         action: Sym,
         /// Sure, or one of taking and refusing, or unsure.
