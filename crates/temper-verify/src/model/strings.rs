@@ -6,6 +6,7 @@ use super::types::{
     Fields, ModelString, ParamValue, ResolvedTransition, StringParam, TemperModel, TemperModelState,
 };
 use std::collections::BTreeSet;
+use temper_spec::automaton::ParameterSource;
 
 /// The scalar strings and list members held by `states`, `''` left out.
 pub fn string_values<'a>(
@@ -96,7 +97,7 @@ fn string_candidates(
     if param.nonempty {
         candidates.retain(|candidate| !candidate.is_blank());
     }
-    if param.caller {
+    if param.source == Some(ParameterSource::AuthenticatedSubject) {
         candidates.retain(|candidate| !candidate.is_empty());
     }
     for var in &param.not_equals {

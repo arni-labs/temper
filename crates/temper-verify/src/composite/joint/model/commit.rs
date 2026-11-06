@@ -343,7 +343,7 @@ impl JointModel {
             && self.unchecked.decides(&dispatch.to, &t.name)
             && carried
             && newer == Truth::True
-            && !t.string_params.iter().any(|param| param.caller);
+            && t.bound.is_empty();
         let certainty =
             if enabled.len() > 1 || chose || !self.order.exact(&dispatch.to, &t.effects, state) {
                 Certainty::Unsure
