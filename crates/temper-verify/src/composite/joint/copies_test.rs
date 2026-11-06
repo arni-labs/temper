@@ -294,12 +294,22 @@ fn a_reaction_walked_as_another_move_still_lands_and_names_its_own_move() {
 #[test]
 fn moves_nothing_can_tell_apart_are_walked_as_one() {
     let model = source_move_unread("status == 'New' => Board[board].status != 'Pinged'");
+    // The walk holds as many Pings in flight as its room fits, so a fixed
+    // count no longer applies: the count is bounded in that number instead.
+    // Walked as one, with one record, the walk measured 6n + 11 states at n
+    // in flight for n from 96 to 1,536; told apart (Cedar reading the move
+    // that sent each Ping), the same specs walk 9,513 states at 48, against
+    // 299 here.
     let one = check(&model, 1);
     assert!(one.holds(), "{one}");
-    assert!(one.states <= 204, "{one}");
+    let n = one.in_flight_bound.expect("the walk held a Ping back");
+    assert!(one.states <= 6 * n + 11, "{one}");
+    // With two records it measured 18n^2 + 83n + 86 for n from 6 to 48;
+    // told apart, 9,727 states at 6, against 1,232 here.
     let two = check(&model, 2);
     assert!(two.holds(), "{two}");
-    assert!(two.states <= 43_936, "{two}");
+    let n = two.in_flight_bound.expect("the walk held a Ping back");
+    assert!(two.states <= 18 * n * n + 83 * n + 86, "{two}");
 }
 
 #[test]
