@@ -14,7 +14,7 @@ use super::super::super::{JointState, LivenessOutcome, StuckCase};
 use super::super::JointModel;
 use super::super::held::Tables;
 use super::super::step::Certainty;
-use super::super::walk::{Edge, Explored, Made, Node, Via};
+use super::super::walk::{Edge, Explored, Made, NearSure, Node, Via};
 use super::{Budget, Engine, Look, could_not_start, plain, print, reads, seeds};
 
 /// What a confirming walk found.
@@ -160,29 +160,13 @@ impl Engine<'_, '_> {
         explored: &mut Explored<'_>,
         cap: usize,
     ) -> Option<LivenessOutcome> {
-        let count = explored.len();
-        let parents_bytes = count
-            * (size_of::<Option<u32>>() + size_of::<Vec<u32>>() + size_of::<usize>())
-            + 2 * explored.edges.len() * size_of::<u32>();
-        explored.held.add(parents_bytes).ok()?;
-        let parents = explored.sure_parents();
-        let near = |mut index: usize| {
-            let mut depth = 0;
-            while let Some(from) = parents[index].filter(|&from| from as usize != index) {
-                depth += 1;
-                if depth > explored.covered {
-                    return None;
-                }
-                index = from as usize;
-            }
-            parents[index].map(|_| depth)
-        };
-        let mut candidates: Vec<(usize, u64, usize)> = (0..count)
-            .filter_map(|index| {
-                let depth = near(index)?;
-                let state = explored.state(index);
+        let NearSure { parents, near } = explored.near_sure(explored.covered).ok()?;
+        let mut candidates: Vec<(u32, u64, usize)> = near
+            .into_iter()
+            .filter_map(|(index, depth)| {
+                let state = explored.state(index as usize);
                 (state.settled() && eval(goal, &self.model.env(owner, &state)) != Truth::True)
-                    .then(|| (depth, print(&state), index))
+                    .then(|| (depth, print(&state), index as usize))
             })
             .collect();
         candidates.sort_unstable();
