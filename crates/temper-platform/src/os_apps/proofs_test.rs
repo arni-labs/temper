@@ -16,7 +16,7 @@ fn no_room() -> Walked {
 }
 
 #[tokio::test]
-async fn every_waiter_reads_a_walk_that_did_not_fit_and_a_later_install_walks_again() {
+async fn every_waiter_and_every_later_install_read_a_walk_that_did_not_fit() {
     let state = PlatformState::new(None);
     let (release, blocked) = std::sync::mpsc::channel();
     let keys = || Keys {
@@ -75,30 +75,22 @@ async fn every_waiter_reads_a_walk_that_did_not_fit_and_a_later_install_walks_ag
         assert_eq!(verdict.unproved, vec!["no room".to_string()]);
         assert_eq!(verdict.refused, None);
     }
-    // A walk that did not fit says nothing of the specs: a later install
-    // walks again.
-    let mut three = Attempt::default();
+    // A later install of the same model reads it too: a walk that did not
+    // fit would only fill the host again and keep nothing.
     let later = proof(
         &state,
         "default",
         "test",
         "test".into(),
         keys(),
-        &three,
-        |_| Walked {
-            verdict: Verdict {
-                held: vec![],
-                unproved: vec![],
-                refused: None,
-            },
-            fit: true,
-        },
+        &Attempt::default(),
+        |_| panic!("a later install reads the walk that did not fit"),
     )
     .await;
-    let Proof::Running(later) = later else {
-        panic!("later install must retry")
+    let Proof::Done(verdict) = later else {
+        panic!("expected the verdict of the walk that did not fit")
     };
-    assert_eq!(later.ended(&mut three).await, Ok(()));
+    assert_eq!(verdict.unproved, vec!["no room".to_string()]);
 }
 
 /// A platform state with its own file database, where verdicts are kept.
@@ -280,5 +272,80 @@ async fn an_install_that_waited_on_another_s_walk_keeps_the_verdict_under_its_ow
     assert_eq!(
         kept(&state, &second_source).await,
         Some(vec!["holds".to_string()])
+    );
+}
+
+/// A walk that did not fit is kept by what it walked, in the blob table too,
+/// so a start of a new process reads it instead of filling the host again.
+/// It is kept under the model key alone: a change to what the walk reads, or
+/// a kernel whose models read differently, walks once.
+#[tokio::test]
+async fn a_walk_that_did_not_fit_is_kept_by_its_model_and_a_new_model_walks_once() {
+    let state = with_store().await;
+    let keys = unique_keys();
+    let (model, source) = (keys.model.clone(), keys.source.clone());
+    let mut attempt = Attempt::default();
+    let Proof::Running(wait) = proof(
+        &state,
+        "default",
+        "test",
+        "test".into(),
+        keys,
+        &attempt,
+        |_| no_room(),
+    )
+    .await
+    else {
+        panic!("keys nothing is kept under must walk")
+    };
+    assert_eq!(wait.ended(&mut attempt).await, Ok(()));
+    assert_eq!(
+        kept(&state, &source).await,
+        None,
+        "it says nothing of the specs under another model"
+    );
+    // As a new process finds it: nothing reached in memory, only the store.
+    proofs()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .reached
+        .remove(&model);
+    let again = Keys {
+        model: model.clone(),
+        source: format!("source-{}", uuid::Uuid::new_v4()),
+    };
+    let other_source = again.source.clone();
+    let read = proof(
+        &state,
+        "default",
+        "test",
+        "test".into(),
+        again,
+        &Attempt::default(),
+        |_| panic!("a kept walk that did not fit is read, not walked again"),
+    )
+    .await;
+    let Proof::Done(verdict) = read else {
+        panic!("expected the kept verdict")
+    };
+    assert_eq!(verdict.unproved, vec!["no room".to_string()]);
+    assert_eq!(kept(&state, &other_source).await, None);
+    let changed = Keys {
+        model: format!("model-{}", uuid::Uuid::new_v4()),
+        source,
+    };
+    let walk = proof(
+        &state,
+        "default",
+        "test",
+        "test".into(),
+        changed,
+        &Attempt::default(),
+        |_| no_room(),
+    )
+    .await;
+    assert!(
+        matches!(walk, Proof::Running(_)),
+        "a model nothing was walked for walks"
     );
 }
