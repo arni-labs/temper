@@ -143,6 +143,7 @@ impl Alike {
                 }
                 sources.retain(|source| !source.is_empty());
                 let mut found = self.join(at, &sources);
+                drop(sources);
                 if !others[at].is_empty() {
                     found = self.join(at, &[others[at].clone(), found]);
                 }
