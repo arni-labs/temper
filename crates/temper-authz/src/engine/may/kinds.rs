@@ -365,11 +365,16 @@ impl SendAnalysis {
             4 * (leaves.len() + memory.branches + 1) + leaves.len(),
             forms.bytes() + seen.len() * memory.form + alike.bytes(),
         )?;
-        let blurred = alike.blurred();
+        let others = alike.others(&|bytes| {
+            memory.reserve(
+                4 * (leaves.len() + memory.branches + 1) + leaves.len(),
+                forms.bytes() + seen.len() * memory.form + bytes,
+            )
+        })?;
         let mut kinds: Vec<(Vec<May>, Kind)> = Vec::new();
         let mut held = 0;
         for (at, node) in leaves {
-            let others = alike.others(&node.profile, &blurred[at]);
+            let others = alike.profile(&node.profile, &others[at]);
             let kind = Kind {
                 examples: vec![node.profile],
                 others: others.into_iter().collect(),
@@ -388,7 +393,7 @@ impl SendAnalysis {
                 None => kinds.push((answers, kind)),
             }
         }
-        std::mem::drop((alike, blurred));
+        std::mem::drop((alike, others));
         memory.reserve(
             4 * (kinds.len() + memory.branches + 1) + held,
             forms.bytes()

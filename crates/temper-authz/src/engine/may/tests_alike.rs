@@ -158,3 +158,43 @@ fn senders_found_alike_across_many_branches_are_held_in_a_few_bytes_each() {
     // node's worth.
     assert!(most.get() < 32 << 20, "reserved {} bytes", most.get());
 }
+
+#[test]
+fn senders_found_alike_keep_what_they_hold_where_they_differ() {
+    // Asked Start only as a request, senders with no role and those with a
+    // role but member answer alike: asked it as a reaction, the kind may
+    // not let them, though it no longer knows which they are.
+    let text = r#"
+permit(principal, action == Action::"Add", resource is Ping);
+permit(principal, action in [Action::"Start", Action::"Finish"], resource is Job)
+when { principal has role && principal.role == "member" };
+"#;
+    let analysis = SendAnalysis::new(text).expect("the policies parse");
+    let questions = [
+        Question {
+            action: "Add",
+            resource_type: "Ping",
+            cause: Cause::request(),
+        },
+        Question {
+            action: "Start",
+            resource_type: "Job",
+            cause: Cause::request(),
+        },
+    ];
+    let reaction = Cause::reaction(false, Hop::unknown());
+    let none = BTreeMap::new();
+    let kinds = analysis
+        .outside_kinds(&questions, &|_| Ok(()))
+        .expect("fits");
+    let refused: Vec<&Answered> = kinds
+        .iter()
+        .filter(|found| found.answers[1] == May::No)
+        .collect();
+    assert!(!refused.is_empty(), "every kind may Start: {kinds:?}");
+    for found in refused {
+        let asker = Asker::OutsideAs(found.kind.clone());
+        let may = analysis.may(&asker, "Start", "Job", &none, Some(&reaction));
+        assert_eq!(may, May::No, "{:?}", found.kind);
+    }
+}
