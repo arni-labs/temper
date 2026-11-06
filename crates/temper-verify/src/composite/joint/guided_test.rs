@@ -285,12 +285,25 @@ fn a_record_the_kernel_puts_right_after_every_move_is_never_stuck() {
 
 #[test]
 fn a_stuck_state_near_the_start_is_found_on_every_run() {
-    // Trap is two moves from the start and no move leaves it: the states
-    // the walk covers in full are the same whatever order its threads take,
-    // and Trap is among them.
+    // Trap is two moves from the start and no move leaves it. With 16 flags
+    // the walk covers the first few moves in full and stops for room long
+    // before its 26 * 2^16 states: the states it covers in full are the
+    // same whatever order its threads take, and Trap is among them.
     let rule = "[[liveness]]\nname = 'rule'\neventually = \"status != 'Trap' && READ\"\n";
-    for _ in 0..3 {
-        let result = liveness_in(&[&falls_early(FLAGS, rule)], SMALL);
+    let deep = falls_early(16, rule);
+    let automatons = parse(&[&deep]);
+    let refs: Vec<&Automaton> = automatons.iter().collect();
+    for threads in [1, 2, 4] {
+        let (room, progress) = (
+            Bytes::new(64 << 20).with_threads(threads),
+            Progress::default(),
+        );
+        let bound = Bound {
+            room: &room,
+            progress: &progress,
+        };
+        let result = verify_joint_liveness(&refs, None, bound).remove(0);
+        assert!(result.states < 26 << 16, "the walk stopped short: {result}");
         let LivenessOutcome::Stuck { cases, .. } = &result.outcome else {
             panic!("Trap has no way out, got {result}");
         };
@@ -302,11 +315,12 @@ fn a_stuck_state_near_the_start_is_found_on_every_run() {
 
 #[test]
 fn a_state_near_the_start_whose_way_out_its_own_walk_cannot_reach_is_not_judged() {
-    // From Trap, outside code is relied on to set and clear every flag and
-    // to let it escape while the condition is false: Trap reaches the
-    // condition, but the walk that would show it is every way the flags can
-    // be, 2^12 states, more than one confirming walk's share of steps.
-    let many = 12;
+    // From Trap, two moves from the start, outside code is relied on to set
+    // and clear every flag and to let it escape while the condition is
+    // false: Trap reaches the condition, but the walk that would show it is
+    // every way the flags can be, 2^16 states, more than one confirming
+    // walk's share of steps.
+    let many = 16;
     let relied = (0..many)
         .flat_map(|i| [format!("'Set{i}'"), format!("'Clear{i}'")])
         .chain(["'Escape'".to_string()])
@@ -316,7 +330,8 @@ fn a_state_near_the_start_whose_way_out_its_own_walk_cannot_reach_is_not_judged(
         "[[liveness]]\nname = 'rule'\neventually = \"status != 'Trap' && READ\"\nrelies_on = [{relied}]\n\
          \n[[action]]\nname = 'Escape'\nkind = 'input'\nfrom = ['Trap']\nto = 'S0'\n"
     );
-    let result = liveness_in(&[&falls_early(many, &rule)], SMALL);
+    let result = liveness_in(&[&falls_early(many, &rule)], 64 << 20);
+    assert!(result.states < 26 << 16, "the walk stopped short: {result}");
     let LivenessOutcome::Incomplete { reason } = &result.outcome else {
         panic!("Trap escapes, and no walk could show it, got {result}");
     };
