@@ -10,7 +10,7 @@ use temper_spec::predicate::{Expr, Truth, eval};
 use super::super::super::liveness::{settle, settle_bytes, sure_steps};
 use super::super::super::pack::{Packed, Packer};
 use super::super::super::room::{Bound, Held, block};
-use super::super::super::state::render;
+use super::super::super::state::whole;
 use super::super::super::{JointState, LivenessOutcome, StuckCase};
 use super::super::JointModel;
 use super::super::held::Tables;
@@ -161,8 +161,8 @@ impl Engine<'_, '_> {
         goal: &Expr,
         explored: &mut Explored<'_>,
     ) -> (Vec<Vec<Packed>>, usize) {
-        // Ordered by what a state reads as, the same in every run.
-        let key = |state: &JointState| print(&render(state));
+        // Ordered by what a state holds, in words, the same in every run.
+        let key = |state: &JointState| print(&whole(state));
         let Ok(NearSure { parents, near }) = explored.near_sure(explored.covered, key) else {
             return (Vec::new(), 0);
         };

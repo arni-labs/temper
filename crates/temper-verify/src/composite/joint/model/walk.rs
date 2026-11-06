@@ -265,7 +265,7 @@ impl Explored<'_> {
         for way in &mut ways {
             way.made = made[way.made as usize].from;
         }
-        self.held.sub(bytes(&made));
+        self.held.give_back(bytes(&made));
         drop(made);
         ways.sort_unstable_by_key(|way| way.made);
         let table = (count + 1) * size_of::<u32>() + count * size_of::<Option<u32>>();
@@ -316,7 +316,8 @@ impl Explored<'_> {
             level = next;
         }
         self.held
-            .sub(bytes(&level) + (count + 1) * size_of::<u32>() + bytes(&ways));
+            .sub(bytes(&level) + (count + 1) * size_of::<u32>());
+        self.held.give_back(bytes(&ways));
         drop(first);
         drop(ways);
         self.held.release();
