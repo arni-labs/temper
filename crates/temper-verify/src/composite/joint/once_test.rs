@@ -63,11 +63,12 @@ target_action = "Open"
 resolve_target = { kind = "same_id" }
 "#;
 
-/// Each `P` steps `B` on, into a status `P` is allowed from again: four
-/// copies, all sent before `Close`, take it to S4.
+/// Each `P` steps `B` on, into a status `P` is allowed from again: two
+/// copies, both sent before `Close`, take it to S2. With `Close`'s `Open`
+/// that is three in flight, all a walk holds at first.
 const STEPPER: &str = r#"[automaton]
 name = "B"
-states = ["Closed", "S0", "S1", "S2", "S3", "S4"]
+states = ["Closed", "S0", "S1", "S2"]
 initial = "Closed"
 
 [[action]]
@@ -88,21 +89,9 @@ kind = "internal"
 from = ["S1"]
 to = "S2"
 
-[[action]]
-name = "P"
-kind = "internal"
-from = ["S2"]
-to = "S3"
-
-[[action]]
-name = "P"
-kind = "internal"
-from = ["S3"]
-to = "S4"
-
 [[invariant]]
 name = "never_last"
-assert = "status != 'S4' || A[Id].status == 'Idle'"
+assert = "status != 'S2' || A[Id].status == 'Idle'"
 "#;
 
 const STACK_POLICIES: &str = r#"permit(principal, action in [Action::"Go", Action::"Close"], resource);
@@ -110,9 +99,9 @@ permit(principal, action, resource) when { context has via && context.via != "re
 "#;
 
 #[test]
-fn a_break_that_needs_four_identical_copies_in_flight_is_found() {
+fn a_break_that_needs_two_identical_copies_in_flight_is_found() {
     // Each P lands into a status P is allowed from, so a record takes it
-    // again and again: every copy counts, and the walk grows to hold them.
+    // again: both copies count, and the walk keeps both.
     let result = invariant(&[STACKER, STEPPER], STACK_POLICIES);
     assert!(
         matches!(result.outcome, JointOutcome::Broken { .. }),
@@ -203,8 +192,8 @@ fn a_dispatch_taken_once_needs_one_copy_in_flight() {
     assert_eq!(result.in_flight_bound, None, "{result}");
 }
 
-/// `Go` sends four different steps at once; `B` takes each once.
-const FOUR: &str = r#"[automaton]
+/// `Go` sends three different steps at once; `B` takes each once.
+const THREE: &str = r#"[automaton]
 name = "A"
 states = ["Idle", "Went"]
 initial = "Idle"
@@ -236,17 +225,11 @@ target_entity = "B"
 target_action = "P3"
 resolve_target = { kind = "same_id" }
 
-[[action.triggers]]
-name = "p4"
-kind = "entity"
-target_entity = "B"
-target_action = "P4"
-resolve_target = { kind = "same_id" }
 "#;
 
 const STEPS: &str = r#"[automaton]
 name = "B"
-states = ["S0", "S1", "S2", "S3", "All"]
+states = ["S0", "S1", "S2", "All"]
 initial = "S0"
 
 [[action]]
@@ -265,12 +248,6 @@ to = "S2"
 name = "P3"
 kind = "internal"
 from = ["S2"]
-to = "S3"
-
-[[action]]
-name = "P4"
-kind = "internal"
-from = ["S3"]
 to = "All"
 
 [[invariant]]
@@ -278,15 +255,15 @@ name = "never_all"
 assert = "status != 'All' || A[Id].status == 'Idle'"
 "#;
 
-const FOUR_POLICIES: &str = r#"permit(principal, action == Action::"Go", resource is A);
+const THREE_POLICIES: &str = r#"permit(principal, action == Action::"Go", resource is A);
 permit(principal, action, resource is B) when { context has via && context.via != "request" };
 "#;
 
 #[test]
-fn four_different_dispatches_in_flight_still_break_the_rule() {
-    // Each step is taken once, but the four are not copies of one another:
-    // all four stay in flight, and the walk grows to hold them.
-    let result = invariant(&[FOUR, STEPS], FOUR_POLICIES);
+fn three_different_dispatches_in_flight_still_break_the_rule() {
+    // Each step is taken once, but the three are not copies of one another:
+    // all three stay in flight.
+    let result = invariant(&[THREE, STEPS], THREE_POLICIES);
     assert!(
         matches!(result.outcome, JointOutcome::Broken { .. }),
         "{result}"
