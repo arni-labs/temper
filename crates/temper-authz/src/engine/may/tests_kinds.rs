@@ -370,3 +370,41 @@ permit(principal, action == Action::"Z", resource) when {{ context.role == "memb
     );
     assert_eq!(kinds, kinds_of(asked, &["A"]));
 }
+
+#[test]
+fn whether_someone_may_make_a_request_is_what_a_split_on_it_alone_finds() {
+    // Members surely may Add; only some "x" senders may Pong, and only when
+    // the record is open, so no sender surely may.
+    let policies = r#"
+permit(principal, action == Action::"Add", resource is Note)
+when { principal has role && principal.role == "member" };
+permit(principal, action == Action::"Pong", resource is Note)
+when { principal has role && principal.role == "x" && resource.open == true };
+"#;
+    let questions = ["Pong", "Add"].map(|action| Question {
+        action,
+        resource_type: "Note",
+        cause: Cause::request(),
+    });
+    let unlimited = |_: usize| Ok(());
+    let alone = SendAnalysis::new(policies).expect("the policies parse");
+    let told = SendAnalysis::new(policies).expect("the policies parse");
+    told.outside_kinds(&questions, &unlimited)
+        .expect("nothing limits the room");
+    for question in &questions {
+        let action = question.action;
+        assert_eq!(
+            told.may_request(&Asker::Outside, action, "Note", &unlimited),
+            alone.may_request(&Asker::Outside, action, "Note", &unlimited),
+            "{action}"
+        );
+    }
+    assert_eq!(
+        told.may_request(&Asker::Outside, "Add", "Note", &unlimited),
+        May::Yes
+    );
+    assert_eq!(
+        told.may_request(&Asker::Outside, "Pong", "Note", &unlimited),
+        May::Maybe
+    );
+}
