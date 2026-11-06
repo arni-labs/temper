@@ -9,10 +9,10 @@ use temper_spec::predicate::{Expr, Name, Truth, eval};
 
 use super::super::env::{Blind, JointEnv};
 use super::super::state::ReactionStep;
-use super::super::{Call, Dispatch, JointState};
+use super::super::{Dispatch, JointState};
 use super::JointModel;
+use super::caller::Sent;
 use super::caller::with_callers;
-use super::react::Sent;
 use super::step::Certainty;
 use crate::model::semantics::{rule_for, step, successors_budgeted, within_bounds};
 use crate::model::{
@@ -20,59 +20,6 @@ use crate::model::{
 };
 
 impl JointModel {
-    /// The kernel sends `name` to `entity`'s record with no parameters, as
-    /// `by` (a timer, or a module's `on_failure`): it goes through the
-    /// dispatch path like any dispatch.
-    pub(super) fn fire(
-        &self,
-        state: JointState,
-        entity: &str,
-        name: &str,
-        text: &str,
-        by: u32,
-    ) -> Vec<(JointState, String, Certainty)> {
-        let dispatch = Dispatch {
-            to: entity.into(),
-            action: name.into(),
-            target_state: None,
-            params: Fields::new(),
-            read: !self.action_reads_related(entity, name),
-            chain: Arc::new([]),
-            via: None,
-            by,
-            unread_guard: None,
-        };
-        if !dispatch.read {
-            let mut next = state;
-            add(&mut next, dispatch);
-            return vec![(next, words!(self, "{text} sent"), Certainty::Sure)];
-        }
-        self.deliver(state, &dispatch, text)
-    }
-
-    /// The states a call that ended unanswered (`text`) leads to from
-    /// `next`, where it is no longer in flight: its `on_failure` action, if
-    /// it names one, sent as `by`, whoever made the move that called the
-    /// module, in the chain the answer comes in.
-    pub(super) fn end_call(
-        &self,
-        next: JointState,
-        call: &Call,
-        text: String,
-        by: u32,
-    ) -> Vec<(JointState, String, Certainty)> {
-        match &call.on_failure {
-            Some(name) => self.fire(
-                next,
-                &call.to,
-                name,
-                &words!(self, "{text}: {}.{name}", call.to),
-                by,
-            ),
-            None => vec![(next, text, Certainty::Sure)],
-        }
-    }
-
     /// `dispatch` reaches its record's actor in `state`, which takes or
     /// refuses it; what the record does next follows.
     pub(super) fn deliver(
@@ -112,8 +59,12 @@ impl JointModel {
             self.spawn_refused(&mut stays, dispatch);
             outcomes.push((stays, refused, certainty.max(Certainty::OneOf)));
         }
-        for moved in moved {
+        for (moved, bound) in moved {
             let text = words!(self, "{text} arrives -> {}", moved.status);
+            let caller = dispatch.caller.clone().map(|mut caller| {
+                caller.extend(bound.iter().map(|(source, value)| (*source, *value)));
+                caller
+            });
             let mut state = state.clone();
             self.place(&mut state, &dispatch.to, moved, &action, dispatch.by);
             let sent = Sent {
@@ -121,6 +72,7 @@ impl JointModel {
                 by: dispatch.by,
                 params: &dispatch.params,
                 request: false,
+                caller: caller.as_ref(),
             };
             let after = self.after_commit(state, &dispatch.to, &action, sent);
             outcomes.extend(
@@ -141,8 +93,16 @@ impl JointModel {
         action: &TemperModelAction,
         chain: &[ReactionStep],
         by: u32,
+        caller: Option<&Fields<ParamValue>>,
     ) -> Vec<(JointState, Certainty)> {
-        self.commit_as(state, entity, action, chain, by, false)
+        let sent = Sent {
+            chain,
+            by,
+            params: &action.params,
+            request: false,
+            caller,
+        };
+        self.commit_as(state, entity, action, sent)
     }
 
     /// [`Self::commit`], for a request `by` made with these parameters.
@@ -153,32 +113,34 @@ impl JointModel {
         action: &TemperModelAction,
         by: u32,
     ) -> Vec<(JointState, Certainty)> {
-        self.commit_as(state, entity, action, &[], by, true)
+        let sent = Sent {
+            chain: &[],
+            by,
+            params: &action.params,
+            request: true,
+            caller: None,
+        };
+        self.commit_as(state, entity, action, sent)
     }
 
+    /// A request starts a chain that binds what it binds.
     fn commit_as(
         &self,
         state: JointState,
         entity: &str,
         action: &TemperModelAction,
-        chain: &[ReactionStep],
-        by: u32,
-        request: bool,
+        sent: Sent<'_>,
     ) -> Vec<(JointState, Certainty)> {
         let record = &state.records[entity];
         let Some(t) = rule_for(&self.models[entity], &action.name, &record.status) else {
             return Vec::new();
         };
         let moved = step(t, record, &action.params);
+        let bound = sent.request.then(|| Self::bound_by(t, &action.params));
         let mut next = state;
-        self.place(&mut next, entity, moved, &action.name, by);
-        let sent = Sent {
-            chain,
-            by,
-            params: &action.params,
-            request,
-        };
-        self.after_commit(next, entity, &action.name, sent)
+        self.place(&mut next, entity, moved, &action.name, sent.by);
+        let caller = bound.as_ref().or(sent.caller);
+        self.after_commit(next, entity, &action.name, Sent { caller, ..sent })
     }
 
     /// Put `entity`'s record, after it took `action` from `by`, into
@@ -266,10 +228,10 @@ impl JointModel {
         let Ok(callers) = self.caller_ids(dispatch, t, target, &values) else {
             return Arrival::Refused;
         };
-        if callers.is_empty() {
+        if callers.choices.is_empty() {
             return Arrival::BeyondBounds;
         }
-        let choices = with_callers(&params, callers, t, target);
+        let choices = with_callers(&params, callers.choices, t, target);
         let Some(params) = choices.first() else {
             return Arrival::Refused;
         };
@@ -311,13 +273,13 @@ impl JointModel {
                 _ => carried = false,
             }
         }
-        let moved: Vec<TemperModelState> = choices
+        let moved: Vec<_> = choices
             .iter()
-            .map(|params| step(t, target, params))
+            .map(|params| (step(t, target, params), Self::bound_by(t, params)))
             .collect();
         if !moved
             .iter()
-            .all(|moved| within_bounds(model, target, moved))
+            .all(|(moved, _)| within_bounds(model, target, moved))
         {
             return Arrival::BeyondBounds;
         }
@@ -339,7 +301,8 @@ impl JointModel {
         let decided = guard
             && self.unchecked.decides(&dispatch.to, &t.name)
             && carried
-            && newer == Truth::True;
+            && newer == Truth::True
+            && callers.sure;
         // A kind some of whose senders name a caller and some do not: the
         // kernel binds for the ones that do and refuses the others.
         let named = t.bound.is_empty() || self.senders.names_a_caller(dispatch.by) == May::Yes;
@@ -429,8 +392,9 @@ pub(super) enum Arrival {
     Refused,
     /// It takes a transition.
     Took {
-        /// The record after it, one for each value the kernel may write.
-        moved: Vec<TemperModelState>,
+        /// The record after it, one for each value the kernel may bind, with
+        /// what it bound by source.
+        moved: Vec<(TemperModelState, Fields<ParamValue>)>,
         /// The transition's action.
         action: Sym,
         /// Sure, or one of taking and refusing, or unsure.

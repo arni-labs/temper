@@ -227,6 +227,15 @@ pub struct StringParam {
     pub not_equals: Vec<Sym>,
 }
 
+/// The key a value the kernel binds goes under in a chain: its source's name.
+#[must_use]
+pub fn source_key(source: ParameterSource) -> Sym {
+    Sym::new(match source {
+        ParameterSource::AuthenticatedSubject => "authenticated_subject",
+        ParameterSource::AuthenticatedAgentLabel => "authenticated_agent_label",
+    })
+}
+
 /// A safety invariant: `assert` must not be false in any reachable state.
 #[derive(Clone, Debug)]
 pub struct ResolvedInvariant {

@@ -134,7 +134,7 @@ impl JointModel {
         by: u32,
     ) -> bool {
         let chain = self.outside_chain(entity, &action.name);
-        self.commit(before.clone(), entity, action, &chain, by)
+        self.commit(before.clone(), entity, action, &chain, by, None)
             .iter()
             .all(|(_, then)| *then <= Certainty::Either)
     }
