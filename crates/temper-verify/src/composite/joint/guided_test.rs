@@ -244,3 +244,81 @@ fn a_stuck_state_past_the_room_only_an_unsure_move_reaches_stays_not_checked() {
         "{reason}"
     );
 }
+
+/// Every status of [`deep`], quoted for a `from` list.
+fn every_status() -> String {
+    (0..=DEPTH)
+        .map(|j| format!("'S{j}'"))
+        .chain(["'Trap'".to_string()])
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// [`deep`] with Fall taken from S1, two moves from the start.
+fn falls_early(flags: usize, rule: &str) -> String {
+    deep(DEPTH, flags, rule).replace(
+        &format!("from = ['S{DEPTH}']\nto = 'Trap'"),
+        "from = ['S1']\nto = 'Trap'",
+    )
+}
+
+#[test]
+fn a_record_the_kernel_puts_right_after_every_move_is_never_stuck() {
+    // Anyone may heat Deep in any status, and the kernel's dispatch cools
+    // it again: every state reaches the condition, past the room too.
+    let all = every_status();
+    let rule = format!(
+        "[[liveness]]\nname = 'rule'\neventually = \"!hot && READ\"\n\
+         \n[[state]]\nname = 'hot'\ntype = 'bool'\ninitial = false\n\
+         \n[[action]]\nname = 'Heat'\nkind = 'input'\nfrom = [{all}]\neffect = ['hot = true']\n\
+         \n[[action.triggers]]\nname = 'cool'\nkind = 'entity'\ntarget_entity = 'Deep'\n\
+         target_action = 'Cool'\nresolve_target = {{ kind = 'same_id' }}\n\
+         \n[[action]]\nname = 'Cool'\nkind = 'internal'\nfrom = [{all}]\neffect = ['hot = false']\n"
+    );
+    let deep = deep(DEPTH, FLAGS, &rule);
+    let result = liveness_in(&[&deep], SMALL);
+    let LivenessOutcome::Incomplete { reason } = &result.outcome else {
+        panic!("every state cools, and the walk stopped short, got {result}");
+    };
+    assert!(reason.contains("does not fit"), "{reason}");
+}
+
+#[test]
+fn a_stuck_state_near_the_start_is_found_on_every_run() {
+    // Trap is two moves from the start and no move leaves it: the states
+    // the walk covers in full are the same whatever order its threads take,
+    // and Trap is among them.
+    let rule = "[[liveness]]\nname = 'rule'\neventually = \"status != 'Trap' && READ\"\n";
+    for _ in 0..3 {
+        let result = liveness_in(&[&falls_early(FLAGS, rule)], SMALL);
+        let LivenessOutcome::Stuck { cases, .. } = &result.outcome else {
+            panic!("Trap has no way out, got {result}");
+        };
+        let path = &cases[0].path;
+        assert_eq!(path.len(), 3, "{result}");
+        assert!(path[2].state.contains("Deep=Trap"), "{result}");
+    }
+}
+
+#[test]
+fn a_state_near_the_start_whose_way_out_its_own_walk_cannot_reach_is_not_judged() {
+    // From Trap, outside code is relied on to set and clear every flag and
+    // to let it escape while the condition is false: Trap reaches the
+    // condition, but the walk that would show it is every way the flags can
+    // be, 2^12 states, more than one confirming walk's share of steps.
+    let many = 12;
+    let relied = (0..many)
+        .flat_map(|i| [format!("'Set{i}'"), format!("'Clear{i}'")])
+        .chain(["'Escape'".to_string()])
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rule = format!(
+        "[[liveness]]\nname = 'rule'\neventually = \"status != 'Trap' && READ\"\nrelies_on = [{relied}]\n\
+         \n[[action]]\nname = 'Escape'\nkind = 'input'\nfrom = ['Trap']\nto = 'S0'\n"
+    );
+    let result = liveness_in(&[&falls_early(many, &rule)], SMALL);
+    let LivenessOutcome::Incomplete { reason } = &result.outcome else {
+        panic!("Trap escapes, and no walk could show it, got {result}");
+    };
+    assert!(reason.contains("does not fit"), "{reason}");
+}

@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 
 use temper_spec::predicate::{Expr, Truth, eval};
 
-use super::super::super::liveness::{settle, settle_bytes};
+use super::super::super::liveness::{settle, settle_bytes, sure_path};
 use super::super::super::pack::{Packed, Packer};
 use super::super::super::room::{Bound, Held, block};
 use super::super::super::{JointState, LivenessOutcome, StuckCase};
@@ -146,6 +146,87 @@ impl Engine<'_, '_> {
     }
 }
 
+impl Engine<'_, '_> {
+    /// Phase two's first look, the same on every run: each state sure moves
+    /// reach within the moves the walk `explored` covered in full, where the
+    /// condition is not known to hold with nothing in flight, nearest first
+    /// and then by fingerprint, gets a confirming walk while steps are left.
+    /// The states that near are the same whatever order the walk's threads
+    /// took, so a stuck state among them is found on every run.
+    fn nearest(
+        &mut self,
+        owner: &str,
+        goal: &Expr,
+        explored: &mut Explored<'_>,
+        cap: usize,
+    ) -> Option<LivenessOutcome> {
+        let count = explored.len();
+        let parents_bytes = count
+            * (size_of::<Option<u32>>() + size_of::<Vec<u32>>() + size_of::<usize>())
+            + 2 * explored.edges.len() * size_of::<u32>();
+        explored.held.add(parents_bytes).ok()?;
+        let parents = explored.sure_parents();
+        let near = |mut index: usize| {
+            let mut depth = 0;
+            while let Some(from) = parents[index].filter(|&from| from as usize != index) {
+                depth += 1;
+                if depth > explored.covered {
+                    return None;
+                }
+                index = from as usize;
+            }
+            parents[index].map(|_| depth)
+        };
+        let mut candidates: Vec<(usize, u64, usize)> = (0..count)
+            .filter_map(|index| {
+                let depth = near(index)?;
+                let state = explored.state(index);
+                (state.settled() && eval(goal, &self.model.env(owner, &state)) != Truth::True)
+                    .then(|| (depth, print(&state), index))
+            })
+            .collect();
+        candidates.sort_unstable();
+        for (_, key, index) in candidates {
+            if self.left == 0 {
+                break;
+            }
+            if self.good.contains_key(&key)
+                || !Engine::mark(&mut self.held, &mut self.tried, key).unwrap_or(false)
+            {
+                continue;
+            }
+            self.stats.candidates += 1;
+            match self.confirm(owner, goal, &explored.state(index), cap) {
+                Confirm::Reaches(prints) => {
+                    for key in prints {
+                        if Engine::mark(&mut self.held, &mut self.good, key).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Confirm::Open => self.stats.unconfirmed += 1,
+                Confirm::Stuck(LivenessOutcome::Stuck { stuck, cases }) => {
+                    let prefix = sure_path(self.model, explored, &parents, index);
+                    let cases = cases
+                        .into_iter()
+                        .map(|case| StuckCase {
+                            path: prefix
+                                .iter()
+                                .cloned()
+                                .chain(case.path.into_iter().skip(1))
+                                .collect(),
+                            moves: case.moves,
+                        })
+                        .collect();
+                    return Some(LivenessOutcome::Stuck { stuck, cases });
+                }
+                Confirm::Stuck(_) => {}
+            }
+        }
+        None
+    }
+}
+
 impl JointModel {
     /// Phase two for the liveness property `goal` of `owner`, after the
     /// breadth-first walk `explored` stopped (`why`): NEVER SETTLES when a
@@ -156,7 +237,7 @@ impl JointModel {
         &self,
         owner: &str,
         goal: &Expr,
-        explored: Explored<'_>,
+        mut explored: Explored<'_>,
         why: String,
         bound: Bound<'_>,
     ) -> LivenessOutcome {
@@ -166,6 +247,9 @@ impl JointModel {
             return LivenessOutcome::Incomplete { reason: why };
         }
         let mut engine = Engine::new(self, bound, reads(owner, &[goal]), budget.steps);
+        if let Some(stuck) = engine.nearest(owner, goal, &mut explored, budget.confirm) {
+            return stuck;
+        }
         let seeds = seeds(self, &explored, &mut engine.packer);
         drop(explored);
         let mut stuck: Option<LivenessOutcome> = None;
