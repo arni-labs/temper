@@ -86,6 +86,11 @@ impl Cause {
 
     /// What the check holds under `key`: None for a key the kernel does not
     /// set from the cause, `Some(None)` for a cause key this check lacks.
+    /// How many keys it names, known or not.
+    pub(super) fn keys(&self) -> usize {
+        self.0.len()
+    }
+
     pub(super) fn get(&self, key: &str) -> Option<Option<&Attr>> {
         platform_keys::CAUSE.contains(&key).then(|| self.0.get(key))
     }
