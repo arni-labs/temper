@@ -245,34 +245,41 @@ impl Explored<'_> {
     /// For each state sure moves alone reach from a start within `depth`
     /// moves, the state they come to it from, a start naming itself; and
     /// those states as a breadth-first walk of sure moves reaches them, each
-    /// with how many moves from a start it is. It gives back what the walk's
-    /// moves held and keeps only its sure ways, sorted where they lie, so a
-    /// walk that stopped for room has room for it; the walk keeps no moves or
-    /// ways after.
+    /// with how many moves from a start it is. A state's ways are taken in
+    /// the order its moves were made, so the walk and the ways it finds are
+    /// the same whatever order the threads walked the states in. It gives
+    /// back what the walk's moves and ways held, so a walk that stopped for
+    /// room has room for it; the walk keeps no moves or ways after.
     pub(in crate::composite::joint) fn near_sure(
         &mut self,
         depth: usize,
     ) -> Result<NearSure, String> {
         let count = self.nodes.len();
         let made = std::mem::take(&mut self.made);
-        let mut ways = std::mem::take(&mut self.edges);
-        ways.retain(|way| way.sure);
-        // Each way now names the state it leaves in place of its move.
-        for way in &mut ways {
-            way.made = made[way.made as usize].from;
-        }
-        self.held.sub(bytes(&made));
-        drop(made);
-        ways.sort_unstable_by_key(|way| way.made);
-        self.held
-            .add((count + 1) * size_of::<u32>() + count * size_of::<Option<u32>>())?;
-        let mut first = vec![0u32; count + 1];
-        for way in &ways {
-            first[way.made as usize + 1] += 1;
+        let ways = std::mem::take(&mut self.edges);
+        let from = |way: &Edge| made[way.made as usize].from as usize;
+        let table = (count + 1) * size_of::<u32>() + count * size_of::<Option<u32>>();
+        self.held.add(table)?;
+        // The sure ways out of each state, together and in order: state `i`'s
+        // end where `ends[i]` says and start where the state before it's do.
+        let mut ends = vec![0u32; count + 1];
+        for way in ways.iter().filter(|way| way.sure) {
+            ends[from(way) + 1] += 1;
         }
         for at in 0..count {
-            first[at + 1] += first[at];
+            ends[at + 1] += ends[at];
         }
+        let sure = ends[count] as usize;
+        self.held.add(sure * size_of::<u32>())?;
+        let mut to = vec![0u32; sure];
+        for way in ways.iter().filter(|way| way.sure) {
+            let at = &mut ends[from(way)];
+            to[*at as usize] = way.to;
+            *at += 1;
+        }
+        self.held.sub(bytes(&made) + bytes(&ways));
+        drop(ways);
+        drop(made);
         let mut parents: Vec<Option<u32>> = vec![None; count];
         let mut near: Vec<(u32, u32)> = Vec::new();
         for (index, node) in self.nodes.iter().enumerate() {
@@ -289,17 +296,17 @@ impl Explored<'_> {
                 continue;
             }
             let at = index as usize;
-            for way in &ways[first[at] as usize..first[at + 1] as usize] {
-                if parents[way.to as usize].is_none() {
-                    parents[way.to as usize] = Some(index);
+            let start = at.checked_sub(1).map_or(0, |before| ends[before]);
+            for &way in &to[start as usize..ends[at] as usize] {
+                if parents[way as usize].is_none() {
+                    parents[way as usize] = Some(index);
                     grow(&mut near, 1, &mut self.held)?;
-                    near.push((way.to, moves + 1));
+                    near.push((way, moves + 1));
                 }
             }
         }
-        self.held.sub((count + 1) * size_of::<u32>());
-        drop(first);
-        self.edges = ways;
+        self.held
+            .sub((count + 1) * size_of::<u32>() + sure * size_of::<u32>());
         Ok(NearSure { parents, near })
     }
 

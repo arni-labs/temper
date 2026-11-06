@@ -263,9 +263,11 @@ fn falls_early(flags: usize, rule: &str) -> String {
 }
 
 #[test]
-fn a_record_the_kernel_puts_right_after_every_move_is_never_stuck() {
+fn a_step_that_copies_a_record_with_many_fields_holds_room_for_the_copy() {
     // Anyone may heat Deep in any status, and the kernel's dispatch cools
-    // it again: every state reaches the condition, past the room too.
+    // it again. Cooling copies a record of eleven flags and an id, which a
+    // step's estimate of its room must cover (a debug build asserts it); and
+    // every state reaches the condition, past the room too.
     let all = every_status();
     let rule = format!(
         "[[liveness]]\nname = 'rule'\neventually = \"!hot && READ\"\n\
@@ -303,6 +305,7 @@ fn a_stuck_state_near_the_start_is_found_on_every_run() {
             progress: &progress,
         };
         let result = verify_joint_liveness(&refs, None, bound).remove(0);
+        assert_eq!(room.held(), 0, "the walks give back what they took");
         assert!(result.states < 26 << 16, "the walk stopped short: {result}");
         let LivenessOutcome::Stuck { cases, .. } = &result.outcome else {
             panic!("Trap has no way out, got {result}");
@@ -314,12 +317,13 @@ fn a_stuck_state_near_the_start_is_found_on_every_run() {
 }
 
 #[test]
-fn a_state_near_the_start_whose_way_out_its_own_walk_cannot_reach_is_not_judged() {
+fn a_state_near_the_start_whose_own_walk_cannot_finish_is_not_judged() {
     // From Trap, two moves from the start, outside code is relied on to set
     // and clear every flag and to let it escape while the condition is
-    // false: Trap reaches the condition, but the walk that would show it is
-    // every way the flags can be, 2^16 states, more than one confirming
-    // walk's share of steps.
+    // false: Trap reaches the condition, but the walk of every move from it
+    // is every way the flags can be, 2^16 states, more than one confirming
+    // walk's share of steps, and a state it never walked on from may be one
+    // whose way out it did not see.
     let many = 16;
     let relied = (0..many)
         .flat_map(|i| [format!("'Set{i}'"), format!("'Clear{i}'")])
