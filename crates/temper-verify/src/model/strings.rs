@@ -157,17 +157,10 @@ pub(super) fn string_assignments(
                 candidates.retain(|value| value == same);
             }
             // A parameter neither effects nor guard reads leads to the same
-            // move with any value its constraints allow: one is enough,
-            // unless it shares its source, whose value the others then take.
-            let shares = param.source.is_some_and(|source| {
-                t.string_params
-                    .iter()
-                    .filter(|other| other.source == Some(source))
-                    .count()
-                    > 1
-            });
+            // move with any value its constraints allow: one is enough. Not
+            // a bound one: what it binds, the rest of its chain binds too.
             if !param.writes
-                && !shares
+                && param.source.is_none()
                 && !t.params.contains_key(param.name.as_str())
                 && !t.guard.params_read().iter().any(|p| *p == param.name)
             {

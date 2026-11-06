@@ -759,6 +759,96 @@ fn an_answers_binding_carries_on_along_its_chain() {
     assert!(holds_under(&[ANSWERED, MARKS], POLICIES_ANSWERED));
 }
 
+/// A bound parameter no rule reads, alone in its move, still takes every
+/// caller its constraints allow: the reaction it sets off binds the same one.
+#[test]
+fn a_lone_bound_parameter_no_one_reads_carries_every_caller() {
+    assert!(!holds_under(&[LONE_PINGED, LONE_MARKED], POLICIES_MARKED));
+}
+
+const LONE_PINGED: &str = r#"
+[automaton]
+name = "Parent"
+states = ["Open", "Pinged"]
+initial = "Open"
+strict_action_params = true
+[[state]]
+name = "blocked"
+type = "string"
+initial = ""
+[[action]]
+name = "Ping"
+kind = "input"
+from = ["Open"]
+to = "Pinged"
+guard = "Child[Id].status == 'Marked'"
+params = [{ name = "a_who", type = "string", source = "authenticated_subject" }]
+[[action.constraints]]
+kind = "param_not_equals_field"
+param = "a_who"
+field = "blocked"
+[[action.triggers]]
+name = "stamp"
+kind = "entity"
+target_entity = "Child"
+target_action = "Stamp"
+[action.triggers.resolve_target]
+kind = "same_id"
+[[invariant]]
+name = "blocked_stays"
+assert = "blocked == ''"
+"#;
+const LONE_MARKED: &str = r#"
+[automaton]
+name = "Child"
+states = ["Waiting", "Marked", "Stamped"]
+initial = "Waiting"
+strict_action_params = true
+[[state]]
+name = "noted"
+type = "string"
+initial = ""
+[[state]]
+name = "zmarked"
+type = "string"
+initial = ""
+[[state]]
+name = "blocked"
+type = "string"
+initial = ""
+[[state]]
+name = "stamped_by"
+type = "string"
+initial = ""
+[[action]]
+name = "Note"
+kind = "input"
+from = ["Waiting"]
+to = "Waiting"
+guard = "noted == ''"
+params = [{ name = "noted", type = "string", source = "authenticated_subject" }]
+[[action]]
+name = "Mark"
+kind = "input"
+from = ["Waiting"]
+to = "Marked"
+guard = "noted != '' && zmarked == ''"
+params = [{ name = "zmarked", type = "string", source = "authenticated_subject" }]
+[[action.constraints]]
+kind = "param_not_equals_field"
+param = "zmarked"
+field = "noted"
+[[action]]
+name = "Stamp"
+kind = "internal"
+from = ["Marked"]
+to = "Stamped"
+guard = "noted != ''"
+params = [{ name = "stamped_by", type = "string", source = "authenticated_subject" }]
+[[invariant]]
+name = "stamper_is_not_marker"
+assert = "status != 'Stamped' || stamped_by != zmarked || Parent[Id].status == 'Open'"
+"#;
 const POLICIES_MARKED: &str = r#"
 permit(principal is Agent, action, resource) unless { action == Action::"Stamp" };
 permit(principal is Agent, action == Action::"Stamp", resource) when { context has via && context.via != "request" };
