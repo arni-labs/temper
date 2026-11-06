@@ -153,12 +153,15 @@ impl JointModel {
     /// `by` makes it: it binds nothing, or `by` surely names a caller. The
     /// kernel refuses the move when the chain names none.
     pub(super) fn binds_surely(&self, entity: &str, action: &str, by: u32) -> bool {
-        self.senders.names_a_caller(by) == May::Yes
-            || self.models[entity]
-                .transitions
-                .iter()
-                .filter(|t| t.name == action)
-                .all(|t| t.bound.is_empty())
+        self.senders.names_a_caller(by) == May::Yes || !self.binds(entity, action)
+    }
+
+    /// Whether `entity`'s `action` binds a parameter.
+    pub(super) fn binds(&self, entity: &str, action: &str) -> bool {
+        self.models[entity]
+            .transitions
+            .iter()
+            .any(|t| t.name == action && !t.bound.is_empty())
     }
 }
 

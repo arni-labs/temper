@@ -216,7 +216,8 @@ impl JointModel {
                         ) == Truth::True
                         && self.unchecked.meets(&call.to, &action.name)
                         && self.exact(&call.to, &action.name, state)
-                        && self.binds_surely(&call.to, &action.name, call.by);
+                        && self.binds_surely(&call.to, &action.name, call.by)
+                        && (call.caller.is_some() || !self.binds(&call.to, &action.name));
                     if !known {
                         let refused = words!(self, "{text} refused by its record");
                         if !self
@@ -226,8 +227,15 @@ impl JointModel {
                             return None;
                         };
                     }
+                    // What the answer binds, its chain binds from here on.
+                    let caller = call.caller.as_ref().map(|caller| {
+                        let mut caller = caller.clone();
+                        let bound = self.bound_values(&call.to, &action.name, &action.params);
+                        caller.extend(bound.iter().map(|(source, value)| (*source, *value)));
+                        caller
+                    });
                     for (outcome, then) in
-                        self.commit(next, &call.to, action, &[], call.by, call.caller.as_ref())
+                        self.commit(next, &call.to, action, &[], call.by, caller.as_ref())
                     {
                         let certainty = Certainty::unless(known, OneOf).then(then);
                         if !self
