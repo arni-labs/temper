@@ -221,7 +221,9 @@ opt-level = 1
 [profile.release]
 lto = true
 codegen-units = 1
-strip = true
+# Keep the symbol table (function names) and drop only debug info: profiles
+# taken from a release binary name its frames by it.
+strip = "debuginfo"
 
 # The profile that 'dist' will build with
 [profile.dist]
