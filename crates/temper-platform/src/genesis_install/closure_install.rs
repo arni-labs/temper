@@ -209,6 +209,36 @@ pub(super) async fn install_materialized_closure(
     }
 }
 
+/// What [`install_materialized_closure`] would answer for the closure in
+/// `cache_root`, writing nothing: the same resolution and parse, then each
+/// app's install checks against the tenant as it is
+/// ([`check_app_install_order`]). The catalog keeps resolving every app to
+/// the files it held. What only an installed version shows, that its required
+/// modules compile once registered, is not checked.
+pub(super) async fn check_materialized_closure(
+    platform: &PlatformState,
+    tenant: &str,
+    cache_root: &Path,
+    closure: &MaterializedClosure<'_>,
+) -> Result<InstallResult, ClosureRefused> {
+    let written: Vec<(String, AppFileSource)> = closure
+        .apps
+        .iter()
+        .map(|app| (app.version.name.clone(), app.files.clone()))
+        .collect();
+    let apps = resolve_materialized_app_closure(tenant, cache_root, &written)
+        .map_err(ClosureRefused::Inactive)?;
+    parse_closure_specs(&closure.root.name, &apps)?;
+    check_app_install_order(platform, tenant, &closure.root.name, &apps)
+        .await
+        .map_err(|error| {
+            ClosureRefused::Inactive(format!(
+                "Genesis install of {} failed: {error}",
+                closure.app_ref
+            ))
+        })
+}
+
 /// Record every app of an installed closure with where it came from, and
 /// return the root's closure id.
 ///

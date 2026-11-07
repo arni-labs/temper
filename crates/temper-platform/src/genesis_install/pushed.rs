@@ -52,7 +52,19 @@ pub struct KeptFile {
     pub keep: String,
 }
 
-/// A pushed version that is installed.
+/// Whether a push installs its files or only checks them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushMode {
+    /// Install the files, or refuse them and keep the version before.
+    Install,
+    /// Answer what the install would, through the same checks, and write
+    /// nothing the tenant reads: no spec, policy, module, record or catalog
+    /// entry. The files' cache directory is removed again unless the tenant
+    /// already serves it.
+    Check,
+}
+
+/// A pushed version that is installed, or that a check found would install.
 #[derive(Debug)]
 pub struct PushedInstall {
     /// The digest of its files, which names its version.
@@ -76,13 +88,16 @@ pub enum PushRefused {
     Server(String),
 }
 
-/// Install `files` as `tenant`'s version of `app`, and say how long the push
-/// waited for this host's install turn ([`temper_server::host_turn`]).
+/// Install `files` as `tenant`'s version of `app`, or with [`PushMode::Check`]
+/// only check them, and say how long the push waited for this host's install
+/// turn ([`temper_server::host_turn`]). A check takes the turn too, so it reads
+/// the tenant between installs, never during one.
 pub async fn install_pushed_app(
     platform: &PlatformState,
     tenant: &str,
     app: &str,
     files: BTreeMap<String, PushedFile>,
+    mode: PushMode,
 ) -> (Duration, Result<PushedInstall, PushRefused>) {
     for (label, value) in [("tenant", tenant), ("app name", app)] {
         if let Err(error) = validate_identity_component(label, value) {
@@ -93,7 +108,7 @@ pub async fn install_pushed_app(
     let turn = temper_server::host_turn::take().await;
     let waited = asked.elapsed();
     let result = match turn {
-        Ok(_turn) => install_in_turn(platform, tenant, app, files).await,
+        Ok(_turn) => install_in_turn(platform, tenant, app, files, mode).await,
         Err(error) => Err(PushRefused::Server(error)),
     };
     (waited, result)
@@ -104,6 +119,7 @@ async fn install_in_turn(
     tenant: &str,
     app: &str,
     files: BTreeMap<String, PushedFile>,
+    mode: PushMode,
 ) -> Result<PushedInstall, PushRefused> {
     let prior = recorded_digest(platform, tenant, app).await;
     let kept_from = prior
@@ -145,6 +161,23 @@ async fn install_in_turn(
     }
 
     let app_ref = pushed_ref(app, &digest);
+    if mode == PushMode::Check {
+        let checked = closure_install::check_materialized_closure(
+            platform,
+            tenant,
+            &root,
+            &closure(&app_ref, app, &digest, written),
+        )
+        .await;
+        discard();
+        return match checked {
+            Ok(result) => Ok(PushedInstall { digest, result }),
+            Err(ClosureRefused::Unparsed(error)) => Err(PushRefused::Unparsed(error)),
+            Err(ClosureRefused::Inactive(error) | ClosureRefused::Failed(error)) => {
+                Err(PushRefused::Install(error))
+            }
+        };
+    }
     let installed = closure_install::install_materialized_closure(
         platform,
         tenant,
