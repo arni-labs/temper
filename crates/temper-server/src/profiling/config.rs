@@ -60,10 +60,29 @@ pub(super) fn continuous_frequency() -> i32 {
     number("TEMPER_PROFILING_CONTINUOUS_FREQUENCY", 100).clamp(10, 500) as i32
 }
 
-/// The configured intake (`TEMPER_PROFILING_INTAKE_URL`), or none: there is
-/// no default destination, so nothing is uploaded until one is named.
+/// The agent's profile endpoint, under the agent URL Datadog's own libraries use.
+const AGENT_PROFILE_PATH: &str = "/profiling/v1/input";
+
+/// The port Datadog's libraries use when `DD_TRACE_AGENT_PORT` is not set.
+const AGENT_DEFAULT_PORT: &str = "8126";
+
+/// Where profiles go, found the way Datadog's own libraries find their agent:
+/// `TEMPER_PROFILING_INTAKE_URL`; else `DD_TRACE_AGENT_URL` plus the profile
+/// path; else `DD_AGENT_HOST` (with `DD_TRACE_AGENT_PORT`, default 8126);
+/// else none, and nothing is uploaded. The kernel names no address itself.
 pub(super) fn intake() -> Option<Intake> {
-    let url = non_empty_env("TEMPER_PROFILING_INTAKE_URL")?;
+    let url = non_empty_env("TEMPER_PROFILING_INTAKE_URL")
+        .or_else(|| {
+            non_empty_env("DD_TRACE_AGENT_URL")
+                .map(|agent| format!("{}{AGENT_PROFILE_PATH}", agent.trim_end_matches('/')))
+        })
+        .or_else(|| {
+            non_empty_env("DD_AGENT_HOST").map(|host| {
+                let port = non_empty_env("DD_TRACE_AGENT_PORT")
+                    .unwrap_or_else(|| AGENT_DEFAULT_PORT.to_string());
+                format!("http://{host}:{port}{AGENT_PROFILE_PATH}")
+            })
+        })?;
     let mut headers: Vec<(String, String)> = non_empty_env("TEMPER_PROFILING_INTAKE_HEADERS")
         .map(|raw| {
             temper_observe::otel::parse_otlp_headers(&raw)

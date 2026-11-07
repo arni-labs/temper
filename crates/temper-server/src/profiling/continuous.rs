@@ -38,7 +38,7 @@ pub fn spawn_continuous_profiler() {
     );
     if config::intake().is_none() {
         tracing::warn!(
-            "continuous profiling is on but TEMPER_PROFILING_INTAKE_URL is not set: nothing is captured until it is"
+            "continuous profiling is on but no intake is set (TEMPER_PROFILING_INTAKE_URL, DD_TRACE_AGENT_URL or DD_AGENT_HOST): nothing is captured until one is"
         );
     }
 
