@@ -725,7 +725,7 @@ async fn run_install(
     #[cfg(not(test))]
     let installed = installed.await;
     #[cfg(test)]
-    let (installed, past_the_check) = check_agreement::watched(installed).await;
+    let (installed, past_the_check) = check_agreement::watched(Box::pin(installed)).await;
     #[cfg(test)]
     if let Some(checked) = &checked {
         check_agreement::agrees(app_name, checked, &installed, past_the_check);
