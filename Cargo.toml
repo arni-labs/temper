@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 exclude = [
+    "vendor/pprof",
     "wasm-modules/http-fetch",
     "wasm-modules/gepa-replay",
     "wasm-modules/gepa-score",
@@ -229,3 +230,7 @@ strip = "debuginfo"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# pprof-rs with a smaller sample table: see vendor/pprof/TEMPER.md.
+[patch.crates-io]
+pprof = { path = "vendor/pprof" }
