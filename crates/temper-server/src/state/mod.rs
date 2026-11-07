@@ -658,13 +658,9 @@ pub struct ServerState {
     pub http_endpoint_tables: Arc<crate::http_endpoint::HttpEndpointTables>,
     /// Host-installed transports available to declared native HTTP endpoints.
     pub http_transports: Arc<crate::http_endpoint::native::TransportRegistry>,
-    /// Shared HTTP stream registry for ADR-0057 streaming exchanges.
-    /// Held by ServerState so the dispatcher can mint inbound
-    /// exchanges before handing the guest-facing handles to the
-    /// WASM invocation. Per-request ProductionWasmHost instances
-    /// receive a clone of this Arc via `with_shared_streams` so
-    /// FFI calls from the guest resolve to the same handle IDs.
-    pub http_stream_registry: Arc<temper_wasm::http_stream::HttpStreamRegistry>,
+    /// Stream handles (ADR-0057) that HttpEndpoint requests hold now. Each request keeps its streams in a registry of
+    /// its own, counted here, and frees them all when it ends.
+    pub http_stream_handles: Arc<std::sync::atomic::AtomicUsize>,
     /// Public hostnames owned by this process that may use in-process TData
     /// dispatch from WASM guests instead of leaving through the public edge.
     pub(crate) local_tdata_hosts: Arc<BTreeSet<String>>,
@@ -693,7 +689,8 @@ impl ServerState {
     /// Stream handles HttpEndpoint requests still hold. A request frees the streams it opened when it ends, so this
     /// is 0 whenever no request is in flight.
     pub async fn http_stream_handles_open(&self) -> usize {
-        self.http_stream_registry.handle_count().await
+        self.http_stream_handles
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Enable commons-mode write guardrails for a tenant.
@@ -908,7 +905,7 @@ impl ServerState {
             bound_action_hook: None,
             http_endpoint_tables: Arc::new(crate::http_endpoint::HttpEndpointTables::new()),
             http_transports: Arc::new(Default::default()),
-            http_stream_registry: Arc::new(temper_wasm::http_stream::HttpStreamRegistry::new()),
+            http_stream_handles: Arc::default(),
             local_tdata_hosts: Arc::new(env_local_tdata_hosts()),
             llm_content_export_tenants: Arc::new(env_llm_content_export_tenants()),
         };
@@ -1195,7 +1192,7 @@ impl ServerState {
             bound_action_hook: None,
             http_endpoint_tables: Arc::new(crate::http_endpoint::HttpEndpointTables::new()),
             http_transports: Arc::new(Default::default()),
-            http_stream_registry: Arc::new(temper_wasm::http_stream::HttpStreamRegistry::new()),
+            http_stream_handles: Arc::default(),
             local_tdata_hosts: Arc::new(env_local_tdata_hosts()),
             llm_content_export_tenants: Arc::new(env_llm_content_export_tenants()),
         };
