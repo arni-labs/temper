@@ -118,7 +118,7 @@ a scheduled action or a reaction has no caller to retry it, and an agent that
 reads "failed" usually moves on. On a user's Temper, 19 moves between
 24 Oct 20:54 and 25 Oct committed, then hit "query projection timed out after
 30 seconds" under Turso write contention, and stayed in their new state with
-no state timer and no follow-on work. A Factory release sat in Making with its
+no state timer and no follow-on work. A release record sat in Making with its
 4500-second Lost timer never armed and its make run never started.
 
 Now the dispatch keeps the work. The state timer the transition entered or
@@ -158,17 +158,18 @@ that refuses one row forever (no such error is known) keeps that request
 waiting and logs every try, and the request keeps what it holds: its
 admission permit, a reaction permit if it is a reaction, and for the commons
 tenant the commons write lock. On Turso this path no longer runs once
-arni-labs/temper #122 writes query rows in the commit, so it is reached only
+query rows are written in the move's own commit ("one commit per move"), so it is reached only
 on the other stores.
 
 A caller can wait longer than 30 seconds while the store is stalled. A caller
 that hangs up meanwhile loses nothing once dispatch runs in its own task
-(arni-labs/temper #122). A caller that retries with the same idempotency key
+("one commit per move"). A caller that retries with the same idempotency key
 while the first dispatch is still catching up can start the dependents a
 second time, and arm its scheduled actions again from the actor's cached
 reply, as it can today while any post-dispatch work (an inline integration,
 awaited reactions) outlasts the caller's timeout. The wait now lasts as long
-as the outage, so the window is wider. arni-labs/temper #79 closes that race
+as the outage, so the window is wider. The change "an Idempotency-Key answers only a retry of its own
+request" closes that race
 by giving a key's post-dispatch effects one owner: a retry that arrives while
 they run waits for them.
 

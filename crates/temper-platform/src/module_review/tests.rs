@@ -340,7 +340,10 @@ async fn test_jev_down_is_tried_at_most_twice() {
 
 #[test]
 fn test_jev_debug_never_shows_the_key() {
-    let judge = JevJudge::new(Some("secret-key-value".to_string()));
+    let judge = JevJudge::at(
+        "https://judge.example.test",
+        Some("secret-key-value".to_string()),
+    );
     assert!(!format!("{judge:?}").contains("secret-key-value"));
 }
 

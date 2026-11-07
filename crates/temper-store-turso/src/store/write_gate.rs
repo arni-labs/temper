@@ -32,7 +32,7 @@ impl WritePriority {
 
 /// How often a writer that gives way to others looks again. It delays only
 /// the one looking, and is short against one commit on a slow drive (about
-/// 170 ms on a Tensorlake drive, roll3, 26 Oct 2026).
+/// 170 ms on a Tensorlake drive, a load test, 26 Oct 2026).
 const GIVE_WAY_RECHECK: Duration = Duration::from_millis(25);
 
 /// A wait at the gate this long is logged, and so is a hold this long that
