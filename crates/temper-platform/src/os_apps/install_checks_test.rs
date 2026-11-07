@@ -131,3 +131,76 @@ async fn an_install_that_changes_neither_specs_nor_cedar_proves_nothing() {
         .unwrap_err();
     assert!(err.contains("Child.rule BROKEN"), "{err}");
 }
+
+/// An install request can end before a walk it started does: the walk runs
+/// on, and the next request, which reads the specs and Cedar again, takes the
+/// verdict it left without walking again. Without a blob store the verdict
+/// is kept only by the digest of its model, as a walk that did not fit is.
+#[tokio::test]
+async fn a_walk_longer_than_one_request_is_read_by_the_next_without_walking_again() {
+    let actions = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| {
+                format!(
+                    "\n[[action]]\nname = '{name}'\nkind = 'input'\nfrom = ['Open']\nto = 'Open'\n"
+                )
+            })
+            .collect::<String>()
+    };
+    let parent = format!(
+        "{}{}",
+        spec("Parent", None),
+        actions(&["Note", "Mark", "Tag"])
+    );
+    let child = format!(
+        "{}{}",
+        spec("Child", Some("Parent[Id].status != 'Closed'")),
+        actions(&["Ping", "Poke"])
+    );
+    let state = state("alice", &[("Parent", &parent), ("Child", &child)]);
+    // Each action is open to its own kind of sender, so the kinds the
+    // policies tell apart are asked several questions each.
+    let cedar = [
+        ("Note", "role", "a"),
+        ("Mark", "role", "b"),
+        ("Tag", "team", "c"),
+        ("Ping", "role", "d"),
+        ("Poke", "team", "e"),
+    ]
+    .iter()
+    .map(|(action, key, value)| {
+        format!(
+            "permit(principal, action == Action::\"{action}\", resource) when {{ principal has {key} && principal.{key} == \"{value}\" }};\n"
+        )
+    })
+    .collect::<String>();
+    let specs = [("Parent".to_string(), parent), ("Child".to_string(), child)];
+    let request = || async {
+        prove(
+            &state,
+            "alice",
+            "app",
+            &specs,
+            true,
+            Some(&cedar),
+            &Attempt::default(),
+        )
+        .await
+        .expect("the rule holds")
+    };
+
+    let ControlFlow::Continue(wait) = request().await else {
+        panic!("the first request starts the walk");
+    };
+    // The request's budget ran out; the walk ends after it.
+    wait.ended(&mut Attempt::default())
+        .await
+        .expect("the walk ends");
+    for later in 1..=3 {
+        match request().await {
+            ControlFlow::Break(unproved) => assert!(unproved.is_empty(), "{unproved:?}"),
+            ControlFlow::Continue(_) => panic!("request {later} after the walk walked again"),
+        }
+    }
+}
