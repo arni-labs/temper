@@ -12,13 +12,21 @@
 //! With `"dry_run": true` the push only checks: the installer's own checks run,
 //! in order, and stop where its first write would be. It answers as the install
 //! would (`"checked"` in place of `"installed"`), refuses what the install would
-//! refuse with the same words, and leaves the tenant as it was. It does not
-//! show what only an installed version can: whether the app's required modules
-//! compile once registered. The
-//! install checks at main's level (each spec parses; joint proofs warn), so
-//! `budget_ms` bounds no check yet; it is still validated, because the
-//! caller (Katagami's apps_build) sends it for the per-spec check. Every answer
-//! says how long the push waited for this host's install turn (`waited_ms`).
+//! refuse with the same words, and leaves the tenant's apps, specs, policies and
+//! records as they were. Like an install, it keeps the joint proofs' verdicts,
+//! filed by what they proved and shared by every tenant, and reports their
+//! progress as design-time events; an install of the same files then reads them
+//! instead of proving again. It does not take this host's install turn: its
+//! files go to a directory of its own, removed when it ends, also when the
+//! caller goes away. It does not show what only an installed version can:
+//! whether the app's required modules compile once registered. When the install
+//! would first install or change another app of the tenant's catalog that the
+//! app needs, a check cannot foresee the app beside it, and it answers 409 with
+//! the app that must be installed first. The install checks at main's level
+//! (each spec parses; joint proofs warn), so `budget_ms` bounds no check yet; it
+//! is still validated, because the caller (Katagami's apps_build) sends it for
+//! the per-spec check. Every answer says how long the push waited for this
+//! host's install turn (`waited_ms`); a check's is 0.
 //!
 //! The answer does not wait for Jev's review of the app's changed modules. It
 //! names the reviews left running (`result.reviewing`), and
@@ -204,6 +212,7 @@ async fn install(
         Err(PushRefused::Unparsed(error)) => (StatusCode::UNPROCESSABLE_ENTITY, error_body(error)),
         Err(PushRefused::Install(error)) => (StatusCode::UNPROCESSABLE_ENTITY, error_body(error)),
         Err(PushRefused::Server(error)) => (StatusCode::INTERNAL_SERVER_ERROR, error_body(error)),
+        Err(PushRefused::Unchecked(error)) => (StatusCode::CONFLICT, error_body(error)),
     };
     // How long the push waited for this host's install turn, so a slow answer
     // says whether it was the push or the queue.

@@ -40,6 +40,7 @@ use cache_paths::{
     CacheOwner, InstallSource, app_cache_dir, genesis_cache_root, replace_directory,
     sanitize_fragment, validate_git_object_id, validate_identity_component,
 };
+use closure_install::CheckRefused;
 use object_lookup::load_genesis_object;
 pub use pushed::{
     PushMode, PushRefused, PushedFile, PushedInstall, adopt_catalog_app, install_pushed_app,
@@ -486,30 +487,33 @@ async fn reconcile_app_install_order(
 }
 
 /// What [`reconcile_app_install_order`] would answer for `apps`, each with
-/// the files it names, writing nothing: each app is checked against the tenant
-/// as it is now, so an app is checked beside the dependencies installed now,
-/// not beside new versions of them the same closure carries.
+/// the files it names, writing nothing. Each app is checked against the tenant
+/// as it is now. The install puts each app in before checking the next, so once
+/// an app before the root would be installed or changed, the apps after it
+/// cannot be checked as the install checks them: the answer is
+/// [`CheckRefused::Unchecked`], naming that app, rather than a check of the
+/// rest beside the version the tenant runs now.
 async fn check_app_install_order(
     platform: &PlatformState,
     tenant: &str,
     root_app_name: &str,
     apps: &[(String, AppFileSource)],
-) -> Result<InstallResult, String> {
+) -> Result<InstallResult, CheckRefused> {
     let mut root_result = InstallResult::default();
-    let mut dependencies = Vec::new();
     for (app_name, files) in apps {
-        if let OsAppReconcileResult::Installed { install, .. } =
-            check_os_app_reconcile(platform, tenant, app_name, files).await?
-        {
-            if app_name == root_app_name {
-                root_result = *install;
-            } else {
-                dependencies.push(*install);
-            }
+        let checked = check_os_app_reconcile(platform, tenant, app_name, files)
+            .await
+            .map_err(CheckRefused::Refused)?;
+        let OsAppReconcileResult::Installed { install, .. } = checked else {
+            continue;
+        };
+        if app_name != root_app_name {
+            return Err(CheckRefused::Unchecked(format!(
+                "'{root_app_name}' cannot be checked before '{app_name}' is installed: \
+                 its install installs '{app_name}' first and checks '{root_app_name}' beside it"
+            )));
         }
-    }
-    for dependency in dependencies.into_iter().rev() {
-        root_result.put_first(dependency);
+        root_result = *install;
     }
     Ok(root_result)
 }

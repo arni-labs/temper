@@ -196,3 +196,96 @@ async fn a_dry_run_passes_what_the_install_takes_and_changes_nothing() {
         assert_eq!(install["result"]["updated"], check["result"]["updated"]);
     }
 }
+
+/// A check takes no install turn: it answers while another install on this
+/// host holds the turn, and says it waited for none.
+#[tokio::test]
+async fn a_dry_run_answers_while_the_host_install_turn_is_held() {
+    let tenant = unique_tenant("dry-turn");
+    let server = server(&tenant);
+    let path = std::env::temp_dir().join("temper-installs.lock");
+    let held = tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .expect("lock file");
+        file.lock().expect("take the turn");
+        file
+    })
+    .await
+    .expect("lock thread");
+
+    let answered = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        send(&server.state, push(&tenant, dry(&app_files()))),
+    )
+    .await;
+    drop(held);
+    let (status, check) = answered.expect("the check waited for the held turn");
+    assert_eq!(status, StatusCode::OK, "{check}");
+    assert_eq!(check["checked"], APP, "{check}");
+    assert_eq!(check["waited_ms"], 0, "{check}");
+}
+
+/// An app that needs another the tenant's catalog holds but has not installed:
+/// its install installs that one first, so a check cannot foresee the app
+/// beside it. The check names the app to install first and changes nothing;
+/// the install then takes both.
+#[tokio::test]
+async fn a_dry_run_names_the_dependency_its_install_installs_first() {
+    use super::source_and_cache::{DEP, dependency_files};
+    use crate::os_apps::{AppFileSource, add_tenant_written_apps};
+
+    let tenant = unique_tenant("dry-dependency");
+    let server = server(&tenant);
+    let catalog = tempfile::tempdir().expect("catalog dir");
+    let dir = catalog.path().join(DEP);
+    let files = dependency_files();
+    for (path, text) in &files {
+        let dest = dir.join(path);
+        std::fs::create_dir_all(dest.parent().expect("inside the app")).expect("app dir");
+        std::fs::write(dest, text).expect("app file");
+    }
+    add_tenant_written_apps(
+        &tenant,
+        catalog.path().to_path_buf(),
+        vec![(DEP.into(), AppFileSource::written(dir, files.into_keys()))],
+    );
+    let mut root = app_files();
+    root.get_mut("app.toml")
+        .expect("app.toml")
+        .push_str(&format!("\ndependencies = [{DEP:?}]\n"));
+    let before = kept(&server, &tenant).await;
+
+    let (status, check) = send(&server.state, push(&tenant, dry(&root))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{check}");
+    assert!(
+        check["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(&format!("'{DEP}' is installed"))),
+        "{check}"
+    );
+    assert_eq!(
+        kept(&server, &tenant).await,
+        before,
+        "the check changed the tenant"
+    );
+    assert!(
+        server
+            .ps
+            .get_installed_app(&tenant, DEP)
+            .await
+            .expect("install records")
+            .is_none(),
+        "the check installed '{DEP}'"
+    );
+
+    let (status, install) = send(
+        &server.state,
+        push(&tenant, serde_json::json!({ "files": root })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{install}");
+}

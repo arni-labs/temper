@@ -69,6 +69,17 @@ pub(super) enum ClosureRefused {
     Inactive(String),
 }
 
+/// Why a check of a closure answers no.
+#[derive(Debug)]
+pub(super) enum CheckRefused {
+    /// A spec does not parse; says which and why.
+    Unparsed(String),
+    /// The install would refuse it, in the install's words.
+    Refused(String),
+    /// The check cannot answer as the install would; says why.
+    Unchecked(String),
+}
+
 /// Install the closure in `cache_root` for `tenant`.
 ///
 /// The caller holds this host's install turn ([`temper_server::host_turn`]).
@@ -220,23 +231,30 @@ pub(super) async fn check_materialized_closure(
     tenant: &str,
     cache_root: &Path,
     closure: &MaterializedClosure<'_>,
-) -> Result<InstallResult, ClosureRefused> {
+) -> Result<InstallResult, CheckRefused> {
     let written: Vec<(String, AppFileSource)> = closure
         .apps
         .iter()
         .map(|app| (app.version.name.clone(), app.files.clone()))
         .collect();
+    let refused = |error: String| {
+        CheckRefused::Refused(format!(
+            "Genesis install of {} failed: {error}",
+            closure.app_ref
+        ))
+    };
     let apps = resolve_materialized_app_closure(tenant, cache_root, &written)
-        .map_err(ClosureRefused::Inactive)?;
-    parse_closure_specs(&closure.root.name, &apps)?;
-    check_app_install_order(platform, tenant, &closure.root.name, &apps)
-        .await
-        .map_err(|error| {
-            ClosureRefused::Inactive(format!(
-                "Genesis install of {} failed: {error}",
-                closure.app_ref
-            ))
-        })
+        .map_err(CheckRefused::Refused)?;
+    parse_closure_specs(&closure.root.name, &apps).map_err(|refusal| match refusal {
+        ClosureRefused::Unparsed(error) => CheckRefused::Unparsed(error),
+        ClosureRefused::Failed(error) | ClosureRefused::Inactive(error) => {
+            CheckRefused::Refused(error)
+        }
+    })?;
+    match check_app_install_order(platform, tenant, &closure.root.name, &apps).await {
+        Err(CheckRefused::Refused(error)) => Err(refused(error)),
+        other => other,
+    }
 }
 
 /// Record every app of an installed closure with where it came from, and

@@ -85,7 +85,8 @@ pub use reconcile::{
     resolve_tenant_os_app_install_order, tenant_os_app_bundle_digest, written_apps_bundle_digests,
 };
 pub(crate) use runtime_heal::{
-    restore_app_specs_from_matching_digest, tenant_has_ready_app_specs_for_bundle,
+    app_specs_restorable, restore_app_specs_from_matching_digest,
+    tenant_has_ready_app_specs_for_bundle,
 };
 pub use types::*;
 use wasm_replacement::{UploadedWasmReplacementContext, uploaded_wasm_replacement_context};
@@ -720,11 +721,14 @@ async fn run_install(
                 ControlFlow::Continue(proof) => proof.ended(&mut attempt).await?,
             }
         }
-    }
-    .await;
+    };
+    #[cfg(not(test))]
+    let installed = installed.await;
+    #[cfg(test)]
+    let (installed, past_the_check) = check_agreement::watched(installed).await;
     #[cfg(test)]
     if let Some(checked) = &checked {
-        check_agreement::agrees(app_name, checked, &installed);
+        check_agreement::agrees(app_name, checked, &installed, past_the_check);
     }
     installed
 }
@@ -936,6 +940,8 @@ async fn install_once(
             ..InstallResult::default()
         }));
     }
+    #[cfg(test)]
+    check_agreement::passed_the_check();
     if bundle.deployment_mode == AppDeploymentMode::Commons {
         state.server.enable_commons_guardrails(tenant);
     }

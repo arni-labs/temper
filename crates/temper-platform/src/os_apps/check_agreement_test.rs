@@ -127,13 +127,35 @@ pub(super) async fn check_first(
     Some(checked)
 }
 
+tokio::task_local! {
+    /// Set once an install goes past where a check stops ([`passed_the_check`]).
+    static PAST_THE_CHECK: std::cell::Cell<bool>;
+}
+
+/// Mark that the install running in this task went past where a check stops:
+/// from here it writes, and a failure is one a check cannot see.
+pub(super) fn passed_the_check() {
+    let _ = PAST_THE_CHECK.try_with(|past| past.set(true));
+}
+
+/// Run `install`, and say whether it went past where a check stops.
+pub(super) async fn watched<F: std::future::Future>(install: F) -> (F::Output, bool) {
+    PAST_THE_CHECK
+        .scope(std::cell::Cell::new(false), async {
+            let out = install.await;
+            (out, PAST_THE_CHECK.with(std::cell::Cell::get))
+        })
+        .await
+}
+
 /// The install refuses at its checks exactly when its check did, in the same
-/// words. An install that fails after the check passed failed at a write,
-/// which a check does not make.
+/// words. An install may fail after its check passed only past where a check
+/// stops ([`passed_the_check`]), at a write, which a check does not make.
 pub(super) fn agrees(
     app_name: &str,
     checked: &Result<InstallResult, String>,
     installed: &Result<InstallResult, String>,
+    past_the_check: bool,
 ) {
     match (checked, installed) {
         (Err(check), Err(install)) => assert_eq!(
@@ -161,6 +183,9 @@ pub(super) fn agrees(
                 "the check of '{app_name}' warned otherwise than its install"
             );
         }
-        (Ok(_), Err(_)) => {}
+        (Ok(_), Err(install)) => assert!(
+            past_the_check,
+            "the check of '{app_name}' passed what its install refused before any write: {install}"
+        ),
     }
 }

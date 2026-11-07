@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use super::closure_install::{ClosureRefused, ClosureSource, MaterializedApp, MaterializedClosure};
+use super::closure_install::{
+    CheckRefused, ClosureRefused, ClosureSource, MaterializedApp, MaterializedClosure,
+};
 use super::*;
 use crate::os_apps::{AppFileSource, read_app_guide, read_app_manifest, tenant_os_app_dir};
 
@@ -59,8 +61,7 @@ pub enum PushMode {
     Install,
     /// Answer what the install would, through the same checks, and write
     /// nothing the tenant reads: no spec, policy, module, record or catalog
-    /// entry. The files' cache directory is removed again unless the tenant
-    /// already serves it.
+    /// entry. Its files go to a directory of its own, removed when it ends.
     Check,
 }
 
@@ -86,12 +87,21 @@ pub enum PushRefused {
     Install(String),
     /// This server could not do its part, such as writing the files.
     Server(String),
+    /// A check that cannot answer as the install would, saying why. Nothing
+    /// changed.
+    Unchecked(String),
 }
 
 /// Install `files` as `tenant`'s version of `app`, or with [`PushMode::Check`]
 /// only check them, and say how long the push waited for this host's install
-/// turn ([`temper_server::host_turn`]). A check takes the turn too, so it reads
-/// the tenant between installs, never during one.
+/// turn ([`temper_server::host_turn`]).
+///
+/// A check takes no turn, so no check, however long its proofs take, holds up
+/// an install. The turn guards the shared cache directories, and a check never
+/// uses them: its files go to a directory of its own ([`check_pushed`]). What
+/// it reads of the tenant it reads under the tenant's install lock, as each
+/// install step does, and it waits for a proof without that lock, as an install
+/// does.
 pub async fn install_pushed_app(
     platform: &PlatformState,
     tenant: &str,
@@ -104,14 +114,83 @@ pub async fn install_pushed_app(
             return (Duration::ZERO, Err(PushRefused::Request(error)));
         }
     }
+    if mode == PushMode::Check {
+        return (
+            Duration::ZERO,
+            check_pushed(platform, tenant, app, files).await,
+        );
+    }
     let asked = Instant::now();
     let turn = temper_server::host_turn::take().await;
     let waited = asked.elapsed();
     let result = match turn {
-        Ok(_turn) => install_in_turn(platform, tenant, app, files, mode).await,
+        Ok(_turn) => install_in_turn(platform, tenant, app, files).await,
         Err(error) => Err(PushRefused::Server(error)),
     };
     (waited, result)
+}
+
+/// What installing `files` would answer. They are written under a directory
+/// of their own beside the pushed versions, which no install reads or prunes
+/// (prune takes only a version's name), and which is removed when the check
+/// ends, even one its caller abandons.
+async fn check_pushed(
+    platform: &PlatformState,
+    tenant: &str,
+    app: &str,
+    files: BTreeMap<String, PushedFile>,
+) -> Result<PushedInstall, PushRefused> {
+    let prior = recorded_digest(platform, tenant, app).await;
+    let kept_from = prior
+        .as_deref()
+        .map(|digest| pushed_root(platform, tenant, app, digest).join(app));
+    let files = files::resolve(files, kept_from.as_deref())?;
+    let digest = files::digest(&files);
+    let unwritten = |error: std::io::Error| {
+        PushRefused::Server(format!("the pushed files could not be written: {error}"))
+    };
+    let versions = pushed_root(platform, tenant, app, &digest)
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            PushRefused::Server("a pushed version's directory has no parent".to_string())
+        })?;
+    std::fs::create_dir_all(&versions).map_err(unwritten)?;
+    let own = tempfile::Builder::new()
+        .prefix(".pushed-check-")
+        .tempdir_in(&versions)
+        .map_err(unwritten)?;
+    let root = own.path().join("version");
+    files::materialize(&root, app, &files).map_err(unwritten)?;
+    let app_dir = root.join(app);
+    let written = AppFileSource::written(app_dir.clone(), files.keys().cloned());
+    is_the_app(&app_dir, app)?;
+    let app_ref = pushed_ref(app, &digest);
+    let checked = closure_install::check_materialized_closure(
+        platform,
+        tenant,
+        &root,
+        &closure(&app_ref, app, &digest, written),
+    )
+    .await;
+    match checked {
+        Ok(result) => Ok(PushedInstall { digest, result }),
+        Err(CheckRefused::Unparsed(error)) => Err(PushRefused::Unparsed(error)),
+        Err(CheckRefused::Refused(error)) => Err(PushRefused::Install(error)),
+        Err(CheckRefused::Unchecked(error)) => Err(PushRefused::Unchecked(error)),
+    }
+}
+
+/// The installer reads an app from its `app.toml`, which must name it, and its
+/// `APP.md`.
+fn is_the_app(app_dir: &Path, app: &str) -> Result<(), PushRefused> {
+    let named = read_app_manifest(app_dir).is_some_and(|manifest| manifest.name == app);
+    if named && read_app_guide(app_dir).is_some() {
+        return Ok(());
+    }
+    Err(PushRefused::Request(format!(
+        "these files are not the app '{app}': it needs an app.toml naming '{app}' and an APP.md"
+    )))
 }
 
 async fn install_in_turn(
@@ -119,7 +198,6 @@ async fn install_in_turn(
     tenant: &str,
     app: &str,
     files: BTreeMap<String, PushedFile>,
-    mode: PushMode,
 ) -> Result<PushedInstall, PushRefused> {
     let prior = recorded_digest(platform, tenant, app).await;
     let kept_from = prior
@@ -152,32 +230,12 @@ async fn install_in_turn(
     // The installer reads exactly these files, by name: a folder just renamed
     // into place can list short, and is never listed here.
     let written = AppFileSource::written(app_dir.clone(), files.keys().cloned());
-    let named = read_app_manifest(&app_dir).is_some_and(|manifest| manifest.name == app);
-    if !named || read_app_guide(&app_dir).is_none() {
+    if let Err(refused) = is_the_app(&app_dir, app) {
         discard();
-        return Err(PushRefused::Request(format!(
-            "these files are not the app '{app}': it needs an app.toml naming '{app}' and an APP.md"
-        )));
+        return Err(refused);
     }
 
     let app_ref = pushed_ref(app, &digest);
-    if mode == PushMode::Check {
-        let checked = closure_install::check_materialized_closure(
-            platform,
-            tenant,
-            &root,
-            &closure(&app_ref, app, &digest, written),
-        )
-        .await;
-        discard();
-        return match checked {
-            Ok(result) => Ok(PushedInstall { digest, result }),
-            Err(ClosureRefused::Unparsed(error)) => Err(PushRefused::Unparsed(error)),
-            Err(ClosureRefused::Inactive(error) | ClosureRefused::Failed(error)) => {
-                Err(PushRefused::Install(error))
-            }
-        };
-    }
     let installed = closure_install::install_materialized_closure(
         platform,
         tenant,

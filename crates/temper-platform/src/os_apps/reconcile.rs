@@ -8,8 +8,8 @@ use temper_server::platform_store::InstalledAppRecord;
 use super::app_catalog::AppCatalog;
 use super::{
     AppBundle, AppEntry, AppFileSource, OsAppBundleDigest, OsAppInstallPlan, OsAppReconcileResult,
-    catalog, get_os_app, install_os_app_swapping, load_app_bundle, load_tenant_os_app,
-    os_app_dependencies, restore_app_specs_from_matching_digest,
+    app_specs_restorable, catalog, get_os_app, install_os_app_swapping, load_app_bundle,
+    load_tenant_os_app, os_app_dependencies, restore_app_specs_from_matching_digest,
     tenant_has_ready_app_specs_for_bundle, tenant_os_app,
 };
 use crate::state::PlatformState;
@@ -626,7 +626,8 @@ pub(crate) async fn check_os_app_reconcile(
 enum Heal {
     /// Load the stored specs back, and go on as they then are.
     Restore,
-    /// Write nothing, and go on as if they loaded.
+    /// Write nothing, and go on as the restore would end, foreseen from what
+    /// the tenant holds ([`app_specs_restorable`]).
     Assume,
 }
 
@@ -666,7 +667,7 @@ async fn reconcile_plan(
             restore_app_specs_from_matching_digest(state, ps.as_ref(), tenant, app_name, bundle)
                 .await
         }
-        Heal::Assume => true,
+        Heal::Assume => app_specs_restorable(state, tenant, bundle),
     };
     let mut specs_ready = tenant_has_ready_app_specs_for_bundle(state, tenant, bundle);
     let wasm_registered = tenant_has_registered_wasm_for_bundle(state, tenant, bundle);
