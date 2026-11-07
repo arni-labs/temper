@@ -310,6 +310,10 @@ async fn a_database_written_before_sync_is_adopted_onto_an_empty_remote() {
 
 #[tokio::test]
 async fn reopening_versioned_secrets_adds_no_change_log_rows() {
+    reopening_body().await;
+}
+
+pub(crate) async fn reopening_body() {
     use temper_runtime::persistence::{SecretPrecondition, SecretWrite};
 
     let Some(server) = SyncServer::start() else {

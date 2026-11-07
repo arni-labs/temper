@@ -28,7 +28,7 @@ impl SyncServer {
         // The store's and the sync engine's logs, and the server's below, show
         // in the output of a test that fails or times out.
         let _ = tracing_subscriber::fmt()
-            .with_env_filter("temper_store_turso=debug,turso_sync_engine=info")
+            .with_env_filter("temper_store_turso=debug,turso_sync_engine=debug,turso=debug")
             .with_writer(std::io::stderr)
             .try_init();
         let dir = tempfile::tempdir().expect("server dir");

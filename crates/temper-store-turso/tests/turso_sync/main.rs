@@ -10,6 +10,7 @@ mod change_log;
 mod hung_push;
 mod projection;
 mod pushes;
+mod repeat;
 mod startup;
 mod support;
 
