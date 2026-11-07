@@ -16,8 +16,9 @@
 //! - `TEMPER_PROFILING_ENABLED` (default off): serve the on-demand endpoints;
 //!   otherwise they answer 503.
 //! - `TEMPER_PROFILING_AUTO_UPLOAD` (default off): on-demand captures upload too.
-//! - `TEMPER_PROFILING_INTAKE_URL`: where profiles go. Default: the Datadog
-//!   Agent at `DD_AGENT_HOST`:`DD_TRACE_AGENT_PORT` (127.0.0.1:8126).
+//! - `TEMPER_PROFILING_INTAKE_URL`: where profiles go, for example a Datadog
+//!   Agent's `http://127.0.0.1:8126/profiling/v1/input`. No default: unset,
+//!   nothing is uploaded and the continuous loop captures nothing.
 //! - `TEMPER_PROFILING_INTAKE_HEADERS`: `key=value,...` headers sent with each
 //!   upload, in the `OTEL_EXPORTER_OTLP_HEADERS` form.
 //! - `TEMPER_PROFILING_MAX_SECONDS` (default 120): longest on-demand window.

@@ -60,13 +60,10 @@ pub(super) fn continuous_frequency() -> i32 {
     number("TEMPER_PROFILING_CONTINUOUS_FREQUENCY", 100).clamp(10, 500) as i32
 }
 
-/// The configured intake, or the local Datadog Agent's profile endpoint.
-pub(super) fn intake() -> Intake {
-    let url = non_empty_env("TEMPER_PROFILING_INTAKE_URL").unwrap_or_else(|| {
-        let host = non_empty_env("DD_AGENT_HOST").unwrap_or_else(|| "127.0.0.1".to_string());
-        let port = non_empty_env("DD_TRACE_AGENT_PORT").unwrap_or_else(|| "8126".to_string());
-        format!("http://{host}:{port}/profiling/v1/input")
-    });
+/// The configured intake (`TEMPER_PROFILING_INTAKE_URL`), or none: there is
+/// no default destination, so nothing is uploaded until one is named.
+pub(super) fn intake() -> Option<Intake> {
+    let url = non_empty_env("TEMPER_PROFILING_INTAKE_URL")?;
     let mut headers: Vec<(String, String)> = non_empty_env("TEMPER_PROFILING_INTAKE_HEADERS")
         .map(|raw| {
             temper_observe::otel::parse_otlp_headers(&raw)
@@ -75,7 +72,7 @@ pub(super) fn intake() -> Intake {
         })
         .unwrap_or_default();
     headers.sort();
-    Intake { url, headers }
+    Some(Intake { url, headers })
 }
 
 /// The service profiles are filed under: `DD_SERVICE`, else the OTLP service

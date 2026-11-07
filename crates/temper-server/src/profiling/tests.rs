@@ -100,23 +100,15 @@ fn windows_and_rates_stay_in_bounds() {
 }
 
 #[test]
-fn intake_is_the_local_agent_unless_configured() {
-    with_env(&[], || {
-        let intake = config::intake();
-        assert_eq!(intake.url, "http://127.0.0.1:8126/profiling/v1/input");
-        assert!(intake.headers.is_empty());
-    });
+fn intake_is_none_unless_configured() {
+    with_env(&[], || assert_eq!(config::intake(), None));
+    // A Datadog Agent's address alone names no intake.
     with_env(
         &[
             ("DD_AGENT_HOST", "agent.internal"),
             ("DD_TRACE_AGENT_PORT", "9126"),
         ],
-        || {
-            assert_eq!(
-                config::intake().url,
-                "http://agent.internal:9126/profiling/v1/input"
-            )
-        },
+        || assert_eq!(config::intake(), None),
     );
     with_env(
         &[
@@ -131,7 +123,7 @@ fn intake_is_the_local_agent_unless_configured() {
             ),
         ],
         || {
-            let intake = config::intake();
+            let intake = config::intake().expect("an intake is configured");
             assert_eq!(intake.url, "https://collector.example/profiling/v1/input");
             assert_eq!(
                 intake.headers,
