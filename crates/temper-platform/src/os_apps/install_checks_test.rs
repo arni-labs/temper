@@ -138,44 +138,37 @@ async fn an_install_that_changes_neither_specs_nor_cedar_proves_nothing() {
 /// is kept only by the digest of its model, as a walk that did not fit is.
 #[tokio::test]
 async fn a_walk_longer_than_one_request_is_read_by_the_next_without_walking_again() {
-    let actions = |names: &[&str]| {
-        names
-            .iter()
-            .map(|name| {
-                format!(
-                    "\n[[action]]\nname = '{name}'\nkind = 'input'\nfrom = ['Open']\nto = 'Open'\n"
-                )
-            })
-            .collect::<String>()
-    };
-    let parent = format!(
-        "{}{}",
-        spec("Parent", None),
-        actions(&["Note", "Mark", "Tag"])
-    );
-    let child = format!(
-        "{}{}",
-        spec("Child", Some("Parent[Id].status != 'Closed'")),
-        actions(&["Ping", "Poke"])
-    );
-    let state = state("alice", &[("Parent", &parent), ("Child", &child)]);
-    // Each action is open to its own kind of sender, so the kinds the
-    // policies tell apart are asked several questions each.
-    let cedar = [
-        ("Note", "role", "a"),
-        ("Mark", "role", "b"),
-        ("Tag", "team", "c"),
-        ("Ping", "role", "d"),
-        ("Poke", "team", "e"),
-    ]
-    .iter()
-    .map(|(action, key, value)| {
+    let board = "[automaton]\nname = 'Board'\nstates = ['Waiting', 'Pinged']\ninitial = 'Waiting'\n\
+        [[action]]\nname = 'Ping'\nkind = 'input'\nfrom = ['Waiting', 'Pinged']\nto = 'Pinged'\n";
+    // Four moves send the same reaction, so Cedar is asked about it once for
+    // each move that causes it.
+    let pinging = |name: &str, to: Option<&str>| {
+        let to = to.map(|to| format!("to = '{to}'\n")).unwrap_or_default();
         format!(
-            "permit(principal, action == Action::\"{action}\", resource) when {{ principal has {key} && principal.{key} == \"{value}\" }};\n"
+            "[[action]]\nname = '{name}'\nkind = 'input'\nfrom = ['Open']\n{to}\
+             [[action.triggers]]\nname = 'ping'\nkind = 'entity'\ntarget_entity = 'Board'\ntarget_action = 'Ping'\n\
+             [action.triggers.resolve_target]\nkind = 'field'\nid_field = 'board'\n"
         )
-    })
-    .collect::<String>();
-    let specs = [("Parent".to_string(), parent), ("Child".to_string(), child)];
+    };
+    let ticket = format!(
+        "[automaton]\nname = 'Ticket'\nstates = ['New', 'Open', 'Kept', 'Dropped']\ninitial = 'New'\n\
+         [[state]]\nname = 'board'\ntype = 'string'\ninitial = ''\n\
+         [[invariant]]\nname = 'rule'\nassert = \"status == 'Dropped' => Board[board].status != 'Pinged'\"\n\
+         [[action]]\nname = 'Start'\nkind = 'input'\nfrom = ['New']\nto = 'Open'\nparams = [{{ name = 'board', type = 'string' }}]\n\
+         {}{}{}{}",
+        pinging("Keep", Some("Kept")),
+        pinging("Drop", Some("Dropped")),
+        pinging("Poke", None),
+        pinging("Prod", None),
+    );
+    // Cedar lets no move's reaction through, so the rule holds.
+    let cedar = "permit(principal, action in [Action::\"Start\", Action::\"Keep\", Action::\"Drop\", Action::\"Poke\", Action::\"Prod\"], resource);\n\
+        permit(principal, action == Action::\"Ping\", resource) when { context has causeAction && context.causeAction == \"Nobody\" };\n";
+    let state = state("alice", &[("Board", board), ("Ticket", &ticket)]);
+    let specs = [
+        ("Board".to_string(), board.to_string()),
+        ("Ticket".to_string(), ticket.clone()),
+    ];
     let request = || async {
         prove(
             &state,
@@ -183,7 +176,7 @@ async fn a_walk_longer_than_one_request_is_read_by_the_next_without_walking_agai
             "app",
             &specs,
             true,
-            Some(&cedar),
+            Some(cedar),
             &Attempt::default(),
         )
         .await
