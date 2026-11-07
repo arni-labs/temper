@@ -690,6 +690,12 @@ fn install_liveness_metrics_reporter_once() {
 
 #[allow(deprecated)] // ADR-0025 Phase 4: RecordStore used until chain validation replaced
 impl ServerState {
+    /// Stream handles HttpEndpoint requests still hold. A request frees the streams it opened when it ends, so this
+    /// is 0 whenever no request is in flight.
+    pub async fn http_stream_handles_open(&self) -> usize {
+        self.http_stream_registry.handle_count().await
+    }
+
     /// Enable commons-mode write guardrails for a tenant.
     pub fn enable_commons_guardrails(&self, tenant: &str) {
         if let Ok(mut tenants) = self.commons_guardrail_tenants.write() {
