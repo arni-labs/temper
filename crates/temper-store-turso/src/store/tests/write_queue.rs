@@ -15,7 +15,7 @@ use super::{make_store, test_envelope};
 const LOCK_WAIT: Duration = Duration::from_secs(5);
 
 /// One commit on a busy drive: a busy app's statements took 1.0 to 1.9 s on
-/// its Tensorlake drive under load (a load test, 26 Oct 2026).
+/// its sandbox host's network drive under load (a load test).
 const SLOW_COMMIT: Duration = Duration::from_secs(2);
 
 /// Moves that arrive together: enough that the last one's turn comes after

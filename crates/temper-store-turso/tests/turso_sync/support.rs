@@ -180,7 +180,7 @@ pub const BIG_LOG: i64 = 300_000;
 /// debug-build inserts before the behavior under test starts. The store
 /// is closed first: the CLI must be the only writer of this database.
 /// CI's disk is warm: the cold rate of 34.2 s per 10,000 rows is a load test's
-/// production measurement on a Tensorlake drive, not this test's.
+/// production measurement on a sandbox host's network drive, not this test's.
 pub async fn confirmed_log(
     server: &SyncServer,
     path: &Path,

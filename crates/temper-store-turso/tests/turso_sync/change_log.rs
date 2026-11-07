@@ -194,7 +194,7 @@ async fn the_trim_outpaces_the_log_while_every_commit_is_slow() {
     };
     let (_dir, path) = machine();
     let (a, copy) = confirmed_log(&server, &path, 20_000).await;
-    // One commit on a Tensorlake drive, whatever its rows (a load test, staging
+    // One commit on a sandbox host's network drive, whatever its rows (a load test, staging
     // canary, 26 Oct 2026).
     copy.simulate_slow_trim(Duration::ZERO, Duration::from_millis(170));
     let rows_before = copy.change_log_rows().await.expect("rows");

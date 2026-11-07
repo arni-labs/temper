@@ -2,7 +2,7 @@
 //!
 //! glibc's resolver asks over UDP and, with no options in `/etc/resolv.conf`,
 //! waits 5 s for the answer before asking again, so one lost packet holds
-//! whatever waits on that lookup for 5 s. Tensorlake sandboxes resolve through
+//! whatever waits on that lookup for 5 s. Some sandbox hosts resolve through
 //! one nameserver with no options. On 28 Oct 2026, 37 synced store opens there
 //! took 5.1 to 5.4 s instead of 0.3 to 1.5 s, each held on a lookup of its
 //! Turso remote. A packet capture in the same kind of sandbox showed the cause:
