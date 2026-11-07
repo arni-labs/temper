@@ -115,6 +115,27 @@ fn refused_versions() -> Vec<(&'static str, BTreeMap<String, String>)> {
     cases
 }
 
+/// An answer with the folders it names left out: a check loads the version
+/// from a folder of its own, the install from its cache, and the words around
+/// them are what the two must share.
+fn without_paths(answer: &str) -> String {
+    let mut kept = String::new();
+    let mut rest = answer;
+    while let Some(at) = rest.find(" at '") {
+        let (before, after) = rest.split_at(at + " at '".len());
+        kept.push_str(before);
+        match after.find('\'') {
+            Some(end) => rest = &after[end..],
+            None => {
+                rest = after;
+                break;
+            }
+        }
+    }
+    kept.push_str(rest);
+    kept
+}
+
 /// Every version the install refuses, checked dry on a tenant with nothing
 /// installed and on one serving the app: the check refuses it with the words
 /// the install then refuses it with, and the tenant is as it was.
@@ -149,11 +170,11 @@ async fn a_dry_run_refuses_what_the_install_refuses_and_changes_nothing() {
                 push(&tenant, serde_json::json!({ "files": files })),
             )
             .await;
-            let said = check["error"].as_str().unwrap_or("(no error)");
+            let said = without_paths(check["error"].as_str().unwrap_or("(no error)"));
             let agrees = installed == checked
                 && install["error"]
                     .as_str()
-                    .is_some_and(|error| error.starts_with(said));
+                    .is_some_and(|error| without_paths(error).starts_with(&said));
             if !agrees {
                 wrong.push(format!(
                     "{case}: the install answered {installed} {install}, the check {checked} {check}"
