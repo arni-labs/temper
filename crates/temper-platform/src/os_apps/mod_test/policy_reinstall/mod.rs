@@ -157,7 +157,7 @@ impl Fixture {
             .insert(self.tenant.clone(), live_text.to_string());
     }
 
-    /// A fresh process on the same database, booted the way TemperPaw boots.
+    /// A fresh process on the same database, booted the way an embedding server boots.
     async fn restart(&self) -> PlatformState {
         let store = TursoEventStore::new(&self.db_url, None)
             .await

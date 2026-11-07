@@ -106,7 +106,7 @@ emits made ordinary transitions queued for the first time. On Postgres that
 made a collection read filtered on a just-changed field return the previous
 answer for about 10 ms (an OAuth grant still matched its old refresh-token
 hash 7 times in 80), where the previous kernel returned 0 in 80. Callers that
-write and then query (Katagami's token route and curation pipeline) depend on
+write and then query (a token route and a curation pipeline) depend on
 that. The cost is one awaited projection write per transition, which is what
 deployments paid before ADR-0181. A projection failure is reported in the
 response as before. The queued path remains for composite dispatch, deletes

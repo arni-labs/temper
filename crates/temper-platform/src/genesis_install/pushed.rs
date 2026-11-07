@@ -274,22 +274,21 @@ async fn install_in_turn(
 /// Boot calls this only after the version installed: one that did not install
 /// was not served, so it is not adopted. Nothing goes empty that way: a boot
 /// install that fails leaves the specs stored in the database serving, and
-/// Katagami's control plane then sends that commit through the install route,
+/// A control plane then sends that commit through the install route,
 /// where a refusal changes nothing.
 ///
 /// Why: an app running before pushes existed has only the catalog version it
-/// was started with (for Katagami, the old checkout). Once adopted, the pushed
+/// was started with (for some embedders, the old checkout). Once adopted, the pushed
 /// version is what every later boot restores, whatever the catalog holds then,
 /// until the next push. Adoption runs no checks and refuses nothing: the
 /// version is already serving, and one whose files fail today's checks must
 /// keep serving until its owner pushes a new one. The whole app directory is
-/// copied, so a `COMMIT` file in it (Katagami writes `<app>/COMMIT` into the
+/// copied, so a `COMMIT` file in it (a control plane may write `<app>/COMMIT` into the
 /// checkout it adopts) names the adopted version's commit.
 ///
 /// This is a migration path for apps that predate pushes. Delete it, and its
 /// call at boot in temper-cli `serve/bootstrap.rs`, once every production app
-/// has a pushed root (tracked on the Katagami hub as "Remove adoption once
-/// every prod app has a pushed root").
+/// has a pushed root (tracked by the deployment's own task list).
 pub async fn adopt_catalog_app(
     platform: &PlatformState,
     tenant: &str,

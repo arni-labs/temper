@@ -1164,7 +1164,7 @@ fn http_endpoint_routes_are_managed_only_by_the_platform() {
     for action in [
         "create", "Create", "update", "delete", "Pause", "Resume", "Delete",
     ] {
-        // The known writers: the platform, temper-git's admin and Katagami's
+        // The known writers: the platform, temper-git's admin and a control plane's
         // route script with the operator key.
         assert!(
             manage(&SecurityContext::system(), action),

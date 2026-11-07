@@ -293,7 +293,7 @@ fn metrics() -> &'static RuntimeMetrics {
                      composite. An answer that keeps the record's status is a move and is not \
                      counted. Under healthy operation this counter is permanently zero; any \
                      nonzero reading is a regression of the consumer-side \
-                     exit-dispatches-an-action invariant (openpaw ADR-0039 Sub-Decision 3a). \
+                     exit-dispatches-an-action invariant (the consumer's own guard). \
                      Alerts on this counter are critical-severity.",
                 )
                 .build(),

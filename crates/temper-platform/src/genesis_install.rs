@@ -2384,10 +2384,10 @@ mod tests {
         assert_eq!(
             registry_git_url(
                 &registry::registry_for_test("https://genesis.example/"),
-                "temperpaw",
-                "paw-agent"
+                "acme",
+                "agent-app"
             ),
-            "https://genesis.example/temperpaw/paw-agent.git"
+            "https://genesis.example/acme/agent-app.git"
         );
     }
 

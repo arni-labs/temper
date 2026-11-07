@@ -147,7 +147,7 @@ if let Some(ref post_response) = inline_response
 }
 ```
 
-**Amendment: a silent exit is a trigger that sends no answer (2026-11-02).** The guard above compared the record's status before and after an inline trigger. It counted every answer that keeps the status (Katagami's `KatagamiApp.UseSurface` answers `SurfaceUsed`, which stays `Live`: every use of an app's interface counted), and it never saw a module that answered nothing, because that dispatch returns no response. The count now happens where the kernel reads the module's result (`dispatch/wasm.rs`), inline or in the background: a successful module that names no move, does not answer `"empty": true`, and wrote nothing as a composite. An answer the record refuses is journaled as a rejected answer and is not counted here.
+**Amendment: a silent exit is a trigger that sends no answer (2026-11-02).** The guard above compared the record's status before and after an inline trigger. It counted every answer that keeps the status (an app entity's `UseSurface` answers `SurfaceUsed`, which stays `Live`: every use of an app's interface counted), and it never saw a module that answered nothing, because that dispatch returns no response. The count now happens where the kernel reads the module's result (`dispatch/wasm.rs`), inline or in the background: a successful module that names no move, does not answer `"empty": true`, and wrote nothing as a composite. An answer the record refuses is journaled as a rejected answer and is not counted here.
 
 Under healthy operation `temper_integration_silent_exit_total` is permanently zero. The consumer (openpaw) is responsible for enforcing the invariant at the WASM layer (per openpaw ADR-0039 Sub-Decision 3a). This platform-side check is a belt-and-suspenders regression guard — if the WASM-side invariant ever regresses, operators see the counter go nonzero and can act before user-visible impact.
 
@@ -156,8 +156,7 @@ Under healthy operation `temper_integration_silent_exit_total` is permanently ze
 **Amendment: timer rows and the boot re-arm (2026-10-16).** The hydration
 re-arm shipped in the post-dispatch path, not in `pre_start`, so a timer came
 back only when some action on its record succeeded, and it then fired as that
-action's caller. A record nobody touched after a restart stayed silent: on
-2026-10-15 every feed in a Katagami app stopped ticking after each restart, and
+action's caller. A record nobody touched after a restart stayed silent: every feed in an app stopped ticking after each restart, and
 each feed's daily timer was gone until someone pressed something.
 
 The event log cannot restore these timers on its own: it does not record who
@@ -180,8 +179,8 @@ next-action hydration re-arm.
 
 That re-arm read how long the entity had been in its state from the retained
 events, which a snapshot leaves out and a window of 50 forgets. Without the
-entry it armed a full budget, on every hydration: from 16 to 20 Oct 2026 the
-daily timers of a Katagami app's 18 feeds were re-armed for a full day after
+entry it armed a full budget, on every hydration: the
+daily timers of an app's 18 feeds were re-armed for a full day after
 each restart (every 2 to 15 hours) and never fired. The entity state now keeps
 a status clock (when the current status was entered, and when each action last
 ran since), which snapshots keep, and the hydration re-arm reads it. A state

@@ -42,7 +42,7 @@ fn request_in(path: &str, body: serde_json::Value, session: Option<&str>) -> Req
                     attributes: Default::default(),
                 },
                 context_attrs: Default::default(),
-                correlation_id: "factory-sized-offers".to_string(),
+                correlation_id: "many-sized-offers".to_string(),
                 cause: None,
                 credential: None,
             },

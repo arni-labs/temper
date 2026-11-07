@@ -1,4 +1,4 @@
-//! Jev (TypeSafe System One): one bounded call per state, a textual state and typed questions answered together.
+//! Jev: one bounded call per state, a textual state and typed questions answered together.
 //! Configured by [`JEV_URL_ENV`] and [`JEV_KEY_ENV`]; with either unset, no module is reviewed.
 //!
 //! Jev answers in well under three seconds nearly every time (2026-09: fit calls averaged 0.3 s, the slowest of 169
