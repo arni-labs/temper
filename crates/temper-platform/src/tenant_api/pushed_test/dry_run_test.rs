@@ -90,13 +90,16 @@ fn refused_versions() -> Vec<(&'static str, BTreeMap<String, String>)> {
 
     let mut cross = with_comment("cross");
     cross.insert(
-        "cross-invariants.toml".to_string(),
+        "specs/cross-invariants.toml".to_string(),
         "this is not toml =".to_string(),
     );
     cases.push(("cross-invariants that do not parse", cross));
 
     let mut reactions = with_comment("reactions");
-    reactions.insert("reactions.toml".to_string(), "[[reaction]]\n".to_string());
+    reactions.insert(
+        "specs/reactions.toml".to_string(),
+        "[[reaction]]\n".to_string(),
+    );
     cases.push(("a reactions.toml", reactions));
 
     let mut module = with_comment("module");
@@ -117,8 +120,10 @@ fn refused_versions() -> Vec<(&'static str, BTreeMap<String, String>)> {
 /// the install then refuses it with, and the tenant is as it was.
 #[tokio::test]
 async fn a_dry_run_refuses_what_the_install_refuses_and_changes_nothing() {
+    let mut wrong = Vec::new();
     for installed_before in [false, true] {
         for (case, files) in refused_versions() {
+            let case = format!("{case} (installed before: {installed_before})");
             let tenant = unique_tenant("dry-refused");
             let server = server(&tenant);
             if installed_before {
@@ -132,32 +137,31 @@ async fn a_dry_run_refuses_what_the_install_refuses_and_changes_nothing() {
             let before = kept(&server, &tenant).await;
 
             let (checked, check) = send(&server.state, push(&tenant, dry(&files))).await;
-            assert_ne!(
-                checked,
-                StatusCode::OK,
-                "{case}: the check took it: {check}"
-            );
-            assert_eq!(
-                kept(&server, &tenant).await,
-                before,
-                "{case}: the check changed the tenant"
-            );
+            if checked == StatusCode::OK {
+                wrong.push(format!("{case}: the check took it: {check}"));
+            }
+            if kept(&server, &tenant).await != before {
+                wrong.push(format!("{case}: the check changed the tenant"));
+            }
 
             let (installed, install) = send(
                 &server.state,
                 push(&tenant, serde_json::json!({ "files": files })),
             )
             .await;
-            assert_eq!(installed, checked, "{case}: {install} vs {check}");
-            let said = check["error"].as_str().expect("the check says why");
-            assert!(
-                install["error"]
+            let said = check["error"].as_str().unwrap_or("(no error)");
+            let agrees = installed == checked
+                && install["error"]
                     .as_str()
-                    .is_some_and(|error| error.starts_with(said)),
-                "{case}: the install said {install}, the check {check}"
-            );
+                    .is_some_and(|error| error.starts_with(said));
+            if !agrees {
+                wrong.push(format!(
+                    "{case}: the install answered {installed} {install}, the check {checked} {check}"
+                ));
+            }
         }
     }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// A version the check passes is the version the install then installs, by
