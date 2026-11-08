@@ -45,11 +45,23 @@ Secret injection into WASM remains filtered by authorization before constructing
 ### Negative
 
 - Losing `TEMPER_VAULT_KEY` makes persisted secrets unrecoverable.
-- Rotating the key requires a deliberate decrypt/re-encrypt migration.
+- Rotating the key needs both keys present for one boot (see Key Rotation).
 
 ### DST Compliance
 
 Secret encryption uses production randomness and is outside deterministic simulation. Sim tests should use fixed fixture values or mocked vault behavior.
+
+## Key Rotation (2026-11-07)
+
+`TEMPER_VAULT_KEY_PREVIOUS` (optional, same format) holds the key being replaced. At boot each tenant secret row is opened with the current key first, then the previous one:
+
+- Current key opens it: kept as stored.
+- Only the previous key opens it: sealed again under the current key and written back on the condition that its version id is unchanged since it was read. A row changed meanwhile is left to its newer write; the next boot retries it. A re-sealed row opens with the current key, so a retry or second boot changes nothing.
+- Neither opens it: logged as an error per row and not loaded.
+
+One boot line counts rows kept, re-sealed, deferred and unreadable. The previous key never seals anything. Setting it without `TEMPER_VAULT_KEY` stops the boot, since rows would be re-sealed under a throwaway key. Without it, loading is unchanged except that an unreadable row is an error, not a warning.
+
+To rotate: set the new key as `TEMPER_VAULT_KEY` and the old one as `TEMPER_VAULT_KEY_PREVIOUS`, boot until the line shows 0 re-sealed and 0 deferred, then remove the previous key. Once a row is re-sealed only the new key opens it, so a rollback, including to a release without this variable, keeps the new key as `TEMPER_VAULT_KEY`.
 
 ## Rollback Policy
 

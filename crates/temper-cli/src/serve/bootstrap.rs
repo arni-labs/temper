@@ -555,18 +555,28 @@ pub(super) async fn recover_secrets(state: &PlatformState) {
             .collect()
     };
 
-    let mut total = 0usize;
+    let mut report = temper_server::state::SecretLoadReport::default();
     for tenant in &tenants {
         match state.server.load_tenant_secrets(tenant).await {
-            Ok(count) => total += count,
+            Ok(loaded) => report.add(loaded),
             Err(e) => {
                 eprintln!("  Warning: failed to load secrets for tenant '{tenant}': {e}");
             }
         }
     }
-    if total > 0 {
-        println!("  Recovered {total} secrets from database.");
+    if report.total() == 0 {
+        return;
     }
+    // Each unreadable row was already logged as an error.
+    let hint = if report.unreadable > 0 {
+        " Unreadable rows open with neither vault key; see the errors above."
+    } else {
+        ""
+    };
+    println!(
+        "  Secrets from database: {} kept, {} re-sealed, {} deferred, {} unreadable.{hint}",
+        report.kept, report.resealed, report.deferred, report.unreadable
+    );
 }
 
 /// Load the verification cache from Turso for a tenant (hash + verified status).

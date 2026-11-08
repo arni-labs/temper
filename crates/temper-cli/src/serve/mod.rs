@@ -157,25 +157,39 @@ pub async fn run(
 
     // Phase 5b: Secrets vault
     {
-        use base64::Engine as _;
-        let key_bytes: [u8; 32] = if let Ok(key_b64) = std::env::var("TEMPER_VAULT_KEY") {
-            // determinism-ok: read once at startup
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(&key_b64)
-                .expect("TEMPER_VAULT_KEY must be valid base64");
-            assert_eq!(decoded.len(), 32, "TEMPER_VAULT_KEY must be 32 bytes");
-            decoded.try_into().unwrap() // ci-ok: length asserted == 32 above
-        } else {
-            // No explicit key — generate an ephemeral one for in-memory secret caching.
-            // determinism-ok: OsRng used once at startup for vault key generation
-            use rand::RngCore as _;
-            let mut key = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut key);
-            key
+        // determinism-ok: read once at startup
+        let current = vault_key_from_env("TEMPER_VAULT_KEY");
+        // determinism-ok: read once at startup
+        let previous = vault_key_from_env("TEMPER_VAULT_KEY_PREVIOUS");
+        let key_bytes: [u8; 32] = match current {
+            Some(key) => key,
+            None => {
+                // Rows opened with the previous key are sealed again under the
+                // current one; an ephemeral current key would lose them on the
+                // next restart.
+                assert!(
+                    previous.is_none(),
+                    "TEMPER_VAULT_KEY_PREVIOUS needs TEMPER_VAULT_KEY: rows would be re-sealed under a throwaway key"
+                );
+                // No explicit key — generate an ephemeral one for in-memory secret caching.
+                // determinism-ok: OsRng used once at startup for vault key generation
+                use rand::RngCore as _;
+                let mut key = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut key);
+                key
+            }
         };
-        let vault = temper_server::secrets::vault::SecretsVault::new(&key_bytes);
+        let mut vault = temper_server::secrets::vault::SecretsVault::new(&key_bytes);
+        if let Some(previous) = previous {
+            vault = vault.with_previous_key(&previous);
+        }
+        let rotating = if vault.has_previous_key() {
+            ", with a previous key to re-seal from"
+        } else {
+            ""
+        };
+        println!("  Secrets vault: configured{rotating}");
         state.server.secrets_vault = Some(std::sync::Arc::new(vault));
-        println!("  Secrets vault: configured");
     }
 
     // Seed secrets from env into the vault for all tenants.
@@ -386,6 +400,20 @@ async fn stop_signal() {
         () = interrupt => {}
         () = terminate => {}
     }
+}
+
+/// Read a base64-encoded 32-byte vault key from `name`, if set.
+///
+/// A set but malformed key stops the boot: running on without it would
+/// leave every stored secret unopened.
+fn vault_key_from_env(name: &str) -> Option<[u8; 32]> {
+    use base64::Engine as _;
+    let key_b64 = std::env::var(name).ok()?; // determinism-ok: read once at startup
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&key_b64)
+        .unwrap_or_else(|_| panic!("{name} must be valid base64"));
+    assert_eq!(decoded.len(), 32, "{name} must be 32 bytes");
+    Some(decoded.try_into().unwrap()) // ci-ok: length asserted == 32 above
 }
 
 fn cache_platform_secret_if_present(
