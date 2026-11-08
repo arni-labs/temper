@@ -44,7 +44,7 @@ async fn standard_server_keeps_schema_for_secrets_wasm_and_spec_restoration() {
         )
         .await
         .unwrap();
-    assert_eq!(state.load_tenant_secrets("tenant").await.unwrap(), 1);
+    assert_eq!(state.load_tenant_secrets("tenant").await.unwrap().kept, 1);
     assert_eq!(vault.get_secret("tenant", "KEY").unwrap(), "test-value");
     state
         .upsert_wasm_module("tenant", "module", b"\0asm\x01\0\0\0", "", "upload")

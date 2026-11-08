@@ -28,6 +28,7 @@ use crate::StorageBackend;
 use super::data_dir::{self, data_dir};
 use super::later::Later;
 use super::loader::load_into_registry;
+use super::secret_tally::SecretTally;
 use super::storage::{
     connect_postgres_store, redact_connection_url, upsert_loaded_specs_to_postgres,
     upsert_loaded_specs_to_turso,
@@ -540,8 +541,9 @@ pub(super) async fn recover_wasm_modules(state: &PlatformState, later: &Later) {
     }
 }
 
-/// Phase 7b: Recover encrypted secrets from persistent backend into in-memory cache.
-pub(super) async fn recover_secrets(state: &PlatformState) {
+/// Phase 7b: Recover encrypted secrets from persistent backend into in-memory
+/// cache, for the tenants restored before serving, and print their line.
+pub(super) async fn recover_secrets(state: &PlatformState, tally: &mut SecretTally) {
     if state.server.secrets_vault.is_none() || state.server.storage_stack.is_none() {
         return;
     }
@@ -555,18 +557,16 @@ pub(super) async fn recover_secrets(state: &PlatformState) {
             .collect()
     };
 
-    let mut total = 0usize;
     for tenant in &tenants {
+        tally.expect(tenant);
         match state.server.load_tenant_secrets(tenant).await {
-            Ok(count) => total += count,
+            Ok(loaded) => tally.record(tenant, loaded),
             Err(e) => {
                 eprintln!("  Warning: failed to load secrets for tenant '{tenant}': {e}");
             }
         }
     }
-    if total > 0 {
-        println!("  Recovered {total} secrets from database.");
-    }
+    tally.print(state, "tenants restored before serving");
 }
 
 /// Load the verification cache from Turso for a tenant (hash + verified status).

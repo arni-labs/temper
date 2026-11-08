@@ -187,4 +187,24 @@ impl TursoEventStore {
         }
         Ok(out)
     }
+
+    /// The tenants that hold at least one secret row in this store.
+    #[instrument(skip_all, fields(otel.name = "turso.list_secret_tenants"))]
+    pub async fn list_secret_tenants(&self) -> Result<Vec<String>, PersistenceError> {
+        let _query_timer = TursoQueryTimer::start("turso.list_secret_tenants");
+        let conn = self.configured_connection().await?;
+        let mut rows = conn
+            .query(
+                "SELECT DISTINCT tenant FROM tenant_secrets ORDER BY tenant",
+                (),
+            )
+            .await
+            .map_err(storage_error)?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(storage_error)? {
+            out.push(row.get::<String>(0).map_err(storage_error)?);
+        }
+        Ok(out)
+    }
 }

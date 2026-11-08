@@ -27,6 +27,9 @@ use super::later::{Later, LaterTenant};
 pub(super) fn spawn_walk(state: PlatformState, mut later: Later) {
     let queue = state.server.tenant_restore.clone();
     queue.begin(later.tenants.keys().map(TenantId::new));
+    for tenant in later.tenants.keys() {
+        later.secrets.expect(tenant);
+    }
     // determinism-ok: the restore walk runs in the background, after the server serves.
     tokio::spawn(async move {
         while let Some(tenant) = queue.next().await {
@@ -36,7 +39,10 @@ pub(super) fn spawn_walk(state: PlatformState, mut later: Later) {
                 .expect("a starting tenant is one left for later");
             let attempt = tokio::spawn(attempt(state.clone(), tenant.clone(), left)); // determinism-ok: one restore at a time
             let outcome = match attempt.await {
-                Ok((outcome, left)) => {
+                Ok((outcome, mut left)) => {
+                    if let Some(report) = left.secrets.take() {
+                        later.secrets.record(tenant.as_str(), report);
+                    }
                     if outcome.is_err() {
                         later.tenants.insert(tenant.to_string(), left);
                     }
@@ -61,6 +67,19 @@ pub(super) fn spawn_walk(state: PlatformState, mut later: Later) {
             queue.ended(&tenant, outcome);
         }
         tracing::info!("every tenant left for after serving is restored");
+        // An unavailable tenant's secrets are never loaded: it counts as unchecked.
+        let unavailable: Vec<String> = {
+            let registry = state.registry.read().expect("registry lock poisoned");
+            let tenants = registry.unavailable_tenants().keys();
+            tenants.map(|tenant| tenant.as_str().to_string()).collect()
+        };
+        for tenant in &unavailable {
+            later.secrets.expect(tenant);
+        }
+        later.secrets.load_rest(&state).await;
+        later
+            .secrets
+            .print(&state, "every tenant, after the restore walk");
     });
 }
 
@@ -126,11 +145,12 @@ async fn restore(
     try_load_and_activate_tenant_policies(&state.server, name)
         .await
         .map_err(|e| format!("its Cedar policies could not be read: {e}"))?;
-    state
+    let secrets = state
         .server
         .load_tenant_secrets(name)
         .await
         .map_err(|e| format!("its secrets could not be read: {e}"))?;
+    left.secrets = Some(secrets);
     state
         .server
         .load_tenant_wasm_modules(name)

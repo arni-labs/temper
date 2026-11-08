@@ -1,11 +1,15 @@
 //! Encrypted tenant secrets in the tenant's metadata store.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use temper_runtime::persistence::{SecretPrecondition, SecretWrite};
 
 use super::super::ServerState;
 use super::TenantMetadataBackend;
+
+mod load;
+
+pub use load::SecretLoadReport;
 
 /// What a secret write did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,121 +113,63 @@ impl ServerState {
             .collect())
     }
 
-    /// Load all secrets for a tenant from persistence, decrypt, and cache.
-    pub async fn load_tenant_secrets(&self, tenant: &str) -> Result<usize, String> {
-        let Some(vault) = self.secrets_vault.as_ref() else {
-            return Ok(0);
+    /// Every tenant holding a stored secret row, in any store, and every
+    /// registered tenant whose database could not be opened or listed, so
+    /// whether it holds any is unknown. A tenant can hold secrets without any
+    /// specs, so the spec registry does not name them all, and a database
+    /// that failed to open at boot is among no connected stores.
+    pub async fn secret_tenants(&self) -> Result<SecretTenants, String> {
+        let mut found = SecretTenants::default();
+        if let Some(store) = self.postgres_metadata_store() {
+            let listed = store.list_secret_tenants().await;
+            let listed = listed.map_err(|e| format!("failed to list secret tenants: {e}"))?;
+            found.holding.extend(listed);
+            return Ok(found);
+        }
+        let Some(provider) = self.storage_stack.as_ref().and_then(|s| s.turso.clone()) else {
+            return Ok(found);
         };
-        let rows = match self.tenant_metadata_backend(tenant).await {
-            None => return Ok(0),
-            Some(TenantMetadataBackend::Postgres(store)) => store
-                .load_secrets_for_tenant(tenant)
-                .await
-                .map_err(|e| format!("failed to load secrets for tenant {tenant}: {e}"))?,
-            Some(TenantMetadataBackend::Turso(turso)) => {
-                turso.load_secrets_for_tenant(tenant).await.map_err(|e| {
-                    format!("failed to load secrets for tenant {tenant} from turso: {e}")
-                })?
-            }
-            Some(TenantMetadataBackend::Redis) => {
-                return Err(Self::redis_ephemeral_error("Secret loading"));
-            }
-        };
-
-        let mut count = 0;
-        for (key_name, ciphertext, nonce) in &rows {
-            match vault.decrypt(ciphertext, nonce) {
-                Ok(plaintext) => {
-                    let value = String::from_utf8(plaintext)
-                        .map_err(|e| format!("secret {key_name} is not valid UTF-8: {e}"))?;
-                    vault.cache_secret(tenant, key_name, value);
-                    count += 1;
-                }
+        if let Some(platform) = provider.platform_store() {
+            let listed = platform.list_secret_tenants().await;
+            let listed =
+                listed.map_err(|e| format!("failed to list secret tenants in turso: {e}"))?;
+            found.holding.extend(listed);
+        }
+        let mut registered: BTreeSet<String> =
+            provider.connected_tenants().await.into_iter().collect();
+        if provider.supports_tenant_admin() {
+            let listed = provider.list_tenants().await;
+            registered.extend(listed.map_err(|e| format!("failed to list tenants: {e}"))?);
+        }
+        for tenant in registered {
+            let Some(store) = provider.store_for_tenant(&tenant).await else {
+                tracing::error!(
+                    tenant,
+                    "tenant database could not be opened; its secrets are unchecked"
+                );
+                found.unopened.insert(tenant);
+                continue;
+            };
+            match store.list_secret_tenants().await {
+                Ok(listed) => found.holding.extend(listed),
                 Err(e) => {
-                    tracing::warn!(
-                        tenant,
-                        key_name,
-                        error = %e,
-                        "failed to decrypt secret, skipping"
-                    );
+                    tracing::error!(tenant, error = %e, "tenant secrets could not be listed; they are unchecked");
+                    found.unopened.insert(tenant);
                 }
             }
         }
-        Ok(count)
+        Ok(found)
     }
+}
+
+/// The tenants [`ServerState::secret_tenants`] found.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SecretTenants {
+    /// Tenants holding at least one stored secret row.
+    pub holding: BTreeSet<String>,
+    /// Registered tenants whose database could not be opened or listed.
+    pub unopened: BTreeSet<String>,
 }
 
 #[cfg(test)]
-mod tests {
-    use temper_runtime::ActorSystem;
-    use temper_runtime::persistence::SecretPrecondition;
-    use temper_store_turso::TursoEventStore;
-
-    use super::SecretWriteOutcome;
-    use crate::registry::SpecRegistry;
-    use crate::secrets::vault::SecretsVault;
-    use crate::state::ServerState;
-    use crate::storage::StorageStack;
-
-    fn make_state() -> ServerState {
-        let system = ActorSystem::new("test-secrets-persistence");
-        ServerState::from_registry(system, SpecRegistry::new())
-            .with_secrets_vault(SecretsVault::new(&[7u8; 32]))
-    }
-
-    #[tokio::test]
-    async fn turso_secret_round_trip() {
-        let db_path =
-            std::env::temp_dir().join(format!("temper-secrets-{}.db", uuid::Uuid::new_v4())); // determinism-ok: test-only temp file
-        let db_url = format!("file:{}", db_path.display());
-        let store = TursoEventStore::new(&db_url, None)
-            .await
-            .expect("create local turso db");
-
-        let mut state = make_state();
-        state.set_storage_stack(StorageStack::from_turso(store));
-
-        let vault = state.secrets_vault.as_ref().expect("vault configured");
-        let (ciphertext, nonce) = vault.encrypt(b"secret-value").expect("encrypt");
-
-        let outcome = state
-            .write_secret(
-                "tenant-a",
-                "API_KEY",
-                &ciphertext,
-                &nonce,
-                SecretPrecondition::Any,
-            )
-            .await
-            .expect("turso secret write should succeed");
-        let SecretWriteOutcome::Written { version_id } = outcome else {
-            panic!("an unconditional write is always written");
-        };
-        assert_eq!(
-            state.secret_versions("tenant-a").await.unwrap()["API_KEY"],
-            version_id
-        );
-
-        // Load and decrypt.
-        let loaded = state
-            .load_tenant_secrets("tenant-a")
-            .await
-            .expect("turso secret load should succeed");
-        assert_eq!(loaded, 1, "should have loaded 1 secret");
-
-        // Verify the decrypted value is cached.
-        let cached = vault
-            .get_secret("tenant-a", "API_KEY")
-            .expect("secret should be cached");
-        assert_eq!(cached, "secret-value");
-
-        // Delete secret.
-        let deleted = state
-            .delete_secret("tenant-a", "API_KEY")
-            .await
-            .expect("turso secret delete should succeed");
-        assert!(deleted, "should have deleted 1 row");
-
-        let _ = std::fs::remove_file(db_path); // determinism-ok: test-only cleanup
-    }
-}
+mod tests;

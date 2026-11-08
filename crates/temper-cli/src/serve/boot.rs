@@ -69,7 +69,7 @@ pub(super) async fn restore_own(
     bootstrap::hydrate_entities(state, apps, later).await;
     bootstrap::recover_cedar_policies(state, later).await;
     bootstrap::recover_wasm_modules(state, later).await;
-    bootstrap::recover_secrets(state).await;
+    bootstrap::recover_secrets(state, &mut later.secrets).await;
     let keys = bootstrap::EarlierOperatorKeys::from_env();
     bootstrap::bootstrap_tenants(state, apps, keys, later).await;
     installed_apps::bootstrap_installed_apps(state, os_app_installs, later).await

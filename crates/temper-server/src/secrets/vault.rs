@@ -3,9 +3,14 @@
 //! Uses AES-256-GCM for authenticated encryption with a master key
 //! (`TEMPER_VAULT_KEY` env var). Secrets are cached in memory and
 //! persisted to Postgres as `(ciphertext, nonce)` pairs.
+//!
+//! During a key rotation the vault also holds the previous master key
+//! (`TEMPER_VAULT_KEY_PREVIOUS`). It only opens rows with it; every seal uses
+//! the current key, so a row opened with the previous key is sealed again
+//! under the current one (see ADR-0075).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use aes_gcm::aead::{Aead, OsRng}; // determinism-ok: cryptographic nonce generation, not simulation-visible
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
@@ -19,12 +24,17 @@ pub const MAX_SECRET_VALUE_BYTES: usize = 8192;
 /// of decrypted secrets per tenant. The cache is populated from the
 /// persistence layer on startup and kept in sync on writes.
 pub struct SecretsVault {
-    /// AES-256-GCM cipher instance.
+    /// AES-256-GCM cipher of the current master key: seals and opens.
     cipher: Arc<Aes256Gcm>,
+    /// Cipher of the previous master key during a rotation: opens only.
+    previous: Option<Arc<Aes256Gcm>>,
     /// Shared platform secrets available to every tenant.
     platform: Arc<RwLock<BTreeMap<String, String>>>,
     /// In-memory cache: tenant → (key_name → plaintext_value).
     cache: Arc<RwLock<BTreeMap<String, BTreeMap<String, String>>>>,
+    /// Each tenant's turn to change its stored secrets and their cached
+    /// values ([`Self::turn`]). One entry per tenant that ever took it.
+    turns: Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl SecretsVault {
@@ -35,9 +45,25 @@ impl SecretsVault {
         let cipher = Aes256Gcm::new(key);
         Self {
             cipher: Arc::new(cipher),
+            previous: None,
             platform: Arc::new(RwLock::new(BTreeMap::new())),
             cache: Arc::new(RwLock::new(BTreeMap::new())),
+            turns: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Also open rows sealed under `previous_key`, the master key this one
+    /// replaces. Nothing is ever sealed with it.
+    pub fn with_previous_key(mut self, previous_key: &[u8; 32]) -> Self {
+        debug_assert!(self.previous.is_none(), "one previous key at most");
+        let key = Key::<Aes256Gcm>::from_slice(previous_key);
+        self.previous = Some(Arc::new(Aes256Gcm::new(key)));
+        self
+    }
+
+    /// Whether this vault holds a previous master key.
+    pub fn has_previous_key(&self) -> bool {
+        self.previous.is_some()
     }
 
     /// Encrypt a plaintext value, returning `(ciphertext, nonce)`.
@@ -56,18 +82,26 @@ impl SecretsVault {
         Ok((ciphertext, nonce.to_vec()))
     }
 
-    /// Decrypt a ciphertext with the given nonce.
+    /// Decrypt a ciphertext with the given nonce under the current key.
     pub fn decrypt(&self, ciphertext: &[u8], nonce_bytes: &[u8]) -> Result<Vec<u8>, String> {
-        if nonce_bytes.len() != 12 {
-            return Err(format!(
-                "invalid nonce length: expected 12, got {}",
-                nonce_bytes.len()
-            ));
+        decrypt_with(&self.cipher, ciphertext, nonce_bytes)
+    }
+
+    /// Open a stored row with the current key, or else the previous one.
+    ///
+    /// The error is the current key's: without a previous key this is
+    /// exactly [`Self::decrypt`].
+    pub fn open(&self, ciphertext: &[u8], nonce_bytes: &[u8]) -> Result<Opened, String> {
+        let current_error = match self.decrypt(ciphertext, nonce_bytes) {
+            Ok(plaintext) => return Ok(Opened::Current(plaintext)),
+            Err(e) => e,
+        };
+        match &self.previous {
+            Some(previous) => decrypt_with(previous, ciphertext, nonce_bytes)
+                .map(Opened::Previous)
+                .map_err(|_| format!("{current_error} under the current and the previous key")),
+            None => Err(current_error),
         }
-        let nonce = Nonce::from_slice(nonce_bytes);
-        self.cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| format!("decryption failed: {e}"))
     }
 
     /// Cache a decrypted secret in memory, adding it or replacing its value.
@@ -77,6 +111,19 @@ impl SecretsVault {
         let mut cache = self.cache.write().unwrap(); // ci-ok: infallible lock
         let tenant_secrets = cache.entry(tenant.to_string()).or_default();
         tenant_secrets.insert(key.to_string(), value);
+    }
+
+    /// Wait for `tenant`'s turn to change its secrets, held until the guard
+    /// drops. A secret write or delete takes it from the store's change to
+    /// the cache's, and a load from its first read to its last cache write,
+    /// so a load never caches a value a request replaced or deleted after
+    /// the load read it.
+    pub async fn turn(&self, tenant: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let turn = {
+            let mut turns = self.turns.lock().unwrap(); // ci-ok: infallible lock
+            Arc::clone(turns.entry(tenant.to_string()).or_default())
+        };
+        turn.lock_owned().await
     }
 
     /// Cache a shared platform secret in memory.
@@ -160,6 +207,32 @@ impl SecretsVault {
         }
         merged
     }
+}
+
+/// Which master key opened a stored row, with its plaintext.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Opened {
+    /// The current key: the row stays as stored.
+    Current(Vec<u8>),
+    /// Only the previous key: the row must be sealed again under the current one.
+    Previous(Vec<u8>),
+}
+
+fn decrypt_with(
+    cipher: &Aes256Gcm,
+    ciphertext: &[u8],
+    nonce_bytes: &[u8],
+) -> Result<Vec<u8>, String> {
+    if nonce_bytes.len() != 12 {
+        return Err(format!(
+            "invalid nonce length: expected 12, got {}",
+            nonce_bytes.len()
+        ));
+    }
+    let nonce = Nonce::from_slice(nonce_bytes);
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| format!("decryption failed: {e}"))
 }
 
 #[cfg(test)]
@@ -302,5 +375,31 @@ mod tests {
         let result = vault.decrypt(b"ciphertext", b"short");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid nonce length"));
+    }
+
+    #[test]
+    fn previous_key_opens_old_rows_and_never_seals() {
+        let old = SecretsVault::new(&[0x01; 32]);
+        let (old_ct, old_nonce) = old.encrypt(b"old-value").unwrap();
+        let (stray_ct, stray_nonce) = SecretsVault::new(&[0x03; 32]).encrypt(b"x").unwrap();
+
+        let rotated = SecretsVault::new(&[0x02; 32]).with_previous_key(&[0x01; 32]);
+        assert_eq!(
+            rotated.open(&old_ct, &old_nonce),
+            Ok(Opened::Previous(b"old-value".to_vec()))
+        );
+        let (new_ct, new_nonce) = rotated.encrypt(b"new-value").unwrap();
+        assert_eq!(
+            rotated.open(&new_ct, &new_nonce),
+            Ok(Opened::Current(b"new-value".to_vec()))
+        );
+        assert!(
+            old.decrypt(&new_ct, &new_nonce).is_err(),
+            "a rotated vault seals with the current key only"
+        );
+        assert!(rotated.open(&stray_ct, &stray_nonce).is_err());
+
+        let without_previous = SecretsVault::new(&[0x02; 32]);
+        assert!(without_previous.open(&old_ct, &old_nonce).is_err());
     }
 }

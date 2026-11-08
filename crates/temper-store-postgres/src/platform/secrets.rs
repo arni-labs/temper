@@ -122,6 +122,17 @@ impl PostgresEventStore {
         .map_err(storage_error)
     }
 
+    /// The tenants that hold at least one secret row.
+    pub async fn list_secret_tenants(&self) -> Result<Vec<String>, PersistenceError> {
+        crate::dbm::postgres_query_scalar!(
+            &self.schema,
+            "SELECT DISTINCT tenant FROM {schema}tenant_secrets ORDER BY tenant"
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(storage_error)
+    }
+
     /// List a tenant's secret names with the version id of each one's latest
     /// write. Never reads a value.
     pub async fn list_secret_versions(
