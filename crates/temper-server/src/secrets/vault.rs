@@ -10,7 +10,7 @@
 //! under the current one (see ADR-0075).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use aes_gcm::aead::{Aead, OsRng}; // determinism-ok: cryptographic nonce generation, not simulation-visible
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
@@ -32,6 +32,9 @@ pub struct SecretsVault {
     platform: Arc<RwLock<BTreeMap<String, String>>>,
     /// In-memory cache: tenant → (key_name → plaintext_value).
     cache: Arc<RwLock<BTreeMap<String, BTreeMap<String, String>>>>,
+    /// Each tenant's turn to change its stored secrets and their cached
+    /// values ([`Self::turn`]). One entry per tenant that ever took it.
+    turns: Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl SecretsVault {
@@ -45,6 +48,7 @@ impl SecretsVault {
             previous: None,
             platform: Arc::new(RwLock::new(BTreeMap::new())),
             cache: Arc::new(RwLock::new(BTreeMap::new())),
+            turns: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -109,17 +113,17 @@ impl SecretsVault {
         tenant_secrets.insert(key.to_string(), value);
     }
 
-    /// Cache a decrypted secret only if the tenant has none cached under
-    /// `key`, so a value a request cached meanwhile is kept. Returns whether
-    /// it was cached.
-    pub fn cache_secret_if_absent(&self, tenant: &str, key: &str, value: String) -> bool {
-        let mut cache = self.cache.write().unwrap(); // ci-ok: infallible lock
-        let tenant_secrets = cache.entry(tenant.to_string()).or_default();
-        if tenant_secrets.contains_key(key) {
-            return false;
-        }
-        tenant_secrets.insert(key.to_string(), value);
-        true
+    /// Wait for `tenant`'s turn to change its secrets, held until the guard
+    /// drops. A secret write or delete takes it from the store's change to
+    /// the cache's, and a load from its first read to its last cache write,
+    /// so a load never caches a value a request replaced or deleted after
+    /// the load read it.
+    pub async fn turn(&self, tenant: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let turn = {
+            let mut turns = self.turns.lock().unwrap(); // ci-ok: infallible lock
+            Arc::clone(turns.entry(tenant.to_string()).or_default())
+        };
+        turn.lock_owned().await
     }
 
     /// Cache a shared platform secret in memory.

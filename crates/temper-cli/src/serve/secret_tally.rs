@@ -36,28 +36,34 @@ impl SecretTally {
 
     /// Load the secrets of every tenant that holds secret rows and was not
     /// loaded yet: one with no specs is restored by neither the boot nor the
-    /// walk. An unavailable tenant's rows stay unloaded; it counts as unchecked.
+    /// walk. An unavailable tenant's rows stay unloaded, and so do those of a
+    /// tenant whose database could not be opened or listed: each counts as
+    /// unchecked.
     pub(super) async fn load_rest(&mut self, state: &PlatformState) {
         if state.server.secrets_vault.is_none() || state.server.storage_stack.is_none() {
             return;
         }
-        let tenants = match state.server.secret_tenants().await {
-            Ok(tenants) => tenants,
+        let found = match state.server.secret_tenants().await {
+            Ok(found) => found,
             Err(e) => {
                 tracing::error!(error = %e, "tenants holding secrets could not be listed");
                 self.unlisted = true;
                 return;
             }
         };
-        for tenant in tenants {
+        for tenant in &found.unopened {
+            self.expect(tenant);
+        }
+        for tenant in found.holding {
             self.expect(&tenant);
             if self.loaded.contains_key(&tenant)
                 || state.tenant_unavailable_reason(&tenant).is_some()
             {
                 continue;
             }
-            // Served already: a request may cache a newer value meanwhile.
-            match state.server.load_served_tenant_secrets(&tenant).await {
+            // Served already: the load takes the tenant's turn, so a request's
+            // write or delete lands wholly before or after it.
+            match state.server.load_tenant_secrets(&tenant).await {
                 Ok(report) => self.record(&tenant, report),
                 Err(e) => tracing::error!(tenant, error = %e, "failed to load secrets"),
             }

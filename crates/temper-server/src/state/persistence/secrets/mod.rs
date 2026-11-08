@@ -113,26 +113,62 @@ impl ServerState {
             .collect())
     }
 
-    /// Every tenant holding a stored secret row, in any store. A tenant can
-    /// hold secrets without any specs, so the registry does not name them all.
-    pub async fn secret_tenants(&self) -> Result<BTreeSet<String>, String> {
-        let mut tenants = BTreeSet::new();
+    /// Every tenant holding a stored secret row, in any store, and every
+    /// registered tenant whose database could not be opened or listed, so
+    /// whether it holds any is unknown. A tenant can hold secrets without any
+    /// specs, so the spec registry does not name them all, and a database
+    /// that failed to open at boot is among no connected stores.
+    pub async fn secret_tenants(&self) -> Result<SecretTenants, String> {
+        let mut found = SecretTenants::default();
         if let Some(store) = self.postgres_metadata_store() {
             let listed = store.list_secret_tenants().await;
-            tenants.extend(listed.map_err(|e| format!("failed to list secret tenants: {e}"))?);
-            return Ok(tenants);
+            let listed = listed.map_err(|e| format!("failed to list secret tenants: {e}"))?;
+            found.holding.extend(listed);
+            return Ok(found);
         }
         let Some(provider) = self.storage_stack.as_ref().and_then(|s| s.turso.clone()) else {
-            return Ok(tenants);
+            return Ok(found);
         };
-        for store in provider.all_stores().await {
-            let listed = store.list_secret_tenants().await;
-            tenants.extend(
-                listed.map_err(|e| format!("failed to list secret tenants in turso: {e}"))?,
-            );
+        if let Some(platform) = provider.platform_store() {
+            let listed = platform.list_secret_tenants().await;
+            let listed =
+                listed.map_err(|e| format!("failed to list secret tenants in turso: {e}"))?;
+            found.holding.extend(listed);
         }
-        Ok(tenants)
+        let mut registered: BTreeSet<String> =
+            provider.connected_tenants().await.into_iter().collect();
+        if provider.supports_tenant_admin() {
+            let listed = provider.list_tenants().await;
+            registered.extend(listed.map_err(|e| format!("failed to list tenants: {e}"))?);
+        }
+        for tenant in registered {
+            let Some(store) = provider.store_for_tenant(&tenant).await else {
+                tracing::error!(
+                    tenant,
+                    "tenant database could not be opened; its secrets are unchecked"
+                );
+                found.unopened.insert(tenant);
+                continue;
+            };
+            match store.list_secret_tenants().await {
+                Ok(listed) => found.holding.extend(listed),
+                Err(e) => {
+                    tracing::error!(tenant, error = %e, "tenant secrets could not be listed; they are unchecked");
+                    found.unopened.insert(tenant);
+                }
+            }
+        }
+        Ok(found)
     }
+}
+
+/// The tenants [`ServerState::secret_tenants`] found.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SecretTenants {
+    /// Tenants holding at least one stored secret row.
+    pub holding: BTreeSet<String>,
+    /// Registered tenants whose database could not be opened or listed.
+    pub unopened: BTreeSet<String>,
 }
 
 #[cfg(test)]

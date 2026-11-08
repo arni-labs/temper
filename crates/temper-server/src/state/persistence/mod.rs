@@ -22,7 +22,7 @@ mod logs_and_secrets;
 mod secrets;
 mod spec_metadata;
 
-pub use secrets::{SecretLoadReport, SecretWriteOutcome};
+pub use secrets::{SecretLoadReport, SecretTenants, SecretWriteOutcome};
 
 const BUNDLED_REPLACE_UPLOAD_SOURCE: &str = "bundled-replace-upload";
 

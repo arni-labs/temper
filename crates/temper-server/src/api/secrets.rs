@@ -198,7 +198,9 @@ pub(super) async fn handle_put_secret(
     };
 
     // Persist the encrypted secret; the store checks the condition in the
-    // same statement that writes.
+    // same statement that writes. The tenant's turn spans the write and the
+    // cache, so a load running meanwhile caches no older value after it.
+    let _turn = vault.turn(tenant).await;
     let version_id = match state
         .write_secret(tenant, &key_name, &ciphertext, &nonce, precondition)
         .await
@@ -256,6 +258,8 @@ pub(super) async fn handle_delete_secret(
             .into_response();
     };
 
+    // As for a write: no load caches the deleted value back after this.
+    let _turn = vault.turn(tenant).await;
     match state.delete_secret(tenant, &key_name).await {
         Ok(true) => {
             vault.remove_secret(tenant, &key_name);

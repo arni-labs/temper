@@ -173,22 +173,31 @@ async fn previous_key_rows_are_resealed_once_and_strays_are_counted() {
 }
 
 #[tokio::test]
-async fn a_served_tenant_load_keeps_a_value_cached_meanwhile() {
+async fn a_load_waits_for_a_delete_in_its_tenant_and_does_not_bring_it_back() {
     let db_path = std::env::temp_dir().join(format!("temper-secrets-{}.db", uuid::Uuid::new_v4())); // determinism-ok: test-only temp file
     let db_url = format!("file:{}", db_path.display());
     let state = state_on(&db_url, SecretsVault::new(&[2_u8; 32])).await;
     seal_row(&state, "LOGIN", b"stored").await;
-    let vault = state.secrets_vault.as_ref().unwrap();
+    let vault = state.secrets_vault.clone().expect("vault configured");
 
-    // A request wrote a newer value and cached it while the load ran.
-    vault.cache_secret("t", "LOGIN", "newer".into());
-    let report = state.load_served_tenant_secrets("t").await.expect("load");
-    assert_eq!(report.kept, 1);
-    assert_eq!(vault.get_secret("t", "LOGIN").as_deref(), Some("newer"));
+    // A DELETE request holds the tenant's turn from the store to the cache.
+    let deleting = vault.turn("t").await;
+    let loading = tokio::spawn({
+        let state = state.clone();
+        async move { state.load_tenant_secrets("t").await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await; // determinism-ok: test-only wait for the load to block
+    assert!(
+        !loading.is_finished(),
+        "the load waits for the tenant's turn"
+    );
+    assert!(state.delete_secret("t", "LOGIN").await.expect("delete"));
+    vault.remove_secret("t", "LOGIN");
+    drop(deleting);
 
-    // Before serving, the stored value is the latest and replaces the cache.
-    state.load_tenant_secrets("t").await.expect("load");
-    assert_eq!(vault.get_secret("t", "LOGIN").as_deref(), Some("stored"));
+    let report = loading.await.expect("load task").expect("load");
+    assert_eq!(report, SecretLoadReport::default());
+    assert_eq!(vault.get_secret("t", "LOGIN"), None);
 
     drop(state);
     let _ = std::fs::remove_file(db_path); // determinism-ok: test-only cleanup
