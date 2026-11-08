@@ -23,6 +23,24 @@ impl ServerState {
     /// value loaded, for the next load to retry. A row neither key opens is
     /// logged as an error and counted.
     pub async fn load_tenant_secrets(&self, tenant: &str) -> Result<SecretLoadReport, String> {
+        self.load_secrets(tenant, CacheWrite::Replace).await
+    }
+
+    /// [`Self::load_tenant_secrets`] for a tenant whose requests are already
+    /// served: a value is cached only where none is, so a secret a request
+    /// wrote and cached during the load keeps its newer value.
+    pub async fn load_served_tenant_secrets(
+        &self,
+        tenant: &str,
+    ) -> Result<SecretLoadReport, String> {
+        self.load_secrets(tenant, CacheWrite::IfAbsent).await
+    }
+
+    async fn load_secrets(
+        &self,
+        tenant: &str,
+        cache: CacheWrite,
+    ) -> Result<SecretLoadReport, String> {
         let mut report = SecretLoadReport::default();
         let Some(vault) = self.secrets_vault.as_ref() else {
             return Ok(report);
@@ -50,7 +68,7 @@ impl ServerState {
                 continue;
             };
             if !under_previous {
-                vault.cache_secret(tenant, key_name, value);
+                cache.put(vault, tenant, key_name, value);
                 report.kept += 1;
                 continue;
             }
@@ -59,20 +77,20 @@ impl ServerState {
                 .await
             {
                 Reseal::Written => {
-                    vault.cache_secret(tenant, key_name, value);
+                    cache.put(vault, tenant, key_name, value);
                     report.resealed += 1;
                 }
                 Reseal::Changed => {
                     changed.insert(key_name.clone());
                 }
                 Reseal::Deferred => {
-                    vault.cache_secret(tenant, key_name, value);
+                    cache.put(vault, tenant, key_name, value);
                     report.deferred += 1;
                 }
             }
         }
         if !changed.is_empty() {
-            self.load_changed_rows(vault, tenant, &changed, &mut report)
+            self.load_changed_rows(vault, cache, tenant, &changed, &mut report)
                 .await?;
         }
         debug_assert!(
@@ -149,6 +167,7 @@ impl ServerState {
     async fn load_changed_rows(
         &self,
         vault: &SecretsVault,
+        cache: CacheWrite,
         tenant: &str,
         changed: &BTreeSet<String>,
         report: &mut SecretLoadReport,
@@ -168,7 +187,7 @@ impl ServerState {
             match open_row(vault, tenant, key_name, ciphertext, nonce)? {
                 None => report.unreadable += 1,
                 Some((value, under_previous)) => {
-                    vault.cache_secret(tenant, key_name, value);
+                    cache.put(vault, tenant, key_name, value);
                     if under_previous {
                         report.deferred += 1;
                     } else {
@@ -178,6 +197,26 @@ impl ServerState {
             }
         }
         Ok(())
+    }
+}
+
+/// How a load writes the values it opened into the vault's cache.
+#[derive(Clone, Copy)]
+enum CacheWrite {
+    /// Before the tenant is served: the stored value is the latest.
+    Replace,
+    /// While the tenant is served: a value a request cached is newer.
+    IfAbsent,
+}
+
+impl CacheWrite {
+    fn put(self, vault: &SecretsVault, tenant: &str, key_name: &str, value: String) {
+        match self {
+            CacheWrite::Replace => vault.cache_secret(tenant, key_name, value),
+            CacheWrite::IfAbsent => {
+                vault.cache_secret_if_absent(tenant, key_name, value);
+            }
+        }
     }
 }
 

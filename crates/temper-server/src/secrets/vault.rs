@@ -109,6 +109,19 @@ impl SecretsVault {
         tenant_secrets.insert(key.to_string(), value);
     }
 
+    /// Cache a decrypted secret only if the tenant has none cached under
+    /// `key`, so a value a request cached meanwhile is kept. Returns whether
+    /// it was cached.
+    pub fn cache_secret_if_absent(&self, tenant: &str, key: &str, value: String) -> bool {
+        let mut cache = self.cache.write().unwrap(); // ci-ok: infallible lock
+        let tenant_secrets = cache.entry(tenant.to_string()).or_default();
+        if tenant_secrets.contains_key(key) {
+            return false;
+        }
+        tenant_secrets.insert(key.to_string(), value);
+        true
+    }
+
     /// Cache a shared platform secret in memory.
     ///
     /// Platform secrets act as a baseline for all tenants but are not

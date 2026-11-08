@@ -171,3 +171,25 @@ async fn previous_key_rows_are_resealed_once_and_strays_are_counted() {
 
     let _ = std::fs::remove_file(db_path); // determinism-ok: test-only cleanup
 }
+
+#[tokio::test]
+async fn a_served_tenant_load_keeps_a_value_cached_meanwhile() {
+    let db_path = std::env::temp_dir().join(format!("temper-secrets-{}.db", uuid::Uuid::new_v4())); // determinism-ok: test-only temp file
+    let db_url = format!("file:{}", db_path.display());
+    let state = state_on(&db_url, SecretsVault::new(&[2_u8; 32])).await;
+    seal_row(&state, "LOGIN", b"stored").await;
+    let vault = state.secrets_vault.as_ref().unwrap();
+
+    // A request wrote a newer value and cached it while the load ran.
+    vault.cache_secret("t", "LOGIN", "newer".into());
+    let report = state.load_served_tenant_secrets("t").await.expect("load");
+    assert_eq!(report.kept, 1);
+    assert_eq!(vault.get_secret("t", "LOGIN").as_deref(), Some("newer"));
+
+    // Before serving, the stored value is the latest and replaces the cache.
+    state.load_tenant_secrets("t").await.expect("load");
+    assert_eq!(vault.get_secret("t", "LOGIN").as_deref(), Some("stored"));
+
+    drop(state);
+    let _ = std::fs::remove_file(db_path); // determinism-ok: test-only cleanup
+}

@@ -56,7 +56,8 @@ impl SecretTally {
             {
                 continue;
             }
-            match state.server.load_tenant_secrets(&tenant).await {
+            // Served already: a request may cache a newer value meanwhile.
+            match state.server.load_served_tenant_secrets(&tenant).await {
                 Ok(report) => self.record(&tenant, report),
                 Err(e) => tracing::error!(tenant, error = %e, "failed to load secrets"),
             }
