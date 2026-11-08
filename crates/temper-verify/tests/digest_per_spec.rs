@@ -6,6 +6,10 @@
 //! Each reading builds every value anew, so a hash table whose order is
 //! seeded per table (`HashMap`, `HashSet`) and reaches the digest's text
 //! prints its entries in a new order and fails this.
+//!
+//! An install tries again until each proof's verdict is found, so a model
+//! that does not fit in the host's room must keep one digest too, however
+//! much memory the host had free on each try.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -13,7 +17,9 @@ use std::path::{Path, PathBuf};
 
 use temper_authz::SendAnalysis;
 use temper_spec::automaton::parse_automaton;
-use temper_verify::composite::{Bytes, joint_proofs};
+use temper_verify::composite::{
+    Bound, Bytes, JointOutcome, JointProof, LivenessOutcome, Progress, Room, joint_proofs,
+};
 
 /// How many times each app is read.
 const READINGS: usize = 5;
@@ -95,9 +101,19 @@ fn apps() -> Vec<App> {
     apps
 }
 
-/// One reading of `app`: each joint proof's name and digest, built from the
-/// text again. A spec that does not parse is left out of every reading alike.
-fn digests(app: &App) -> BTreeMap<String, String> {
+/// One reading of `app` in `room`: each joint proof's name and digest, built
+/// from the text again. A spec that does not parse is left out of every
+/// reading alike.
+fn digests(app: &App, room: &dyn Room) -> BTreeMap<String, String> {
+    proofs(app, room, |proof| proof.digest())
+}
+
+/// `each` of every joint proof of `app` built in `room`, by the proof's name.
+fn proofs<T>(
+    app: &App,
+    room: &dyn Room,
+    each: impl Fn(&JointProof<'_>) -> T,
+) -> BTreeMap<String, T> {
     let automatons: Vec<_> = app
         .specs
         .iter()
@@ -106,10 +122,9 @@ fn digests(app: &App) -> BTreeMap<String, String> {
     let refs: Vec<_> = automatons.iter().collect();
     let policies =
         SendAnalysis::new(&app.cedar).unwrap_or_else(|e| panic!("{}: Cedar parses: {e}", app.name));
-    let room = Bytes::new(1 << 30);
     let mut found = BTreeMap::new();
-    for proof in joint_proofs(&refs, Some(&policies), &room) {
-        let earlier = found.insert(proof.name(), proof.digest());
+    for proof in joint_proofs(&refs, Some(&policies), room) {
+        let earlier = found.insert(proof.name(), each(&proof));
         assert!(
             earlier.is_none(),
             "{}: two proofs named {}",
@@ -126,10 +141,10 @@ fn every_joint_proof_has_one_digest_however_often_its_app_is_read() {
     assert!(apps.len() >= 10, "the fixtures were found: {}", apps.len());
     let mut proofs = 0;
     for app in &apps {
-        let first = digests(app);
+        let first = digests(app, &Bytes::new(1 << 30));
         proofs += first.len();
         for reading in 1..READINGS {
-            let again = digests(app);
+            let again = digests(app, &Bytes::new(1 << 30));
             assert_eq!(
                 again, first,
                 "{}: reading {reading} gave other digests than the first",
@@ -138,4 +153,68 @@ fn every_joint_proof_has_one_digest_however_often_its_app_is_read() {
         }
     }
     assert!(proofs >= 10, "the fixtures hold joint proofs: {proofs}");
+}
+
+/// A host with no room left for joint walks, which says how much it leaves
+/// as a host does: a figure that differs from one try to the next.
+struct Full {
+    mb: usize,
+}
+
+impl Room for Full {
+    fn take(&self, _bytes: usize) -> Result<(), String> {
+        Err(format!("this host leaves joint walks {} MB", self.mb))
+    }
+
+    fn give(&self, _bytes: usize) {}
+}
+
+/// Why each proof of `app` built in `room` could not be checked, if it could not.
+fn reasons(app: &App, room: &Full) -> BTreeMap<String, Option<String>> {
+    proofs(app, room, |proof| {
+        let progress = Progress::default();
+        let bound = Bound {
+            room,
+            progress: &progress,
+        };
+        match proof {
+            JointProof::Invariants(invariants) => {
+                invariants
+                    .check(bound)
+                    .into_iter()
+                    .find_map(|result| match result.outcome {
+                        JointOutcome::Incomplete { reason } => Some(reason),
+                        _ => None,
+                    })
+            }
+            JointProof::Liveness(liveness) => match liveness.check(bound).outcome {
+                LivenessOutcome::Incomplete { reason } => Some(reason),
+                _ => None,
+            },
+        }
+    })
+}
+
+#[test]
+fn a_proof_that_does_not_fit_has_one_digest_however_much_room_the_host_left() {
+    let (tight, tighter) = (Full { mb: 2 }, Full { mb: 1 });
+    let mut unbuilt = 0;
+    for app in &apps() {
+        assert_eq!(
+            digests(app, &tight),
+            digests(app, &tighter),
+            "{}: a try with less room gave other digests than the first",
+            app.name
+        );
+        // The verdict still says why, in the room's own words.
+        unbuilt += reasons(app, &tight)
+            .into_values()
+            .flatten()
+            .filter(|reason| reason.contains("leaves joint walks 2 MB"))
+            .count();
+    }
+    assert!(
+        unbuilt > 0,
+        "the fixtures hold proofs a full host cannot build: {unbuilt}"
+    );
 }
