@@ -20,6 +20,7 @@ pub(crate) mod options;
 #[cfg(test)]
 mod pushed_boot_tests;
 mod restore;
+mod secret_tally;
 #[cfg(test)]
 mod serve_first_tests;
 mod storage;

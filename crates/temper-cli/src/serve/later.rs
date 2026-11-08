@@ -15,6 +15,9 @@ use temper_platform::genesis_install::PlannedCacheRoot;
 use temper_platform::state::PlatformState;
 use temper_runtime::tenant::TenantId;
 use temper_server::registry_bootstrap::StoredTenant;
+use temper_server::state::SecretLoadReport;
+
+use super::secret_tally::SecretTally;
 
 /// The system tenant every server serves.
 const SYSTEM_TENANT: &str = "temper-system";
@@ -23,6 +26,8 @@ const SYSTEM_TENANT: &str = "temper-system";
 pub(super) struct Later {
     own: BTreeSet<String>,
     pub(super) tenants: BTreeMap<String, LaterTenant>,
+    /// What loading secrets found, over the boot and then the walk.
+    pub(super) secrets: SecretTally,
 }
 
 /// What one tenant left for after serving needs restored.
@@ -42,6 +47,8 @@ pub(super) struct LaterTenant {
     pub(super) installs: Vec<String>,
     /// The service-side installs into it whose files come back first.
     pub(super) cache_roots: Vec<PlannedCacheRoot>,
+    /// What loading its secrets found, once its restore has loaded them.
+    pub(super) secrets: Option<SecretLoadReport>,
 }
 
 impl Later {
@@ -50,6 +57,7 @@ impl Later {
         Self {
             own,
             tenants: BTreeMap::new(),
+            secrets: SecretTally::default(),
         }
     }
 
