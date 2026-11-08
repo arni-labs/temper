@@ -14,7 +14,9 @@ use super::model::{self, JointModel, Sending};
 use super::room::{Bound, Construction, MB, Room};
 use super::{JointInvariantResult, JointLivenessResult, JointOutcome, LivenessOutcome};
 
+mod no_model;
 mod widen;
+use no_model::NoModel;
 use widen::Wider;
 
 /// One walk of the joint checks: an entity's invariants that read related
@@ -43,11 +45,12 @@ impl JointProof<'_> {
     pub fn digest(&self) -> String {
         // Every type a proof holds keeps its entries in order (no hash maps)
         // and prints all a walk reads of it, so this text is the same each
-        // time. Three print less than they hold: a model's `Senders` leaves
+        // time. Four print less than they hold: a model's `Senders` leaves
         // out its cache and the policies no walk reads, its `Order` leaves
-        // out the refusals it works out from what it prints, and its
-        // `Expansion` is the walk's own accounting. A kernel that changes those types
-        // changes the text, and its proofs walk once again.
+        // out the refusals it works out from what it prints, its
+        // `Expansion` is the walk's own accounting, and a model that did not
+        // fit leaves out the host's free memory ([`NoModel`]). A kernel that
+        // changes those types changes the text, and its proofs walk once again.
         let text = format!("{self:?}");
         format!("{:x}", Sha256::digest(text.as_bytes()))
     }
@@ -82,9 +85,8 @@ pub struct InvariantProof<'room> {
     pub(super) entity: String,
     invariants: Vec<Invariant>,
     scope: BTreeSet<String>,
-    /// The model, or why there is none: a type the invariants read that the
-    /// app does not declare.
-    model: Result<Arc<JointModel>, String>,
+    /// The model, or why there is none.
+    model: Result<Arc<JointModel>, NoModel>,
     /// The model with the types reactions from outside the scope come from
     /// taken in too, built when there are any, to walk once more.
     wider: Option<Box<Wider<'room>>>,
@@ -108,8 +110,8 @@ impl InvariantProof<'_> {
         };
         let model = match &self.model {
             Ok(model) => model,
-            Err(reason) => {
-                let reason = reason.clone();
+            Err(no_model) => {
+                let reason = no_model.reason().to_string();
                 return self
                     .invariants
                     .iter()
@@ -157,7 +159,7 @@ fn invariant_model(
     policies: Option<&SendAnalysis>,
     memory: &Construction<'_>,
     records: usize,
-) -> Result<Arc<JointModel>, String> {
+) -> Result<Arc<JointModel>, NoModel> {
     let reserve = |bytes| memory.set(bytes);
     let exprs: Vec<&Expr> = invariants.iter().map(|inv| &inv.assert).collect();
     // Code outside the specs sends what a liveness property relies on,
@@ -188,6 +190,7 @@ fn invariant_model(
         .with_alike_as_one()
         .built(memory)
         .map(Arc::new)
+        .map_err(NoModel::DidNotFit)
 }
 
 /// How many records of each type an invariant's walk holds. Two is the fewest
@@ -261,10 +264,7 @@ pub fn invariant_proofs_holding<'room>(
                 records,
             )
         } else {
-            Err(format!(
-                "it reads {}, which this app does not declare",
-                missing.join(", ")
-            ))
+            Err(NoModel::undeclared(&missing))
         };
         let wider = match &model {
             Ok(model) => Wider::new(&app, &scope, model.outside_types(), policies, room, records)
@@ -296,9 +296,8 @@ pub struct LivenessProof<'room> {
     /// What its fairness check assumes, when it asks for one.
     fairness: Option<Box<Fairness>>,
     scope: BTreeSet<String>,
-    /// The model, or why there is none: a type the condition reads that the
-    /// app does not declare.
-    model: Result<Arc<JointModel>, String>,
+    /// The model, or why there is none.
+    model: Result<Arc<JointModel>, NoModel>,
     // Declared last so the model releases its allocations before its room.
     _memory: Construction<'room>,
 }
@@ -328,12 +327,13 @@ impl LivenessProof<'_> {
         };
         let model = match &self.model {
             Ok(model) => model,
-            Err(reason) => {
+            Err(no_model) => {
+                let reason = no_model.reason();
                 result.outcome = LivenessOutcome::Incomplete {
-                    reason: reason.clone(),
+                    reason: reason.to_string(),
                 };
                 result.fair = verdict(FairOutcome::Incomplete {
-                    reason: reason.clone(),
+                    reason: reason.to_string(),
                 });
                 return result;
             }
@@ -441,11 +441,9 @@ pub fn liveness_proofs<'room>(
                     .without_silent(&by_name)
                     .built(&memory)
                     .map(Arc::new)
+                    .map_err(NoModel::DidNotFit)
             } else {
-                Err(format!(
-                    "it reads {}, which this app does not declare",
-                    missing.join(", ")
-                ))
+                Err(NoModel::undeclared(&missing))
             };
             proofs.push(LivenessProof {
                 _memory: memory,
