@@ -76,6 +76,7 @@ pub(super) fn spawn_walk(state: PlatformState, mut later: Later) {
         for tenant in &unavailable {
             later.secrets.expect(tenant);
         }
+        later.secrets.load_rest(&state).await;
         later
             .secrets
             .print(&state, "every tenant, after the restore walk");

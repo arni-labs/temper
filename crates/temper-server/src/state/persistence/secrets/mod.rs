@@ -1,6 +1,6 @@
 //! Encrypted tenant secrets in the tenant's metadata store.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use temper_runtime::persistence::{SecretPrecondition, SecretWrite};
 
@@ -111,6 +111,27 @@ impl ServerState {
             .into_iter()
             .filter_map(|(key_name, version_id)| version_id.map(|id| (key_name, id)))
             .collect())
+    }
+
+    /// Every tenant holding a stored secret row, in any store. A tenant can
+    /// hold secrets without any specs, so the registry does not name them all.
+    pub async fn secret_tenants(&self) -> Result<BTreeSet<String>, String> {
+        let mut tenants = BTreeSet::new();
+        if let Some(store) = self.postgres_metadata_store() {
+            let listed = store.list_secret_tenants().await;
+            tenants.extend(listed.map_err(|e| format!("failed to list secret tenants: {e}"))?);
+            return Ok(tenants);
+        }
+        let Some(provider) = self.storage_stack.as_ref().and_then(|s| s.turso.clone()) else {
+            return Ok(tenants);
+        };
+        for store in provider.all_stores().await {
+            let listed = store.list_secret_tenants().await;
+            tenants.extend(
+                listed.map_err(|e| format!("failed to list secret tenants in turso: {e}"))?,
+            );
+        }
+        Ok(tenants)
     }
 }
 

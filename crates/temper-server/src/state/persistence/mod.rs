@@ -44,6 +44,20 @@ impl ServerState {
         )
     }
 
+    /// The Postgres store every tenant's metadata lives in, when the server
+    /// runs on Postgres.
+    pub(crate) fn postgres_metadata_store(&self) -> Option<PostgresEventStore> {
+        let stack = self.storage_stack.as_ref()?;
+        let pool = stack.postgres_pool.as_ref()?;
+        Some(
+            stack
+                .metadata
+                .as_ref()
+                .and_then(|provider| provider.postgres_store())
+                .unwrap_or_else(|| PostgresEventStore::new(pool.clone())),
+        )
+    }
+
     /// Return a tenant-scoped metadata backend.
     ///
     /// In TenantRouted mode, routes to the per-tenant database.
@@ -54,12 +68,7 @@ impl ServerState {
         tenant: &str,
     ) -> Option<TenantMetadataBackend> {
         let stack = self.storage_stack.as_ref()?;
-        if let Some(pool) = stack.postgres_pool.as_ref() {
-            let store = stack
-                .metadata
-                .as_ref()
-                .and_then(|provider| provider.postgres_store())
-                .unwrap_or_else(|| PostgresEventStore::new(pool.clone()));
+        if let Some(store) = self.postgres_metadata_store() {
             return Some(TenantMetadataBackend::Postgres(store));
         }
         if let Some(provider) = stack.turso.as_ref()
