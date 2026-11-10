@@ -256,11 +256,7 @@ mod prelude_tests {
     struct MyErr(u32);
 
     fn helper(ok: bool) -> Result<String> {
-        if ok {
-            Ok("x".into())
-        } else {
-            Err("no".into())
-        }
+        if ok { Ok("x".into()) } else { Err("no".into()) }
     }
 
     fn typed(ok: bool) -> Result<u32, MyErr> {
