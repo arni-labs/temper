@@ -47,6 +47,7 @@ async fn serve_temper_client() -> (
 /// - GET  /tdata/$hints               → agent hints JSON
 /// - GET  /tdata/$events              → SSE stream of entity state changes
 /// - GET  /tdata/{*path}              → entity set / entity / navigation / function
+/// - POST /tdata/$batch               → many creates / bound actions, answered per row
 /// - POST /tdata/{*path}              → create entity / bound action
 /// - any method on /webhooks/{tenant}/{*path} → inbound webhook receiver
 ///
@@ -72,6 +73,9 @@ pub fn build_routes(state: ServerState) -> Router {
         // route so axum routes it ahead of the generic `/{*path}`
         // catch-all, and so the body extractor can take a streaming
         // `Body` instead of a buffered `Bytes`.
+        // Many writes in one request (OData JSON `$batch`), each answered on
+        // its own. Registered ahead of the `/{*path}` catch-all.
+        .route("/$batch", axum::routing::post(odata::handle_odata_batch))
         .route(
             "/Blobs/Temper.IngestRaw",
             axum::routing::post(odata::handle_blob_ingest_raw),
