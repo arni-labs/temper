@@ -426,3 +426,27 @@ async fn a_create_is_checked_on_its_top_level_fields() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
 }
+
+#[tokio::test]
+async fn a_bound_action_whose_target_cannot_be_read_answers_retry_as_a_create_does() {
+    let mut state = seeded().await;
+    // The environments' runtime is not running, so no target can be read.
+    state.actor_backed_types.insert("Environment".into());
+    let (status, created) = send(
+        &state,
+        Method::POST,
+        "/tdata/Sessions",
+        json!({"Id": "s2", "EnvironmentId": "env-b"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{created}");
+    assert_eq!(created["error"]["details"]["type"], "relation_unverified");
+
+    let (status, acted) = bound_action(&state, "Move", json!({"EnvironmentId": "env-b"})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{acted}");
+    assert_eq!(acted["error"]["code"], "ConstraintViolation", "{acted}");
+    assert_eq!(acted["error"]["details"]["type"], "relation_unverified");
+    assert_eq!(acted["error"]["details"]["operation"], "action");
+    let (_, fields) = stored_session(&state, "s1").await;
+    assert_eq!(fields["EnvironmentId"], "env-a");
+}
