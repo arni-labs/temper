@@ -247,3 +247,35 @@ pub mod prelude {
     };
     pub use crate::{Value, json, serde_json, set_error_result, set_success_result, temper_module};
 }
+
+#[cfg(test)]
+mod prelude_tests {
+    use crate::prelude::*;
+
+    #[derive(Debug, PartialEq)]
+    struct MyErr(u32);
+
+    fn helper(ok: bool) -> Result<String> {
+        if ok {
+            Ok("x".into())
+        } else {
+            Err("no".into())
+        }
+    }
+
+    fn typed(ok: bool) -> Result<u32, MyErr> {
+        if ok { Ok(7) } else { Err(MyErr(3)) }
+    }
+
+    #[test]
+    fn prelude_result_defaults_error_to_string() {
+        assert_eq!(helper(true), Ok("x".to_string()));
+        assert_eq!(helper(false), Err("no".to_string()));
+    }
+
+    #[test]
+    fn prelude_result_accepts_explicit_error_type() {
+        assert_eq!(typed(true), Ok(7));
+        assert_eq!(typed(false), Err(MyErr(3)));
+    }
+}
