@@ -55,6 +55,23 @@ pub fn odata_refusal(
     response
 }
 
+/// The status a refused write answers with. A data rule the server could not
+/// finish checking (a related record could not be read) is 503, so the
+/// caller retries; every other refusal is 409, a conflict with the record.
+pub fn refusal_status(refusal: Option<&temper_jit::table::Refusal>) -> StatusCode {
+    use temper_jit::table::{ConstraintKind, Refusal};
+    let Some(Refusal::ConstraintViolation { details }) = refusal else {
+        return StatusCode::CONFLICT;
+    };
+    match details.kind {
+        ConstraintKind::RelationUnverified => StatusCode::SERVICE_UNAVAILABLE,
+        ConstraintKind::RelationIntegrity
+        | ConstraintKind::CrossInvariant
+        | ConstraintKind::FieldInvariant
+        | ConstraintKind::StoredValueUnreadable => StatusCode::CONFLICT,
+    }
+}
+
 /// Write `refusal`'s code and fields into a JSON object, beside its message.
 pub fn merge_refusal(target: &mut serde_json::Value, refusal: &temper_jit::table::Refusal) {
     let (Some(target), Ok(serde_json::Value::Object(fields))) =

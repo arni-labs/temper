@@ -14,7 +14,7 @@ use temper_authz::SecurityContext;
 use super::response::annotate_entity;
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::request_context::AgentContext;
-use crate::response::{ODataResponse, odata_error, odata_refusal};
+use crate::response::{ODataResponse, odata_error, odata_refusal, refusal_status};
 use crate::state::redecide::Redecide;
 use crate::state::write_record::WriteCaller;
 use crate::state::{BoundActionHookContext, DispatchCommand, DispatchError, ServerState};
@@ -252,7 +252,7 @@ pub(super) async fn dispatch_bound_action(
                     action_span
                         .set_status(Status::error(response.error.clone().unwrap_or_default()));
                     odata_refusal(
-                        StatusCode::CONFLICT,
+                        refusal_status(response.refusal.as_ref()),
                         "ActionFailed",
                         response.error.as_deref().unwrap_or("Action failed"),
                         response.refusal.as_ref(),

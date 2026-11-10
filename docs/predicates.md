@@ -9,7 +9,7 @@ Every condition in an IOA spec is one string in one grammar (ADR-0179):
 | `[[invariant]]` | `assert` | every reachable state (proven by the verification cascade), and the entity before and after every move ([checked on moves](#invariants-on-every-move)) |
 | `[[field_invariant]]` | `assert` | the entity's fields after a write (checked on writes) |
 
-A create, update, delete or action whose record would break a `[[field_invariant]]`, a cross invariant or relation integrity is refused with `ConstraintViolation` (HTTP 409). Its `details` name the rule's `type` (`field_invariant`, `cross_invariant` or `relation_integrity`), the `invariant`, the record's `entity_type` and `entity_id`, and the `operation` (`create`, `patch`, `put`, `delete` or `action`), the same for every write.
+A create, update, delete or action whose record would break a `[[field_invariant]]`, a cross invariant or relation integrity is refused with `ConstraintViolation` (HTTP 409). Its `details` name the rule's `type` (`field_invariant`, `cross_invariant` or `relation_integrity`), the `invariant`, the record's `entity_type` and `entity_id`, and the `operation` (`create`, `patch`, `put`, `delete` or `action`), the same for every write. A related record that could not be read is `relation_unverified` and answers HTTP 503 instead: the rule was not checked, so the caller retries.
 
 An action's `effect` is a list of statements over the same literals and names ([Effects](#effects)), and trigger and state-timeout `args` are values in it ([Arguments](#arguments)).
 
