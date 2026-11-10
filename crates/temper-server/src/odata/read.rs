@@ -18,7 +18,7 @@ use tracing::instrument;
 use super::authz::{READ_ACTION, authorize_read, require_authenticated_context};
 use super::blob_media::handle_blob_primitive_stream;
 use super::common::{
-    check_has_stream_or_400, extract_key, extract_tenant, has_expand_options, resolve_entity_type,
+    check_has_stream_or_400, extract_key, has_expand_options, resolve_entity_type,
     resolve_value_parent, tenant_csdl_xml, tenant_entity_sets,
 };
 use super::filter_sql;
@@ -1302,15 +1302,15 @@ pub async fn handle_odata_get(
 #[instrument(skip_all, fields(otel.name = "GET /odata"))]
 pub async fn handle_service_document(
     State(state): State<ServerState>,
-    headers: HeaderMap,
+    authenticated: Option<Extension<AuthenticatedRequestContext>>,
 ) -> impl IntoResponse {
-    let tenant = match extract_tenant(&headers, &state) {
-        Ok(t) => t,
-        Err(e) => return e.into_response(),
+    let authenticated = match require_authenticated_context(authenticated) {
+        Ok(context) => context,
+        Err(error) => return error.into_response(),
     };
     ODataResponse {
         status: StatusCode::OK,
-        body: service_document_body(&state, &tenant),
+        body: service_document_body(&state, authenticated.tenant()),
     }
     .into_response()
 }
@@ -1318,14 +1318,14 @@ pub async fn handle_service_document(
 #[instrument(skip_all, fields(otel.name = "GET /odata/$metadata"))]
 pub async fn handle_metadata(
     State(state): State<ServerState>,
-    headers: HeaderMap,
+    authenticated: Option<Extension<AuthenticatedRequestContext>>,
 ) -> impl IntoResponse {
-    let tenant = match extract_tenant(&headers, &state) {
-        Ok(t) => t,
-        Err(e) => return e.into_response(),
+    let authenticated = match require_authenticated_context(authenticated) {
+        Ok(context) => context,
+        Err(error) => return error.into_response(),
     };
     ODataXmlResponse {
-        body: tenant_csdl_xml(&state, &tenant),
+        body: tenant_csdl_xml(&state, authenticated.tenant()),
     }
     .into_response()
 }

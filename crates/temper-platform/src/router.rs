@@ -172,16 +172,10 @@ permit(
 
     #[tokio::test]
     async fn test_tdata_routes_accessible() {
-        let app = build_platform_router(test_state());
-        let response = app
-            .oneshot(
-                Request::get("/tdata")
-                    .header("X-Tenant-Id", "default")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let state = test_state();
+        let request = authenticated_request(&state, Method::GET, "/tdata", Body::empty());
+        let app = build_platform_router(state);
+        let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
     }

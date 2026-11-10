@@ -7,11 +7,10 @@
 Callers read entity sets with the standard OData query options - filtering, projecting, expanding relations, paging.
 
 ## Driving it
-Entity-set reads are governed - they need the bearer AND the tenant header.
-The public OData paths in `authz/edge.rs::is_public_kernel_request` are GET
-`/tdata`, `/tdata/`, and `/tdata/$metadata`; that fn also admits GET
-`/temper-client.js`, `/static/temper-client.js`, `/genesis`, `/genesis/`,
-`/genesis/*`, and any method on `/webhooks/`. Set `KEY=$TEMPER_API_KEY`:
+Every `/tdata` read is governed - it needs the bearer AND the tenant header,
+the service document and `$metadata` included. `authz/edge.rs::is_public_kernel_request`
+admits only GET `/temper-client.js`, `/static/temper-client.js`, `/genesis`,
+`/genesis/`, `/genesis/*`, and any method on `/webhooks/`. Set `KEY=$TEMPER_API_KEY`:
 ```bash
 A=(-H "Authorization: Bearer $KEY" -H "X-Tenant-Id: default")
 curl "http://localhost:3600/tdata/<Set>?\$filter=status eq 'Draft'" "${A[@]}"
@@ -28,5 +27,5 @@ A `$filter` returns exactly the matching set; `$expand` returns nested related e
 - `$expand` depth is capped at 3 hops (`MAX_EXPAND_DEPTH = 3`, `query_eval.rs`) and is **silently truncated** past that (no error) - plus cycle detection. Do not rely on deeper expansion.
 - `$filter` nesting is capped at `FILTER_DEPTH_BUDGET = 32` (`filter.rs`) - deeper parses error naming the budget (a DoS guard).
 - Paging: default page size 100 (`TEMPER_ODATA_DEFAULT_PAGE_SIZE`), hard max 1000 entities/response (`TEMPER_ODATA_MAX_ENTITIES`); a `$top` above the max is clamped and the rest served via `nextLink`.
-- Auth split (measured): `GET /tdata`, `/tdata/` (service document) and `/tdata/$metadata` are PUBLIC (200 without a key); every concrete entity-set read requires the bearer (401 without it, 403 if Cedar denies the principal). Do not copy temperpaw's "service document 401s" gotcha - temper's is public.
+- Auth: `GET /tdata`, `/tdata/` (service document) and `/tdata/$metadata` take a credential for the tenant named by `X-Tenant-Id`, like a record read (401 without one, or with another tenant's). An entity-set read also answers 403 if Cedar denies the principal; the service document and `$metadata` have no per-type Cedar check.
 - Entity-set names are the CSDL `EntitySet.Name` - read them from `$metadata`, do not hand-pluralize. They ARE the entity types pluralized, but irregularly (measured: `Plan`->`Plans`, `Policy`->`Policies` not `Policys`), so computing the name yourself will miss.
