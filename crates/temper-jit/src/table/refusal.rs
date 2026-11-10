@@ -51,6 +51,14 @@ pub enum Refusal {
         /// operator and a wanted value, with the value the move would leave.
         conditions: Vec<GuardCondition>,
     },
+    /// The record the move would store breaks one of the app's data rules:
+    /// a field invariant, a cross invariant or relation integrity. A create
+    /// or update that breaks one answers with the same code and details.
+    ConstraintViolation {
+        /// The rule broken and the record it was checked on. Boxed so the
+        /// other refusals stay small.
+        details: Box<ConstraintDetails>,
+    },
     /// The record changed after the move was decided on it, so nothing was
     /// written. The move is decided again on the record as it is now.
     RecordChanged,
@@ -71,10 +79,46 @@ impl Refusal {
             Refusal::ParameterConstraint { .. } => "ParameterConstraint",
             Refusal::MissingParameter { .. } => "MissingParameter",
             Refusal::InvariantViolated { .. } => "InvariantViolated",
+            Refusal::ConstraintViolation { .. } => "ConstraintViolation",
             Refusal::RecordChanged => "RecordChanged",
             Refusal::IdempotencyKeyReused { .. } => "IdempotencyKeyReused",
         }
     }
+}
+
+/// A broken data rule, and the record and write it was checked on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConstraintDetails {
+    /// Which kind of rule was broken.
+    #[serde(rename = "type")]
+    pub kind: ConstraintKind,
+    /// The invariant's name, as the spec writes it; `None` for relation
+    /// integrity and for a check that could not be finished.
+    pub invariant: Option<String>,
+    /// The record's entity type.
+    pub entity_type: String,
+    /// The record's id.
+    pub entity_id: String,
+    /// The write: `create`, `patch`, `put`, `delete` or `action`.
+    pub operation: String,
+}
+
+/// The kinds of data rule a stored record is checked against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstraintKind {
+    /// A relation field names a record that does not exist, or a delete
+    /// would leave a reference to it.
+    RelationIntegrity,
+    /// A related or referencing record could not be checked.
+    RelationUnverified,
+    /// A `cross_invariant` over this record and a related one.
+    CrossInvariant,
+    /// A `[[field_invariant]]` over the record's own fields.
+    FieldInvariant,
+    /// A value the checks read could not be read back from where an earlier
+    /// write stored it, so the record cannot be checked and is not written.
+    StoredValueUnreadable,
 }
 
 /// One comparison of a failed guard: `field op wants`, and the value the kernel read.

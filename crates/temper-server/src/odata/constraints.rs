@@ -14,6 +14,7 @@ use std::time::Instant; // determinism-ok: scoped duration measurement only
 use futures_util::FutureExt;
 use tracing::instrument;
 
+use temper_jit::table::{ConstraintDetails, ConstraintKind, Refusal};
 use temper_runtime::tenant::TenantId;
 use temper_spec::FieldInvariant;
 use temper_spec::cross_invariant::{
@@ -48,44 +49,43 @@ impl PendingRecords {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConstraintViolationType {
-    RelationIntegrity,
-    /// A related or referencing record could not be checked.
-    RelationUnverified,
-    CrossInvariant,
-    FieldInvariant,
-    /// A value the checks read could not be read back from where an earlier
-    /// write stored it, so the record cannot be checked and is not written.
-    StoredValueUnreadable,
-}
-
+/// A write refused because the record it would store breaks a data rule:
+/// the message callers read, and the typed details a refusal carries.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConstraintViolation {
-    pub violation_type: ConstraintViolationType,
-    pub invariant: Option<String>,
     pub message: String,
-    pub entity_type: String,
-    pub entity_id: String,
-    pub operation: String,
+    pub details: ConstraintDetails,
 }
 
 impl ConstraintViolation {
-    fn relation(
+    fn new(
+        kind: ConstraintKind,
+        invariant: Option<&str>,
         message: impl Into<String>,
         entity_type: &str,
         entity_id: &str,
         operation: &str,
     ) -> Self {
         Self {
-            violation_type: ConstraintViolationType::RelationIntegrity,
-            invariant: None,
             message: message.into(),
-            entity_type: entity_type.to_string(),
-            entity_id: entity_id.to_string(),
-            operation: operation.to_string(),
+            details: ConstraintDetails {
+                kind,
+                invariant: invariant.map(str::to_string),
+                entity_type: entity_type.to_string(),
+                entity_id: entity_id.to_string(),
+                operation: operation.to_string(),
+            },
         }
+    }
+
+    fn relation(
+        message: impl Into<String>,
+        entity_type: &str,
+        entity_id: &str,
+        operation: &str,
+    ) -> Self {
+        let kind = ConstraintKind::RelationIntegrity;
+        Self::new(kind, None, message, entity_type, entity_id, operation)
     }
 
     fn relation_unverified(
@@ -94,14 +94,8 @@ impl ConstraintViolation {
         entity_id: &str,
         operation: &str,
     ) -> Self {
-        Self {
-            violation_type: ConstraintViolationType::RelationUnverified,
-            invariant: None,
-            message: message.into(),
-            entity_type: entity_type.to_string(),
-            entity_id: entity_id.to_string(),
-            operation: operation.to_string(),
-        }
+        let kind = ConstraintKind::RelationUnverified;
+        Self::new(kind, None, message, entity_type, entity_id, operation)
     }
 
     fn invariant(
@@ -111,14 +105,15 @@ impl ConstraintViolation {
         entity_id: &str,
         operation: &str,
     ) -> Self {
-        Self {
-            violation_type: ConstraintViolationType::CrossInvariant,
-            invariant: Some(invariant.to_string()),
-            message: message.into(),
-            entity_type: entity_type.to_string(),
-            entity_id: entity_id.to_string(),
-            operation: operation.to_string(),
-        }
+        let kind = ConstraintKind::CrossInvariant;
+        Self::new(
+            kind,
+            Some(invariant),
+            message,
+            entity_type,
+            entity_id,
+            operation,
+        )
     }
 
     fn field_invariant(
@@ -128,14 +123,15 @@ impl ConstraintViolation {
         entity_id: &str,
         operation: &str,
     ) -> Self {
-        Self {
-            violation_type: ConstraintViolationType::FieldInvariant,
-            invariant: Some(invariant.to_string()),
-            message: message.into(),
-            entity_type: entity_type.to_string(),
-            entity_id: entity_id.to_string(),
-            operation: operation.to_string(),
-        }
+        let kind = ConstraintKind::FieldInvariant;
+        Self::new(
+            kind,
+            Some(invariant),
+            message,
+            entity_type,
+            entity_id,
+            operation,
+        )
     }
 
     /// The record's checks read a stored value that could not be read.
@@ -144,15 +140,22 @@ impl ConstraintViolation {
         entity_id: &str,
         operation: &str,
     ) -> Self {
-        Self {
-            violation_type: ConstraintViolationType::StoredValueUnreadable,
-            invariant: None,
-            message: format!(
+        Self::new(
+            ConstraintKind::StoredValueUnreadable,
+            None,
+            format!(
                 "a stored value of {entity_type}('{entity_id}') that this write is checked against could not be read; retry the write"
             ),
-            entity_type: entity_type.to_string(),
-            entity_id: entity_id.to_string(),
-            operation: operation.to_string(),
+            entity_type,
+            entity_id,
+            operation,
+        )
+    }
+
+    /// The typed refusal a create and an action both answer with.
+    pub(crate) fn refusal(&self) -> Refusal {
+        Refusal::ConstraintViolation {
+            details: Box::new(self.details.clone()),
         }
     }
 }

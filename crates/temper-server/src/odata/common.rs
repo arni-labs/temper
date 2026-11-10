@@ -2,11 +2,12 @@
 
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
+use temper_jit::table::ConstraintKind;
 use temper_odata::path::{KeyValue, ODataPath};
 use temper_runtime::tenant::TenantId;
 
 use super::constraints::ConstraintViolation;
-use crate::response::{ODataResponse, odata_error};
+use crate::response::{ODataResponse, odata_error, odata_refusal};
 use crate::state::write_record::RecordWrite;
 use crate::state::{DispatchError, ServerState, VerificationGateError};
 
@@ -147,37 +148,15 @@ pub(super) fn verification_gate_response(err: VerificationGateError) -> axum::re
 pub(super) fn constraint_violation_response(err: ConstraintViolation) -> axum::response::Response {
     // An unverified relation is a check the server could not finish, not a
     // conflict with the entity's data, so the caller is told to retry.
-    let (violation_type, status) = match err.violation_type {
-        super::constraints::ConstraintViolationType::RelationIntegrity => {
-            ("relation_integrity", StatusCode::CONFLICT)
-        }
-        super::constraints::ConstraintViolationType::RelationUnverified => {
-            ("relation_unverified", StatusCode::SERVICE_UNAVAILABLE)
-        }
-        super::constraints::ConstraintViolationType::CrossInvariant => {
-            ("cross_invariant", StatusCode::CONFLICT)
-        }
-        super::constraints::ConstraintViolationType::StoredValueUnreadable => {
-            ("stored_value_unreadable", StatusCode::CONFLICT)
-        }
-        super::constraints::ConstraintViolationType::FieldInvariant => {
-            ("field_invariant", StatusCode::CONFLICT)
-        }
+    let status = match err.details.kind {
+        ConstraintKind::RelationUnverified => StatusCode::SERVICE_UNAVAILABLE,
+        ConstraintKind::RelationIntegrity
+        | ConstraintKind::CrossInvariant
+        | ConstraintKind::FieldInvariant
+        | ConstraintKind::StoredValueUnreadable => StatusCode::CONFLICT,
     };
-    let body = serde_json::json!({
-        "error": {
-            "code": "ConstraintViolation",
-            "message": err.message,
-            "details": {
-                "type": violation_type,
-                "invariant": err.invariant,
-                "entity_type": err.entity_type,
-                "entity_id": err.entity_id,
-                "operation": err.operation,
-            }
-        }
-    });
-    (status, axum::Json(body)).into_response()
+    let refusal = err.refusal();
+    odata_refusal(status, refusal.code(), &err.message, Some(&refusal)).into_response()
 }
 
 /// Check the record a write will store, answering a violation with 409
