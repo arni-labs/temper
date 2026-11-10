@@ -323,19 +323,10 @@ impl PendingAction<'_> {
         let response = self.post(target_id).await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body: Value = response.json().await.unwrap();
-        assert_eq!(
-            body["error"]["code"],
-            if self.initial.is_some() {
-                "ConstraintViolation"
-            } else {
-                "ActionFailed"
-            }
-        );
+        assert_eq!(body["error"]["code"], "ConstraintViolation", "{body}");
         if let Some(value) = bad_value {
-            if self.initial.is_some() {
-                assert_eq!(body["error"]["details"]["type"], "cross_invariant");
-                assert_eq!(body["error"]["details"]["invariant"], "EligibleTarget");
-            }
+            assert_eq!(body["error"]["details"]["type"], "cross_invariant");
+            assert_eq!(body["error"]["details"]["invariant"], "EligibleTarget");
             assert!(
                 body["error"]["message"].as_str().unwrap().contains(value),
                 "{body}"

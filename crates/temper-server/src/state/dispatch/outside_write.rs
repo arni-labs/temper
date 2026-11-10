@@ -72,7 +72,10 @@ impl ServerState {
         if let Err(error) = self.check_action_record(caller, tenant, preview).await {
             let mut current = current;
             let message = match error {
-                ActionRecordError::Constraint(violation) => violation.message,
+                ActionRecordError::Constraint(violation) => {
+                    current.refusal = Some(violation.refusal());
+                    violation.message
+                }
                 ActionRecordError::Preview(result) => {
                     current.refusal = result.refusal;
                     result.error.expect("a refused preview carries its reason")

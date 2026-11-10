@@ -22,6 +22,7 @@ const CSDL_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
       <EntityType Name="Lock">
         <Key><PropertyRef Name="Id"/></Key>
         <Property Name="Id" Type="Edm.String" Nullable="false"/>
+        <Property Name="count" Type="Edm.Int64"/>
       </EntityType>
       <EntityContainer Name="Container">
         <EntitySet Name="Locks" EntityType="Temper.Refusal.Lock"/>
@@ -94,6 +95,12 @@ name = "Release"
 kind = "input"
 from = ["Held"]
 to = "Free"
+
+[[action]]
+name = "Count"
+kind = "input"
+from = ["Free"]
+params = ["count"]
 
 [[action]]
 name = "Claim"
@@ -319,4 +326,51 @@ async fn a_checked_preview_preserves_the_interpreters_typed_refusal() {
         .set_verification_status(&TenantId::default(), "Lock", verified);
     let (status, previewed) = act(&state, "Pickup", json!({})).await;
     assert_refusal(status, &previewed, original["error"].clone());
+}
+
+#[tokio::test]
+async fn an_action_that_breaks_a_field_invariant_names_it_as_a_create_does() {
+    let state = busy_lock().await;
+    let verified = state
+        .registry
+        .read()
+        .unwrap()
+        .get_verification_status(&TenantId::default(), "Lock")
+        .cloned()
+        .unwrap();
+    let ioa = format!(
+        "{LOCK_IOA}\n[[field_invariant]]\nname = 'NonnegativeCount'\nmessage = 'a count is never below zero'\nassert = 'count != null => count >= 0'\n"
+    );
+    state.registry.write().unwrap().register_tenant(
+        "default",
+        parse_csdl(CSDL_XML).unwrap(),
+        CSDL_XML.into(),
+        &[("Lock", &ioa)],
+    );
+    state
+        .registry
+        .write()
+        .unwrap()
+        .set_verification_status(&TenantId::default(), "Lock", verified);
+
+    let (status, created) = post(&state, "/tdata/Locks", json!({"Id": "l2", "count": -1})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{created}");
+    let expected = json!({
+        "code": "ConstraintViolation",
+        "details": {
+            "type": "field_invariant",
+            "invariant": "NonnegativeCount",
+            "entity_type": "Lock",
+            "entity_id": "l1",
+            "operation": "action",
+        },
+    });
+    let (status, acted) = act(&state, "Count", json!({"count": -1})).await;
+    assert_refusal(status, &acted, expected);
+    // One shape: the action's refusal reads as the create's, but for the
+    // record and the operation it names.
+    let mut create_error = created["error"].clone();
+    create_error["details"]["entity_id"] = json!("l1");
+    create_error["details"]["operation"] = json!("action");
+    assert_eq!(acted["error"], create_error, "create: {created}");
 }
