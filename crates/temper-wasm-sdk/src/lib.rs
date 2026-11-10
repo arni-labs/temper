@@ -246,6 +246,9 @@ pub mod prelude {
         Context, HttpRequest, HttpResponse, SubWrite, SubWriteBuilder, TriggerPrincipal, WasmSpan,
     };
     pub use crate::{Value, json, serde_json, set_error_result, set_success_result, temper_module};
+
+    /// `Result` with `String` as the default error, the error type module entry points report.
+    pub type Result<T, E = String> = core::result::Result<T, E>;
 }
 
 #[cfg(test)]
