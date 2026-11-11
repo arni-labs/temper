@@ -125,6 +125,48 @@ async fn a_boot_that_retires_earlier_operator_keys_revokes_the_previous_key() {
     assert_eq!(old.state.status, "Revoked");
 }
 
+/// A boot set to retire earlier keys whose own key an earlier boot revoked
+/// (a volume gave back an older key file) leaves the key that still works
+/// alone: retiring it would leave the tenant no operator key (production,
+/// 9 Nov 2026: a8k4askve1ye).
+#[tokio::test]
+async fn a_boot_on_a_revoked_operator_key_keeps_the_key_that_still_works() {
+    const OLD_KEY: &str = "tmpr_operator-key-a-volume-gave-back";
+    const NEW_KEY: &str = "tmpr_operator-key-that-retired-it";
+    let tenant = TenantId::new("default");
+    let mut state = PlatformState::new(None);
+    state.api_token = Some(OLD_KEY.to_string());
+    bootstrap_tenants(&state, &[], EarlierOperatorKeys::Keep, &own_only()).await;
+    state.api_token = Some(NEW_KEY.to_string());
+    bootstrap_tenants(&state, &[], EarlierOperatorKeys::Retire, &own_only()).await;
+
+    // The volume gives back the old key, whose credential is Revoked.
+    state.api_token = Some(OLD_KEY.to_string());
+    bootstrap_tenants(&state, &[], EarlierOperatorKeys::Retire, &own_only()).await;
+
+    let resolver = IdentityResolver::new();
+    assert!(
+        resolver
+            .resolve(&state.server, &tenant, OLD_KEY)
+            .await
+            .is_err(),
+        "a revoked key is never made the operator again"
+    );
+    assert!(
+        resolver
+            .resolve(&state.server, &tenant, NEW_KEY)
+            .await
+            .is_ok(),
+        "the key that still worked keeps working"
+    );
+    let new = state
+        .server
+        .get_tenant_entity_state(&tenant, "AgentCredential", &hash_token(NEW_KEY))
+        .await
+        .expect("the working key's credential");
+    assert_eq!(new.state.status, "Active");
+}
+
 #[tokio::test]
 async fn bootstrap_installed_apps_replays_persisted_app_when_registry_specs_are_stale() {
     let tenant = "bootstrap-drift";

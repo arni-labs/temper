@@ -659,20 +659,32 @@ pub(super) async fn bootstrap_tenants(
 
     // Register the bootstrap key as a normal operator credential in the default
     // tenant. It grants no implicit authority in other tenants (ADR-0157).
+    let mut issued = true;
     if let Some(ref api_key) = state.api_token
         && agent_spec_tenants.contains("default")
         && let Err(e) =
             temper_platform::bootstrap_operator_credential(state, api_key, "default").await
     {
+        issued = false;
         eprintln!("  Warning: failed to bootstrap operator credential for tenant 'default': {e}");
     }
     // A deployment that is the only holder of its key (an app's Temper,
     // keyed by its control plane) retires the credentials earlier boots issued
-    // for other keys, so a key it no longer holds stops working.
+    // for other keys, so a key it no longer holds stops working. Only once
+    // its own key is the operator: a boot whose key was refused (revoked by a
+    // later boot, its file given back by the volume) would otherwise revoke
+    // the one key that still worked, and leave the tenant none (production,
+    // 9 Nov 2026: a8k4askve1ye answered every operator call 401 for two days).
     if earlier_operator_keys == EarlierOperatorKeys::Retire
         && let Some(ref api_key) = state.api_token
     {
-        temper_platform::retire_other_operator_credentials(state, api_key, "default").await;
+        if issued {
+            temper_platform::retire_other_operator_credentials(state, api_key, "default").await;
+        } else {
+            tracing::error!(
+                "Earlier operator keys kept: this boot's operator key was refused, so retiring them would leave tenant 'default' none that works"
+            );
+        }
     }
 }
 
