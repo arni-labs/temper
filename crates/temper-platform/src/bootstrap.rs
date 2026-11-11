@@ -703,7 +703,11 @@ pub async fn bootstrap_operator_credential(
         return Ok(());
     }
 
-    state
+    // An Issue the credential refuses (one an earlier boot revoked, given back
+    // by a volume that kept an older key file) answers without an error, so
+    // its answer is read: this key is not the operator, and the caller must
+    // not go on as if it were (production, 9 Nov 2026: a8k4askve1ye).
+    let issued = state
         .server
         .dispatch_tenant_action(
             &tenant_id,
@@ -725,6 +729,13 @@ pub async fn bootstrap_operator_credential(
         .map_err(|e| {
             format!("failed to issue operator AgentCredential for tenant '{tenant}': {e}")
         })?;
+    if !issued.success {
+        return Err(format!(
+            "failed to issue operator AgentCredential for tenant '{tenant}' (key_hash={}...): {}",
+            &key_hash[..8],
+            issued.error.as_deref().unwrap_or("refused")
+        ));
+    }
 
     crate::operator_manage_policies::seed_operator_permits(state, tenant).await;
 
