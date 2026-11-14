@@ -140,14 +140,12 @@ impl SyncCopy {
         match pushed {
             Ok(Ok(())) => {
                 self.inner.unsure.store(false, Ordering::Release);
-                self.inner.timeouts.store(0, Ordering::Release);
                 if sends > 0 {
                     PushOutcome::Confirmed.record();
                     record_changes_pushed(sends.unsigned_abs());
                 }
             }
             Ok(Err(error)) => {
-                self.inner.timeouts.store(0, Ordering::Release);
                 let message = error.to_string();
                 PushOutcome::of_engine_error(&message).record();
                 if message.contains(REMOTE_STATEMENT_FAILED) {
@@ -157,7 +155,6 @@ impl SyncCopy {
             }
             Err(_) => {
                 PushOutcome::Failed.record();
-                self.inner.timeouts.fetch_add(1, Ordering::AcqRel);
                 return Err(PersistenceError::Storage(format!(
                     "turso.sync push timed out after {} s",
                     PUSH_ATTEMPT_TIMEOUT.as_secs()
@@ -190,9 +187,7 @@ impl SyncCopy {
         if !self.inner.unsure.load(Ordering::Acquire) {
             return Ok(hint);
         }
-        // A remote that does not answer this counts like a push that timed
-        // out, so a hung remote still ends in the restart. A push that stops
-        // here counts failed in `temper_turso_sync_pushes`: this read's errors
+        // A push that stops here counts failed in `temper_turso_sync_pushes`: this read's errors
         // carry no code to tell a refusal apart, and a refusal of a read is
         // rare, since a blocked org refuses writes, not reads.
         match tokio::time::timeout(REMOTE_READ_TIMEOUT, self.inner.remote.last_change()).await {
@@ -203,7 +198,6 @@ impl SyncCopy {
             }
             Err(_) => {
                 PushOutcome::Failed.record();
-                self.inner.timeouts.fetch_add(1, Ordering::AcqRel);
                 Err(PersistenceError::Storage(format!(
                     "turso.sync the remote did not say how far it got within {} s",
                     REMOTE_READ_TIMEOUT.as_secs()
