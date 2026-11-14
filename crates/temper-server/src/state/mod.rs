@@ -548,6 +548,9 @@ pub struct ServerState {
     /// When each live timer is due by the wall clock: what its wait runs to,
     /// and what the wake reports name (`wake`).
     pub(crate) due_times: Arc<crate::wake::DueTimes>,
+    /// Feature flags read from the deployment's flag address (`flags`):
+    /// every one off until a read says otherwise.
+    pub flags: Arc<crate::flags::Flags>,
     /// This process's background calls are live, even during boot retries.
     pub(crate) call_process_id: uuid::Uuid,
     /// The writes committed moves owe that the store has not taken yet, by
@@ -867,6 +870,7 @@ impl ServerState {
             state_timer_rows: None,
             scheduled_armed: Arc::default(),
             due_times: Arc::default(),
+            flags: Arc::default(),
             call_process_id: temper_runtime::scheduler::sim_uuid(),
             owed_writes: Arc::default(),
             timer_recovery_complete: Arc::default(),
@@ -1154,6 +1158,7 @@ impl ServerState {
             state_timer_rows: None,
             scheduled_armed: Arc::default(),
             due_times: Arc::default(),
+            flags: Arc::default(),
             call_process_id: temper_runtime::scheduler::sim_uuid(),
             owed_writes: Arc::default(),
             timer_recovery_complete: Arc::default(),
