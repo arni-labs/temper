@@ -10,8 +10,8 @@ WORKSPACE_ROOT="$(git rev-parse --show-toplevel)"
 # --- Item 7: Integrity Check (Placeholder Detection) ---
 echo "Pre-commit: checking for placeholders in staged files..." >&2
 
-# vendor/ holds published crates copied as they are (see each TEMPER.md).
-STAGED_RS="$(git diff --cached --name-only --diff-filter=ACM -- '*.rs' | grep -v '^vendor/' | grep -v '/tests/' | grep -v '_test\.rs' | grep -v 'test_' || true)"
+
+STAGED_RS="$(git diff --cached --name-only --diff-filter=ACM -- '*.rs' | grep -v '/tests/' | grep -v '_test\.rs' | grep -v 'test_' || true)"
 
 if [ -n "$STAGED_RS" ]; then
     INTEGRITY_FAIL=false

@@ -26,9 +26,13 @@ step, not per request, so a long restore that keeps sending body chunks is not
 cut. It would cut a long-poll pull longer than 8 s; Temper never pulls (a
 restore sets the file aside and bootstraps).
 
-The rest of the crate is unchanged. `examples/`, `tests/`, the dev-dependencies
-and their manifest entries were left out. The upstream crate is MIT licensed
-(https://github.com/tursodatabase/turso).
+Left out, because they need a Turso admin server or a local sync server and
+CI runs `cargo test` in every workspace (`scripts/ci/workspaces.py`):
+`examples/`, `tests/`, the `#[cfg(test)]` modules at the end of `lib.rs`,
+`sync.rs`, `params.rs` and `transaction.rs`, the dev-dependencies and their
+manifest entries. Two upstream `TODO` comments are reworded, because the
+pre-commit check covers vendored code too. Nothing else is changed. The
+upstream crate is MIT licensed (https://github.com/tursodatabase/turso).
 
-To move to a new turso, copy the published crate here and apply the two
-changes again, or drop this patch once upstream bounds its requests.
+To move to a new turso, copy the published crate here and make the same
+changes again, or drop this copy once upstream bounds its requests.
