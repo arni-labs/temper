@@ -1,0 +1,580 @@
+//! # Turso bindings for Rust
+//!
+//! Turso is an in-process SQL database engine, compatible with SQLite.
+//!
+//! ## Getting Started
+//!
+//! To get started, you first need to create a [`Database`] object and then open a [`Connection`] to it, which you use to query:
+//!
+//! ```rust,no_run
+//! # async fn run() {
+//! use turso::Builder;
+//!
+//! let db = Builder::new_local(":memory:").build().await.unwrap();
+//! let conn = db.connect().unwrap();
+//! conn.execute("CREATE TABLE IF NOT EXISTS users (email TEXT)", ()).await.unwrap();
+//! conn.execute("INSERT INTO users (email) VALUES ('alice@example.org')", ()).await.unwrap();
+//! # }
+//! ```
+//!
+//! You can also prepare statements with the [`Connection`] object and then execute the [`Statement`] objects:
+//!
+//! ```rust,no_run
+//! # async fn run() {
+//! # use turso::Builder;
+//! # let db = Builder::new_local(":memory:").build().await.unwrap();
+//! # let conn = db.connect().unwrap();
+//! let mut stmt = conn.prepare("SELECT * FROM users WHERE email = ?1").await.unwrap();
+//! let mut rows = stmt.query(["foo@example.com"]).await.unwrap();
+//! let row = rows.next().await.unwrap().unwrap();
+//! let value = row.get_value(0).unwrap();
+//! println!("Row: {:?}", value);
+//! # }
+//! ```
+#![allow(warnings, clippy::all)]
+
+#[cfg(all(feature = "mimalloc", not(target_family = "wasm"), not(miri)))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+pub mod connection;
+pub mod params;
+mod rows;
+pub mod transaction;
+pub mod value;
+
+#[cfg(feature = "sync")]
+pub mod sync;
+
+pub use connection::Connection;
+use turso_sdk_kit::rsapi::TursoError;
+pub use value::Value;
+
+pub use params::params_from_iter;
+pub use params::IntoParams;
+
+use std::fmt::Debug;
+use std::future::Future;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::task::Poll;
+
+// Re-exports rows
+pub use crate::rows::{Row, Rows};
+
+// Re-export turso_core
+pub use turso_core as core;
+
+/// Assert that a type implements both Send and Sync at compile time.
+/// Usage: assert_send_sync!(MyType);
+/// Usage: assert_send_sync!(Type1, Type2, Type3);
+macro_rules! assert_send_sync {
+    ($($t:ty),+ $(,)?) => {
+        #[cfg(test)]
+        $(const _: () = {
+            const fn _assert_send<T: ?Sized + Send>() {}
+            const fn _assert_sync<T: ?Sized + Sync>() {}
+            _assert_send::<$t>();
+            _assert_sync::<$t>();
+        };)+
+    };
+}
+
+pub(crate) use assert_send_sync;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("SQL conversion failure: `{0}`")]
+    ToSqlConversionFailure(BoxError),
+    #[error("Query returned no rows")]
+    QueryReturnedNoRows,
+    #[error("Conversion failure: `{0}`")]
+    ConversionFailure(String),
+    #[error("{0}")]
+    Busy(String),
+    #[error("{0}")]
+    BusySnapshot(String),
+    #[error("{0}")]
+    Interrupt(String),
+    #[error("{0}")]
+    Error(String),
+    #[error("{0}")]
+    Misuse(String),
+    #[error("{0}")]
+    Constraint(String),
+    #[error("{0}")]
+    Readonly(String),
+    #[error("{0}")]
+    DatabaseFull(String),
+    #[error("{0}")]
+    NotAdb(String),
+    #[error("{0}")]
+    Corrupt(String),
+    #[error("I/O error ({1}): {0}")]
+    IoError(std::io::ErrorKind, &'static str),
+}
+
+impl From<turso_sdk_kit::rsapi::TursoError> for Error {
+    fn from(value: turso_sdk_kit::rsapi::TursoError) -> Self {
+        match value {
+            turso_sdk_kit::rsapi::TursoError::Busy(err) => Error::Busy(err),
+            turso_sdk_kit::rsapi::TursoError::BusySnapshot(err) => Error::BusySnapshot(err),
+            turso_sdk_kit::rsapi::TursoError::Interrupt(err) => Error::Interrupt(err),
+            turso_sdk_kit::rsapi::TursoError::Error(err) => Error::Error(err),
+            turso_sdk_kit::rsapi::TursoError::Misuse(err) => Error::Misuse(err),
+            turso_sdk_kit::rsapi::TursoError::Constraint(err) => Error::Constraint(err),
+            turso_sdk_kit::rsapi::TursoError::Readonly(err) => Error::Readonly(err),
+            turso_sdk_kit::rsapi::TursoError::DatabaseFull(err) => Error::DatabaseFull(err),
+            turso_sdk_kit::rsapi::TursoError::NotAdb(err) => Error::NotAdb(err),
+            turso_sdk_kit::rsapi::TursoError::Corrupt(err) => Error::Corrupt(err),
+            turso_sdk_kit::rsapi::TursoError::IoError(kind, op) => Error::IoError(kind, op),
+        }
+    }
+}
+
+pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+pub type Result<T> = std::result::Result<T, Error>;
+pub type EncryptionOpts = turso_sdk_kit::rsapi::EncryptionOpts;
+
+/// A builder for `Database`.
+pub struct Builder {
+    path: String,
+    enable_encryption: bool,
+    enable_attach: bool,
+    enable_custom_types: bool,
+    enable_index_method: bool,
+    enable_materialized_views: bool,
+    enable_vacuum: bool,
+    enable_generated_columns: bool,
+    enable_multiprocess_wal: bool,
+    enable_without_rowid: bool,
+    enable_mvcc_passive_checkpoint: bool,
+    vfs: Option<String>,
+    encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
+    io: Option<Arc<dyn turso_core::IO>>,
+}
+
+impl Builder {
+    /// Create a new local database.
+    pub fn new_local(path: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            enable_encryption: false,
+            enable_attach: false,
+            enable_custom_types: false,
+            enable_index_method: false,
+            enable_materialized_views: false,
+            enable_vacuum: false,
+            enable_generated_columns: false,
+            enable_multiprocess_wal: false,
+            enable_without_rowid: false,
+            enable_mvcc_passive_checkpoint: false,
+            vfs: None,
+            encryption_opts: None,
+            io: None,
+        }
+    }
+
+    pub fn experimental_encryption(mut self, encryption_enabled: bool) -> Self {
+        self.enable_encryption = encryption_enabled;
+        self
+    }
+
+    pub fn with_encryption(mut self, opts: turso_sdk_kit::rsapi::EncryptionOpts) -> Self {
+        self.encryption_opts = Some(opts);
+        self
+    }
+
+    /// Kept for backwards compatibility. Triggers are now always enabled.
+    pub fn experimental_triggers(self, _triggers_enabled: bool) -> Self {
+        self
+    }
+
+    pub fn experimental_attach(mut self, attach_enabled: bool) -> Self {
+        self.enable_attach = attach_enabled;
+        self
+    }
+
+    /// Kept for backwards compatibility. Strict tables are now always enabled.
+    pub fn experimental_strict(self, _strict_enabled: bool) -> Self {
+        self
+    }
+
+    pub fn experimental_custom_types(mut self, custom_types_enabled: bool) -> Self {
+        self.enable_custom_types = custom_types_enabled;
+        self
+    }
+
+    pub fn experimental_generated_columns(mut self, gencols_enabled: bool) -> Self {
+        self.enable_generated_columns = gencols_enabled;
+        self
+    }
+
+    pub fn experimental_index_method(mut self, index_method_enabled: bool) -> Self {
+        self.enable_index_method = index_method_enabled;
+        self
+    }
+
+    pub fn experimental_materialized_views(mut self, enabled: bool) -> Self {
+        self.enable_materialized_views = enabled;
+        self
+    }
+
+    pub fn experimental_vacuum(mut self, enabled: bool) -> Self {
+        self.enable_vacuum = enabled;
+        self
+    }
+
+    pub fn experimental_multiprocess_wal(mut self, enabled: bool) -> Self {
+        self.enable_multiprocess_wal = enabled;
+        self
+    }
+
+    pub fn experimental_without_rowid(mut self, enabled: bool) -> Self {
+        self.enable_without_rowid = enabled;
+        self
+    }
+
+    pub fn experimental_mvcc_passive_checkpoint(mut self, enabled: bool) -> Self {
+        self.enable_mvcc_passive_checkpoint = enabled;
+        self
+    }
+
+    pub fn with_io(mut self, vfs: String) -> Self {
+        self.vfs = Some(vfs);
+        self
+    }
+
+    /// Can pass custom IO implementation
+    pub fn with_io_impl(mut self, io: Arc<dyn turso_core::IO>) -> Self {
+        self.io = Some(io);
+        self
+    }
+
+    fn build_features_string(&self) -> Option<String> {
+        let mut features = Vec::new();
+        if self.enable_encryption {
+            features.push("encryption");
+        }
+        if self.enable_attach {
+            features.push("attach");
+        }
+        if self.enable_custom_types {
+            features.push("custom_types");
+        }
+        if self.enable_index_method {
+            features.push("index_method");
+        }
+        if self.enable_materialized_views {
+            features.push("views");
+        }
+        if self.enable_vacuum {
+            features.push("vacuum");
+        }
+        if self.enable_generated_columns {
+            features.push("generated_columns");
+        }
+        if self.enable_multiprocess_wal {
+            features.push("multiprocess_wal");
+        }
+        if self.enable_without_rowid {
+            features.push("without_rowid");
+        }
+        if self.enable_mvcc_passive_checkpoint {
+            features.push("mvcc_passive_checkpoint");
+        }
+        if features.is_empty() {
+            return None;
+        }
+        Some(features.join(","))
+    }
+
+    /// Build the database.
+    #[allow(unused_variables, clippy::arc_with_non_send_sync)]
+    pub async fn build(self) -> Result<Database> {
+        let features = self.build_features_string();
+        let db =
+            turso_sdk_kit::rsapi::TursoDatabase::new(turso_sdk_kit::rsapi::TursoDatabaseConfig {
+                path: self.path,
+                experimental_features: features,
+                async_io: true,
+                encryption: self.encryption_opts,
+                vfs: self.vfs,
+                io: self.io,
+                db_file: None,
+            });
+        while let Some(io_c) = db.open()?.io() {
+            // At this point IO must already be created
+            let io = db
+                .io()
+                .expect("IO must have been set on the first call to db open");
+            io_c.wait_async(io.as_ref())
+                .await
+                .map_err(TursoError::from)?;
+        }
+        Ok(Database { inner: db })
+    }
+}
+
+/// A database.
+///
+/// The `Database` object points to a database and allows you to connect to it
+#[derive(Clone)]
+pub struct Database {
+    inner: Arc<turso_sdk_kit::rsapi::TursoDatabase>,
+}
+
+impl Debug for Database {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Database").finish()
+    }
+}
+
+impl Database {
+    /// Connect to the database.
+    pub fn connect(&self) -> Result<Connection> {
+        let conn = self.inner.connect()?;
+        Ok(Connection::create(conn, None))
+    }
+}
+
+/// A prepared statement.
+#[derive(Clone)]
+pub struct Statement {
+    conn: Connection,
+    inner: Arc<Mutex<Box<turso_sdk_kit::rsapi::TursoStatement>>>,
+}
+
+struct Execute {
+    stmt: Statement,
+}
+
+assert_send_sync!(Execute);
+
+impl Future for Execute {
+    type Output = Result<u64>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match self.stmt.step(None, cx)? {
+            Poll::Ready(_) => {
+                let n_change = self.stmt.inner.lock().unwrap().n_change();
+                Poll::Ready(Ok(n_change as u64))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Statement {
+    fn step(
+        &self,
+        columns: Option<usize>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Option<Row>>> {
+        let mut stmt = self.inner.lock().unwrap();
+        match stmt.step(Some(cx.waker()))? {
+            turso_sdk_kit::rsapi::TursoStatusCode::Row => {
+                if let Some(columns) = columns {
+                    let mut values = Vec::with_capacity(columns);
+                    for i in 0..columns {
+                        let value = stmt.row_value(i)?;
+                        values.push(value);
+                    }
+                    Poll::Ready(Ok(Some(Row { values })))
+                } else {
+                    Poll::Ready(Err(Error::Misuse(
+                        "unexpected row during execution".to_string(),
+                    )))
+                }
+            }
+            turso_sdk_kit::rsapi::TursoStatusCode::Done => Poll::Ready(Ok(None)),
+            turso_sdk_kit::rsapi::TursoStatusCode::Io => {
+                stmt.run_io()?;
+                if let Some(extra_io) = &self.conn.extra_io {
+                    extra_io(cx.waker().clone())?;
+                }
+                Poll::Pending
+            }
+        }
+    }
+    /// Query the database with this prepared statement.
+    pub async fn query(&mut self, params: impl IntoParams) -> Result<Rows> {
+        self.reset()?;
+
+        let mut stmt = self.inner.lock().unwrap();
+        let params = params.into_params()?;
+        match params {
+            params::Params::None => (),
+            params::Params::Positional(values) => {
+                for (i, value) in values.into_iter().enumerate() {
+                    stmt.bind_positional(i + 1, value.into())?;
+                }
+            }
+            params::Params::Named(values) => {
+                for (name, value) in values.into_iter() {
+                    let position = stmt.named_position(name)?;
+                    stmt.bind_positional(position, value.into())?;
+                }
+            }
+        }
+        let rows = Rows::new(self.clone());
+        Ok(rows)
+    }
+
+    /// Execute this prepared statement.
+    pub async fn execute(&mut self, params: impl IntoParams) -> Result<u64> {
+        {
+            // Reset the statement before executing
+            self.inner.lock().unwrap().reset()?;
+        }
+        let params = params.into_params()?;
+        match params {
+            params::Params::None => (),
+            params::Params::Positional(values) => {
+                for (i, value) in values.into_iter().enumerate() {
+                    let mut stmt = self.inner.lock().unwrap();
+                    stmt.bind_positional(i + 1, value.into())?;
+                }
+            }
+            params::Params::Named(values) => {
+                for (name, value) in values.into_iter() {
+                    let mut stmt = self.inner.lock().unwrap();
+                    let position = stmt.named_position(name)?;
+                    stmt.bind_positional(position, value.into())?;
+                }
+            }
+        }
+
+        let execute = Execute { stmt: self.clone() };
+        execute.await
+    }
+
+    /// Returns the number of columns in the result set.
+    pub fn column_count(&self) -> usize {
+        self.inner.lock().unwrap().column_count()
+    }
+
+    /// Returns the name of the column at the given index.
+    pub fn column_name(&self, idx: usize) -> Result<String> {
+        let stmt = self.inner.lock().unwrap();
+        if idx >= stmt.column_count() {
+            return Err(Error::Misuse(format!(
+                "column index {idx} out of bounds (statement has {} columns)",
+                stmt.column_count()
+            )));
+        }
+        Ok(stmt
+            .column_name(idx)
+            .expect("column index must be within valid range"))
+    }
+
+    /// Returns the names of all columns in the result set.
+    pub fn column_names(&self) -> Vec<String> {
+        let stmt = self.inner.lock().unwrap();
+        let n = stmt.column_count();
+        (0..n)
+            .map(|i| {
+                stmt.column_name(i)
+                    .expect("column index must be within valid range")
+            })
+            .collect()
+    }
+
+    /// Returns the index of the column with the given name.
+    pub fn column_index(&self, name: &str) -> Result<usize> {
+        let stmt = self.inner.lock().unwrap();
+        let n = stmt.column_count();
+        for i in 0..n {
+            let col_name = stmt
+                .column_name(i)
+                .expect("column index must be within valid range");
+            if col_name.as_str().eq_ignore_ascii_case(name) {
+                return Ok(i);
+            }
+        }
+        Err(Error::Misuse(format!(
+            "column '{name}' not found in result set"
+        )))
+    }
+
+    /// Returns columns of the result of this prepared statement.
+    pub fn columns(&self) -> Vec<Column> {
+        let stmt = self.inner.lock().unwrap();
+
+        let n = stmt.column_count();
+
+        let mut cols = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let name = stmt
+                .column_name(i)
+                .expect("column index must be within valid range");
+            let decl_type = stmt.column_decltype(i);
+            cols.push(Column { name, decl_type });
+        }
+
+        cols
+    }
+
+    /// Reset internal statement state after previous execution so it can be reused again
+    pub fn reset(&self) -> Result<()> {
+        let mut stmt = self.inner.lock().unwrap();
+        stmt.reset()?;
+        Ok(())
+    }
+
+    /// Returns the number of rows modified (insert/delete operations) by the most recent executed statement.
+    pub fn n_change(&self) -> u64 {
+        self.inner.lock().unwrap().n_change() as u64
+    }
+
+    /// Execute a query that returns the first [`Row`].
+    ///
+    /// # Errors
+    ///
+    /// - Returns `QueryReturnedNoRows` if no rows were returned.
+    pub async fn query_row(&mut self, params: impl IntoParams) -> Result<Row> {
+        let mut rows = self.query(params).await?;
+
+        let first_row = rows.next().await?.ok_or(Error::QueryReturnedNoRows)?;
+        // Discard remaining rows so that the statement is executed to completion
+        // Otherwise Drop of the statement will cause transaction rollback
+        while rows.next().await?.is_some() {}
+        Ok(first_row)
+    }
+}
+
+/// Column information.
+pub struct Column {
+    name: String,
+    decl_type: Option<String>,
+}
+
+impl Column {
+    /// Return the name of the column.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the type of the column.
+    pub fn decl_type(&self) -> Option<&str> {
+        self.decl_type.as_deref()
+    }
+}
+
+pub trait IntoValue {
+    fn into_value(self) -> Result<Value>;
+}
+
+#[derive(Debug, Clone)]
+pub enum Params {
+    None,
+    Positional(Vec<Value>),
+    Named(Vec<(String, Value)>),
+}
+
+pub struct Transaction {}

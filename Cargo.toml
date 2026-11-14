@@ -2,6 +2,7 @@
 resolver = "2"
 exclude = [
     "vendor/pprof",
+    "vendor/turso",
     "wasm-modules/http-fetch",
     "wasm-modules/gepa-replay",
     "wasm-modules/gepa-score",
@@ -232,5 +233,7 @@ inherits = "release"
 lto = "thin"
 
 # pprof-rs with a smaller sample table: see vendor/pprof/TEMPER.md.
+# turso with a time limit on each sync request: see vendor/turso/TEMPER.md.
 [patch.crates-io]
 pprof = { path = "vendor/pprof" }
+turso = { path = "vendor/turso" }
