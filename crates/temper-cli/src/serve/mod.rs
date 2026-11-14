@@ -343,6 +343,24 @@ pub async fn run(
             "wake reports off: TEMPER_WAKE_REPORT_URL and TEMPER_WAKE_REPORT_TOKEN are needed together"
         ),
     }
+    // Where this process reads its feature flags (temper_server::flags). Both
+    // are needed; with neither, every flag stays off.
+    match (
+        std::env::var("TEMPER_FLAGS_URL").ok(), // determinism-ok: startup config
+        std::env::var("TEMPER_FLAGS_TOKEN").ok(), // determinism-ok: startup config
+    ) {
+        (Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
+            if let Err(error) =
+                temper_server::flags::spawn_reader(state.server.flags.clone(), url, token)
+            {
+                tracing::error!(%error, "flags off");
+            }
+        }
+        (None, None) => {}
+        _ => tracing::error!(
+            "flags off: TEMPER_FLAGS_URL and TEMPER_FLAGS_TOKEN are needed together"
+        ),
+    }
     // How long the sandbox stays awake after an inbound request, in seconds:
     // a timer due before then fires on its own and is not reported. The
     // control plane sets it below the time its sandboxes really stay awake,
