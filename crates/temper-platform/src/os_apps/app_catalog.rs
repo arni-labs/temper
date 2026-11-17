@@ -130,6 +130,11 @@ pub(crate) fn load_tenant_os_app(tenant: &str, name: &str) -> Result<AppBundle, 
     })
 }
 
+/// The files `tenant` resolves `name` to, as [`tenant_os_app`] reads them.
+pub(crate) fn tenant_os_app_files(tenant: &str, name: &str) -> Option<AppFileSource> {
+    read_catalog().app_files(Some(tenant), name).cloned()
+}
+
 /// The directory `tenant` resolves `name` from, as [`tenant_os_app`] reads it.
 pub(crate) fn tenant_os_app_dir(tenant: &str, name: &str) -> Option<PathBuf> {
     read_catalog()

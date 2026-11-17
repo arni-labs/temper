@@ -44,7 +44,7 @@ impl AppFileSource {
     }
 
     /// Whether the app has a file at `path`.
-    pub(super) fn has(&self, path: &str) -> bool {
+    pub(crate) fn has(&self, path: &str) -> bool {
         match self {
             Self::Listed(dir) => dir.join(path).is_file(),
             Self::Written { paths, .. } => paths.contains(path),

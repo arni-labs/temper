@@ -52,7 +52,7 @@ pub use app_catalog::{
     list_startup_os_apps, list_tenant_os_apps, reload_os_apps, set_os_apps_dir, tenant_app_guide,
     tenant_os_app,
 };
-pub(crate) use app_catalog::{load_tenant_os_app, tenant_os_app_dir};
+pub(crate) use app_catalog::{load_tenant_os_app, tenant_os_app_dir, tenant_os_app_files};
 pub use app_files::{AppFiles, Shadowed, app_dir_of};
 pub(crate) use bundle_files::find_ioa_files;
 use bundle_files::{find_adrs, find_agents, find_app_skills, find_seed_data, find_wasm_modules};

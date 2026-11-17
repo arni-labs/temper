@@ -5,8 +5,9 @@
 //! writes the files its caller sent. From there every install is the same:
 //! a dependency already installed is left as it is ([`uninstalled_apps`]),
 //! each spec is parsed, the named files become what the tenant resolves, the
-//! closure reconciles and is verified runtime-ready, and the install commits
-//! with its records or goes back to the version installed before it. Nothing
+//! closure reconciles and is verified runtime-ready, the routes each app
+//! declares are set ([`routes`]), and the install commits with its records or
+//! goes back, routes included, to the version installed before it. Nothing
 //! here lists the directory the source just wrote.
 //!
 //! An install checks at main's level, as a TrustBundle install does: each
@@ -17,6 +18,7 @@
 use super::*;
 use crate::os_apps::{
     AppFileSource, find_ioa_files, installed_line, resolve_materialized_app_closure,
+    tenant_os_app_files,
 };
 
 /// Where an installed closure came from, as its install records name it.
@@ -118,6 +120,9 @@ pub(super) async fn install_materialized_closure(
 
     // One complete order drives the parse, snapshots, reconcile and verification.
     parse_closure_specs(&closure.root.name, &apps)?;
+    // The routes each installed app declares now and declared before, read
+    // before anything changes: a route file that does not read refuses here.
+    let route_changes = route_changes(tenant, &written).map_err(ClosureRefused::Inactive)?;
 
     // Capture the previously-installed records for EVERY app in the closure BEFORE mutating the
     // catalog or store, so a failed install can be rolled back to them. reconcile overwrites the
@@ -169,6 +174,21 @@ pub(super) async fn install_materialized_closure(
         (Ok(_), None) => true,
         _ => false,
     };
+    // The routes go in last, once the version they call is ready; when they
+    // cannot, they are put back and the install goes back with them.
+    let mut routes_failed = None;
+    let new_version_ready = new_version_ready
+        && match routes::apply(platform, tenant, &route_changes).await {
+            Ok(()) => true,
+            Err(error) => {
+                let error = match routes::put_back(platform, tenant, &route_changes).await {
+                    Ok(()) => error,
+                    Err(back) => format!("{error}; putting the routes back: {back}"),
+                };
+                routes_failed = Some(error);
+                false
+            }
+        };
 
     match classify_install_verify(new_version_ready, prior_root_record.as_ref()) {
         InstallVerifyDecision::Commit => {
@@ -198,9 +218,10 @@ pub(super) async fn install_materialized_closure(
             let ps = ps.expect("RollBackToPrevious implies a platform store");
             // The reconcile's own error says why, such as a refused spec
             // change; only a reconcile that went through failed verification.
-            let failed = match &reconcile_result {
-                Err(error) => format!("failed: {error}"),
-                Ok(_) => "failed runtime verification".to_string(),
+            let failed = match (&reconcile_result, &routes_failed) {
+                (Err(error), _) => format!("failed: {error}"),
+                (Ok(_), Some(error)) => format!("failed: {error}"),
+                (Ok(_), None) => "failed runtime verification".to_string(),
             };
             if let Err(error) =
                 rollback_to_prior(platform, ps.as_ref(), tenant, &prior, &prior_records).await
@@ -227,8 +248,9 @@ pub(super) async fn install_materialized_closure(
                 if let Some(ps) = &ps {
                     mark_install_failed(ps.as_ref(), tenant, &closure.root.name).await;
                 }
+                let why = routes_failed.unwrap_or_else(|| "runtime verification".to_string());
                 Err(ClosureRefused::Failed(format!(
-                    "Genesis install of {} failed runtime verification and no previous install exists to roll back to",
+                    "Genesis install of {} failed: {why}; no previous install exists to roll back to",
                     closure.app_ref
                 )))
             }
@@ -270,6 +292,7 @@ pub(super) async fn check_materialized_closure(
             CheckRefused::Refused(error)
         }
     })?;
+    route_changes(tenant, &written).map_err(refused)?;
     match check_app_install_order(platform, tenant, &closure.root.name, &apps).await {
         Err(CheckRefused::Refused(error)) => Err(refused(error)),
         other => other,
@@ -317,6 +340,31 @@ pub(super) async fn uninstalled_apps<T>(
         }
     }
     Ok(taken)
+}
+
+/// For each app the install puts in place, the routes it declares and the
+/// routes the version the tenant resolves now declared.
+fn route_changes(
+    tenant: &str,
+    written: &[(String, AppFileSource)],
+) -> Result<Vec<routes::RouteChange>, String> {
+    written
+        .iter()
+        .map(|(app, files)| {
+            let before = match tenant_os_app_files(tenant, app) {
+                Some(installed) => routes::declared_routes(app, &installed).unwrap_or_else(|error| {
+                    tracing::warn!(tenant, app = %app, %error, "the installed version's routes do not read; none are taken as its");
+                    Vec::new()
+                }),
+                None => Vec::new(),
+            };
+            Ok(routes::RouteChange {
+                app: app.clone(),
+                before,
+                now: routes::declared_routes(app, files)?,
+            })
+        })
+        .collect()
 }
 
 /// Record every app of an installed closure with where it came from, and

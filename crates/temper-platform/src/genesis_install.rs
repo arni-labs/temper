@@ -25,6 +25,8 @@ mod object_lookup;
 mod pushed;
 mod registry;
 mod restore;
+mod routes;
+mod runs;
 mod written;
 use blob_materialization::{
     MAX_GENESIS_TREE_CANONICAL_BYTES, blob_content_len, canonical_field_len, git_object_body,
@@ -54,6 +56,9 @@ pub use restore::{
     restore_genesis_app_cache_roots, restore_genesis_registry_cache_roots,
     restore_planned_cache_roots, start_genesis_registry_cache_recovery,
     start_registry_cache_recovery_of,
+};
+pub use runs::{
+    ANSWER_WITHIN, InstallAnswer, InstallRun, InstallRuns, RunOutcome, install_answering,
 };
 use written::Written;
 

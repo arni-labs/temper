@@ -41,6 +41,8 @@ pub struct PlatformState {
     pub module_reviewer: Arc<OnceLock<Arc<ModuleReviewer>>>,
     /// The module reviews running in this process.
     pub module_reviews: Arc<ReviewsUnderWay>,
+    /// The last app install of each app in this process (`genesis_install::install_answering`).
+    pub installs: Arc<crate::genesis_install::InstallRuns>,
 }
 
 /// Default broadcast channel capacity.
@@ -106,6 +108,7 @@ impl PlatformState {
             spec_store,
             module_reviewer: Arc::new(OnceLock::new()),
             module_reviews: Arc::default(),
+            installs: Arc::default(),
         };
         state.server.bound_action_hook = Some(Arc::new(
             crate::genesis_install::GenesisInstallHook::new(state.clone()),
@@ -151,6 +154,7 @@ impl PlatformState {
             spec_store,
             module_reviewer: Arc::new(OnceLock::new()),
             module_reviews: Arc::default(),
+            installs: Arc::default(),
         };
         state.server.bound_action_hook = Some(Arc::new(
             crate::genesis_install::GenesisInstallHook::new(state.clone()),
