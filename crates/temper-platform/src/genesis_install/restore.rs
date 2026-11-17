@@ -153,7 +153,23 @@ pub async fn restore_planned_cache_roots(
             root,
         } = planned;
         let tenant = TenantId::new(&source_tenant);
-        match materialize_app_closure(&platform.server, &tenant, &cache_root, root).await {
+        let root_name = root.name.clone();
+        let written =
+            match materialize_app_closure(&platform.server, &tenant, &cache_root, root).await {
+                // As the install did, leave an installed dependency's version as it is.
+                Ok(written) => {
+                    closure_install::uninstalled_apps(
+                        platform,
+                        &target_tenant,
+                        &root_name,
+                        written,
+                        |app| &app.0,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+        match written {
             Ok(written) => {
                 legacy_specs::convert_legacy_bundle_specs(&cache_root);
                 register_written_apps(&target_tenant, cache_root, written);

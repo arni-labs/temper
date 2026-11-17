@@ -4,7 +4,7 @@
 //! governed action has succeeded, then materializes the pinned Genesis commit
 //! into the platform's app installer.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -273,7 +273,9 @@ pub async fn list_genesis_follow_latest_updates(
 /// CLI, and admin clients call one semantic install operation, while this
 /// helper materializes the pinned Git-native Genesis closure into the local
 /// app catalog and then runs the normal Temper installer against this
-/// instance's storage backend. The install is verified-or-reverted: after
+/// instance's storage backend. It installs the root app and each dependency
+/// not installed yet; an installed dependency keeps its version
+/// (`closure_install::uninstalled_apps`). The install is verified-or-reverted: after
 /// reconciling the pinned closure it checks the root app is runtime-ready
 /// (incl. required-wasm compile) and, if not, rolls back to the previously
 /// installed pinned version so a bad publish never leaves the tenant broken.
@@ -721,12 +723,12 @@ async fn materialize_registry_app_closure(
     root_ref: RegistryAppRef,
     cache_root: &Path,
 ) -> Result<Vec<closure_install::MaterializedApp>, String> {
-    let mut stack = vec![root_ref];
+    let mut queue = VecDeque::from([root_ref]);
     let mut seen = BTreeSet::new();
     let mut materialized_refs = Vec::new();
     let mut materialized = Written::new();
 
-    while let Some(app_ref) = stack.pop() {
+    while let Some(app_ref) = queue.pop_front() {
         let key = format!("{}/{}", app_ref.owner, app_ref.name);
         if !seen.insert(key) {
             continue;
@@ -755,9 +757,9 @@ async fn materialize_registry_app_closure(
         let paths = tree.split('\0').filter(|path| !path.is_empty());
         materialized.insert(app_ref.name.clone(), paths.map(str::to_string).collect());
 
-        for dependency in read_manifest_dependencies(&app_dir)?.into_iter().rev() {
+        for dependency in read_manifest_dependencies(&app_dir)? {
             let dependency = parse_dependency_ref(&dependency, &app_ref.owner);
-            stack.push(RegistryAppRef {
+            queue.push_back(RegistryAppRef {
                 owner: dependency.owner.unwrap_or_else(|| app_ref.owner.clone()),
                 name: dependency.name,
                 version_hash: dependency.version_hash,
@@ -890,13 +892,18 @@ impl BoundActionHook for GenesisInstallHook {
         .await?;
         let materialized_apps: Vec<String> = written.iter().map(|(app, _)| app.clone()).collect();
         let app_dir = app_cache_dir(&cache_root, &name)?;
+        let mut platform = self.platform.clone();
+        platform.server = state.clone();
         // Late boot recovery uses the same turn when checking current records
         // and publishing files. Keep publication and provenance in one turn.
         let _turn = temper_server::host_turn::take().await?;
+        let written =
+            closure_install::uninstalled_apps(&platform, &target_tenant, &name, written, |app| {
+                &app.0
+            })
+            .await?;
         register_written_apps(&target_tenant, cache_root, written);
 
-        let mut platform = self.platform.clone();
-        platform.server = state.clone();
         match reconcile_materialized_app_closure(
             &platform,
             &target_tenant,
@@ -1163,41 +1170,41 @@ struct GenesisAppBundle {
     version_hash: String,
 }
 
+/// The apps of one closure, one version of each: a closure's apps share one
+/// cache directory, each app at `<cache root>/<name>`.
+///
+/// When apps of a closure pin different versions of one dependency, the pin
+/// nearest the root is the one taken: every closure walk is breadth-first, so
+/// the root's own pins come first. Differing pins are not an error. A
+/// dependency's pin names the version to bring when none is installed, and an
+/// install keeps whatever version is installed
+/// ([`closure_install::uninstalled_apps`]).
 #[derive(Default)]
 struct GenesisClosureAdmission {
-    versions_by_app: BTreeMap<(String, String), String>,
+    /// Each admitted app's owner, by its name, which is its cache directory.
     owners_by_directory: BTreeMap<String, String>,
 }
 
 impl GenesisClosureAdmission {
+    /// Whether `app` is new to the closure: `false` when the closure already
+    /// holds a version of it.
     fn admit(&mut self, app: &GenesisAppBundle) -> Result<bool, String> {
-        let app_key = (app.owner.clone(), app.name.clone());
-        if let Some(version) = self.versions_by_app.get(&app_key) {
-            if version != &app.version_hash {
-                return Err(format!(
-                    "Genesis dependency {}/{} resolves to conflicting versions '{}' and '{}'",
-                    app.owner, app.name, version, app.version_hash
-                ));
+        if let Some(owner) = self.owners_by_directory.get(&app.name) {
+            if owner == &app.owner {
+                return Ok(false);
             }
-            return Ok(false);
-        }
-        if let Some(owner) = self.owners_by_directory.get(&app.name)
-            && owner != &app.owner
-        {
             return Err(format!(
                 "Genesis dependencies {owner}/{} and {}/{} collide on cache directory '{}'",
                 app.name, app.owner, app.name, app.name
             ));
         }
-        if self.versions_by_app.len() >= MAX_GENESIS_BUNDLE_APPS {
+        if self.owners_by_directory.len() >= MAX_GENESIS_BUNDLE_APPS {
             return Err(format!(
                 "Genesis dependency closure exceeds app budget {MAX_GENESIS_BUNDLE_APPS}"
             ));
         }
         self.owners_by_directory
             .insert(app.name.clone(), app.owner.clone());
-        self.versions_by_app
-            .insert(app_key, app.version_hash.clone());
         Ok(true)
     }
 }
@@ -1415,12 +1422,12 @@ async fn resolve_genesis_app_closure(
     root: GenesisAppBundle,
     audience: BundleAudience,
 ) -> Result<Vec<GenesisAppBundle>, String> {
-    let mut stack = vec![root];
+    let mut queue = VecDeque::from([root]);
     let mut admission = GenesisClosureAdmission::default();
     let mut closure = Vec::new();
     let mut materialization_budget = GenesisBundleBudget::new();
 
-    while let Some(app) = stack.pop() {
+    while let Some(app) = queue.pop_front() {
         if !admission.admit(&app)? {
             continue;
         }
@@ -1452,7 +1459,7 @@ async fn resolve_genesis_app_closure(
             &mut materialization_budget,
         )
         .await?;
-        for dependency in read_manifest_dependencies(&app_dir)?.into_iter().rev() {
+        for dependency in read_manifest_dependencies(&app_dir)? {
             let dependency = resolve_genesis_dependency(state, tenant, &app.owner, &dependency)
                 .await
                 .map_err(|error| {
@@ -1461,7 +1468,7 @@ async fn resolve_genesis_app_closure(
                         dependency, app.name
                     )
                 })?;
-            stack.push(dependency);
+            queue.push_back(dependency);
         }
         closure.push(app);
     }
@@ -1478,12 +1485,12 @@ async fn materialize_app_closure(
     cache_root: &Path,
     root: GenesisAppBundle,
 ) -> Result<Vec<(String, AppFileSource)>, String> {
-    let mut stack = vec![root];
+    let mut queue = VecDeque::from([root]);
     let mut admission = GenesisClosureAdmission::default();
     let mut materialized = Written::new();
     let mut materialization_budget = GenesisBundleBudget::new();
 
-    while let Some(app) = stack.pop() {
+    while let Some(app) = queue.pop_front() {
         if !admission.admit(&app)? {
             continue;
         }
@@ -1501,7 +1508,7 @@ async fn materialize_app_closure(
         .await?;
         materialized.insert(app.name.clone(), paths);
 
-        for dependency in read_manifest_dependencies(&app_dir)?.into_iter().rev() {
+        for dependency in read_manifest_dependencies(&app_dir)? {
             let dependency = resolve_genesis_dependency(state, tenant, &app.owner, &dependency)
                 .await
                 .map_err(|error| {
@@ -1510,7 +1517,7 @@ async fn materialize_app_closure(
                         dependency, app.name
                     )
                 })?;
-            stack.push(dependency);
+            queue.push_back(dependency);
         }
     }
 
@@ -2242,7 +2249,7 @@ mod tests {
     }
 
     #[test]
-    fn closure_admission_rejects_version_and_directory_collisions() {
+    fn closure_admission_takes_the_first_version_and_rejects_directory_collisions() {
         let app = |owner: &str, name: &str, version: &str| GenesisAppBundle {
             owner: owner.to_string(),
             name: name.to_string(),
@@ -2253,10 +2260,10 @@ mod tests {
         assert!(admission.admit(&app("acme", "notes", "v1")).unwrap());
         assert!(!admission.admit(&app("acme", "notes", "v1")).unwrap());
 
-        let version_error = admission
-            .admit(&app("acme", "notes", "v2"))
-            .expect_err("one dependency cannot resolve to two versions");
-        assert!(version_error.contains("conflicting versions"));
+        assert!(
+            !admission.admit(&app("acme", "notes", "v2")).unwrap(),
+            "a pin farther from the root is neither taken nor an error"
+        );
 
         let directory_error = admission
             .admit(&app("other", "notes", "v1"))

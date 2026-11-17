@@ -3,6 +3,7 @@
 //! A source only puts an app closure's files in a cache directory and names
 //! each app's files: the registry fetches a pinned Genesis closure, a push
 //! writes the files its caller sent. From there every install is the same:
+//! a dependency already installed is left as it is ([`uninstalled_apps`]),
 //! each spec is parsed, the named files become what the tenant resolves, the
 //! closure reconciles and is verified runtime-ready, and the install commits
 //! with its records or goes back to the version installed before it. Nothing
@@ -34,8 +35,9 @@ pub(super) struct MaterializedClosure<'a> {
     /// The closure's root app.
     pub(super) root: RegistryAppRef,
     /// Every app this source materialized at its version, the root among
-    /// them. The core resolves dependencies already in the tenant catalog
-    /// before checking or mutating anything; they retain their own source.
+    /// them. The install takes the root and each dependency not installed
+    /// yet ([`uninstalled_apps`]); every other dependency resolves from the
+    /// tenant catalog and keeps its own version and source.
     pub(super) apps: Vec<MaterializedApp>,
     pub(super) source: ClosureSource<'a>,
 }
@@ -87,8 +89,22 @@ pub(super) async fn install_materialized_closure(
     platform: &PlatformState,
     tenant: &str,
     cache_root: &Path,
-    closure: MaterializedClosure<'_>,
+    mut closure: MaterializedClosure<'_>,
 ) -> Result<ClosureInstalled, ClosureRefused> {
+    closure.apps = uninstalled_apps(
+        platform,
+        tenant,
+        &closure.root.name,
+        std::mem::take(&mut closure.apps),
+        |app| &app.version.name,
+    )
+    .await
+    .map_err(|error| {
+        ClosureRefused::Inactive(format!(
+            "Genesis install of {} aborted before mutating: {error}",
+            closure.app_ref
+        ))
+    })?;
     // Keep the source's explicit paths, including through dependency
     // resolution: a fresh install never relies on listing its new directory.
     let written: Vec<(String, AppFileSource)> = closure
@@ -237,6 +253,9 @@ pub(super) async fn check_materialized_closure(
         .iter()
         .map(|app| (app.version.name.clone(), app.files.clone()))
         .collect();
+    let written = uninstalled_apps(platform, tenant, &closure.root.name, written, |app| &app.0)
+        .await
+        .map_err(CheckRefused::Unchecked)?;
     let refused = |error: String| {
         CheckRefused::Refused(format!(
             "Genesis install of {} failed: {error}",
@@ -255,6 +274,49 @@ pub(super) async fn check_materialized_closure(
         Err(CheckRefused::Refused(error)) => Err(refused(error)),
         other => other,
     }
+}
+
+/// The apps of `root`'s closure that installing `root` puts in place: `root`
+/// itself, and each dependency of which no version is installed in `tenant`.
+///
+/// Installing an app never replaces or downgrades an installed dependency.
+/// Other installed apps run on that dependency too, and a closure often pins
+/// an older version than the tenant runs: on 17 Nov 2026 one app's pinned
+/// install replaced the dependency another app's releases needed with an
+/// older copy, and those releases stopped. So a dependency's pin names the
+/// version to bring when none is installed, not the one that must run, and a
+/// dependency is upgraded by installing it. Installed means the tenant has an
+/// install record for the app's name, whatever its source, version or status,
+/// as TemperPaw's boot decides for its bootstrap apps: the record is what boot
+/// restores and what a failed install rolls back to. A dependency left out
+/// resolves from the tenant's catalog, at the version its record names. With
+/// no platform store there are no records, and every app is taken.
+pub(super) async fn uninstalled_apps<T>(
+    platform: &PlatformState,
+    tenant: &str,
+    root: &str,
+    apps: Vec<T>,
+    name: impl Fn(&T) -> &str,
+) -> Result<Vec<T>, String> {
+    let Some(ps) = platform_store(platform) else {
+        return Ok(apps);
+    };
+    let mut taken = Vec::with_capacity(apps.len());
+    for app in apps {
+        let app_name = name(&app);
+        let installed = app_name != root
+            && ps
+                .get_installed_app(tenant, app_name)
+                .await
+                .map_err(|error| {
+                    format!("could not read the install record of dependency {app_name}: {error}")
+                })?
+                .is_some();
+        if !installed {
+            taken.push(app);
+        }
+    }
+    Ok(taken)
 }
 
 /// Record every app of an installed closure with where it came from, and
@@ -351,3 +413,7 @@ fn parse_closure_specs(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "closure_install_tests.rs"]
+mod tests;
