@@ -20,3 +20,11 @@ success-output = "final"
 [[profile.default.overrides]]
 filter = 'binary(turso_sync)'
 slow-timeout = { period = "60s", terminate-after = 2 }
+
+# The tests that need a disposable PostgreSQL (the Postgres job, `--profile
+# postgres`) each take under 25 s; the longest, a timer that must survive a
+# restart, takes about 20 s. One still running after 5 minutes, over ten times
+# that, is hung: end it so the job fails naming the test, instead of holding
+# the job until GitHub's own timeout.
+[profile.postgres]
+slow-timeout = { period = "60s", terminate-after = 5 }

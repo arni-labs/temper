@@ -736,7 +736,7 @@ jobs:
           TEST_POLICY_DATABASE_URL: postgres://postgres:temper@localhost:5432/morrow_temper
           ARGS: ${{ steps.select.outputs.args }}
           FILTER: ${{ steps.select.outputs.filter }}
-        run: cargo nextest run --locked $ARGS --run-ignored only --test-threads 1 --no-fail-fast -E "$FILTER"
+        run: cargo nextest run --locked --profile postgres $ARGS --run-ignored only --test-threads 1 --no-fail-fast -E "$FILTER"
 
   # ─────────────────────────────────────────────────────
   # Gate 3b: DST/platform coverage (matrixed)
