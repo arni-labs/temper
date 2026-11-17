@@ -95,10 +95,6 @@ struct InstalledAppView {
     /// The absolute path of the folder the tenant serves the app from (its
     /// `specs/`, its `COMMIT`), or `""` when only its stored specs serve.
     dir: String,
-    /// The last install of the app this process ran: its id, ref and
-    /// `status` (`running`, `installed`, or `failed` with `reason`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    install: Option<crate::genesis_install::InstallRun>,
 }
 
 impl InstalledAppView {
@@ -115,7 +111,6 @@ impl InstalledAppView {
             installed_at: record.installed_at,
             last_reconciled_at: record.last_reconciled_at,
             dir,
-            install: None,
         }
     }
 }
@@ -163,9 +158,12 @@ fn authorize_app_install_read<'a>(
 /// reads the installed version hashes instead of trusting that a deployed
 /// image carried the commit. It is a plain read of the platform store and
 /// makes no registry or network calls. A storage stack without a platform
-/// store has no records, and lists only the installs this process ran.
-/// Each app carries its last install here (`install`), so a caller that
-/// got `202` from an install polls this list for how it ended.
+/// store has nothing installed to report and lists no app.
+///
+/// Beside the apps (`value`), `installs` gives each app's last install this
+/// process ran: `{app, id, app_ref, status}`, `status` being `running`,
+/// `installed`, or `failed` with `reason`. A caller that got `202` from an
+/// install polls this list for how it ended.
 pub(crate) async fn list_app_installs(
     State(state): State<PlatformState>,
     authenticated: Option<Extension<AuthenticatedRequestContext>>,
@@ -175,7 +173,22 @@ pub(crate) async fn list_app_installs(
         Err(status) => return authorization_error(status),
     };
     match installed_apps_in_tenant(&state, tenant).await {
-        Ok(apps) => (StatusCode::OK, Json(serde_json::json!({ "value": apps }))),
+        Ok(apps) => {
+            let installs: Vec<serde_json::Value> = state
+                .installs
+                .of_tenant(tenant)
+                .into_iter()
+                .map(|(app, run)| {
+                    let mut entry = serde_json::json!(run);
+                    entry["app"] = serde_json::Value::String(app);
+                    entry
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "value": apps, "installs": installs })),
+            )
+        }
         Err(error) => {
             tracing::warn!(tenant, error = %error, "failed to read installed apps");
             (
@@ -207,23 +220,6 @@ async fn installed_apps_in_tenant(
             if let Some(record) = platform_store.get_installed_app(tenant, &app_name).await? {
                 let dir = served_dir(tenant, &app_name)?;
                 apps.push(InstalledAppView::new(record, dir));
-            }
-        }
-    }
-    // Each app with its last install; an app whose first install is running,
-    // or failed, has no record yet and is listed by its install alone.
-    for (app_name, run) in state.installs.of_tenant(tenant) {
-        match apps.iter_mut().find(|app| app.app_name == app_name) {
-            Some(app) => app.install = Some(run),
-            None => {
-                let record = InstalledAppRecord {
-                    tenant: tenant.to_string(),
-                    app_name,
-                    ..InstalledAppRecord::default()
-                };
-                let mut view = InstalledAppView::new(record, String::new());
-                view.install = Some(run);
-                apps.push(view);
             }
         }
     }

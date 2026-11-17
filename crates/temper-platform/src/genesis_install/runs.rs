@@ -3,9 +3,9 @@
 //! A request starts the install and waits for it up to [`ANSWER_WITHIN`]. An
 //! install that ends by then answers with what it did. One that does not
 //! answers `202` with its id and goes on; the installs list
-//! (`GET /api/genesis/apps/installs`) says how it went, each app carrying the
-//! last install this process ran for it: `running`, `installed`, or `failed`
-//! with the reason. The runs are kept in memory: an install a restart cut off
+//! (`GET /api/genesis/apps/installs`, its `installs`) says how it went, with
+//! the last install this process ran for each app: `running`, `installed`, or
+//! `failed` with the reason. The runs are kept in memory: an install a restart cut off
 //! is gone from the list, and the app's install record says which version
 //! runs. Installing a ref again is safe, and asking for the ref an install is
 //! still running answers that install.
