@@ -123,9 +123,9 @@ def changed_paths():
 def shards(packages, libraries):
     cells = []
     if SERVER in packages:
-        for i in (1, 2):
-            cells.append({"name": f"temper-server {i}/2", "args": f"-p {SERVER} --features {SERVER_FEATURES}",
-                          "partition": f"hash:{i}/2", "gepa": True, "doc": ""})
+        for i in (1, 2, 3):
+            cells.append({"name": f"temper-server {i}/3", "args": f"-p {SERVER} --features {SERVER_FEATURES}",
+                          "partition": f"hash:{i}/3", "gepa": True, "doc": ""})
     rest = sorted(packages - {SERVER})
     if rest:
         count = 2 if rest and HEAVY & set(rest) else 1

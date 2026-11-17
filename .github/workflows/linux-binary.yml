@@ -7,7 +7,7 @@ name: Linux binary
 # that repository a repository_dispatch `temper-binary` with the tag, sha256 and commit, so a downstream image build
 # can start from it.
 #
-# Built on ubuntu-22.04 so its glibc is no newer than the sandbox image's. Tagged releases stay with release.yml.
+# Built on ubuntu-22.04 so its glibc is no newer than the sandbox image's.
 #
 # Each release also lists the repository files its build depends on (`temper-x86_64-linux.inputs`: every file git
 # tracks in each crate cargo's dep-info for the binary names, every Cargo.toml, Cargo.lock, the toolchain file and this
@@ -42,7 +42,7 @@ jobs:
   build:
     name: Build and publish
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 35  # about 2x its normal 15 minutes
     steps:
       - uses: actions/checkout@v4
         with:

@@ -78,7 +78,7 @@ jobs:
   # push's changes are what it moved main by. Changes land by pushing to main (trunk-based
   # development; there is no merge queue), and every test runs once, on that push, so tests
   # never run twice for one change: a pull request only compiles and lints (Compile &
-  # Lint, Integrity, Instrumentation Hygiene, the SDK's type check), so its author sees a broken
+  # Lint with its source-tree and instrumentation checks, the SDK's type check), so its author sees a broken
   # build in about four minutes, and every job that runs tests is skipped on it (output
   # tests=false). To run on a branch, before pushing it to main, exactly what that push will:
   #   gh workflow run ci.yml --ref <branch> -f changed="$(git diff --name-only origin/main...)"
@@ -92,6 +92,7 @@ jobs:
     # is skipped too; Tests, which runs after skipped jobs, checks the input itself.
     if: inputs.tests == ''
     runs-on: ubuntu-latest
+    timeout-minutes: 5  # about 2x its normal 10 s
     outputs:
       lane: ${{ steps.affected.outputs.lane }}
       mode: ${{ steps.affected.outputs.mode }}
@@ -125,7 +126,8 @@ jobs:
           LANE: ${{ steps.affected.outputs.lane }}
         run: |
           SUITES='[
-            {"suite":"core","filter":"test(dst_) and not binary(/^dst_platform_/)"},
+            {"suite":"core","part_index":"1","part_count":"2","filter":"test(dst_) and not binary(/^dst_platform_/)"},
+            {"suite":"core","part_index":"2","part_count":"2","filter":"test(dst_) and not binary(/^dst_platform_/)"},
             {"suite":"platform-boot","filter":"test(dst_) and binary(=dst_platform_boot)"},
             {"suite":"platform-consistency","filter":"test(dst_) and binary(/^dst_platform_/) and not binary(=dst_platform_boot) and not binary(=dst_platform_random)"}
           ]'
@@ -146,7 +148,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15  # about 2x its normal 6 to 8 minutes, checks included
     steps:
       - uses: actions/checkout@v4
 
@@ -188,103 +190,7 @@ jobs:
       - name: cargo clippy --workspace --all-targets
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-  # ─────────────────────────────────────────────────────
-  # Gate 1a: TypeScript SDK (packages/temper-sdk-ts)
-  # ─────────────────────────────────────────────────────
-  sdk-ts:
-    name: TypeScript SDK
-    needs: changes
-    if: needs.changes.outputs.sdk_ts == 'true'
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: packages/temper-sdk-ts
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: packages/temper-sdk-ts/package-lock.json
-      - run: npm ci
-      - name: Type check
-        run: npx tsc --noEmit
-      - name: Tests
-        if: needs.changes.outputs.tests == 'true'
-        run: npx vitest run
-
-  # ─────────────────────────────────────────────────────
-  # Gate 1b: Bench compile (non-PR events only)
-  # ─────────────────────────────────────────────────────
-  bench-build:
-    name: Bench Build
-    needs: changes
-    runs-on: ubuntu-latest
-    if: needs.changes.outputs.lane == 'full'
-    timeout-minutes: 45
-    env:
-      # ARN-439: CI only compiles benches (--no-run), never runs them, so the release-inherited
-      # lto=true + codegen-units=1 are pure compile-time waste here. Override them off for the
-      # bench profile on this job only.
-      CARGO_PROFILE_BENCH_LTO: "off"
-      CARGO_PROFILE_BENCH_CODEGEN_UNITS: "16"
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install system dependencies
-        timeout-minutes: 5  # a stalled mirror, see APT_OPTS
-        run: sudo apt-get $APT_OPTS update && sudo apt-get $APT_OPTS install -y libz3-dev
-
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-
-      - name: Set up mold linker
-        uses: rui314/setup-mold@v1
-
-      # rust-cache hashes every installed toolchain into its key. The runner image's own
-      # stable Rust changes between image versions, which split one cache into several.
-      - name: Keep only the pinned toolchain
-        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ env.SAVE_RUST_CACHE }}
-
-      - name: cargo bench --workspace --no-run
-        run: cargo bench --locked --workspace --no-run
-
-  # ─────────────────────────────────────────────────────
-  # Gate 2: Integrity checks (seconds)
-  # ─────────────────────────────────────────────────────
-  integrity:
-    name: Integrity & DST Patterns
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-
-      - name: Set up mold linker
-        uses: rui314/setup-mold@v1
-
-      # rust-cache hashes every installed toolchain into its key. The runner image's own
-      # stable Rust changes between image versions, which split one cache into several.
-      - name: Keep only the pinned toolchain
-        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ env.SAVE_RUST_CACHE }}
-
+      # Source-tree checks and ratchets (formerly the Integrity job).
       - name: No TODO/FIXME/HACK in production code
         run: |
           # Strip #[cfg(test)] blocks and proc macro crates before scanning
@@ -340,14 +246,6 @@ jobs:
           rustup target add wasm32-unknown-unknown
           bash scripts/build-http-fetch-wasm.sh --check
 
-      # DST pattern scan DISABLED (2026-02-17)
-      # Reason: Grep-based pattern matching is too brittle and caused 5+ consecutive
-      # CI failures from false positives. The DST reviewer agent (.claude/agents/dst-reviewer.md)
-      # performs semantic analysis which is strictly superior to regex scanning.
-      # The pattern scan will be re-evaluated once the DST architecture refactor
-      # (shared effect application) is complete.
-      # See: .progress/012_20260217_dst_architecture_fix.md
-
       - name: Dependency isolation
         run: |
           # Check temper-jit has no production dep on temper-verify
@@ -364,6 +262,36 @@ jobs:
           done
           echo "Dependency isolation: OK"
 
+      # Fails when a metric registration has no emission site (ADR-0052; formerly the Instrumentation Hygiene job).
+      - name: Instrumentation hygiene (every metric has an emission site)
+        run: cargo run --locked -q -p temper-server --bin check_instrumentation
+
+  # ─────────────────────────────────────────────────────
+  # Gate 1a: TypeScript SDK (packages/temper-sdk-ts)
+  # ─────────────────────────────────────────────────────
+  sdk-ts:
+    name: TypeScript SDK
+    needs: changes
+    if: needs.changes.outputs.sdk_ts == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5  # about 2x its normal 15 s
+    defaults:
+      run:
+        working-directory: packages/temper-sdk-ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/temper-sdk-ts/package-lock.json
+      - run: npm ci
+      - name: Type check
+        run: npx tsc --noEmit
+      - name: Tests
+        if: needs.changes.outputs.tests == 'true'
+        run: npx vitest run
+
   # ─────────────────────────────────────────────────────
   # Gate 3a: pull-request tests, split across machines
   # Only the packages a change can reach (scripts/ci/affected.py), by test-name hash.
@@ -375,7 +303,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.lane == 'pr' && needs.changes.outputs.mode != 'none' && needs.changes.outputs.tests == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30  # about 2x its normal 10 to 15 minutes
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.shards) }}
@@ -488,6 +416,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.mode != 'none' && needs.changes.outputs.tests == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 5  # about 2x its normal 1 to 2 minutes
     steps:
       - uses: actions/checkout@v4
 
@@ -515,7 +444,7 @@ jobs:
     needs: [changes, test-shards, workspaces]
     if: ${{ !cancelled() && inputs.tests == '' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 60  # about 2x the nightly full run's 30 minutes; on a push it ends in seconds
     # Tests that need a database run or fail in CI (crates/temper-test-resource), so
     # every machine that runs them has one. Each test isolates itself by a unique tenant
     # or key, so a parallel run can share one database and one Redis.
@@ -673,7 +602,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.packages != '' && needs.changes.outputs.tests == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20  # about 2x its normal 7 to 10 minutes
     services:
       postgres:
         image: postgres:18
@@ -755,10 +684,10 @@ jobs:
   # The matrix is built per run by the changes job.
   # ─────────────────────────────────────────────────────
   dst-platform-tests:
-    name: DST/Platform Tests (${{ matrix.suite }}${{ matrix.shard_count && format(' {0}/{1}', matrix.shard_index, matrix.shard_count) || '' }})
+    name: DST/Platform Tests (${{ matrix.suite }}${{ matrix.shard_count && format(' {0}/{1}', matrix.shard_index, matrix.shard_count) || '' }}${{ matrix.part_count && format(' {0}/{1}', matrix.part_index, matrix.part_count) || '' }})
     needs: changes
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30  # about 2x its normal 8 to 16 minutes
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.dst_matrix) }}
@@ -823,7 +752,13 @@ jobs:
           TEMPER_DST_RANDOM_MODE: ${{ matrix.suite == 'platform-random' && needs.changes.outputs.lane == 'pr' && 'smoke' || 'full' }}
           TEMPER_DST_SHARD_INDEX: ${{ matrix.shard_index }}
           TEMPER_DST_SHARD_COUNT: ${{ matrix.shard_count }}
-        run: cargo nextest run --locked $TEST_ARGS --no-tests=warn -E "$FILTER"
+          PART_INDEX: ${{ matrix.part_index }}
+          PART_COUNT: ${{ matrix.part_count }}
+        run: |
+          # core is split in two by test-name hash (nextest --partition) so neither half sets the run's length.
+          PART=()
+          if [ -n "$PART_COUNT" ]; then PART=(--partition "hash:$PART_INDEX/$PART_COUNT"); fi
+          cargo nextest run --locked $TEST_ARGS --no-tests=warn -E "$FILTER" "${PART[@]}"
 
   # ─────────────────────────────────────────────────────
   # Gate 4: Spec verification (minutes)
@@ -839,7 +774,7 @@ jobs:
       needs.changes.outputs.specs == 'true' && needs.changes.outputs.tests == 'true'
       && !contains(format(' {0} ', needs.changes.outputs.packages), ' temper-cli ')
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 30  # kept: it runs only when a spec file changed, so no recent run sizes it
     steps:
       - uses: actions/checkout@v4
 
@@ -874,39 +809,6 @@ jobs:
           cargo test --locked -p temper-cli verify::
 
 
-
-  # ─────────────────────────────────────────────────────
-  # Gate N: Instrumentation hygiene (ADR-0052)
-  # Fails when a metric registration has no emission site.
-  # ─────────────────────────────────────────────────────
-  instrumentation-hygiene:
-    name: Instrumentation Hygiene (ADR-0052)
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-
-      - name: Set up mold linker
-        uses: rui314/setup-mold@v1
-
-      # rust-cache hashes every installed toolchain into its key. The runner image's own
-      # stable Rust changes between image versions, which split one cache into several.
-      - name: Keep only the pinned toolchain
-        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ env.SAVE_RUST_CACHE }}
-
-      - name: Run check_instrumentation
-        run: cargo run --locked -q -p temper-server --bin check_instrumentation
 
   # ─────────────────────────────────────────────────────
   # Focused tests: a dispatch given tests runs only the tests its filterset selects, so a
