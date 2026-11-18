@@ -80,6 +80,7 @@ pub struct BoxedEventStore {
     limits: EventSizeLimits,
     room: Option<StorageRoom>,
     health: write_room::HealthCell,
+    meaning_wake: Arc<tokio::sync::Notify>,
 }
 
 impl BoxedEventStore {
@@ -99,6 +100,7 @@ impl BoxedEventStore {
             limits: EventSizeLimits::default(),
             room: None,
             health: write_room::HealthCell::default(),
+            meaning_wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -121,6 +123,7 @@ impl BoxedEventStore {
         let result = self.record_append(result);
         if result.is_ok() {
             count_written(persistence_id, events);
+            self.meaning_wake.notify_one();
         }
         result
     }
@@ -142,6 +145,7 @@ impl BoxedEventStore {
             for append in appends {
                 count_written(&append.persistence_id, &append.events);
             }
+            self.meaning_wake.notify_one();
         }
         result
     }
@@ -191,6 +195,7 @@ impl BoxedEventStore {
         let result = self.record_append(result);
         if result.is_ok() {
             count_written(persistence_id, events);
+            self.meaning_wake.notify_one();
         }
         result
     }
@@ -211,6 +216,7 @@ impl BoxedEventStore {
         let result = self.record_append(result);
         if result.is_ok() {
             count_written(persistence_id, events);
+            self.meaning_wake.notify_one();
         }
         result
     }
@@ -267,57 +273,97 @@ impl BoxedEventStore {
             .await
     }
 
-    pub async fn backfill_entity_vectors(
+    /// Keep a record's meaning row outside an append (ADR-0186): its text, or
+    /// None to remove it.
+    pub async fn write_meaning(
         &self,
         tenant: &str,
         entity_type: &str,
         entity_id: &str,
-        vector_rows: &[temper_runtime::persistence::EntityVectorRow],
+        text: Option<&str>,
     ) -> Result<(), PersistenceError> {
-        self.store
-            .backfill_entity_vectors(tenant, entity_type, entity_id, vector_rows)
-            .await
+        let result = self
+            .store
+            .write_meaning(tenant, entity_type, entity_id, text)
+            .await;
+        if result.is_ok() && text.is_some() {
+            self.meaning_wake.notify_one();
+        }
+        result
     }
 
-    pub async fn vector_candidates(
+    /// Up to `limit` meaning rows of `entity_type` after `after`, in id order.
+    pub async fn meaning_rows(
         &self,
         tenant: &str,
         entity_type: &str,
-        decl_name: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<temper_runtime::persistence::MeaningRow>, PersistenceError> {
+        self.store
+            .meaning_rows(tenant, entity_type, after, limit)
+            .await
+    }
+
+    /// One record's meaning row.
+    pub async fn meaning_row(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<Option<temper_runtime::persistence::MeaningRow>, PersistenceError> {
+        self.store.meaning_row(tenant, entity_type, entity_id).await
+    }
+
+    /// Up to `limit` of `tenant`'s meaning rows that wait for `model_tag`.
+    pub async fn meaning_pending(
+        &self,
+        tenant: &str,
         model_tag: &str,
         limit: usize,
-    ) -> Result<Vec<temper_runtime::persistence::EntityVectorCandidate>, PersistenceError> {
-        self.store
-            .vector_candidates(tenant, entity_type, decl_name, model_tag, limit)
-            .await
+    ) -> Result<Vec<temper_runtime::persistence::MeaningPending>, PersistenceError> {
+        self.store.meaning_pending(tenant, model_tag, limit).await
     }
 
-    pub async fn mark_vector_index_backfilled(
+    /// Keep `vector` as a record's meaning if its text still hashes to `text_hash`.
+    pub async fn set_meaning_vector(
         &self,
         tenant: &str,
         entity_type: &str,
-        vector_set: &str,
-    ) -> Result<(), PersistenceError> {
+        entity_id: &str,
+        text_hash: &str,
+        model_tag: &str,
+        vector: &[f32],
+    ) -> Result<bool, PersistenceError> {
         self.store
-            .mark_vector_index_backfilled(tenant, entity_type, vector_set)
+            .set_meaning_vector(tenant, entity_type, entity_id, text_hash, model_tag, vector)
             .await
     }
 
-    pub async fn vector_index_backfilled_types(
+    /// Record that `(tenant, entity_type)`'s meaning rows are whole under `rule`.
+    pub async fn mark_meaning_backfilled(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        rule: &str,
+    ) -> Result<(), PersistenceError> {
+        self.store
+            .mark_meaning_backfilled(tenant, entity_type, rule)
+            .await
+    }
+
+    /// The `(entity_type, rule)` meaning backfill marks for `tenant`.
+    pub async fn meaning_backfilled_types(
         &self,
         tenant: &str,
     ) -> Result<Vec<(String, String)>, PersistenceError> {
-        self.store.vector_index_backfilled_types(tenant).await
+        self.store.meaning_backfilled_types(tenant).await
     }
 
-    pub async fn vectored_entity_ids_for_type(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-    ) -> Result<Vec<String>, PersistenceError> {
-        self.store
-            .vectored_entity_ids_for_type(tenant, entity_type)
-            .await
+    /// Notified after every append and every meaning write: a record's text may
+    /// wait for the model. The meaning worker waits on it.
+    pub fn meaning_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.meaning_wake.clone()
     }
 
     pub async fn lookup_by_key(

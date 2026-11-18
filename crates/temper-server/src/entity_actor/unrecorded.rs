@@ -58,7 +58,7 @@ pub(super) fn leaves_record_unchanged(
     // What a move can change, as `effects::MoveStart` copies it: the status,
     // counters (`item_count` among them), booleans, lists, the fields with the
     // action's params written into them, and spawn reservations. The record's
-    // key and vector rows are read from its fields, so they stay as they are.
+    // key and meaning rows are read from its fields, so they stay as they are.
     let record_kept = before.status == after.status
         && before.item_count == after.item_count
         && before.counters == after.counters

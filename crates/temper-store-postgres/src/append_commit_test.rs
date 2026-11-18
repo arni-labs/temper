@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 
 use sqlx::PgPool;
 use temper_runtime::persistence::{
-    AppendProjection, CommitRows, EntityKeyRow, EntityVectorRow, EventMetadata, EventStore,
-    PersistenceAppend, PersistenceEnvelope, PersistenceError, ProjectionRow, ScheduledActionRecord,
-    StateTimerRecord, StateTimerRow,
+    AppendProjection, CommitRows, EntityKeyRow, EventMetadata, EventStore, PersistenceAppend,
+    PersistenceEnvelope, PersistenceError, ProjectionRow, ScheduledActionRecord, StateTimerRecord,
+    StateTimerRow,
 };
 
 use crate::migration::run_migrations_in_schema;
@@ -298,7 +298,7 @@ fn move_that_drops_one_field_and_changes_another() {
             .unwrap();
         assert_eq!(fields, next.fields);
         assert_eq!(sequence_nr, 2);
-        // The key, vector, scheduled action and timer moved with it.
+        // The key, meaning row, scheduled action and timer moved with it.
         let key: (String, i64) = sqlx::query_as(&store.schema().qualify_sql(
             "SELECT key_hash, sequence_nr FROM {schema}entity_key_index WHERE tenant = 't'",
         ))
@@ -306,7 +306,7 @@ fn move_that_drops_one_field_and_changes_another() {
         .await
         .unwrap();
         assert_eq!(key, ("slug-2".into(), 2));
-        assert_eq!(count(&store, &pool, "entity_vector_index").await, 1);
+        assert_eq!(count(&store, &pool, "entity_meaning").await, 1);
         assert_eq!(count(&store, &pool, "scheduled_actions").await, 2);
         let timer: String = sqlx::query_scalar(
             &store
@@ -349,7 +349,6 @@ fn tombstone_removes_rows_and_leaves_a_terminal_mark() {
                 CommitRows {
                     projection: Some(ProjectionRow::Remove),
                     state_timer: Some(StateTimerRow::End),
-                    reconcile_vectors: true,
                     ..CommitRows::default()
                 },
             )
@@ -359,7 +358,7 @@ fn tombstone_removes_rows_and_leaves_a_terminal_mark() {
             "entity_catalog",
             "entity_field_index",
             "state_timers",
-            "entity_vector_index",
+            "entity_meaning",
         ] {
             assert_eq!(count(&store, &pool, table).await, 0, "{table}");
         }
@@ -380,5 +379,7 @@ use support::*;
 
 #[path = "append_commit_test/batch_test.rs"]
 mod batch;
+#[path = "append_commit_test/meaning_test.rs"]
+mod meaning;
 #[path = "append_commit_test/race_test.rs"]
 mod race;

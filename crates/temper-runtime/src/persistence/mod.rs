@@ -5,10 +5,14 @@ pub use projection::{JournalHead, ProjectionCheckpoint, ProjectionRepairCandidat
 
 mod catalog_group;
 mod catalog_state;
+mod meaning;
 mod secret;
 mod tombstone;
 pub use catalog_group::CatalogGroupRow;
 pub use catalog_state::{catalog_state_for_storage, catalog_state_from_storage};
+pub use meaning::{
+    MeaningPending, MeaningRow, TEXT_RULE, fold, meaning_input, record_text, text_hash,
+};
 pub use secret::{SecretPrecondition, SecretWrite};
 pub use tombstone::{EVENT_KIND_KEY, EventKind, TOMBSTONE_EVENT_TYPE, journal_is_deleted};
 
@@ -121,26 +125,9 @@ pub struct EntityKeyRow {
     pub key_hash: String,
 }
 
-/// A derived vector-index row to co-commit with an append (ADR-0155). Parsed from
-/// the entity's post-transition state for one declared `[[vector]]` path: the
-/// float vector and the model tag that partitions its space. Stores that maintain
-/// `entity_vector_index` write one row per `(decl_name, model_tag, entity_id)`; the
-/// blob is packed little-endian f32. Unlike a key row this has no uniqueness
-/// constraint — it is derived, rebuildable ranking state.
-#[derive(Debug, Clone, PartialEq)]
-pub struct EntityVectorRow {
-    /// The declared vector path's identifier (the `[[vector]]` block's `name`).
-    pub decl_name: String,
-    /// The model tag that partitions this vector's space (only same-tag vectors
-    /// are ever compared).
-    pub model_tag: String,
-    /// The float vector, exactly `dims` long.
-    pub vector: Vec<f32>,
-}
-
-/// Pack an `f32` slice to little-endian bytes — the `entity_vector_index` blob
-/// encoding shared by every backend (ADR-0155). Kept here beside [`EntityVectorRow`]
-/// so the stores and the kernel ranking agree on the byte layout.
+/// Pack an `f32` slice to little-endian bytes: the meaning vector's blob encoding,
+/// shared by every backend (ADR-0186), so the stores and the kernel's ranking agree
+/// on the byte layout.
 pub fn pack_f32_le(vector: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(vector.len() * 4);
     for value in vector {
@@ -152,7 +139,7 @@ pub fn pack_f32_le(vector: &[f32]) -> Vec<u8> {
 /// Unpack little-endian bytes back to `f32`. `None` if the byte length is not a
 /// multiple of 4, or if any component is not finite (both signal a corrupt blob),
 /// so a bad row is skipped rather than panicking or feeding a `NaN`/`inf` into the
-/// kNN ranking — where a `NaN` would sort ahead of every real score.
+/// ranking — where a `NaN` would sort ahead of every real score.
 pub fn unpack_f32_le(bytes: &[u8]) -> Option<Vec<f32>> {
     if !bytes.len().is_multiple_of(4) {
         return None;
@@ -166,18 +153,6 @@ pub fn unpack_f32_le(bytes: &[u8]) -> Option<Vec<f32>> {
         out.push(value);
     }
     Some(out)
-}
-
-/// One candidate row returned from the vector index for a kNN read (ADR-0155):
-/// an entity and its packed vector for one `(tenant, type, decl, model_tag)`
-/// partition. The kernel — not the store — computes the metric over these in the
-/// store-supplied (entity-id) order, so ranking is identical across backends.
-#[derive(Debug, Clone, PartialEq)]
-pub struct EntityVectorCandidate {
-    /// The entity holding this vector.
-    pub entity_id: String,
-    /// The float vector, exactly `dims` long.
-    pub vector: Vec<f32>,
 }
 
 /// One armed `[[state_timeout]]`, kept so that a restarted server arms it
@@ -261,11 +236,6 @@ pub struct ScheduledActionRecord {
 pub struct CommitRows<'a> {
     /// Declared key-index rows (ADR-0153).
     pub key_rows: &'a [EntityKeyRow],
-    /// Derived vector-index rows (ADR-0155).
-    pub vector_rows: &'a [EntityVectorRow],
-    /// The type declares vector paths: the entity's vector rows become
-    /// exactly `vector_rows`, so a delete or a cleared property purges them.
-    pub reconcile_vectors: bool,
     /// The scheduled actions the appended transition armed: they exist if and
     /// only if its event does.
     pub scheduled_actions: &'a [ScheduledActionRecord],
@@ -284,6 +254,11 @@ pub struct CommitRows<'a> {
 }
 
 /// An entity's query-plane row, written with the events that change it.
+///
+/// A store writes the entity's meaning row (ADR-0186) with it, in the same
+/// transaction: an upsert keeps [`record_text`] of `fields` and its
+/// [`text_hash`], clearing the row's vector only when the hash changed; a remove
+/// removes the meaning row too.
 #[derive(Debug, Clone, Copy)]
 pub enum ProjectionRow<'a> {
     /// The entity's status, its projected fields and its projected state.
@@ -292,7 +267,7 @@ pub enum ProjectionRow<'a> {
         fields: &'a serde_json::Value,
         state: &'a serde_json::Value,
     },
-    /// The entity was deleted: its row and its field-index rows go.
+    /// The entity was deleted: its row, its field-index rows and its meaning row go.
     Remove,
 }
 
@@ -347,15 +322,10 @@ pub trait EventStore: Send + Sync + 'static {
     }
 
     /// Append events and commit `rows` with them: declared key-index rows
-    /// (ADR-0153), derived vector-index rows (ADR-0155) and the scheduled
-    /// actions the transition armed. This is the single co-commit entry point
-    /// the entity actor calls. Postgres and the sim store commit every kind in
-    /// the journal's transaction; Turso commits the scheduled actions there and
-    /// maintains the vector index write-behind (event first, index follows).
-    /// When `reconcile_vectors` is true (the entity's type declares ≥1
-    /// `[[vector]]` path) the store first DELETES all of the entity's vector
-    /// rows, then inserts `vector_rows`. The sequence and atomicity contract is
-    /// identical to `append`.
+    /// (ADR-0153), the scheduled actions the transition armed, and the entity's
+    /// query-plane, meaning (ADR-0186) and timer rows. This is the single
+    /// co-commit entry point the entity actor calls. The sequence and atomicity
+    /// contract is identical to `append`.
     ///
     /// The default keeps only the events: a store without a timer table cannot
     /// keep scheduled actions, so it logs that a restart loses them.
@@ -442,81 +412,96 @@ pub trait EventStore: Send + Sync + 'static {
         async { Ok(()) }
     }
 
-    /// Reconcile the derived vector-index rows for an **existing** entity to exactly
-    /// `vector_rows` (ADR-0155), without appending a journal event: DELETE every
-    /// existing row for `(tenant, entity_type, entity_id)`, then INSERT `vector_rows`.
-    /// Idempotent, and an empty `vector_rows` PURGES the entity (used to clean up a
-    /// deleted or un-embedded entity). Used by the backfill and by the Turso
-    /// write-behind path. The default is a no-op (non-indexing backends); query-plane
-    /// stores implement it.
-    fn backfill_entity_vectors(
+    /// Write a record's meaning row outside an append (ADR-0186): the backfill for
+    /// records saved before their store kept meaning rows, or before the current
+    /// [`TEXT_RULE`]. `Some(text)` keeps the text and its [`text_hash`], clearing the
+    /// vector only when the hash changed; `None` removes the row. Idempotent. The
+    /// default is a no-op for a store that keeps no query plane.
+    fn write_meaning(
         &self,
         tenant: &str,
         entity_type: &str,
         entity_id: &str,
-        vector_rows: &[EntityVectorRow],
+        text: Option<&str>,
     ) -> impl std::future::Future<Output = Result<(), PersistenceError>> + Send {
-        let _ = (tenant, entity_type, entity_id, vector_rows);
+        let _ = (tenant, entity_type, entity_id, text);
         async { Ok(()) }
     }
 
-    /// The candidate `(entity_id, vector)` rows for one vector-index partition
-    /// `(tenant, entity_type, decl_name, model_tag)`, in **deterministic entity-id
-    /// order** (ADR-0155), capped at `limit` rows. The kernel ranks these; the store
-    /// only supplies the packed vectors, and applies `LIMIT` so an over-budget
-    /// partition is detected (caller passes `budget + 1`) without loading the whole
-    /// partition into memory. Default empty (non-indexing backends have no index).
-    fn vector_candidates(
+    /// Up to `limit` meaning rows of `entity_type`, in entity-id order, starting after
+    /// `after` (exclusive) when given: a search reads a type page by page.
+    fn meaning_rows(
         &self,
         tenant: &str,
         entity_type: &str,
-        decl_name: &str,
-        model_tag: &str,
+        after: Option<&str>,
         limit: usize,
-    ) -> impl std::future::Future<Output = Result<Vec<EntityVectorCandidate>, PersistenceError>> + Send
-    {
-        let _ = (tenant, entity_type, decl_name, model_tag, limit);
+    ) -> impl std::future::Future<Output = Result<Vec<MeaningRow>, PersistenceError>> + Send {
+        let _ = (tenant, entity_type, after, limit);
         async { Ok(Vec::new()) }
     }
 
-    /// Record that `entity_vector_index` is **complete** for `(tenant, entity_type)`
-    /// — every existing entity has had its declared vectors indexed by the backfill
-    /// (ADR-0155 watermark, mirroring `mark_key_index_backfilled`). `vector_set` is
-    /// the sorted, comma-joined declared vector-path NAMES the backfill covered, so a
-    /// later declaration of an ADDITIONAL path is detected as a set change and the
-    /// type is re-indexed. Idempotent. Default no-op.
-    fn mark_vector_index_backfilled(
+    /// One record's meaning row, if it has one.
+    fn meaning_row(
         &self,
         tenant: &str,
         entity_type: &str,
-        vector_set: &str,
+        entity_id: &str,
+    ) -> impl std::future::Future<Output = Result<Option<MeaningRow>, PersistenceError>> + Send
+    {
+        let _ = (tenant, entity_type, entity_id);
+        async { Ok(None) }
+    }
+
+    /// Up to `limit` of `tenant`'s meaning rows whose vector was not made by
+    /// `model_tag` (none yet, or an older model's), in (type, id) order.
+    fn meaning_pending(
+        &self,
+        tenant: &str,
+        model_tag: &str,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<MeaningPending>, PersistenceError>> + Send
+    {
+        let _ = (tenant, model_tag, limit);
+        async { Ok(Vec::new()) }
+    }
+
+    /// Keep `vector`, made by `model_tag`, as the record's meaning, if its row still
+    /// holds the text that hashes to `text_hash`. Returns whether it was kept: false
+    /// when the text changed since (its new text waits for the model) or the row is
+    /// gone.
+    fn set_meaning_vector(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        text_hash: &str,
+        model_tag: &str,
+        vector: &[f32],
+    ) -> impl std::future::Future<Output = Result<bool, PersistenceError>> + Send {
+        let _ = (tenant, entity_type, entity_id, text_hash, model_tag, vector);
+        async { Ok(false) }
+    }
+
+    /// Record that every record of `(tenant, entity_type)` saved before now has a
+    /// meaning row by text rule `rule` (a [`TEXT_RULE`]). Idempotent. Default no-op.
+    fn mark_meaning_backfilled(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        rule: &str,
     ) -> impl std::future::Future<Output = Result<(), PersistenceError>> + Send {
-        let _ = (tenant, entity_type, vector_set);
+        let _ = (tenant, entity_type, rule);
         async { Ok(()) }
     }
 
-    /// The `(entity_type, vector_set)` watermarks for `tenant` — each type whose
-    /// `entity_vector_index` backfill is complete, paired with the covered path set.
-    /// Default empty (no backend authority). Mirrors `key_index_backfilled_types`.
-    fn vector_index_backfilled_types(
+    /// The `(entity_type, rule)` backfill marks for `tenant`.
+    fn meaning_backfilled_types(
         &self,
         tenant: &str,
     ) -> impl std::future::Future<Output = Result<Vec<(String, String)>, PersistenceError>> + Send
     {
         let _ = tenant;
-        async { Ok(Vec::new()) }
-    }
-
-    /// The `entity_id`s that already have at least one `entity_vector_index` row for
-    /// `(tenant, entity_type)`. Lets the vector backfill **resume** cheaply, skipping
-    /// already-indexed entities. Default empty (no resumption). Mirrors
-    /// `keyed_entity_ids_for_type`.
-    fn vectored_entity_ids_for_type(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-    ) -> impl std::future::Future<Output = Result<Vec<String>, PersistenceError>> + Send {
-        let _ = (tenant, entity_type);
         async { Ok(Vec::new()) }
     }
 

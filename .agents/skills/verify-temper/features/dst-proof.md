@@ -9,7 +9,7 @@ The `dst_*` suites in `crates/temper-server/tests/` (each is its own `cargo test
 |---|---|
 | `dst_concurrency_retry` | optimistic-concurrency retry under contention (ADR-0046) |
 | `dst_entity_key_index` | key-index negative-existence invariant (ADR-0153) |
-| `dst_entity_vector_index` | kNN vector-index reproducibility (ADR-0155) |
+| `dst_meaning` | search-by-meaning ranking reproducibility and stale-vector safety (ADR-0186) |
 | `dst_genesis_install_rollback` | Genesis install-verify + rollback, invariant P18 (ARN-421) |
 | `dst_hotswap` | spec hot-swap safety |
 | `dst_lifecycle` | create -> dispatch -> persist -> crash -> respawn -> replay -> continue |

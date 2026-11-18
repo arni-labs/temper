@@ -191,6 +191,7 @@ fn test_apply_query_options_combined() {
         count: Some(true),
         expand: None,
         skiptoken: None,
+        search: None,
     };
 
     let (result, count) = apply_query_options(entities, &options);

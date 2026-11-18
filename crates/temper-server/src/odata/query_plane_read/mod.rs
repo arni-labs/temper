@@ -3,11 +3,13 @@
 mod equality;
 mod pagination;
 mod scan;
+mod search;
 #[cfg(test)]
 mod tests;
 mod types;
 
 pub(in crate::odata) use pagination::read_entity_set_from_query_plane;
+pub(in crate::odata) use search::walk_ranked;
 pub(in crate::odata) use types::{
     QueryPlaneReadBudget, QueryPlaneReadError, QueryPlaneReadRequest, QueryPlaneReadResult,
 };

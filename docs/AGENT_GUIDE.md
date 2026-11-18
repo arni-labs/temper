@@ -487,7 +487,7 @@ The server exposes OData v4 endpoints:
 |--------|------|-------------|
 | GET | `/tdata` | Service document (lists entity sets) |
 | GET | `/tdata/$metadata` | CSDL XML (full data model) |
-| GET | `/tdata/Orders` | List orders (with $filter, $select, $expand, $orderby, $top, $skip) |
+| GET | `/tdata/Orders` | List orders (with $filter, $select, $expand, $orderby, $top, $skip, $search) |
 | GET | `/tdata/Orders('id')` | Get single order |
 | POST | `/tdata/Orders` | Create order |
 | POST | `/tdata/Orders('id')/Ns.SubmitOrder` | Invoke bound action |
@@ -553,7 +553,11 @@ GET /tdata/Orders?$filter=Status eq 'Draft' and Total gt 100.0
 GET /tdata/Orders?$select=Id,Status,Total&$orderby=CreatedAt desc&$top=10
 GET /tdata/Orders('abc')?$expand=Items($select=ProductName,Quantity)
 GET /tdata/Customers('xyz')?$expand=Orders($filter=Status ne 'Cancelled')
+GET /tdata/Orders?$search=late delivery to the coast&$top=10
+GET /tdata/Orders/Temper.Nearest(to='abc',k=5)
 ```
+
+`$search` finds records by their words and their meaning, in any language: records whose text holds every word come first, then the rest by closeness in meaning. Each result carries `@temper.words` and `@temper.score`. `Temper.Nearest` lists the records closest in meaning to one record. Apps declare nothing for either (ADR-0186).
 
 ### Headers for Agent Authentication
 

@@ -116,7 +116,6 @@ mod tests {
             states: vec!["Draft".into(), "Submitted".into(), "Cancelled".into()],
             initial_state: "Draft".into(),
             keys: vec![],
-            vectors: vec![],
             rules: vec![
                 TransitionRule {
                     name: "SubmitOrder".into(),

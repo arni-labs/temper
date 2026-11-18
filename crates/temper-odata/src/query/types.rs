@@ -34,6 +34,8 @@ pub struct QueryOptions {
     /// interprets it as a keyset cursor over the response's ordering. Clients
     /// echo it back verbatim; they never construct one.
     pub skiptoken: Option<String>,
+    /// The `$search` words, if present: word matches first, then by meaning (ADR-0186).
+    pub search: Option<String>,
 }
 
 /// An item in a `$expand` clause, optionally with nested query options.
@@ -168,6 +170,11 @@ pub fn parse_query_options(query_string: &str) -> Result<QueryOptions, ODataErro
     parse_query_options_from_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
 }
 
+/// An option's trimmed value, or None when it is empty.
+fn non_empty(value: &str) -> Option<String> {
+    (!value.trim().is_empty()).then(|| value.trim().to_string())
+}
+
 /// Parse separated, already-decoded query parameters into [`QueryOptions`].
 ///
 /// Each value reaches its option's parser exactly as given: nothing is joined,
@@ -202,12 +209,8 @@ pub fn parse_query_options_from_pairs<'a>(
             "$count" => {
                 opts.count = Some(parse_bool("$count", value)?);
             }
-            "$skiptoken" => {
-                let token = value.trim();
-                if !token.is_empty() {
-                    opts.skiptoken = Some(token.to_string());
-                }
-            }
+            "$skiptoken" => opts.skiptoken = non_empty(value),
+            "$search" => opts.search = non_empty(value),
             // Custom options, $format and system options not handled yet are ignored.
             _ => {}
         }

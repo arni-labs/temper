@@ -50,7 +50,7 @@ pub enum ODataPath {
 
     /// A bound function on an entity or collection, e.g.
     /// `/Orders('abc-123')/Namespace.GetTotal()` or, with named arguments,
-    /// `/Orders/Temper.Nearest(decl='taste',to='x',k=10)`. `params` holds the
+    /// `/Orders/Temper.Nearest(to='x',k=10)`. `params` holds the
     /// parsed `name=value` argument list in declared order (empty for `()`).
     BoundFunction {
         parent: Box<ODataPath>,
@@ -219,7 +219,7 @@ fn parse_continuation_segment(segment: &str, parent: ODataPath) -> Result<ODataP
     // Check if this is a qualified name (contains dot) — bound operation
     if segment.contains('.') {
         // Bound function: a qualified name with a parenthesized argument list,
-        // e.g. `Namespace.GetTotal()` or `Temper.Nearest(decl='taste',to='x',k=10)`.
+        // e.g. `Namespace.GetTotal()` or `Temper.Nearest(to='x',k=10)`.
         if let Some(paren_start) = segment.find('(') {
             if !segment.ends_with(')') {
                 return Err(ODataError::InvalidPath {
@@ -314,11 +314,11 @@ fn parse_key_value(key_str: &str) -> Result<KeyValue, ODataError> {
     }
 }
 
-/// Parse a bound-function argument list like `decl='taste',to='x',k=10` into an
+/// Parse a bound-function argument list like `to='x',k=10` into an
 /// ordered list of `(name, value)` pairs. Empty input yields an empty list (the
 /// `Function()` case). Quoted values are unquoted (with `''` escapes collapsed) via
-/// [`parse_key_literal`], and commas inside quotes do not split, so a raw-vector
-/// argument such as `vector='[0.1, 0.2]'` parses as one value. Reuses the composite
+/// [`parse_key_literal`], and commas inside quotes do not split, so an argument
+/// such as `filter='Tags eq ''a, b'''` parses as one value. Reuses the composite
 /// key splitting/unquoting rules so URL argument syntax stays consistent.
 fn parse_function_params(args_str: &str) -> Result<Vec<(String, String)>, ODataError> {
     if args_str.trim().is_empty() {
@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn parse_collection_bound_function_with_named_params() {
-        // ADR-0155: Temper.Nearest is a collection-bound function with named args.
+        // Temper.Nearest is a collection-bound function with named args.
         let result =
             parse_path("/DesignLanguages/Temper.Nearest(decl='taste',to='en-1',k=10)").unwrap();
         assert_eq!(
@@ -602,7 +602,7 @@ mod tests {
 
     #[test]
     fn parse_bound_function_arg_value_may_contain_commas_in_quotes() {
-        // A raw-vector argument is a quoted list; commas inside quotes do not split.
+        // A quoted argument may hold commas; they do not split it.
         let result = parse_path(
             "/DesignLanguages/Temper.Nearest(decl='taste',vector='[0.1, 0.2]',model='m')",
         )

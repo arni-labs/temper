@@ -619,18 +619,11 @@ impl EntityActor {
 
         // W2 / temper#146: measure append wait — the hypothesis is that
         // writer-lock / fsync serialization is a cold-start bottleneck.
-        // ADR-0153/0155: derive the declared key rows AND the vector-index rows from
-        // the new state and co-commit them with the journal append, so a keyed read
-        // is correct without a scan and a kNN read reflects the write deterministically.
-        let (key_rows, vector_rows, reconcile_vectors) = {
+        // ADR-0153: derive the declared key rows from the new state and co-commit
+        // them with the journal append, so a keyed read is correct without a scan.
+        let key_rows = {
             let table = self.table.read().expect("table lock poisoned");
-            // The type declares vector paths → the store reconciles this entity's
-            // vector rows (delete stale + insert current) even when no row is emitted
-            // this write (a delete transition or a cleared property), so stale rows are
-            // purged instead of being ranked forever (ADR-0155).
-            let reconcile_vectors = !table.vectors.is_empty();
             let mut key_rows = Vec::new();
-            let mut vector_rows = Vec::new();
             if let Some(field_map) = state.fields.as_object() {
                 for key in &table.keys {
                     if let Some(hash) =
@@ -642,36 +635,8 @@ impl EntityActor {
                         });
                     }
                 }
-                // A soft-deleted (tombstone) entity is never indexed — it emits no
-                // vector rows, so the reconcile below PURGES any it had, even though
-                // its embedding field may still be present. Mirrors how the field-index
-                // projection removes a deleted entity.
-                let index_vectors = state.status != "Deleted";
-                for decl in table.vectors.iter().filter(|_| index_vectors) {
-                    // A vector is indexed only when its property parses to `dims`
-                    // floats AND its model tag is a non-empty string — otherwise the
-                    // path indexes nothing for this entity (like an incomplete key).
-                    let Some(vector) = field_map
-                        .get(&decl.property)
-                        .and_then(|v| crate::vector_index::parse_vector_property(v, decl.dims))
-                    else {
-                        continue;
-                    };
-                    let Some(model_tag) = field_map
-                        .get(&decl.model_property)
-                        .and_then(|v| v.as_str())
-                        .filter(|tag| !tag.is_empty())
-                    else {
-                        continue;
-                    };
-                    vector_rows.push(temper_runtime::persistence::EntityVectorRow {
-                        decl_name: decl.name.clone(),
-                        model_tag: model_tag.to_string(),
-                        vector,
-                    });
-                }
             }
-            (key_rows, vector_rows, reconcile_vectors)
+            key_rows
         };
         let append_start = Instant::now(); // determinism-ok: production-only event-store wait metric
         let result = self
@@ -684,8 +649,6 @@ impl EntityActor {
                     &[envelope],
                     entity_rows.commit_rows(CommitRows {
                         key_rows: &key_rows,
-                        vector_rows: &vector_rows,
-                        reconcile_vectors,
                         scheduled_actions: &scheduled.armed,
                         fired_scheduled_action: scheduled.fired.as_deref(),
                         projection: None,

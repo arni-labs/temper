@@ -230,6 +230,7 @@ async fn row_authorized_count_over_budget_returns_413() {
         QueryPlaneReadError::InvalidContinuation => {
             panic!("no $skiptoken was supplied")
         }
+        QueryPlaneReadError::Unsupported(message) => panic!("no $search was supplied: {message}"),
     }
 }
 

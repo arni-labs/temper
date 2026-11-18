@@ -196,28 +196,6 @@ impl ServerState {
             .unwrap_or_default()
     }
 
-    /// The declared `[[vector]]` access paths for `(tenant, entity_type)` — the
-    /// registry table first (covers os-app entities), the boot-time
-    /// `transition_tables` as fallback (ADR-0155). Same registry-lock discipline as
-    /// [`Self::declared_keys_for`]: fail fast on a poisoned lock rather than silently
-    /// falling through. Empty when the type declares no vector path.
-    pub(crate) fn declared_vectors_for(
-        &self,
-        tenant: &TenantId,
-        entity_type: &str,
-    ) -> Vec<temper_jit::table::types::DeclaredVector> {
-        {
-            let registry = self.registry.read().expect("registry lock poisoned");
-            if let Some(table) = registry.get_table(tenant, entity_type) {
-                return table.vectors.clone();
-            }
-        }
-        self.transition_tables
-            .get(entity_type)
-            .map(|table| table.vectors.clone())
-            .unwrap_or_default()
-    }
-
     /// Whether the entity exists: resident, or with a snapshot or events in
     /// the journal.
     pub(crate) async fn entity_exists_durably(
@@ -676,12 +654,12 @@ impl ServerState {
         projection_backfill::populate_key_index_from_snapshots(self, tenant).await;
     }
 
-    /// ADR-0155: backfill `entity_vector_index` for pre-existing entities of every
-    /// vector-declaring type and record the watermark. Idempotent; entities written
-    /// after boot maintain their vectors inline (co-commit) or write-behind.
-    #[instrument(skip_all, fields(otel.name = "entity.populate_vector_index", tenant = %tenant))]
-    pub async fn populate_vector_index_from_snapshots(&self, tenant: &TenantId) {
-        projection_backfill::populate_vector_index_from_snapshots(self, tenant).await;
+    /// ADR-0186: give every record saved before its store kept meaning rows (or
+    /// before the current text rule) its meaning row, and mark each type. Idempotent;
+    /// records saved since keep theirs in the commit that saves them.
+    #[instrument(skip_all, fields(otel.name = "entity.populate_meaning", tenant = %tenant))]
+    pub async fn populate_meaning_from_snapshots(&self, tenant: &TenantId) {
+        projection_backfill::populate_meaning_from_snapshots(self, tenant).await;
     }
 
     /// Hydrate the per-tenant `entity_key_index` watermark cache once from the durable

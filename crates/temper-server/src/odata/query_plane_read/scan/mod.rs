@@ -310,7 +310,8 @@ pub(super) fn apply_select_only(
         .collect()
 }
 
-fn entity_id_from_odata_id(entity: &serde_json::Value) -> Option<String> {
+/// The record id an entity's `@odata.id` names, as in `Notes('n1')`.
+pub(super) fn entity_id_from_odata_id(entity: &serde_json::Value) -> Option<String> {
     let odata_id = entity.get("@odata.id")?.as_str()?;
     let (_, rest) = odata_id.split_once('(')?;
     let inner = rest.strip_suffix(')')?;

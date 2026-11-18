@@ -8,9 +8,9 @@ use std::time::Instant;
 
 use sqlx::{Acquire, PgPool};
 use temper_runtime::persistence::{
-    CommitRows, EntityVectorCandidate, EntityVectorRow, EventMetadata, EventStore,
-    PersistenceAppend, PersistenceAppendResult, PersistenceEnvelope, PersistenceError,
-    ScheduledActionRecord, pack_f32_le, unpack_f32_le,
+    CommitRows, EventMetadata, EventStore, MeaningPending, MeaningRow, PersistenceAppend,
+    PersistenceAppendResult, PersistenceEnvelope, PersistenceError, ScheduledActionRecord,
+    pack_f32_le, unpack_f32_le,
 };
 use temper_runtime::tenant::parse_persistence_id_parts;
 
@@ -90,7 +90,7 @@ impl EventStore for PostgresEventStore {
     }
 
     /// Append `events` and every row in `rows` in one statement
-    /// (`append_commit`): the journal, its keys, vectors and scheduled actions,
+    /// (`append_commit`): the journal, its keys, meaning row and scheduled actions,
     /// and the record's catalog, field-index, timer and gap rows.
     async fn append_with_rows(
         &self,
@@ -321,77 +321,126 @@ impl EventStore for PostgresEventStore {
         Ok(row.map(|(id,)| id))
     }
 
-    async fn backfill_entity_vectors(
+    async fn write_meaning(
         &self,
         tenant: &str,
         entity_type: &str,
         entity_id: &str,
-        vector_rows: &[EntityVectorRow],
+        text: Option<&str>,
     ) -> Result<(), PersistenceError> {
-        // Reconcile: DELETE all of the entity's rows, then insert the current ones.
-        // Empty `vector_rows` purges the entity (deleted / un-embedded). Always runs
-        // the delete (even for empty rows) so a purge is honored.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| PersistenceError::Storage(e.to_string()))?;
-        crate::dbm::postgres_query!(
-            &self.schema,
-            "DELETE FROM {schema}entity_vector_index \
-             WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
-        )
-        .bind(tenant)
-        .bind(entity_type)
-        .bind(entity_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| PersistenceError::Storage(e.to_string()))?;
-        for row in vector_rows {
-            crate::dbm::postgres_query!(
-                &self.schema,
-                "INSERT INTO {schema}entity_vector_index \
-                 (tenant, entity_type, decl_name, model_tag, entity_id, vector, sequence_nr) \
-                 VALUES ($1, $2, $3, $4, $5, $6, 0)",
-            )
-            .bind(tenant)
-            .bind(entity_type)
-            .bind(&row.decl_name)
-            .bind(&row.model_tag)
-            .bind(entity_id)
-            .bind(pack_f32_le(&row.vector))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| PersistenceError::Storage(e.to_string()))?;
-        }
-        tx.commit()
-            .await
-            .map_err(|e| PersistenceError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn vector_candidates(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-        decl_name: &str,
-        model_tag: &str,
-        limit: usize,
-    ) -> Result<Vec<EntityVectorCandidate>, PersistenceError> {
         let mut conn = self
             .pool
             .acquire()
             .await
             .map_err(|e| PersistenceError::Storage(e.to_string()))?;
-        let rows: Vec<(String, Vec<u8>)> = crate::dbm::postgres_query_as!(
+        match text {
+            Some(text) => {
+                crate::dbm::postgres_query!(
+                    &self.schema,
+                    "INSERT INTO {schema}entity_meaning AS m \
+                     (tenant, entity_type, entity_id, text, text_hash) \
+                     VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT (tenant, entity_type, entity_id) DO UPDATE SET \
+                     text = EXCLUDED.text, text_hash = EXCLUDED.text_hash, \
+                     model_tag = '', vector = ''::bytea \
+                     WHERE m.text_hash <> EXCLUDED.text_hash",
+                )
+                .bind(tenant)
+                .bind(entity_type)
+                .bind(entity_id)
+                .bind(text)
+                .bind(temper_runtime::persistence::text_hash(text))
+                .execute(&mut *conn)
+                .await
+            }
+            None => {
+                crate::dbm::postgres_query!(
+                    &self.schema,
+                    "DELETE FROM {schema}entity_meaning \
+                     WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
+                )
+                .bind(tenant)
+                .bind(entity_type)
+                .bind(entity_id)
+                .execute(&mut *conn)
+                .await
+            }
+        }
+        .map_err(|e| PersistenceError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn meaning_rows(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MeaningRow>, PersistenceError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| PersistenceError::Storage(e.to_string()))?;
+        let rows: Vec<(String, String, String, Vec<u8>)> = crate::dbm::postgres_query_as!(
             &self.schema,
-            "SELECT entity_id, vector FROM {schema}entity_vector_index \
-             WHERE tenant = $1 AND entity_type = $2 AND decl_name = $3 AND model_tag = $4 \
-             ORDER BY entity_id LIMIT $5",
+            "SELECT entity_id, text, model_tag, vector FROM {schema}entity_meaning \
+             WHERE tenant = $1 AND entity_type = $2 AND ($3::text IS NULL OR entity_id > $3) \
+             ORDER BY entity_id LIMIT $4",
         )
         .bind(tenant)
         .bind(entity_type)
-        .bind(decl_name)
+        .bind(after)
+        .bind(limit as i64)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| PersistenceError::Storage(e.to_string()))?;
+        Ok(rows.into_iter().map(meaning_row_from).collect())
+    }
+
+    async fn meaning_row(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<Option<MeaningRow>, PersistenceError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| PersistenceError::Storage(e.to_string()))?;
+        let row: Option<(String, String, String, Vec<u8>)> = crate::dbm::postgres_query_as!(
+            &self.schema,
+            "SELECT entity_id, text, model_tag, vector FROM {schema}entity_meaning \
+             WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
+        )
+        .bind(tenant)
+        .bind(entity_type)
+        .bind(entity_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| PersistenceError::Storage(e.to_string()))?;
+        Ok(row.map(meaning_row_from))
+    }
+
+    async fn meaning_pending(
+        &self,
+        tenant: &str,
+        model_tag: &str,
+        limit: usize,
+    ) -> Result<Vec<MeaningPending>, PersistenceError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| PersistenceError::Storage(e.to_string()))?;
+        let rows: Vec<(String, String, String, String)> = crate::dbm::postgres_query_as!(
+            &self.schema,
+            "SELECT entity_type, entity_id, text, text_hash FROM {schema}entity_meaning \
+             WHERE tenant = $1 AND model_tag <> $2 \
+             ORDER BY entity_type, entity_id LIMIT $3",
+        )
+        .bind(tenant)
         .bind(model_tag)
         .bind(limit as i64)
         .fetch_all(&mut *conn)
@@ -399,17 +448,51 @@ impl EventStore for PostgresEventStore {
         .map_err(|e| PersistenceError::Storage(e.to_string()))?;
         Ok(rows
             .into_iter()
-            .filter_map(|(entity_id, bytes)| {
-                unpack_f32_le(&bytes).map(|vector| EntityVectorCandidate { entity_id, vector })
+            .map(|(entity_type, entity_id, text, text_hash)| MeaningPending {
+                entity_type,
+                entity_id,
+                text,
+                text_hash,
             })
             .collect())
     }
 
-    async fn mark_vector_index_backfilled(
+    async fn set_meaning_vector(
         &self,
         tenant: &str,
         entity_type: &str,
-        vector_set: &str,
+        entity_id: &str,
+        text_hash: &str,
+        model_tag: &str,
+        vector: &[f32],
+    ) -> Result<bool, PersistenceError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| PersistenceError::Storage(e.to_string()))?;
+        let done = crate::dbm::postgres_query!(
+            &self.schema,
+            "UPDATE {schema}entity_meaning SET model_tag = $5, vector = $6 \
+             WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 AND text_hash = $4",
+        )
+        .bind(tenant)
+        .bind(entity_type)
+        .bind(entity_id)
+        .bind(text_hash)
+        .bind(model_tag)
+        .bind(pack_f32_le(vector))
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| PersistenceError::Storage(e.to_string()))?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    async fn mark_meaning_backfilled(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        rule: &str,
     ) -> Result<(), PersistenceError> {
         let mut conn = self
             .pool
@@ -418,21 +501,21 @@ impl EventStore for PostgresEventStore {
             .map_err(|e| PersistenceError::Storage(e.to_string()))?;
         crate::dbm::postgres_query!(
             &self.schema,
-            "INSERT INTO {schema}vector_index_backfill_watermark (tenant, entity_type, vector_set) \
+            "INSERT INTO {schema}entity_meaning_backfill (tenant, entity_type, rule) \
              VALUES ($1, $2, $3) \
              ON CONFLICT (tenant, entity_type) \
-             DO UPDATE SET vector_set = EXCLUDED.vector_set, completed_at = now()",
+             DO UPDATE SET rule = EXCLUDED.rule, completed_at = now()",
         )
         .bind(tenant)
         .bind(entity_type)
-        .bind(vector_set)
+        .bind(rule)
         .execute(&mut *conn)
         .await
         .map_err(|e| PersistenceError::Storage(e.to_string()))?;
         Ok(())
     }
 
-    async fn vector_index_backfilled_types(
+    async fn meaning_backfilled_types(
         &self,
         tenant: &str,
     ) -> Result<Vec<(String, String)>, PersistenceError> {
@@ -441,37 +524,15 @@ impl EventStore for PostgresEventStore {
             .acquire()
             .await
             .map_err(|e| PersistenceError::Storage(e.to_string()))?;
-        let rows: Vec<(String, String)> = crate::dbm::postgres_query_as!(&self.schema,
-            "SELECT entity_type, vector_set FROM {schema}vector_index_backfill_watermark WHERE tenant = $1",
-        )
-        .bind(tenant)
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(|e| PersistenceError::Storage(e.to_string()))?;
-        Ok(rows.into_iter().collect())
-    }
-
-    async fn vectored_entity_ids_for_type(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-    ) -> Result<Vec<String>, PersistenceError> {
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| PersistenceError::Storage(e.to_string()))?;
-        let rows: Vec<(String,)> = crate::dbm::postgres_query_as!(
+        let rows: Vec<(String, String)> = crate::dbm::postgres_query_as!(
             &self.schema,
-            "SELECT DISTINCT entity_id FROM {schema}entity_vector_index \
-             WHERE tenant = $1 AND entity_type = $2",
+            "SELECT entity_type, rule FROM {schema}entity_meaning_backfill WHERE tenant = $1",
         )
         .bind(tenant)
-        .bind(entity_type)
         .fetch_all(&mut *conn)
         .await
         .map_err(|e| PersistenceError::Storage(e.to_string()))?;
-        Ok(rows.into_iter().map(|(entity_id,)| entity_id).collect())
+        Ok(rows)
     }
 
     /// Atomically append to multiple entity journals in one PostgreSQL
@@ -926,6 +987,23 @@ fn envelope_from_row(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// A meaning row from its columns; an empty or corrupt vector is None.
+fn meaning_row_from(
+    (entity_id, text, model_tag, bytes): (String, String, String, Vec<u8>),
+) -> MeaningRow {
+    let vector = if bytes.is_empty() {
+        None
+    } else {
+        unpack_f32_le(&bytes)
+    };
+    MeaningRow {
+        entity_id,
+        text,
+        model_tag,
+        vector,
+    }
+}
 
 #[cfg(test)]
 #[path = "store_projection_test.rs"]

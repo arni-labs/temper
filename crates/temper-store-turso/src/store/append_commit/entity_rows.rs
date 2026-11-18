@@ -1,22 +1,19 @@
 //! The rows an entity keeps beside its journal, written in its append's
-//! transaction: its query-plane row, its state-timer row and its vector rows.
+//! transaction: its query-plane row, its state-timer row and its meaning row.
 //! An event then never lands without them, and a move pays one commit.
 
 use temper_runtime::persistence::{
-    CommitRows, EntityVectorRow, PersistenceError, ProjectionRow, StateTimerRecord, StateTimerRow,
-    pack_f32_le, storage_error,
+    CommitRows, PersistenceError, ProjectionRow, StateTimerRecord, StateTimerRow, storage_error,
 };
 
 use super::super::projection_rows::{ProjectionWrite, remove_projection, write_projection};
-use crate::driver::{Transaction, Value, params};
+use crate::driver::{Transaction, params};
 
 /// An append's entity rows, owned.
 #[derive(Debug, Clone, Default)]
 pub(super) struct EntityRows {
     projection: Option<Projection>,
     state_timer: Option<TimerRow>,
-    /// The entity's vector rows become exactly these (None: leave them).
-    vectors: Option<Vec<EntityVectorRow>>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,7 +51,6 @@ impl EntityRows {
                 StateTimerRow::Arm(row) => TimerRow::Arm(Box::new(row.clone())),
                 StateTimerRow::End => TimerRow::End,
             }),
-            vectors: rows.reconcile_vectors.then(|| rows.vector_rows.to_vec()),
         }
     }
 
@@ -104,35 +100,6 @@ impl EntityRows {
                 .map_err(storage_error)?;
             }
             None => {}
-        }
-        if let Some(vectors) = &self.vectors {
-            tx.execute(
-                // The entity's index: without it the planner may read every
-                // vector row of the type (driver/plan_check.rs).
-                "DELETE FROM entity_vector_index INDEXED BY idx_evi_entity \
-                 WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
-                params![tenant, entity_type, entity_id],
-            )
-            .await
-            .map_err(storage_error)?;
-            for row in vectors {
-                tx.execute(
-                    "INSERT INTO entity_vector_index \
-                     (tenant, entity_type, decl_name, model_tag, entity_id, vector, sequence_nr) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        tenant,
-                        entity_type,
-                        row.decl_name.as_str(),
-                        row.model_tag.as_str(),
-                        entity_id,
-                        Value::Blob(pack_f32_le(&row.vector)),
-                        i64::try_from(sequence_nr).unwrap_or(i64::MAX),
-                    ],
-                )
-                .await
-                .map_err(storage_error)?;
-            }
         }
         Ok(())
     }

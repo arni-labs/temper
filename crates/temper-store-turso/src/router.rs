@@ -803,8 +803,7 @@ impl EventStore for TenantStoreRouter {
         store.list_entity_ids_by_type(tenant, entity_type).await
     }
 
-    // ADR-0155: forward the vector-index surface to the per-tenant store so kNN works
-    // on the routed Turso deployment. (Keys deliberately fall through to the no-op
+    // Forward the commit and meaning-row surface to the per-tenant store. (Keys deliberately fall through to the no-op
     // defaults — Turso does not maintain entity_key_index live; see event_store.rs.)
     #[instrument(skip_all, fields(persistence_id, otel.name = "router.append_with_rows"))]
     async fn append_with_rows(
@@ -878,67 +877,90 @@ impl EventStore for TenantStoreRouter {
             .await
     }
 
-    #[instrument(skip_all, fields(tenant, entity_type, otel.name = "router.backfill_entity_vectors"))]
-    async fn backfill_entity_vectors(
+    #[instrument(skip_all, fields(tenant, entity_type, otel.name = "router.write_meaning"))]
+    async fn write_meaning(
         &self,
         tenant: &str,
         entity_type: &str,
         entity_id: &str,
-        vector_rows: &[temper_runtime::persistence::EntityVectorRow],
+        text: Option<&str>,
     ) -> Result<(), PersistenceError> {
         let store = self.store_for_tenant(tenant).await?;
         store
-            .backfill_entity_vectors(tenant, entity_type, entity_id, vector_rows)
+            .write_meaning(tenant, entity_type, entity_id, text)
             .await
     }
 
-    #[instrument(skip_all, fields(tenant, entity_type, otel.name = "router.vector_candidates"))]
-    async fn vector_candidates(
+    #[instrument(skip_all, fields(tenant, entity_type, otel.name = "router.meaning_rows"))]
+    async fn meaning_rows(
         &self,
         tenant: &str,
         entity_type: &str,
-        decl_name: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<temper_runtime::persistence::MeaningRow>, PersistenceError> {
+        let store = self.store_for_tenant(tenant).await?;
+        store.meaning_rows(tenant, entity_type, after, limit).await
+    }
+
+    #[instrument(skip_all, fields(tenant, entity_type, otel.name = "router.meaning_row"))]
+    async fn meaning_row(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<Option<temper_runtime::persistence::MeaningRow>, PersistenceError> {
+        let store = self.store_for_tenant(tenant).await?;
+        store.meaning_row(tenant, entity_type, entity_id).await
+    }
+
+    #[instrument(skip_all, fields(tenant, otel.name = "router.meaning_pending"))]
+    async fn meaning_pending(
+        &self,
+        tenant: &str,
         model_tag: &str,
         limit: usize,
-    ) -> Result<Vec<temper_runtime::persistence::EntityVectorCandidate>, PersistenceError> {
+    ) -> Result<Vec<temper_runtime::persistence::MeaningPending>, PersistenceError> {
         let store = self.store_for_tenant(tenant).await?;
-        store
-            .vector_candidates(tenant, entity_type, decl_name, model_tag, limit)
-            .await
+        store.meaning_pending(tenant, model_tag, limit).await
     }
 
-    #[instrument(skip_all, fields(tenant, entity_type, otel.name = "router.mark_vector_index_backfilled"))]
-    async fn mark_vector_index_backfilled(
+    #[instrument(skip_all, fields(tenant, entity_type, otel.name = "router.set_meaning_vector"))]
+    async fn set_meaning_vector(
         &self,
         tenant: &str,
         entity_type: &str,
-        vector_set: &str,
-    ) -> Result<(), PersistenceError> {
+        entity_id: &str,
+        text_hash: &str,
+        model_tag: &str,
+        vector: &[f32],
+    ) -> Result<bool, PersistenceError> {
         let store = self.store_for_tenant(tenant).await?;
         store
-            .mark_vector_index_backfilled(tenant, entity_type, vector_set)
+            .set_meaning_vector(tenant, entity_type, entity_id, text_hash, model_tag, vector)
             .await
     }
 
-    #[instrument(skip_all, fields(tenant, otel.name = "router.vector_index_backfilled_types"))]
-    async fn vector_index_backfilled_types(
+    #[instrument(skip_all, fields(tenant, entity_type, otel.name = "router.mark_meaning_backfilled"))]
+    async fn mark_meaning_backfilled(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        rule: &str,
+    ) -> Result<(), PersistenceError> {
+        let store = self.store_for_tenant(tenant).await?;
+        store
+            .mark_meaning_backfilled(tenant, entity_type, rule)
+            .await
+    }
+
+    #[instrument(skip_all, fields(tenant, otel.name = "router.meaning_backfilled_types"))]
+    async fn meaning_backfilled_types(
         &self,
         tenant: &str,
     ) -> Result<Vec<(String, String)>, PersistenceError> {
         let store = self.store_for_tenant(tenant).await?;
-        store.vector_index_backfilled_types(tenant).await
-    }
-
-    #[instrument(skip_all, fields(tenant, entity_type, otel.name = "router.vectored_entity_ids_for_type"))]
-    async fn vectored_entity_ids_for_type(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-    ) -> Result<Vec<String>, PersistenceError> {
-        let store = self.store_for_tenant(tenant).await?;
-        store
-            .vectored_entity_ids_for_type(tenant, entity_type)
-            .await
+        store.meaning_backfilled_types(tenant).await
     }
 }
 
