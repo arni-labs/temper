@@ -179,7 +179,8 @@ pub(super) async fn remove_meaning(
     [tenant, entity_type, entity_id]: [&str; 3],
 ) -> Result<(), PersistenceError> {
     tx.execute(
-        "DELETE FROM entity_meaning WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
+        "DELETE FROM entity_meaning INDEXED BY sqlite_autoindex_entity_meaning_1 \
+         WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
         params![tenant, entity_type, entity_id],
     )
     .await

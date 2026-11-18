@@ -242,7 +242,7 @@ impl EventStore for TursoEventStore {
         let conn = self.configured_connection().await?;
         let mut rows = conn
             .query(
-                "SELECT entity_id, text, model_tag, vector FROM entity_meaning \
+                "SELECT entity_id, text, model_tag, vector FROM entity_meaning INDEXED BY sqlite_autoindex_entity_meaning_1 \
                  WHERE tenant = ?1 AND entity_type = ?2 AND entity_id > ?3 \
                  ORDER BY entity_id LIMIT ?4",
                 params![tenant, entity_type, after.unwrap_or(""), limit as i64],
@@ -265,7 +265,7 @@ impl EventStore for TursoEventStore {
         let conn = self.configured_connection().await?;
         let mut rows = conn
             .query(
-                "SELECT entity_id, text, model_tag, vector FROM entity_meaning \
+                "SELECT entity_id, text, model_tag, vector FROM entity_meaning INDEXED BY sqlite_autoindex_entity_meaning_1 \
                  WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
                 params![tenant, entity_type, entity_id],
             )
@@ -319,7 +319,7 @@ impl EventStore for TursoEventStore {
             .await?;
         let changed = conn
             .execute(
-                "UPDATE entity_meaning SET model_tag = ?1, vector = ?2 \
+                "UPDATE entity_meaning INDEXED BY sqlite_autoindex_entity_meaning_1 SET model_tag = ?1, vector = ?2 \
                  WHERE tenant = ?3 AND entity_type = ?4 AND entity_id = ?5 AND text_hash = ?6",
                 params![
                     model_tag,
