@@ -71,6 +71,9 @@ async fn refuse_findings(
             module
                 .findings
                 .iter()
+                // Size alone is advice, never a refusal: it is a count, not something the spec should do, and a long
+                // module that only computes is allowed. The questions Jev answers are what refuse.
+                .filter(|finding| finding.kind != "large_module")
                 .map(|finding| refusal_line(&module.module, finding))
         })
         .collect();

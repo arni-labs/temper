@@ -519,6 +519,30 @@ async fn a_changed_module_with_a_finding_is_refused_and_an_unchanged_one_is_not(
     );
 }
 
+/// A changed module Jev finds nothing in installs even when it is large: size is advice, not a refusal.
+#[tokio::test]
+async fn a_large_changed_module_with_no_finding_installs() {
+    let tenant = unique_tenant("review-large");
+    let server = seeded(&tenant).await;
+    server
+        .state
+        .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::open())));
+    install_over_http(&server.state, &tenant, app_with_module(Some("c1"), 1)).await;
+
+    let mut files = app_with_module(Some("c2"), 2);
+    let body: String = (0..crate::module_review::LARGE_LINES + 10)
+        .map(|n| format!("    let v{n} = if x > {n} {{ 1 }} else {{ 0 }};\n"))
+        .collect();
+    files[format!("wasm/{MODULE}/src/lib.rs")] =
+        format!("pub fn step(x: u32) -> u32 {{\n{body}    x + 2\n}}\n").into();
+    let (status, body) = send(
+        &server.state,
+        push(&tenant, serde_json::json!({ "files": files })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 #[tokio::test]
 async fn the_route_answers_only_for_the_credentials_own_tenant() {
     let tenant = unique_tenant("review-owner");
