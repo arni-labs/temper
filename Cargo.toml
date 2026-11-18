@@ -226,6 +226,11 @@ codegen-units = 1
 # taken from a release binary name its frames by it.
 strip = "debuginfo"
 
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
 # pprof-rs with a smaller sample table: see vendor/pprof/TEMPER.md.
 [patch.crates-io]
 pprof = { path = "vendor/pprof" }
