@@ -15,7 +15,7 @@ pub struct Item {
 }
 
 /// Raise when a statement or the state's wording changes, so a cached review of the old wording is not reused.
-pub const QUESTION_VERSION: u32 = 1;
+pub const QUESTION_VERSION: u32 = 2;
 
 /// At or above this rating a module is said to show an item: the calibration's gap lies between 0.34 and 0.74.
 pub const FOUND_AT: f64 = 0.5;
@@ -86,3 +86,22 @@ pub const ITEMS: [Item; 7] = [
 /// A big module is rarely one that still complies: in a census of real apps (26 Oct 2026), every module with no finding was under 100 lines and every one over
 /// 400 had three findings or more.
 pub const LARGE_LINES: usize = 200;
+
+/// The finding number of a module whose author's sentence (`does` in the app's manifest) is not what its code does.
+pub const DOES_ITEM: u8 = 8;
+
+/// The key the sentence's question is asked under.
+pub const DOES_KEY: &str = "does";
+
+/// Below this rating, in every window of the module, its sentence is not what it does. Jev rates how true the sentence
+/// is; a close call is no reason to refuse, so the sentence must lean false by the margin Katagami's builder asked of the
+/// same question before it moved here (a lean to no of 0.15, so a rating under 0.425). Not recalibrated on Temper's
+/// rating questions yet.
+pub const DOES_MATCHES_AT: f64 = 0.425;
+
+/// The statement Jev rates for a module's sentence: whether it says what the module computes, and from what.
+pub fn does_statement(does: &str) -> String {
+    format!(
+        "This sentence says what the module computes, and from what, as its code does it: \"{does}\""
+    )
+}

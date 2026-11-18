@@ -365,10 +365,16 @@ pub(super) fn read_source(
     }
     let source =
         std::fs::read_to_string(&file).map_err(|_| format!("its source {path} is not text"))?;
+    let does = config
+        .and_then(|config| config.does.as_deref())
+        .map(str::trim)
+        .filter(|does| !does.is_empty())
+        .map(str::to_string);
     Ok(Some(ModuleSource {
         module: module.to_string(),
         path,
         source,
+        does,
     }))
 }
 

@@ -1,6 +1,6 @@
 //! A module whose code is as installed is reviewed as advice: an install answers without waiting for it, what the
 //! review found stays readable, and a caller that answers with all of it still can. A new or changed module with a
-//! finding is refused.
+//! finding, its author's sentence on what it does among them, is refused.
 
 use std::time::Duration;
 
@@ -551,6 +551,36 @@ async fn a_large_changed_module_with_no_finding_installs() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A changed module whose author's sentence Jev does not read its code as doing is refused, like any finding.
+#[tokio::test]
+async fn a_changed_module_whose_sentence_is_not_what_it_does_is_refused() {
+    let tenant = unique_tenant("review-does");
+    let server = seeded(&tenant).await;
+    // Rates every statement false: no item shows, and neither does the sentence.
+    server
+        .state
+        .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::clean())));
+
+    let mut files = app_with_module(Some("c2"), 2);
+    let manifest = files["app.toml"].as_str().expect("text").to_string()
+        + "does = \"Sends the morning's orders to the bakery.\"\n";
+    files["app.toml"] = manifest.into();
+    let (status, body) = send(
+        &server.state,
+        push(&tenant, serde_json::json!({ "files": files })),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    let said = body.to_string();
+    for words in [
+        "(does_mismatch) in module answer at wasm/answer/src/lib.rs",
+        "Sends the morning's orders to the bakery.",
+        "Instead:",
+    ] {
+        assert!(said.contains(words), "{words}: {said}");
+    }
 }
 
 #[tokio::test]

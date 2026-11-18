@@ -94,12 +94,14 @@ pub trait Judge: Send + Sync {
     ) -> Result<Answers, JudgeUnavailable>;
 }
 
-/// A module to review: its kernel name, where its Rust source sits in the app, and that source.
+/// A module to review: its kernel name, where its Rust source sits in the app, that source, and its author's sentence
+/// on what it computes, when the app's manifest gives one.
 #[derive(Debug, Clone)]
 pub struct ModuleSource {
     pub module: String,
     pub path: String,
     pub source: String,
+    pub does: Option<String>,
 }
 
 /// One record type's spec, as installed, and which of its actions run which module.
@@ -141,9 +143,9 @@ impl SpecSource {
 /// One thing a module does that the spec should do, where it shows, and what should do it instead.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Finding {
-    /// The item of [`super::items::ITEMS`], 1 to 7.
+    /// The item of [`super::items::ITEMS`], 1 to 7, or [`super::items::DOES_ITEM`] for a sentence the code does not do.
     pub item: u8,
-    /// The item's kind, or `large_module` for a module flagged by its size.
+    /// The item's kind, `large_module` for a module flagged by its size, or `does_mismatch`.
     pub kind: String,
     pub title: String,
     /// Jev's rating of the item's statement, to two places; 1 for a size flag.

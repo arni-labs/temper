@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use super::excerpt::Excerpt;
-use super::items::{ITEMS, Item, LEAF};
+use super::items::{DOES_KEY, ITEMS, Item, LEAF, does_statement};
 use super::source::{Line, Part};
 use super::types::{Question, SpecSource};
 
@@ -82,9 +82,17 @@ pub fn review_state(
     .join("\n")
 }
 
-/// One call: every item's statement and the leaf statement, rated.
-pub fn item_questions() -> BTreeMap<String, Question> {
+/// One call: every item's statement and the leaf statement, rated, and the module's sentence (`does`) when it has one.
+pub fn item_questions(does: Option<&str>) -> BTreeMap<String, Question> {
     let mut questions = BTreeMap::new();
+    if let Some(does) = does {
+        questions.insert(
+            DOES_KEY.to_string(),
+            Question::Noul {
+                instructions: does_statement(does),
+            },
+        );
+    }
     questions.insert(
         "leaf".to_string(),
         Question::Noul {

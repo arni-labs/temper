@@ -842,6 +842,7 @@ fn test_find_wasm_modules_discovers_packaged_root_wasm() {
             provenance: None,
             import_class: None,
             source: None,
+            does: None,
         },
     );
 
@@ -2461,6 +2462,7 @@ fn test_required_wasm_config_without_artifact_is_not_registered_ready() {
             provenance: None,
             import_class: None,
             source: None,
+            does: None,
         },
     );
     let bundle = AppBundle {
@@ -2570,6 +2572,7 @@ fn test_find_wasm_modules_respects_manifest_target() {
             provenance: None,
             import_class: None,
             source: None,
+            does: None,
         },
     );
 
@@ -2616,6 +2619,7 @@ fn test_find_wasm_modules_prefers_packaged_sibling_over_target_output() {
             provenance: None,
             import_class: None,
             source: None,
+            does: None,
         },
     );
 
@@ -2654,6 +2658,7 @@ fn test_find_wasm_modules_finds_sibling_artifact() {
             provenance: None,
             import_class: None,
             source: None,
+            does: None,
         },
     );
 

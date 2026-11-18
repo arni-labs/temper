@@ -119,11 +119,12 @@ impl ModuleReviewer {
     }
 }
 
-/// What a review read: the question wording, the module's name, path and source, and the specs that run it.
+/// What a review read: the question wording, the module's name, path, source and sentence, and the specs that run it.
 fn cache_key(module: &ModuleSource, specs: &[SpecSource]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(QUESTION_VERSION.to_le_bytes());
-    for part in [&module.module, &module.path, &module.source] {
+    let does = module.does.clone().unwrap_or_default();
+    for part in [&module.module, &module.path, &module.source, &does] {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
     }

@@ -5,7 +5,7 @@
 use futures::future::{join_all, try_join_all};
 
 use super::excerpt::excerpt;
-use super::items::{FOUND_AT, ITEMS, Item, LARGE_LINES};
+use super::items::{DOES_ITEM, DOES_KEY, DOES_MATCHES_AT, FOUND_AT, ITEMS, Item, LARGE_LINES};
 use super::questions::{
     item_questions, line_key, line_questions, review_state, runners, runs_from, where_key,
     where_questions,
@@ -43,7 +43,7 @@ pub async fn review_module(
         .collect();
     debug_assert_eq!(states.len(), windows.len());
 
-    let questions = item_questions();
+    let questions = item_questions(module.does.as_deref());
     let ratings = try_join_all(
         states
             .iter()
@@ -64,6 +64,11 @@ pub async fn review_module(
             finding(found.item, found.rating, &module.path, line, &runs)
         })
         .collect();
+    if let Some(does) = &module.does
+        && let Some(found) = does_mismatch(does, &ratings, &module.path, &runs)
+    {
+        findings.push(found);
+    }
     let size = said(&lines);
     if size > LARGE_LINES {
         findings.push(large(size, &lines, &module.path, &runs));
@@ -225,6 +230,32 @@ fn large(size: usize, lines: &[Line], path: &str, runs: &str) -> Finding {
         ),
         ..finding(several_concerns, 1.0, path, None, runs)
     }
+}
+
+/// The module's sentence as a finding when no window of its code reads as doing it: its highest rating is under
+/// [`DOES_MATCHES_AT`]. A window is part of the module, so one window that does what the sentence says is enough. None
+/// when Jev rated it in no window: the sentence is unknown, not wrong.
+fn does_mismatch(does: &str, ratings: &[Answers], path: &str, runs: &str) -> Option<Finding> {
+    let rating = ratings
+        .iter()
+        .filter_map(|answers| answers.rating(DOES_KEY))
+        .max_by(f64::total_cmp)?;
+    debug_assert!((0.0..=1.0).contains(&rating), "a rating is 0..1");
+    (rating < DOES_MATCHES_AT).then(|| Finding {
+        item: DOES_ITEM,
+        kind: "does_mismatch".to_string(),
+        title: "A sentence that is not what the module does".to_string(),
+        rating: (rating * 100.0).round() / 100.0,
+        location: path.to_string(),
+        line: None,
+        why: format!(
+            "In this app the module runs from {runs}; its sentence says \"{does}\", and Jev does not read its code as \
+             doing that, so whoever reads the app is told something the module does not do."
+        ),
+        instead: "Instead: say what the module computes, and from what, as its code does it, or make the code do what \
+                  the sentence says."
+            .to_string(),
+    })
 }
 
 /// Whether a line branches or loops (`if`, `match`, `while`, `loop`, `for` as words).

@@ -3,7 +3,9 @@
 //! A module may only compute a value between two moves: parse, format, score, transform, or call one outside service
 //! and return its answer. What else it does (choosing the move, keeping steps of its own, waiting, doing several
 //! steps, holding rules, deciding out of sight, packing several concerns) belongs to the spec's states, guards, timers
-//! and Cedar, where the checker can see it and the person can follow it.
+//! and Cedar, where the checker can see it and the person can follow it. When the app's manifest gives a module's
+//! sentence on what it computes (`does`), Jev is also asked whether its code does that, and a sentence it does not is a
+//! finding too.
 //!
 //! Enforced for an author's new and changed code: a push whose new or changed module gets a finding is refused
 //! (`os_apps::module_review_gate`). A module whose code is as installed, and any version installed as published

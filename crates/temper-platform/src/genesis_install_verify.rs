@@ -329,6 +329,7 @@ mod tests {
             provenance: None,
             import_class: None,
             source: None,
+            does: None,
         };
         let modules = |bytes: &Vec<u8>| {
             let mut m = BTreeMap::new();

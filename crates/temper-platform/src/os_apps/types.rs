@@ -297,6 +297,10 @@ pub struct WasmModuleManifest {
     /// app's folder; `wasm/<name>/src/lib.rs` when not given.
     #[serde(default)]
     pub source: Option<String>,
+    /// One sentence by the app's author on what the module computes, and from what. Jev's review asks whether the
+    /// module's code does that, and a sentence it does not is a finding (`crate::module_review`).
+    #[serde(default)]
+    pub does: Option<String>,
 }
 
 impl WasmModuleManifest {

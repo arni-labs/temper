@@ -15,8 +15,8 @@ use crate::state::PlatformState;
 
 /// Refuse the install when Jev finds, in a module of `bundle` whose code is new or differs from what `tenant` has,
 /// something the spec should do: each finding is named with its line and what to move into the spec. It uses the
-/// review's own rules (an item rated at [`crate::module_review::FOUND_AT`] or more, or a module past its size), and its
-/// cache, so the advisory review after it reads nothing twice.
+/// review's own rules (an item rated at [`crate::module_review::FOUND_AT`] or more, or a sentence under `does` that its
+/// code does not do), and its cache, so the advisory review after it reads nothing twice.
 ///
 /// Rita, 17 Nov 2026: every Jev module check belongs to Temper, and a module that decides is refused. Untouched code is
 /// never refused for it, so the apps that run now are not blocked until someone changes that module.
@@ -81,9 +81,10 @@ async fn refuse_findings(
         return Ok(());
     }
     Err(format!(
-        "Refused: Jev's review found work in a new or changed module that belongs in the spec. A module computes a \
-         value or calls one outside service; the spec's states, guards, timers and policies decide the move, where the \
-         checker proves it. Move each into the spec and install again.\n{}",
+        "Refused: Jev's review found work in a new or changed module that belongs in the spec, or a sentence on a \
+         module that is not what it does. A module computes a value or calls one outside service; the spec's states, \
+         guards, timers and policies decide the move, where the checker proves it. Move each into the spec, or say \
+         what the module does, and install again.\n{}",
         found.join("\n")
     ))
 }

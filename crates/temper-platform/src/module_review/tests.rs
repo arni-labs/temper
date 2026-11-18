@@ -128,6 +128,7 @@ fn module(name: &str, source: &str) -> ModuleSource {
         module: name.to_string(),
         path: format!("wasm/{name}/src/lib.rs"),
         source: source.to_string(),
+        does: None,
     }
 }
 
