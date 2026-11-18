@@ -150,74 +150,107 @@ where
         ))
     }
 
-    fn backfill_entity_vectors<'a>(
+    fn write_meaning<'a>(
         &'a self,
         tenant: &'a str,
         entity_type: &'a str,
         entity_id: &'a str,
-        vector_rows: &'a [temper_runtime::persistence::EntityVectorRow],
+        text: Option<&'a str>,
     ) -> EventStoreFuture<'a, Result<(), PersistenceError>> {
-        Box::pin(EventStore::backfill_entity_vectors(
+        Box::pin(EventStore::write_meaning(
             self,
             tenant,
             entity_type,
             entity_id,
-            vector_rows,
+            text,
         ))
     }
 
-    fn vector_candidates<'a>(
+    fn meaning_rows<'a>(
         &'a self,
         tenant: &'a str,
         entity_type: &'a str,
-        decl_name: &'a str,
-        model_tag: &'a str,
+        after: Option<&'a str>,
         limit: usize,
-    ) -> EventStoreFuture<
-        'a,
-        Result<Vec<temper_runtime::persistence::EntityVectorCandidate>, PersistenceError>,
-    > {
-        Box::pin(EventStore::vector_candidates(
+    ) -> EventStoreFuture<'a, Result<Vec<temper_runtime::persistence::MeaningRow>, PersistenceError>>
+    {
+        Box::pin(EventStore::meaning_rows(
             self,
             tenant,
             entity_type,
-            decl_name,
-            model_tag,
+            after,
             limit,
         ))
     }
 
-    fn mark_vector_index_backfilled<'a>(
+    fn meaning_row<'a>(
         &'a self,
         tenant: &'a str,
         entity_type: &'a str,
-        vector_set: &'a str,
-    ) -> EventStoreFuture<'a, Result<(), PersistenceError>> {
-        Box::pin(EventStore::mark_vector_index_backfilled(
+        entity_id: &'a str,
+    ) -> EventStoreFuture<
+        'a,
+        Result<Option<temper_runtime::persistence::MeaningRow>, PersistenceError>,
+    > {
+        Box::pin(EventStore::meaning_row(
             self,
             tenant,
             entity_type,
-            vector_set,
+            entity_id,
         ))
     }
 
-    fn vector_index_backfilled_types<'a>(
+    fn meaning_pending<'a>(
+        &'a self,
+        tenant: &'a str,
+        model_tag: &'a str,
+        limit: usize,
+    ) -> EventStoreFuture<
+        'a,
+        Result<Vec<temper_runtime::persistence::MeaningPending>, PersistenceError>,
+    > {
+        Box::pin(EventStore::meaning_pending(self, tenant, model_tag, limit))
+    }
+
+    fn set_meaning_vector<'a>(
+        &'a self,
+        tenant: &'a str,
+        entity_type: &'a str,
+        entity_id: &'a str,
+        text_hash: &'a str,
+        model_tag: &'a str,
+        vector: &'a [f32],
+    ) -> EventStoreFuture<'a, Result<bool, PersistenceError>> {
+        Box::pin(EventStore::set_meaning_vector(
+            self,
+            tenant,
+            entity_type,
+            entity_id,
+            text_hash,
+            model_tag,
+            vector,
+        ))
+    }
+
+    fn mark_meaning_backfilled<'a>(
+        &'a self,
+        tenant: &'a str,
+        entity_type: &'a str,
+        rule: &'a str,
+    ) -> EventStoreFuture<'a, Result<(), PersistenceError>> {
+        Box::pin(EventStore::mark_meaning_backfilled(
+            self,
+            tenant,
+            entity_type,
+            rule,
+        ))
+    }
+
+    fn meaning_backfilled_types<'a>(
         &'a self,
         tenant: &'a str,
     ) -> EventStoreFuture<'a, Result<Vec<(String, String)>, PersistenceError>> {
-        Box::pin(EventStore::vector_index_backfilled_types(self, tenant))
-    }
-
-    fn vectored_entity_ids_for_type<'a>(
-        &'a self,
-        tenant: &'a str,
-        entity_type: &'a str,
-    ) -> EventStoreFuture<'a, Result<Vec<String>, PersistenceError>> {
-        Box::pin(EventStore::vectored_entity_ids_for_type(
-            self,
-            tenant,
-            entity_type,
-        ))
+        Box::pin(EventStore::meaning_backfilled_types(self, tenant))
     }
 
     fn lookup_by_key<'a>(

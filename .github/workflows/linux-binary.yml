@@ -95,6 +95,8 @@ jobs:
         if: steps.kept.outputs.kept != 'true'
         uses: Swatinem/rust-cache@v2
         with:
+          # The model's weights (crates/temper-meaning/build.rs), fetched once.
+          cache-directories: ~/.cargo/temper-meaning-cache
           key: linux-binary
 
       - name: Build temper

@@ -32,6 +32,8 @@ pub(super) const SECTIONS: [&str; 15] = [
     "field_invariant",
     "state_timeout",
     "key",
+    // Retired by ADR-0186 (the kernel finds every record by meaning): accepted and
+    // ignored, so a spec written before it still loads.
     "vector",
     "admission",
     "group",
@@ -101,7 +103,6 @@ fn read(doc: &Table) -> Result<Automaton, AutomatonParseError> {
             typed_entry(scope, table)
         })?,
         keys: entries(doc, "key", "name", typed_entry)?,
-        vectors: entries(doc, "vector", "name", typed_entry)?,
         carries: entries(doc, "carry", "from", typed_entry)?,
         admission: doc
             .get("admission")

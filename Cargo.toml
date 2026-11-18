@@ -29,6 +29,7 @@ members = [
     "crates/temper-store-sim",
     "crates/temper-server",
     "crates/temper-cli",
+    "crates/temper-meaning",
     "crates/temper-mcp",
     "crates/temper-evolution",
     "crates/temper-jit",
@@ -140,6 +141,7 @@ futures = "0.3"
 temper-macros = { path = "crates/temper-macros" }
 temper-runtime = { path = "crates/temper-runtime" }
 temper-spec = { path = "crates/temper-spec" }
+temper-meaning = { path = "crates/temper-meaning" }
 temper-codegen = { path = "crates/temper-codegen" }
 temper-odata = { path = "crates/temper-odata" }
 temper-authz = { path = "crates/temper-authz" }

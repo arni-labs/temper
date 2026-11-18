@@ -33,6 +33,7 @@ pub mod identity;
 pub mod internal_invocation;
 /// ADR-0153: declared composite-key index hashing (the negative-existence access path).
 pub mod key_index;
+pub mod meaning;
 #[cfg(feature = "observe")]
 pub mod observe;
 pub mod odata;
@@ -59,7 +60,6 @@ pub(crate) mod test_spans;
 pub mod trace_context;
 pub(crate) mod trajectory_outbox;
 pub mod trigger;
-pub mod vector_index;
 pub mod wake;
 pub mod wasm_registry;
 pub mod webhooks;

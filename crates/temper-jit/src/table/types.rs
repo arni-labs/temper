@@ -25,20 +25,6 @@ pub struct DeclaredKey {
     pub properties: Vec<String>,
 }
 
-/// A declared vector access path carried on the table (ADR-0155). `name`
-/// identifies it; `property` is the float-vector state variable, `model_property`
-/// the model-tag state variable that partitions the space, `dims` the expected
-/// length, `metric` one of `cosine`/`dot`/`l2`. The actor parses and co-commits
-/// these on write to maintain `entity_vector_index`; `Temper.Nearest` reads them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeclaredVector {
-    pub name: String,
-    pub property: String,
-    pub model_property: String,
-    pub dims: usize,
-    pub metric: String,
-}
-
 /// A transition table: state machine transitions as DATA, not code.
 /// Can be hot-swapped per-actor without restart.
 #[derive(Debug, Clone, Serialize)]
@@ -54,10 +40,6 @@ pub struct TransitionTable {
     /// ADR-0153: declared unique/alternate keys the kernel indexes for
     /// negative-existence reads. Empty when the spec declared no `[[key]]`.
     pub keys: Vec<DeclaredKey>,
-    /// ADR-0155: declared vector access paths the kernel indexes for exact-scan
-    /// kNN reads (`Temper.Nearest`). Empty when the spec declared no `[[vector]]`.
-    #[serde(default)]
-    pub vectors: Vec<DeclaredVector>,
     /// Per-state-variable metadata for platform primitives (ADR-0045, ADR-0047).
     /// Keyed by state-variable name. Empty map when the IOA spec did not
     /// declare any per-field overrides.
@@ -182,8 +164,6 @@ impl<'de> Deserialize<'de> for TransitionTable {
             #[serde(default)]
             keys: Vec<DeclaredKey>,
             #[serde(default)]
-            vectors: Vec<DeclaredVector>,
-            #[serde(default)]
             invariants: Vec<super::invariant::MoveInvariant>,
         }
 
@@ -194,7 +174,6 @@ impl<'de> Deserialize<'de> for TransitionTable {
             initial_state: raw.initial_state,
             rules: raw.rules,
             keys: raw.keys,
-            vectors: raw.vectors,
             state_var_metadata: raw.state_var_metadata,
             composite_actions: raw.composite_actions,
             strict_action_params: raw.strict_action_params,
@@ -358,7 +337,6 @@ mod tests {
             states: vec!["Draft".to_string(), "Active".to_string()],
             initial_state: "Draft".to_string(),
             keys: vec![],
-            vectors: vec![],
             rules: vec![
                 TransitionRule {
                     name: "Submit".to_string(),

@@ -1538,7 +1538,7 @@ effect = ["version_count += 1", "has_content = true"]
 /// `[1,2,3]` reaches the actor. Once field updates are journaled, letting a
 /// non-object through would make the damage permanent: `apply_field_update`
 /// cannot restore `Id`/`Status` into a non-object, and `persist_event` would
-/// co-commit zero key and zero vector rows, purging the entity's index. Before
+/// co-commit zero key rows, purging the entity's index. Before
 /// journaling, that corruption was in-memory and healed on restart.
 #[cfg(feature = "sim")]
 #[tokio::test]

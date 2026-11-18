@@ -1,6 +1,6 @@
 # ADR-0155: Declared vector access path (kernel-native kNN)
 
-- Status: Accepted
+- Status: Superseded by ADR-0186 (search by meaning: the kernel embeds every record; `[[vector]]` is retired)
 - Date: 2026-07-06
 - Deciders: Temper core maintainers
 - Related:

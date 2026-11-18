@@ -4,7 +4,7 @@ use super::{AppendAnswer, check_distinct_key_names, check_same_record, stored_se
 use crate::platform::{canonical_projection_status, json_hash, scalar_index_fields};
 use temper_runtime::persistence::{
     CommitRows, PersistenceEnvelope, PersistenceError, ProjectionRow, StateTimerRow,
-    catalog_state_for_storage, pack_f32_le,
+    catalog_state_for_storage, record_text, text_hash,
 };
 
 /// One append's parameters, owned and laid out as the statement's arrays.
@@ -17,10 +17,6 @@ pub(super) struct AppendParams<'a> {
     tombstone: bool,
     key_names: Vec<&'a str>,
     key_hashes: Vec<&'a str>,
-    reconcile_vectors: bool,
-    vector_decls: Vec<&'a str>,
-    vector_models: Vec<&'a str>,
-    vectors: Vec<Vec<u8>>,
     arm_ids: Vec<&'a str>,
     arm_actions: Vec<&'a str>,
     arm_due_at: Vec<&'a str>,
@@ -38,6 +34,9 @@ pub(super) struct ProjectionParams<'a> {
     fields: Option<&'a serde_json::Value>,
     stored_state: serde_json::Value,
     hash: String,
+    /// The record's meaning row (ADR-0186): its text and the text's hash.
+    meaning_text: String,
+    meaning_hash: String,
     index_names: Vec<String>,
     index_values: Vec<String>,
     wrapped: bool,
@@ -83,11 +82,6 @@ impl<'a> AppendParams<'a> {
                 [&action.tenant, &action.entity_type, &action.entity_id],
             )?;
         }
-        let vector_rows = if rows.reconcile_vectors {
-            rows.vector_rows
-        } else {
-            &[]
-        };
         let params = Self {
             record,
             expected_sequence,
@@ -97,10 +91,6 @@ impl<'a> AppendParams<'a> {
             tombstone: events.iter().any(PersistenceEnvelope::is_tombstone),
             key_names: rows.key_rows.iter().map(|k| k.key_name.as_str()).collect(),
             key_hashes: rows.key_rows.iter().map(|k| k.key_hash.as_str()).collect(),
-            reconcile_vectors: rows.reconcile_vectors,
-            vector_decls: vector_rows.iter().map(|v| v.decl_name.as_str()).collect(),
-            vector_models: vector_rows.iter().map(|v| v.model_tag.as_str()).collect(),
-            vectors: vector_rows.iter().map(|v| pack_f32_le(&v.vector)).collect(),
             arm_ids: rows
                 .scheduled_actions
                 .iter()
@@ -132,7 +122,6 @@ impl<'a> AppendParams<'a> {
 
     fn index_lengths_match(&self) -> bool {
         self.key_names.len() == self.key_hashes.len()
-            && self.vector_decls.len() == self.vectors.len()
             && self.arm_ids.len() == self.arm_armed_by.len()
             && self.projection.index_names.len() == self.projection.index_values.len()
     }
@@ -153,7 +142,10 @@ impl<'a> ProjectionParams<'a> {
             }) => {
                 let (index, indexed_fields, skipped_fields) = scalar_index_fields(fields);
                 let (index_names, index_values) = index.into_iter().unzip();
+                let meaning_text = record_text(fields);
                 Self {
+                    meaning_hash: text_hash(&meaning_text),
+                    meaning_text,
                     op: Some("upsert"),
                     status: canonical_projection_status(status, state),
                     fields: Some(fields),
@@ -222,10 +214,8 @@ impl AppendParams<'_> {
             .bind(&self.metadata)
             .bind(&self.key_names)
             .bind(&self.key_hashes)
-            .bind(self.reconcile_vectors)
-            .bind(&self.vector_decls)
-            .bind(&self.vector_models)
-            .bind(&self.vectors)
+            .bind(projection.meaning_text.as_str())
+            .bind(projection.meaning_hash.as_str())
             .bind(&self.arm_ids)
             .bind(&self.arm_actions)
             .bind(&self.arm_due_at)

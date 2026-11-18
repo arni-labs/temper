@@ -454,6 +454,9 @@ pub struct ServerState {
     pub last_accessed: Arc<RwLock<BTreeMap<String, chrono::DateTime<chrono::Utc>>>>,
     /// First-class storage capabilities selected for this runtime.
     pub storage_stack: Option<Arc<StorageStack>>,
+    /// The model that gives records their meaning (ADR-0186), once the binary
+    /// installs one. Without it, search finds records by their words alone.
+    pub(crate) meaning_model: Arc<std::sync::OnceLock<Arc<dyn crate::meaning::MeaningModel>>>,
     /// Bounded background writer for durable actor recovery snapshots.
     pub(crate) snapshot_write_queue: Arc<Mutex<Option<Arc<SnapshotWriteQueue>>>>,
     /// Bounded background writer for full OTS trajectory artifacts.
@@ -762,6 +765,18 @@ impl ServerState {
     }
 
     /// Return the runtime event journal capability plus backend label.
+    /// Install the model that gives records their meaning (ADR-0186). The first
+    /// install holds for the life of the server; returns false if one was already
+    /// installed.
+    pub fn install_meaning_model(&self, model: Arc<dyn crate::meaning::MeaningModel>) -> bool {
+        self.meaning_model.set(model).is_ok()
+    }
+
+    /// The installed meaning model, if any.
+    pub fn meaning_model(&self) -> Option<Arc<dyn crate::meaning::MeaningModel>> {
+        self.meaning_model.get().cloned()
+    }
+
     pub(crate) fn event_journal(&self) -> Option<(BoxedEventStore, BackendLabel)> {
         self.storage_stack
             .as_ref()
@@ -830,6 +845,7 @@ impl ServerState {
             actor_registry: Arc::new(RwLock::new(BTreeMap::new())),
             last_accessed: Arc::new(RwLock::new(BTreeMap::new())),
             storage_stack: None,
+            meaning_model: Arc::new(std::sync::OnceLock::new()),
             snapshot_write_queue: Arc::new(Mutex::new(None)),
             ots_trajectory_outbox: Arc::new(Mutex::new(None)),
             data_dir: std::path::PathBuf::new(),
@@ -1118,6 +1134,7 @@ impl ServerState {
             actor_registry: Arc::new(RwLock::new(BTreeMap::new())),
             last_accessed: Arc::new(RwLock::new(BTreeMap::new())),
             storage_stack: None,
+            meaning_model: Arc::new(std::sync::OnceLock::new()),
             snapshot_write_queue: Arc::new(Mutex::new(None)),
             ots_trajectory_outbox: Arc::new(Mutex::new(None)),
             data_dir: std::path::PathBuf::new(),

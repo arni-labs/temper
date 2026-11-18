@@ -13,9 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use temper_runtime::persistence::{
-    CommitRows, EntityVectorCandidate, EntityVectorRow, EventStore, PersistenceAppend,
-    PersistenceAppendResult, PersistenceEnvelope, PersistenceError, ScheduledActionRecord,
-    StateTimerRecord,
+    CommitRows, EventStore, MeaningPending, MeaningRow, PersistenceAppend, PersistenceAppendResult,
+    PersistenceEnvelope, PersistenceError, ScheduledActionRecord, StateTimerRecord,
 };
 use temper_runtime::tenant::parse_persistence_id_parts;
 
@@ -173,12 +172,10 @@ struct SimEventStoreInner {
     /// table — gates authoritative keyed absence, and detects a key-set change so a
     /// newly-declared key re-keys instead of being treated as already complete.
     key_index_watermark: BTreeMap<(String, String), String>,
-    /// ADR-0155: derived vector index, co-committed with the journal under the same
-    /// lock. `(tenant, entity_type, decl_name, model_tag, entity_id) -> vector`. The
-    /// deterministic reference for the real stores' `entity_vector_index` — the
-    /// exact-scan kNN access path. Unlike the key index this has no uniqueness
-    /// constraint; it is derived, rebuildable ranking state.
-    vector_index: BTreeMap<(String, String, String, String, String), Vec<f32>>,
+    /// ADR-0186: one meaning row per entity, written with its query-plane row
+    /// under the same lock. `(tenant, entity_type, entity_id) -> row`. The
+    /// deterministic reference for the real stores' `entity_meaning`.
+    meaning: BTreeMap<(String, String, String), entity_rows::SimMeaning>,
     /// Pending scheduled actions, committed with the event that armed them
     /// under the same lock. `(tenant, entity_type, entity_id, arm_id) -> row`.
     scheduled_actions: BTreeMap<(String, String, String, String), ScheduledActionRecord>,
@@ -189,10 +186,8 @@ struct SimEventStoreInner {
     /// Each entry makes `list_scheduled_actions` for that tenant fail with a
     /// storage error on the next N calls. See `fail_next_scheduled_lists`.
     pending_scheduled_list_failures: BTreeMap<String, usize>,
-    /// ADR-0155 backfill watermark: `(tenant, entity_type) -> vector_set` — each
-    /// completed type mapped to the sorted comma-joined declared vector-path names the
-    /// backfill covered. Mirrors `key_index_watermark`.
-    vector_index_watermark: BTreeMap<(String, String), String>,
+    /// ADR-0186 backfill marks: `(tenant, entity_type) -> text rule`.
+    meaning_watermark: BTreeMap<(String, String), String>,
     /// Query-plane rows written with their entity's events, by persistence id.
     projections: BTreeMap<String, entity_rows::SimProjection>,
     /// One state-timer row per entity: `(tenant, entity_type, entity_id)`.
@@ -243,12 +238,12 @@ impl SimEventStore {
                 pending_append_delays: BTreeMap::new(),
                 key_index: BTreeMap::new(),
                 key_index_watermark: BTreeMap::new(),
-                vector_index: BTreeMap::new(),
+                meaning: BTreeMap::new(),
                 scheduled_actions: BTreeMap::new(),
                 scheduled_deletes_held: false,
                 pending_scheduled_delete_failures: 0,
                 pending_scheduled_list_failures: BTreeMap::new(),
-                vector_index_watermark: BTreeMap::new(),
+                meaning_watermark: BTreeMap::new(),
                 projections: BTreeMap::new(),
                 state_timers: BTreeMap::new(),
                 commits: BTreeMap::new(),
@@ -599,8 +594,6 @@ impl EventStore for SimEventStore {
     ) -> Result<u64, PersistenceError> {
         let CommitRows {
             key_rows,
-            vector_rows,
-            reconcile_vectors,
             scheduled_actions,
             fired_scheduled_action,
             ..
@@ -796,34 +789,6 @@ impl EventStore for SimEventStore {
                         row.key_hash.clone(),
                     ),
                     entity_id.to_string(),
-                );
-            }
-        }
-
-        // ADR-0155: co-commit the derived vector-index rows under the SAME lock as
-        // the journal write. When the entity's type declares vector paths
-        // (`reconcile_vectors`), DELETE all of the entity's rows first, then insert
-        // the current ones — so a delete transition or a cleared vector/model
-        // property (empty `vector_rows`) purges the stale rows instead of leaving
-        // them to rank forever. No uniqueness constraint — vectors are derived state.
-        if reconcile_vectors {
-            let mut parts = persistence_id.splitn(3, ':');
-            let tenant = parts.next().unwrap_or("");
-            let entity_type = parts.next().unwrap_or("");
-            let entity_id = parts.next().unwrap_or("");
-            inner.vector_index.retain(|(t, et, _, _, eid), _| {
-                !(t.as_str() == tenant && et.as_str() == entity_type && eid.as_str() == entity_id)
-            });
-            for row in vector_rows {
-                inner.vector_index.insert(
-                    (
-                        tenant.to_string(),
-                        entity_type.to_string(),
-                        row.decl_name.clone(),
-                        row.model_tag.clone(),
-                        entity_id.to_string(),
-                    ),
-                    row.vector.clone(),
                 );
             }
         }
@@ -1067,105 +1032,133 @@ impl EventStore for SimEventStore {
         Ok(ids.into_iter().collect())
     }
 
-    async fn backfill_entity_vectors(
+    async fn write_meaning(
         &self,
         tenant: &str,
         entity_type: &str,
         entity_id: &str,
-        vector_rows: &[EntityVectorRow],
+        text: Option<&str>,
     ) -> Result<(), PersistenceError> {
         let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
-        // Reconcile: drop ALL of the entity's rows, then insert the current ones.
-        // Empty `vector_rows` purges the entity (deleted / un-embedded). Idempotent.
-        inner.vector_index.retain(|(t, et, _, _, eid), _| {
-            !(t.as_str() == tenant && et.as_str() == entity_type && eid == entity_id)
-        });
-        for row in vector_rows {
-            inner.vector_index.insert(
-                (
-                    tenant.to_string(),
-                    entity_type.to_string(),
-                    row.decl_name.clone(),
-                    row.model_tag.clone(),
-                    entity_id.to_string(),
-                ),
-                row.vector.clone(),
-            );
-        }
-        Ok(())
-    }
-
-    async fn vector_candidates(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-        decl_name: &str,
-        model_tag: &str,
-        limit: usize,
-    ) -> Result<Vec<EntityVectorCandidate>, PersistenceError> {
-        let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
-        // BTreeMap iteration is ordered by key, so `entity_id` (the last key
-        // component within a fixed partition) yields deterministic candidate order.
-        // Cap at `limit` so an over-budget partition is detected without copying it all.
-        let mut out = Vec::new();
-        for ((t, et, decl, tag, entity_id), vector) in inner.vector_index.iter() {
-            if t.as_str() == tenant
-                && et.as_str() == entity_type
-                && decl.as_str() == decl_name
-                && tag.as_str() == model_tag
-            {
-                if out.len() >= limit {
-                    break;
-                }
-                out.push(EntityVectorCandidate {
-                    entity_id: entity_id.clone(),
-                    vector: vector.clone(),
-                });
-            }
-        }
-        Ok(out)
-    }
-
-    async fn mark_vector_index_backfilled(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-        vector_set: &str,
-    ) -> Result<(), PersistenceError> {
-        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
-        inner.vector_index_watermark.insert(
-            (tenant.to_string(), entity_type.to_string()),
-            vector_set.to_string(),
+        inner.keep_meaning(
+            (
+                tenant.to_string(),
+                entity_type.to_string(),
+                entity_id.to_string(),
+            ),
+            text,
         );
         Ok(())
     }
 
-    async fn vector_index_backfilled_types(
+    async fn meaning_rows(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MeaningRow>, PersistenceError> {
+        let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        // BTreeMap order is (tenant, type, id), so one type's rows come in id order.
+        Ok(inner
+            .meaning
+            .iter()
+            .filter(|((t, et, id), _)| {
+                t == tenant && et == entity_type && after.is_none_or(|after| id.as_str() > after)
+            })
+            .take(limit)
+            .map(|((_, _, id), row)| row.as_row(id))
+            .collect())
+    }
+
+    async fn meaning_row(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<Option<MeaningRow>, PersistenceError> {
+        let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        Ok(inner
+            .meaning
+            .get(&(
+                tenant.to_string(),
+                entity_type.to_string(),
+                entity_id.to_string(),
+            ))
+            .map(|row| row.as_row(entity_id)))
+    }
+
+    async fn meaning_pending(
+        &self,
+        tenant: &str,
+        model_tag: &str,
+        limit: usize,
+    ) -> Result<Vec<MeaningPending>, PersistenceError> {
+        let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        Ok(inner
+            .meaning
+            .iter()
+            .filter(|((t, _, _), row)| t == tenant && row.model_tag != model_tag)
+            .take(limit)
+            .map(|((_, entity_type, entity_id), row)| MeaningPending {
+                entity_type: entity_type.clone(),
+                entity_id: entity_id.clone(),
+                text: row.text.clone(),
+                text_hash: row.text_hash.clone(),
+            })
+            .collect())
+    }
+
+    async fn set_meaning_vector(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        text_hash: &str,
+        model_tag: &str,
+        vector: &[f32],
+    ) -> Result<bool, PersistenceError> {
+        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        let key = (
+            tenant.to_string(),
+            entity_type.to_string(),
+            entity_id.to_string(),
+        );
+        match inner.meaning.get_mut(&key) {
+            Some(row) if row.text_hash == text_hash => {
+                row.model_tag = model_tag.to_string();
+                row.vector = vector.to_vec();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn mark_meaning_backfilled(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        rule: &str,
+    ) -> Result<(), PersistenceError> {
+        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        inner.meaning_watermark.insert(
+            (tenant.to_string(), entity_type.to_string()),
+            rule.to_string(),
+        );
+        Ok(())
+    }
+
+    async fn meaning_backfilled_types(
         &self,
         tenant: &str,
     ) -> Result<Vec<(String, String)>, PersistenceError> {
         let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
         Ok(inner
-            .vector_index_watermark
+            .meaning_watermark
             .iter()
-            .filter(|((t, _), _)| t.as_str() == tenant)
-            .map(|((_, et), vector_set)| (et.clone(), vector_set.clone()))
+            .filter(|((t, _), _)| t == tenant)
+            .map(|((_, et), rule)| (et.clone(), rule.clone()))
             .collect())
-    }
-
-    async fn vectored_entity_ids_for_type(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-    ) -> Result<Vec<String>, PersistenceError> {
-        let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
-        let mut ids: BTreeSet<String> = BTreeSet::new();
-        for ((t, et, _, _, entity_id), _) in inner.vector_index.iter() {
-            if t.as_str() == tenant && et.as_str() == entity_type {
-                ids.insert(entity_id.clone());
-            }
-        }
-        Ok(ids.into_iter().collect())
     }
 
     async fn append_batch(

@@ -605,8 +605,7 @@ impl TursoEventStore {
             .await
             .map_err(storage_error)?;
 
-        // Entity vector index (ADR-0155) — declared vector paths for exact-scan kNN,
-        // maintained write-behind (the event append is followed by the index write).
+        // Unused since ADR-0186; kept so an older build can still roll back onto the database.
         conn.execute(schema::CREATE_ENTITY_VECTOR_INDEX_TABLE, ())
             .await
             .map_err(storage_error)?;
@@ -617,6 +616,17 @@ impl TursoEventStore {
             .await
             .map_err(storage_error)?;
         conn.execute(schema::CREATE_VECTOR_INDEX_BACKFILL_WATERMARK, ())
+            .await
+            .map_err(storage_error)?;
+
+        // Meaning rows (ADR-0186), written with the query-plane row.
+        conn.execute(schema::CREATE_ENTITY_MEANING_TABLE, ())
+            .await
+            .map_err(storage_error)?;
+        conn.execute(schema::CREATE_ENTITY_MEANING_PENDING, ())
+            .await
+            .map_err(storage_error)?;
+        conn.execute(schema::CREATE_ENTITY_MEANING_BACKFILL, ())
             .await
             .map_err(storage_error)?;
 

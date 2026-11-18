@@ -4,13 +4,13 @@ use crate::schema::tombstone_sql;
 
 /// The append statement. Parameters, in order:
 /// `$1..$3` the record; `$4` the expected sequence; `$5..$7` the events' types,
-/// payloads and metadata; `$8, $9` the declared keys; `$10` whether the record's
-/// vector rows become `$11..$13`; `$14..$17` the scheduled actions armed; `$18`
-/// the one fired; `$19` the projection (`upsert`, `remove` or NULL) with
-/// `$20..$26` its status, fields, stored state, hash, index names and values
-/// and whether its fields are wrapped where the index cannot see; `$27` whether
-/// the events hold the tombstone; `$28` the timer (`arm`, `end` or NULL) with
-/// `$29..$34` its row.
+/// payloads and metadata; `$8, $9` the declared keys; `$10, $11` the record's
+/// meaning text and its hash; `$12..$15` the scheduled actions armed; `$16`
+/// the one fired; `$17` the projection (`upsert`, `remove` or NULL) with
+/// `$18..$24` its status, fields, stored state, hash, index names and values
+/// and whether its fields are wrapped where the index cannot see; `$25` whether
+/// the events hold the tombstone; `$26` the timer (`arm`, `end` or NULL) with
+/// `$27..$33` its row.
 pub(crate) const APPEND_COMMIT_SQL: &str = concat!(
     "WITH locked AS (
     SELECT c.sequence_nr, c.projection_hash FROM {schema}entity_catalog c
@@ -93,43 +93,30 @@ key_add AS (
     FROM unnest($8::text[], $9::text[]) AS nk(key_name, key_hash), w
     WHERE NOT EXISTS (SELECT 1 FROM held h
         WHERE h.key_name = nk.key_name AND h.key_hash = nk.key_hash)),
-vec_drop AS (
-    DELETE FROM {schema}entity_vector_index v USING w
-    WHERE $10::boolean AND v.tenant = $1 AND v.entity_type = $2 AND v.entity_id = $3
-      AND NOT EXISTS (SELECT 1 FROM unnest($11::text[], $12::text[]) AS nv(decl_name, model_tag)
-          WHERE nv.decl_name = v.decl_name AND nv.model_tag = v.model_tag)),
-vec_put AS (
-    INSERT INTO {schema}entity_vector_index AS v
-        (tenant, entity_type, decl_name, model_tag, entity_id, vector, sequence_nr)
-    SELECT $1, $2, nv.decl_name, nv.model_tag, $3, nv.vector, w.seq
-    FROM unnest($11::text[], $12::text[], $13::bytea[]) AS nv(decl_name, model_tag, vector), w
-    WHERE $10::boolean
-    ON CONFLICT (tenant, entity_type, decl_name, model_tag, entity_id) DO UPDATE SET
-        vector = EXCLUDED.vector, sequence_nr = EXCLUDED.sequence_nr),
 sched_add AS (
     INSERT INTO {schema}scheduled_actions
         (tenant, entity_type, entity_id, arm_id, action, due_at, armed_by)
     SELECT $1, $2, $3, s.arm_id, s.action, s.due_at, s.armed_by
-    FROM unnest($14::text[], $15::text[], $16::text[], $17::text[])
+    FROM unnest($12::text[], $13::text[], $14::text[], $15::text[])
         AS s(arm_id, action, due_at, armed_by), w
-    WHERE s.arm_id IS DISTINCT FROM $18::text
+    WHERE s.arm_id IS DISTINCT FROM $16::text
     ON CONFLICT (tenant, entity_type, entity_id, arm_id) DO NOTHING),
 sched_fire AS (
     DELETE FROM {schema}scheduled_actions s USING w
     WHERE s.tenant = $1 AND s.entity_type = $2 AND s.entity_id = $3
-      AND s.arm_id = $18::text),
+      AND s.arm_id = $16::text),
 go AS (
     SELECT w.seq,
-        NOT EXISTS (SELECT 1 FROM prev WHERE prev.projection_hash = $23::text) AS reindex
+        NOT EXISTS (SELECT 1 FROM prev WHERE prev.projection_hash = $21::text) AS reindex
     FROM w
-    WHERE $19::text = 'upsert'
+    WHERE $17::text = 'upsert'
       AND NOT EXISTS (SELECT 1 FROM prev WHERE prev.sequence_nr > w.seq)),
 cat_put AS (
     INSERT INTO {schema}entity_catalog AS c
         (tenant, entity_type, entity_id, status, fields, state, sequence_nr,
          projection_version, projection_hash, updated_at, first_event_at)
-    SELECT $1, $2, $3, $20::text, $21::jsonb, $22::jsonb, go.seq, 2, $23::text, now(),
-        $22::jsonb->>'first_event_at'
+    SELECT $1, $2, $3, $18::text, $19::jsonb, $20::jsonb, go.seq, 2, $21::text, now(),
+        $20::jsonb->>'first_event_at'
     FROM go
     ON CONFLICT (tenant, entity_type, entity_id) DO UPDATE SET
         status = EXCLUDED.status,
@@ -145,21 +132,31 @@ cat_put AS (
     RETURNING 1),
 cat_drop AS (
     DELETE FROM {schema}entity_catalog c USING w
-    WHERE $19::text = 'remove'
+    WHERE $17::text = 'remove'
       AND c.tenant = $1 AND c.entity_type = $2 AND c.entity_id = $3
     RETURNING 1),
 cat AS (
     SELECT (SELECT count(*) FROM cat_put) + (SELECT count(*) FROM cat_drop) AS written),
+mean_put AS (
+    INSERT INTO {schema}entity_meaning AS m (tenant, entity_type, entity_id, text, text_hash)
+    SELECT $1, $2, $3, $10::text, $11::text FROM go
+    ON CONFLICT (tenant, entity_type, entity_id) DO UPDATE SET
+        text = EXCLUDED.text, text_hash = EXCLUDED.text_hash, model_tag = '', vector = ''::bytea
+    WHERE m.text_hash <> EXCLUDED.text_hash),
+mean_drop AS (
+    DELETE FROM {schema}entity_meaning m USING w
+    WHERE $17::text = 'remove'
+      AND m.tenant = $1 AND m.entity_type = $2 AND m.entity_id = $3),
 fi_drop AS (
     DELETE FROM {schema}entity_field_index f USING w, cat
     WHERE f.tenant = $1 AND f.entity_type = $2 AND f.entity_id = $3
-      AND ($19::text = 'remove' OR EXISTS (SELECT 1 FROM go
-          WHERE go.reindex AND f.field_name <> ALL($24::text[])))),
+      AND ($17::text = 'remove' OR EXISTS (SELECT 1 FROM go
+          WHERE go.reindex AND f.field_name <> ALL($22::text[])))),
 fi_put AS (
     INSERT INTO {schema}entity_field_index AS f
         (tenant, entity_type, entity_id, field_name, field_value)
     SELECT $1, $2, $3, i.field_name, i.field_value
-    FROM unnest($24::text[], $25::text[]) AS i(field_name, field_value), go, cat
+    FROM unnest($22::text[], $23::text[]) AS i(field_name, field_value), go, cat
     WHERE go.reindex
     ON CONFLICT (tenant, entity_type, entity_id, field_name) DO UPDATE SET
         field_value = EXCLUDED.field_value, status = NULL
@@ -168,35 +165,35 @@ mark AS (
     INSERT INTO {schema}entity_projection_delta AS m
         (tenant, entity_type, entity_id, sequence_nr, terminal)
     SELECT $1, $2, $3,
-        CASE WHEN $19::text = 'remove' THEN GREATEST(w.seq, COALESCE(
+        CASE WHEN $17::text = 'remove' THEN GREATEST(w.seq, COALESCE(
             (SELECT sn.sequence_nr FROM {schema}snapshots sn
              WHERE sn.tenant = $1 AND sn.entity_type = $2 AND sn.entity_id = $3), 0))
         ELSE w.seq END,
-        $27::boolean OR ($19::text = 'remove' AND EXISTS (SELECT 1 FROM {schema}events d
+        $25::boolean OR ($17::text = 'remove' AND EXISTS (SELECT 1 FROM {schema}events d
             WHERE d.tenant = $1 AND d.entity_type = $2 AND d.entity_id = $3 AND ",
     tombstone_sql!(),
     "))
     FROM w, cat
-    WHERE CASE $19::text
+    WHERE CASE $17::text
         WHEN 'remove' THEN true
-        WHEN 'upsert' THEN $26::boolean OR NOT EXISTS (SELECT 1 FROM go)
+        WHEN 'upsert' THEN $24::boolean OR NOT EXISTS (SELECT 1 FROM go)
         ELSE w.seq > $4::bigint END
     ON CONFLICT (tenant, entity_type, entity_id) DO UPDATE SET
         sequence_nr = GREATEST(m.sequence_nr, EXCLUDED.sequence_nr),
         terminal = m.terminal OR EXCLUDED.terminal),
 retire AS (
     DELETE FROM {schema}entity_projection_delta m USING go, cat
-    WHERE NOT $26::boolean
+    WHERE NOT $24::boolean
       AND m.tenant = $1 AND m.entity_type = $2 AND m.entity_id = $3
       AND m.sequence_nr <= go.seq AND NOT m.terminal
-      AND CASE WHEN go.reindex THEN cardinality($24::text[]) > 0
+      AND CASE WHEN go.reindex THEN cardinality($22::text[]) > 0
           ELSE EXISTS (SELECT 1 FROM {schema}entity_field_index f
               WHERE f.tenant = $1 AND f.entity_type = $2 AND f.entity_id = $3) END),
 timer_arm AS (
     INSERT INTO {schema}state_timers AS t
         (tenant, entity_type, entity_id, state, arm_id, sequence_nr, started_at, params, armed_by, due_at)
-    SELECT $1, $2, $3, $29::text, $30::text, $31::bigint, $32::text, $33::text, $34::text, $35::text
-    FROM w WHERE $28::text = 'arm'
+    SELECT $1, $2, $3, $27::text, $28::text, $29::bigint, $30::text, $31::text, $32::text, $33::text
+    FROM w WHERE $26::text = 'arm'
     ON CONFLICT (tenant, entity_type, entity_id) DO UPDATE SET
         state = EXCLUDED.state,
         arm_id = EXCLUDED.arm_id,
@@ -208,7 +205,7 @@ timer_arm AS (
     WHERE EXCLUDED.sequence_nr >= t.sequence_nr),
 timer_end AS (
     DELETE FROM {schema}state_timers t USING w
-    WHERE $28::text = 'end'
+    WHERE $26::text = 'end'
       AND t.tenant = $1 AND t.entity_type = $2 AND t.entity_id = $3)
 SELECT chk.ok, chk.head, (SELECT seq FROM w),
     (SELECT key_name FROM clash), (SELECT entity_id FROM clash), chk.raced
