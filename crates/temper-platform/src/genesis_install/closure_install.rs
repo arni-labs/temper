@@ -18,7 +18,7 @@
 use super::*;
 use crate::os_apps::{
     AppFileSource, find_ioa_files, installed_line, resolve_materialized_app_closure,
-    tenant_os_app_files,
+    tenant_os_app_files, unheld_dependencies,
 };
 
 /// Where an installed closure came from, as its install records name it.
@@ -114,6 +114,7 @@ pub(super) async fn install_materialized_closure(
         .iter()
         .map(|app| (app.version.name.clone(), app.files.clone()))
         .collect();
+    hold_installed_dependencies(platform, tenant, cache_root, &written).await;
     let apps = resolve_materialized_app_closure(tenant, cache_root, &written)
         .map_err(ClosureRefused::Inactive)?;
     let materialized: Vec<String> = apps.iter().map(|(name, _)| name.clone()).collect();
@@ -340,6 +341,36 @@ pub(super) async fn uninstalled_apps<T>(
         }
     }
     Ok(taken)
+}
+
+/// Bring back the files of each installed app the closure of `written`
+/// depends on that this process does not hold, so the closure resolves.
+///
+/// A dependency left installed resolves at the version its record names, from
+/// the files this process holds for it. A boot that could not fetch those
+/// files (its registry did not answer) leaves the app running on its stored
+/// specs but without them, and every install of an app that needs it would
+/// then be refused. So the install brings them back first, as a boot does,
+/// and each dependency they name in turn. One whose files cannot be brought
+/// back is named by the resolution that follows. The caller holds the install
+/// turn.
+async fn hold_installed_dependencies(
+    platform: &PlatformState,
+    tenant: &str,
+    cache_root: &Path,
+    written: &[(String, AppFileSource)],
+) {
+    let mut asked = BTreeSet::new();
+    loop {
+        let unheld: Vec<String> = unheld_dependencies(tenant, cache_root, written)
+            .into_iter()
+            .filter(|app| asked.insert(app.clone()))
+            .collect();
+        if unheld.is_empty() {
+            return;
+        }
+        super::restore::hold_installed_apps_in_turn(platform, tenant, &unheld).await;
+    }
 }
 
 /// For each app the install puts in place, the routes it declares and the

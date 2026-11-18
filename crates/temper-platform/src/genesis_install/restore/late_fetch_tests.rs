@@ -356,3 +356,59 @@ async fn late_dependency_retries_a_persisted_local_parent() {
         Some(tags)
     );
 }
+
+/// A restart whose registry fetch failed leaves an installed app running on
+/// its stored specs without its files. Installing an app that needs it must
+/// bring those files back from its recorded registry, as the boot would have,
+/// instead of refusing the install because the dependency is not found.
+#[tokio::test]
+async fn an_install_brings_back_an_installed_dependency_the_boot_could_not_fetch() {
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let remote = tempfile::tempdir().expect("registry files");
+    let ps = Arc::new(store());
+    let platform = server_on(data_dir.path(), &ps);
+    let tenant = format!("{TENANT}-unheld-dependency");
+    let v1 = "1".repeat(40);
+    write_app(remote.path(), "tags", "tags v1");
+    let mut tags = record(remote.path(), &tenant, "tags", &v1);
+    let (registry, arrivals) = Registry::serve(vec![bundle(remote.path(), "tags", &v1)]).await;
+    // The registry answers as soon as it is asked.
+    arrivals[0].release.notify_one();
+    tags.registry_url = registry.url.clone();
+    ps.record_installed_app_metadata(&tags).await.unwrap();
+    assert!(
+        crate::os_apps::tenant_os_app(&tenant, "tags").is_none(),
+        "this process holds no files for the installed dependency"
+    );
+
+    install_pushed_app(
+        &platform,
+        &tenant,
+        "notes",
+        BTreeMap::from([
+            (
+                "app.toml".to_string(),
+                PushedFile::Text("name = \"notes\"\ndependencies = [\"tags\"]\n".to_string()),
+            ),
+            (
+                "APP.md".to_string(),
+                PushedFile::Text("# notes\n\nnotes v1\n".to_string()),
+            ),
+        ]),
+        PushMode::Install,
+    )
+    .await
+    .1
+    .expect("the install brings the installed dependency's files back");
+    assert!(
+        crate::os_apps::tenant_app_guide(&tenant, "tags")
+            .unwrap()
+            .contains("tags v1"),
+        "the dependency resolves at the version its record names"
+    );
+    assert_eq!(
+        ps.get_installed_app(&tenant, "tags").await.unwrap(),
+        Some(tags),
+        "the dependency's install record is left as it was"
+    );
+}

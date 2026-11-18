@@ -1,5 +1,6 @@
 //! Resolve an install's named files over the tenant's catalog without registering them.
 
+use std::cell::RefCell;
 use std::path::Path;
 
 use super::app_catalog::AppCatalog;
@@ -47,4 +48,35 @@ pub(crate) fn resolve_materialized_app_closure(
             Ok((name, files))
         })
         .collect()
+}
+
+/// The apps the closure of `apps` depends on that neither `apps` nor the
+/// tenant's catalog holds files for, in the order resolution meets them. An
+/// installed app whose files this process could not bring back (a boot whose
+/// registry fetch failed) is one; [`resolve_materialized_app_closure`] cannot
+/// resolve a closure until its files are back.
+pub(crate) fn unheld_dependencies(
+    tenant: &str,
+    cache_root: &Path,
+    apps: &[(String, AppFileSource)],
+) -> Vec<String> {
+    let incoming = AppCatalog::from_apps(cache_root.to_path_buf(), apps.to_vec());
+    let roots: Vec<String> = apps.iter().map(|(name, _)| name.clone()).collect();
+    let unheld = RefCell::new(Vec::new());
+    // Only the names met matter here; a cycle is resolution's to report.
+    let _ = resolve_os_app_install_order_with_dependencies(&roots, |name| {
+        if let Some(entry) = incoming.app_entry(None, name) {
+            return dependencies_for_entry(name, Some(entry));
+        }
+        let held = catalog()
+            .read()
+            .expect("OS app catalog lock poisoned")
+            .app_files(Some(tenant), name)
+            .is_some();
+        if !held {
+            unheld.borrow_mut().push(name.to_string());
+        }
+        os_app_dependencies(Some(tenant), name)
+    });
+    unheld.into_inner()
 }

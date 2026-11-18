@@ -71,7 +71,7 @@ pub use entity_owners::unspecified_entity_types;
 pub(crate) use file_source::seam as app_files_seam;
 pub use file_source::{AppFileSource, list_install_dir};
 pub use install_lines::{installed_line, stored_line, waiting_line};
-pub(crate) use materialized_closure::resolve_materialized_app_closure;
+pub(crate) use materialized_closure::{resolve_materialized_app_closure, unheld_dependencies};
 pub use module_review_step::ReviewAsked;
 pub use own_schema::converge_installed_schemas;
 #[cfg(test)]

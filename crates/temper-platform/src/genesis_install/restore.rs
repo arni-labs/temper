@@ -14,9 +14,12 @@ mod cache_recovery;
 mod fetch;
 mod rollback;
 
+pub(super) use fetch::hold_installed_apps_in_turn;
+
 pub(crate) use cache_recovery::installed_version_files;
 use cache_recovery::{
     cached_apps_matching_records, first_matching_install, install_cache_candidates,
+    plan_cache_recovery,
 };
 
 pub use fetch::{CacheFetchSummary, CacheFetches};
@@ -277,106 +280,7 @@ pub async fn start_registry_cache_recovery_of(
     else {
         return GenesisCacheRecovery::nothing();
     };
-
-    let mut restored = 0usize;
-    let mut seen = BTreeSet::new();
-    let mut pending = Vec::new();
-    for (tenant, app_name) in installed.iter().cloned() {
-        let record = match ps.get_installed_app(&tenant, &app_name).await {
-            Ok(Some(record)) => record,
-            Ok(None) => continue,
-            Err(error) => {
-                tracing::warn!(
-                    recovery = "genesis_cache",
-                    result = "error",
-                    tenant = %tenant,
-                    app = %app_name,
-                    error = %error,
-                    "Failed to read installed app metadata for Genesis cache recovery"
-                );
-                continue;
-            }
-        };
-        // A pushed install's files exist only in its own cache directory; a
-        // Genesis install's can be fetched again from its registry.
-        let pushed = record.source_kind == pushed::SOURCE_KIND;
-        if !pushed && (record.source_kind != "genesis" || record.registry_url.trim().is_empty()) {
-            continue;
-        }
-        let root_ref = match parse_registry_app_ref(&record.app_ref) {
-            Ok(root_ref) => root_ref,
-            Err(error) => {
-                tracing::warn!(
-                    recovery = "genesis_cache",
-                    result = "error",
-                    tenant = %tenant,
-                    app = %app_name,
-                    app_ref = %record.app_ref,
-                    error = %error,
-                    "Installed app has invalid Genesis app_ref"
-                );
-                continue;
-            }
-        };
-        let registry_tenant = if record.registry_tenant.trim().is_empty() {
-            "default"
-        } else {
-            record.registry_tenant.trim()
-        };
-        let candidates =
-            install_cache_candidates(platform, &tenant, registry_tenant, &record.app_ref);
-        let cache_root = candidates[0].path.clone();
-        // Each tenant's install has its own directory, so records restore it
-        // once per directory, from that install's own registry tenant.
-        if !seen.insert(cache_root.clone()) {
-            continue;
-        }
-        let recorded = std::slice::from_ref(&record);
-        if let Some((stored, apps)) =
-            first_matching_install(ps.as_ref(), &candidates, &record, recorded).await
-        {
-            register_written_apps(&tenant, stored, apps);
-            restored += 1;
-            continue;
-        }
-        // A pushed version came through the install route and has no registry:
-        // only whoever pushed it can send it again.
-        if pushed {
-            tracing::warn!(
-                recovery = "genesis_cache",
-                result = "missing",
-                tenant = %tenant,
-                app = %app_name,
-                app_ref = %record.app_ref,
-                "Installed pushed app's files are not on disk; its install record is kept, and it serves its stored specs until its version is pushed again"
-            );
-            continue;
-        }
-        let registry = match recorded_registry(&record.registry_url) {
-            Ok(registry) => registry,
-            Err(error) => {
-                tracing::warn!(
-                    recovery = "genesis_cache",
-                    result = "error",
-                    tenant = %tenant,
-                    app = %app_name,
-                    app_ref = %record.app_ref,
-                    error = %error,
-                    "Installed Genesis app's files are not on disk and its recorded registry cannot be fetched from; its install record is kept"
-                );
-                continue;
-            }
-        };
-        pending.push(fetch::Pending {
-            registry_tenant: registry_tenant.to_string(),
-            tenant,
-            record,
-            registry,
-            root_ref,
-            cache_root,
-        });
-    }
-
+    let (restored, pending) = plan_cache_recovery(platform, ps.as_ref(), &installed).await;
     GenesisCacheRecovery {
         restored,
         fetching: fetch::spawn(platform, ps, pending, installed),

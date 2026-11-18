@@ -143,6 +143,61 @@ async fn fetch_and_bring_up(
     install: Pending,
     retrying: Arc<Mutex<BTreeSet<String>>>,
 ) -> bool {
+    let Some(fetched) = fetch_files(&install).await else {
+        return false;
+    };
+    let tenant = &install.tenant;
+    let app_name = &install.record.app_name;
+    // Keep failed replays pending before another arrival can retry them. The
+    // network work above holds neither this tenant's queue nor an install turn.
+    let mut retrying = retrying.lock().await;
+    let _turn = match temper_server::host_turn::take().await {
+        Ok(turn) => turn,
+        Err(error) => {
+            tracing::warn!(
+                recovery = "genesis_cache", result = "error", tenant = %tenant,
+                app = %app_name, error = %error,
+                "Could not take the install turn for Genesis cache recovery"
+            );
+            return false;
+        }
+    };
+    publish_and_bring_up(&platform, ps.as_ref(), &install, &fetched, &mut retrying).await
+}
+
+/// Bring back the files of `tenant`'s installed `apps` that this process does
+/// not hold, from disk or from each one's recorded registry, as a boot does,
+/// for a caller that holds the install turn. An app whose files cannot be
+/// brought back keeps its record, and the reason is logged at WARN.
+pub(in crate::genesis_install) async fn hold_installed_apps_in_turn(
+    platform: &PlatformState,
+    tenant: &str,
+    apps: &[String],
+) {
+    let Some(ps) = platform_store(platform) else {
+        return;
+    };
+    let installed: Vec<(String, String)> = apps
+        .iter()
+        .map(|app| (tenant.to_string(), app.clone()))
+        .collect();
+    let (_, pending) = super::plan_cache_recovery(platform, ps.as_ref(), &installed).await;
+    for install in pending {
+        fetch_in_turn(platform, ps.as_ref(), install).await;
+    }
+}
+
+/// Fetch one install and publish it only while current, for a caller that
+/// holds the install turn. Returns whether the fetch succeeded.
+async fn fetch_in_turn(platform: &PlatformState, ps: &dyn PlatformStore, install: Pending) -> bool {
+    let Some(fetched) = fetch_files(&install).await else {
+        return false;
+    };
+    publish_and_bring_up(platform, ps, &install, &fetched, &mut BTreeSet::new()).await
+}
+
+/// Fetch one install's files from its registry into a directory of their own.
+async fn fetch_files(install: &Pending) -> Option<tempfile::TempDir> {
     let Pending {
         tenant,
         record,
@@ -151,11 +206,11 @@ async fn fetch_and_bring_up(
         root_ref,
         cache_root,
     } = install;
-    let app_name = record.app_name.clone();
+    let app_name = &record.app_name;
     // A fetch owns its files until it can check and publish under the install
     // locks. Even a repeated install of the same ref cannot have its active
     // directory overwritten by a stale recovery in the meantime.
-    let fetched = match fetch_directory(&cache_root) {
+    let fetched = match fetch_directory(cache_root) {
         Ok(fetched) => fetched,
         Err(error) => {
             tracing::warn!(
@@ -163,13 +218,13 @@ async fn fetch_and_bring_up(
                 app = %app_name, error = %error,
                 "Could not prepare Genesis cache fetch; its install record is kept"
             );
-            return false;
+            return None;
         }
     };
     let fetched_root = fetched.path().join("bundle");
     let materialized = match materialize_registry_app_closure_via_bundle(
-        &registry,
-        &registry_tenant,
+        registry,
+        registry_tenant,
         root_ref.clone(),
         &fetched_root,
     )
@@ -187,7 +242,7 @@ async fn fetch_and_bring_up(
                 error = %error,
                 "Genesis bundle cache recovery failed; falling back to git clone because TEMPER_GENESIS_INSTALL_GIT_FALLBACK is enabled"
             );
-            materialize_registry_app_closure(&registry, root_ref, &fetched_root)
+            materialize_registry_app_closure(registry, root_ref.clone(), &fetched_root)
                 .await
                 .map(|_| ())
         }
@@ -203,44 +258,49 @@ async fn fetch_and_bring_up(
             error = %error,
             "Failed to fetch installed Genesis app files again; its install record is kept"
         );
-        return false;
+        return None;
     }
     legacy_specs::convert_legacy_bundle_specs(&fetched_root);
-    // Keep failed replays pending before another arrival can retry them. The
-    // network work above holds neither this tenant's queue nor an install turn.
-    let mut retrying = retrying.lock().await;
-    let _turn = match temper_server::host_turn::take().await {
-        Ok(turn) => turn,
+    Some(fetched)
+}
+
+/// Publish the fetched files while their record is current, then bring up
+/// the published apps and the tenant's apps in `retrying`. The caller holds
+/// the install turn.
+async fn publish_and_bring_up(
+    platform: &PlatformState,
+    ps: &dyn PlatformStore,
+    install: &Pending,
+    fetched: &tempfile::TempDir,
+    retrying: &mut BTreeSet<String>,
+) -> bool {
+    let Pending {
+        tenant,
+        record,
+        cache_root,
+        ..
+    } = install;
+    let app_name = &record.app_name;
+    let fetched_root = fetched.path().join("bundle");
+    let names = match publish_if_current(platform, ps, record, &fetched_root, cache_root).await {
+        Ok(names) => names,
         Err(error) => {
             tracing::warn!(
-                recovery = "genesis_cache", result = "error", tenant = %tenant,
-                app = %app_name, error = %error,
-                "Could not take the install turn for Genesis cache recovery"
+                recovery = "genesis_cache",
+                result = "error",
+                tenant = %tenant,
+                app = %app_name,
+                app_ref = %record.app_ref,
+                error = %error,
+                "Fetched Genesis app files could not be published; its install record is kept"
             );
             return false;
         }
     };
-    let names =
-        match publish_if_current(&platform, ps.as_ref(), &record, &fetched_root, &cache_root).await
-        {
-            Ok(names) => names,
-            Err(error) => {
-                tracing::warn!(
-                    recovery = "genesis_cache",
-                    result = "error",
-                    tenant = %tenant,
-                    app = %app_name,
-                    app_ref = %record.app_ref,
-                    error = %error,
-                    "Fetched Genesis app files could not be published; its install record is kept"
-                );
-                return false;
-            }
-        };
     retrying.extend(names);
     let mut failed = BTreeSet::new();
     for name in retrying.iter() {
-        if !bring_up(&platform, ps.as_ref(), &tenant, name).await {
+        if !bring_up(platform, ps, tenant, name).await {
             failed.insert(name.clone());
         }
     }
@@ -249,8 +309,8 @@ async fn fetch_and_bring_up(
         .map(|name| (tenant.clone(), name.clone()))
         .collect();
     *retrying = failed;
-    let _install = crate::os_apps::install_guard::tenant(&platform.server, &tenant).await;
-    crate::os_apps::converge_installed_schemas(&platform, &installed).await;
+    let _install = crate::os_apps::install_guard::tenant(&platform.server, tenant).await;
+    crate::os_apps::converge_installed_schemas(platform, &installed).await;
     true
 }
 
