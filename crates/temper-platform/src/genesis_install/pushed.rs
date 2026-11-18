@@ -165,6 +165,10 @@ async fn check_pushed(
     let app_dir = root.join(app);
     let written = AppFileSource::written(app_dir.clone(), files.keys().cloned());
     is_the_app(&app_dir, app)?;
+    // The author's new or changed modules, as the install that follows would refuse them (os_apps module_review_gate).
+    crate::os_apps::refuse_pushed_findings(platform, tenant, &written)
+        .await
+        .map_err(PushRefused::Install)?;
     let app_ref = pushed_ref(app, &digest);
     let checked = closure_install::check_materialized_closure(
         platform,
@@ -233,6 +237,11 @@ async fn install_in_turn(
     if let Err(refused) = is_the_app(&app_dir, app) {
         discard();
         return Err(refused);
+    }
+    // A push is its author's change: a new or changed module with a finding is refused (os_apps module_review_gate).
+    if let Err(refused) = crate::os_apps::refuse_pushed_findings(platform, tenant, &written).await {
+        discard();
+        return Err(PushRefused::Install(refused));
     }
 
     let app_ref = pushed_ref(app, &digest);

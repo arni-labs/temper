@@ -36,6 +36,7 @@ pub(crate) mod install_guard;
 mod install_lines;
 mod materialized_closure;
 mod module_review_gate;
+pub(crate) use module_review_gate::refuse_pushed_findings;
 mod module_review_step;
 mod own_schema;
 mod policy_rows;
@@ -931,9 +932,6 @@ async fn install_once(
         ControlFlow::Continue(proof) => return Ok(ControlFlow::Continue(proof)),
         ControlFlow::Break(found) => warnings.extend(found),
     }
-    // A new or changed module Jev finds deciding what the spec should is refused, by a check too, before anything is
-    // written. It waits on Jev only once no proof is left to wait for, so a try that waits pays for nothing.
-    module_review_gate::refuse_findings(state, tenant, app_dir, &bundle, plan.wasm).await?;
     // Every check has answered, and nothing is written yet: a check ends here.
     if let Run::Check(_) = run {
         return Ok(ControlFlow::Break(InstallResult {

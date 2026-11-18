@@ -1,8 +1,13 @@
-//! The refusal half of the install's module review ([`super::module_review_step`]): a new or changed module with a
-//! finding is not let in.
+//! The refusal half of the install's module review ([`super::module_review_step`]): a push whose new or changed
+//! module gets a finding is not let in.
+//!
+//! Only a push is refused, its check too: its files are its author's change. A Genesis registry install, a start's
+//! `--app` from the catalog and a restore install a version already published, and a refusal there would fall on
+//! whoever installs it, such as a fresh tenant taking an app as shipped, never on the author. Those are advised on.
 
 use std::path::Path;
 
+use super::file_source::AppFileSource;
 use super::module_review_step::{changed_modules, read_source, specs_of};
 use super::types::AppBundle;
 use crate::module_review::{Finding, ModuleSource};
@@ -15,7 +20,20 @@ use crate::state::PlatformState;
 ///
 /// Rita, 17 Nov 2026: every Jev module check belongs to Temper, and a module that decides is refused. Untouched code is
 /// never refused for it, so the apps that run now are not blocked until someone changes that module.
-pub(super) async fn refuse_findings(
+/// Refuse a pushed version of an app (`files`, as its author sent them) as [`refuse_findings`] does. Files that do not
+/// read as an app are left to the install, which says why.
+pub(crate) async fn refuse_pushed_findings(
+    state: &PlatformState,
+    tenant: &str,
+    files: &AppFileSource,
+) -> Result<(), String> {
+    let Ok(bundle) = super::load_app_bundle(files) else {
+        return Ok(());
+    };
+    refuse_findings(state, tenant, files.dir(), &bundle, true).await
+}
+
+async fn refuse_findings(
     state: &PlatformState,
     tenant: &str,
     app_dir: &Path,

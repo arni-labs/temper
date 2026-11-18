@@ -5,9 +5,10 @@
 //! steps, holding rules, deciding out of sight, packing several concerns) belongs to the spec's states, guards, timers
 //! and Cedar, where the checker can see it and the person can follow it.
 //!
-//! Enforced for new and changed code: an install whose new or changed module gets a finding is refused
-//! (`os_apps::module_review_step::refuse_findings`). A module whose code is as installed is only advised on, so the
-//! apps that run now are not blocked until someone changes that module. A Jev that does not answer refuses nothing and
+//! Enforced for an author's new and changed code: a push whose new or changed module gets a finding is refused
+//! (`os_apps::module_review_gate`). A module whose code is as installed, and any version installed as published
+//! (Genesis registry, a start's `--app`, a restore), is only advised on, so the apps that run now are not blocked until
+//! someone changes that module. A Jev that does not answer refuses nothing and
 //! is said once in what the review keeps, never retried in a loop: a Jev outage must not stop every install.
 
 mod excerpt;

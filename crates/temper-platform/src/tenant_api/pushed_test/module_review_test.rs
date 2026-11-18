@@ -396,14 +396,15 @@ async fn a_genesis_install_still_answers_with_what_the_review_found() {
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
-    // The first version installs the module with no Jev; the second changes only a spec, so its review is advice.
+    // The first version installs the module with no Jev; the second changes its code. A Genesis install takes a
+    // published version, so its review is advice and never refuses it.
     const FIRST: &str = "0123456789abcdef0123456789abcdef01234567";
     const HASH: &str = "89abcdef0123456789abcdef0123456789abcdef";
     let tenant = unique_tenant("review-genesis");
     let server = server(&tenant);
     let registry = MockServer::start().await;
-    for (hash, commit) in [(FIRST, "seed"), (HASH, "c1")] {
-        let files: Vec<serde_json::Value> = app_with_module(Some(commit), 1)
+    for (hash, commit, version) in [(FIRST, "seed", 1), (HASH, "c1", 2)] {
+        let files: Vec<serde_json::Value> = app_with_module(Some(commit), version)
             .as_object()
             .expect("files")
             .iter()

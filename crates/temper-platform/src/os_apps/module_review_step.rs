@@ -1,9 +1,9 @@
 //! The install's review of its app's modules ([`crate::module_review`]).
 //!
-//! A module whose code is new or changed is reviewed before the install writes anything, and a finding refuses the
-//! install ([`super::module_review_gate::refuse_findings`]): a module computes, and the spec decides the move, where the checker proves it, so a
-//! module that decides out of the spec's sight is not let in. Only new or changed code is held to it, so an app that
-//! runs keeps installing until someone changes that module.
+//! A push whose module code is new or changed is reviewed before it installs anything, and a finding refuses it
+//! ([`super::module_review_gate`]): a module computes, and the spec decides the move, where the checker proves it, so
+//! a module that decides out of the spec's sight is not let in. Only an author's new or changed code is held to it, so
+//! an app that runs keeps installing until someone changes that module, and a published version always installs.
 //!
 //! The rest is advice. It starts when the install starts, so Jev reads beside the install's own proofs and writes, and
 //! it goes on after the install answers. What it says is kept for the app (`PlatformStore::save_module_review`). A
