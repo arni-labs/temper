@@ -1,5 +1,6 @@
-//! An install answers without waiting for Jev's review of its modules, what the review found stays readable, and a
-//! caller that answers with all of it still can.
+//! A module whose code is as installed is reviewed as advice: an install answers without waiting for it, what the
+//! review found stays readable, and a caller that answers with all of it still can. A new or changed module with a
+//! finding is refused.
 
 use std::time::Duration;
 
@@ -18,10 +19,12 @@ use crate::os_apps::InstallResult;
 
 const MODULE: &str = "answer";
 
-/// Jev, who answers once the test lets him. Says every module shows the first item, at its first line.
+/// Jev, who answers once the test lets him. Says every module shows one item (the first, unless told), at its first
+/// line.
 struct HeldJudge {
     gate: Semaphore,
     down: bool,
+    item: usize,
 }
 
 impl HeldJudge {
@@ -29,6 +32,16 @@ impl HeldJudge {
         Arc::new(Self {
             gate: Semaphore::new(0),
             down: false,
+            item: 0,
+        })
+    }
+
+    /// Answers at once, finding `ITEMS[item]`.
+    fn finding(item: usize) -> Arc<Self> {
+        Arc::new(Self {
+            gate: Semaphore::new(1),
+            down: false,
+            item,
         })
     }
 
@@ -42,6 +55,7 @@ impl HeldJudge {
         Arc::new(Self {
             gate: Semaphore::new(1),
             down: true,
+            item: 0,
         })
     }
 
@@ -67,7 +81,7 @@ impl Judge for HeldJudge {
             .map(|(key, question)| {
                 let answer = match question {
                     Question::Noul { instructions } => Answer {
-                        noul: Some(if *instructions == ITEMS[0].shows {
+                        noul: Some(if *instructions == ITEMS[self.item].shows {
                             0.85
                         } else {
                             0.1
@@ -95,12 +109,16 @@ fn wasm(version: u8) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// The workspace's app with one module, as a push sends it, naming its commit when it has one.
+/// The workspace's app with one module, as a push sends it, naming its commit when it has one. Each commit's spec
+/// differs by a comment, so a module whose code is as installed is still read again, as advice.
 fn app_with_module(commit: Option<&str>, version: u8) -> serde_json::Value {
     let mut files: serde_json::Map<String, serde_json::Value> = app_files()
         .into_iter()
         .map(|(path, text)| (path, serde_json::Value::String(text)))
         .collect();
+    let spec = files[SPEC].as_str().expect("text").to_string()
+        + &format!("\n# {}\n", commit.unwrap_or("no commit"));
+    files.insert(SPEC.into(), spec.into());
     let manifest = files["app.toml"].as_str().expect("text").to_string()
         + &format!(
             "\n[[wasm_modules]]\nname = {MODULE:?}\ntarget = \"wasm32-unknown-unknown\"\n\
@@ -120,6 +138,17 @@ fn app_with_module(commit: Option<&str>, version: u8) -> serde_json::Value {
         files.insert("COMMIT".into(), format!("{commit}\n").into());
     }
     serde_json::Value::Object(files)
+}
+
+/// A server whose tenant has the app's module installed at version 1, by an install with no Jev, its note kept.
+async fn seeded(tenant: &str) -> Server {
+    let server = server(tenant);
+    install_over_http(&server.state, tenant, app_with_module(Some("seed"), 1)).await;
+    assert_eq!(
+        finished_review(&server.state, tenant, "seed").await["state"],
+        "done"
+    );
+    server
 }
 
 fn as_operator(tenant: &str, mut request: Request<Body>) -> Request<Body> {
@@ -197,7 +226,7 @@ fn found_first_item(warnings: &serde_json::Value) -> bool {
 #[tokio::test]
 async fn the_answer_does_not_wait_for_the_review_and_what_it_found_is_kept() {
     let tenant = unique_tenant("review-kept");
-    let server = server(&tenant);
+    let server = seeded(&tenant).await;
     let judge = HeldJudge::held();
     server
         .state
@@ -236,7 +265,7 @@ async fn the_answer_does_not_wait_for_the_review_and_what_it_found_is_kept() {
 #[tokio::test]
 async fn a_version_with_no_commit_is_asked_about_by_what_the_answer_names() {
     let tenant = unique_tenant("review-digest");
-    let server = server(&tenant);
+    let server = seeded(&tenant).await;
     server
         .state
         .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::open())));
@@ -286,7 +315,7 @@ async fn a_server_with_no_jev_says_so_in_the_same_place() {
 #[tokio::test]
 async fn a_restart_during_a_review_answers_none() {
     let tenant = unique_tenant("review-restart");
-    let server = server(&tenant);
+    let server = seeded(&tenant).await;
     server
         .state
         .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::held())));
@@ -305,14 +334,14 @@ async fn a_restart_during_a_review_answers_none() {
 #[tokio::test]
 async fn a_newer_review_stops_the_older_and_a_caller_waiting_on_the_older_is_told() {
     let tenant = unique_tenant("review-newer");
-    let server = server(&tenant);
+    let server = seeded(&tenant).await;
     let judge = HeldJudge::held();
     server
         .state
         .set_module_reviewer(Arc::new(ModuleReviewer::new(judge.clone())));
 
     let older = install_directly(&server.state, &tenant, app_with_module(Some("c1"), 1)).await;
-    install_over_http(&server.state, &tenant, app_with_module(Some("c2"), 2)).await;
+    install_over_http(&server.state, &tenant, app_with_module(Some("c2"), 1)).await;
 
     assert_eq!(
         review_of(&server.state, &tenant, "c1").await["state"],
@@ -347,7 +376,7 @@ async fn a_newer_review_stops_the_older_and_a_caller_waiting_on_the_older_is_tol
 #[tokio::test]
 async fn a_caller_that_answers_with_all_of_it_can_wait_for_it() {
     let tenant = unique_tenant("review-read");
-    let server = server(&tenant);
+    let server = seeded(&tenant).await;
     server
         .state
         .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::open())));
@@ -367,66 +396,132 @@ async fn a_genesis_install_still_answers_with_what_the_review_found() {
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
+    // The first version installs the module with no Jev; the second changes only a spec, so its review is advice.
+    const FIRST: &str = "0123456789abcdef0123456789abcdef01234567";
     const HASH: &str = "89abcdef0123456789abcdef0123456789abcdef";
     let tenant = unique_tenant("review-genesis");
     let server = server(&tenant);
-    server
-        .state
-        .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::open())));
     let registry = MockServer::start().await;
-    let files: Vec<serde_json::Value> = app_with_module(None, 1)
-        .as_object()
-        .expect("files")
-        .iter()
-        .map(|(path, file)| {
-            let bytes = match file {
-                serde_json::Value::String(text) => text.clone().into_bytes(),
-                file => base64::engine::general_purpose::STANDARD
-                    .decode(file["base64"].as_str().expect("base64"))
-                    .expect("base64 should read"),
-            };
-            serde_json::json!({
-                "path": path,
-                "content_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+    for (hash, commit) in [(FIRST, "seed"), (HASH, "c1")] {
+        let files: Vec<serde_json::Value> = app_with_module(Some(commit), 1)
+            .as_object()
+            .expect("files")
+            .iter()
+            .filter(|(path, _)| path.as_str() != "COMMIT")
+            .map(|(path, file)| {
+                let bytes = match file {
+                    serde_json::Value::String(text) => text.clone().into_bytes(),
+                    file => base64::engine::general_purpose::STANDARD
+                        .decode(file["base64"].as_str().expect("base64"))
+                        .expect("base64 should read"),
+                };
+                serde_json::json!({
+                    "path": path,
+                    "content_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+                })
             })
-        })
-        .collect();
-    Mock::given(method("GET"))
-        .and(path(format!(
-            "/api/genesis/apps/acme/{APP}/versions/{HASH}/bundle"
-        )))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "app_ref": format!("acme/{APP}@{HASH}"), "registry_tenant": "default",
-            "apps": [{"owner": "acme", "name": APP, "version_hash": HASH, "files": files}]
-        })))
-        .mount(&registry)
-        .await;
+            .collect();
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/genesis/apps/acme/{APP}/versions/{hash}/bundle"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "app_ref": format!("acme/{APP}@{hash}"), "registry_tenant": "default",
+                "apps": [{"owner": "acme", "name": APP, "version_hash": hash, "files": files}]
+            })))
+            .mount(&registry)
+            .await;
+    }
     // SAFETY: these HTTP regressions run with nextest's process isolation,
     // as required by the existing registry-install tests.
     unsafe { std::env::set_var("TEMPER_GENESIS_REGISTRY_URL", registry.uri()) };
+    let install = |hash: &str| {
+        install_genesis_app_from_registry(
+            &server.state,
+            GenesisRegistryInstallRequest {
+                tenant: tenant.clone(),
+                app_ref: format!("acme/{APP}@{hash}"),
+                registry_url: registry.uri(),
+                registry_tenant: "default".into(),
+                follow_policy: "pinned".into(),
+            },
+        )
+    };
+    install(FIRST)
+        .await
+        .expect("the first Genesis install should succeed");
+    server
+        .state
+        .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::open())));
 
-    let installed = install_genesis_app_from_registry(
-        &server.state,
-        GenesisRegistryInstallRequest {
-            tenant: tenant.clone(),
-            app_ref: format!("acme/{APP}@{HASH}"),
-            registry_url: registry.uri(),
-            registry_tenant: "default".into(),
-            follow_policy: "pinned".into(),
-        },
-    )
-    .await
-    .expect("the Genesis install should succeed");
+    let installed = install(HASH)
+        .await
+        .expect("the Genesis install should succeed");
 
     assert_eq!(installed.modules_reviewed, vec![MODULE.to_string()]);
     let warnings = serde_json::to_value(&installed.warnings).expect("warnings serialize");
     assert!(found_first_item(&warnings), "{warnings}");
 }
 
+/// A new or changed module with a finding is refused, naming the finding, its line and what to move into the spec;
+/// the same finding in a module whose code is as installed is advice, and the install goes on.
+#[tokio::test]
+async fn a_changed_module_with_a_finding_is_refused_and_an_unchanged_one_is_not() {
+    let several_concerns = ITEMS
+        .iter()
+        .position(|item| item.kind == "several_concerns")
+        .expect("an item for several concerns");
+    let tenant = unique_tenant("review-refuses");
+    let server = seeded(&tenant).await;
+    server
+        .state
+        .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::finding(
+            several_concerns,
+        ))));
+
+    // The module's code is as installed; only a spec changed.
+    install_over_http(&server.state, &tenant, app_with_module(Some("c1"), 1)).await;
+    let done = finished_review(&server.state, &tenant, "c1").await;
+    assert!(
+        done["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| {
+                warning["detail"]["module"] == MODULE
+                    && warning["detail"]["kind"] == "several_concerns"
+            }),
+        "{done}"
+    );
+
+    // Its code changed: refused, with nothing written.
+    let (status, body) = send(
+        &server.state,
+        push(
+            &tenant,
+            serde_json::json!({ "files": app_with_module(Some("c2"), 2) }),
+        ),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    let said = body.to_string();
+    for words in [
+        "Refused: Jev's review found work in a new or changed module",
+        "(several_concerns) in module answer at wasm/answer/src/lib.rs",
+        "Instead:",
+    ] {
+        assert!(said.contains(words), "{words}: {said}");
+    }
+    assert_eq!(
+        review_of(&server.state, &tenant, "c2").await["state"],
+        "none"
+    );
+}
+
 #[tokio::test]
 async fn the_route_answers_only_for_the_credentials_own_tenant() {
     let tenant = unique_tenant("review-owner");
-    let server = server(&tenant);
+    let server = seeded(&tenant).await;
     server
         .state
         .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::open())));

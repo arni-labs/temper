@@ -56,7 +56,7 @@ impl ModuleReviewer {
     }
 
     /// Review `modules` against `specs`, all at once. A module whose review fails is left out and the first reason is
-    /// kept for the install to say; a review never fails the install.
+    /// kept for the install to say; a judge that gives no answer never fails the install.
     pub async fn review(&self, modules: &[ModuleSource], specs: &[SpecSource]) -> BundleReview {
         let reviews = join_all(modules.iter().map(|module| self.review_one(module, specs))).await;
         let mut out = BundleReview::default();

@@ -73,7 +73,7 @@ async fn a_failed_install_cannot_replace_saved_findings_even_when_no_jev_is_conf
 #[tokio::test]
 async fn waiting_callers_receive_findings_while_the_save_is_still_blocked() {
     let tenant = unique_tenant("review-slow-save");
-    let mut server = server(&tenant);
+    let mut server = seeded(&tenant).await;
     let store = ReviewStore::attach(&mut server.state, server.ps.clone(), false, false);
     server
         .state
@@ -91,13 +91,16 @@ async fn waiting_callers_receive_findings_while_the_save_is_still_blocked() {
     assert!(found_first_item(
         &serde_json::to_value(&result.warnings).unwrap()
     ));
-    assert!(
+    // The store still holds the seeding install's review, not this one's.
+    assert_eq!(
         server
             .ps
             .load_module_review(&tenant, APP)
             .await
             .unwrap()
-            .is_none()
+            .map(|kept| kept.version)
+            .as_deref(),
+        Some("seed")
     );
     store.save_release.add_permits(1);
     let done = finished_review(&server.state, &tenant, "c1").await;
@@ -109,7 +112,7 @@ async fn waiting_callers_receive_findings_while_the_save_is_still_blocked() {
 #[tokio::test]
 async fn failed_saves_leave_findings_and_the_failure_readable_until_a_newer_review() {
     let tenant = unique_tenant("review-failed-save");
-    let mut server = server(&tenant);
+    let mut server = seeded(&tenant).await;
     let store = ReviewStore::attach(&mut server.state, server.ps.clone(), false, true);
     server
         .state
@@ -131,13 +134,16 @@ async fn failed_saves_leave_findings_and_the_failure_readable_until_a_newer_revi
     assert_eq!(done["modules_reviewed"], serde_json::json!([MODULE]));
     assert!(found_first_item(&done["warnings"]), "{done}");
     assert_eq!(review_of(&server.state, &tenant, "c1").await, done);
-    assert!(
+    // The store still holds the seeding install's review, not this one's.
+    assert_eq!(
         server
             .ps
             .load_module_review(&tenant, APP)
             .await
             .unwrap()
-            .is_none()
+            .map(|kept| kept.version)
+            .as_deref(),
+        Some("seed")
     );
     let other = unique_tenant("review-failed-save-other");
     server
@@ -153,7 +159,7 @@ async fn failed_saves_leave_findings_and_the_failure_readable_until_a_newer_revi
         review_of(&server.state, &other, "c1").await["state"],
         "none"
     );
-    install_over_http(&server.state, &tenant, app_with_module(Some("c2"), 2)).await;
+    install_over_http(&server.state, &tenant, app_with_module(Some("c2"), 1)).await;
     assert_eq!(
         review_of(&server.state, &tenant, "c1").await["state"],
         "none"

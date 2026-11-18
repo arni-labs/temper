@@ -1,10 +1,17 @@
-//! The install's review of its app's modules ([`crate::module_review`]). It starts when the install starts, so Jev
-//! reads beside the install's own proofs and writes, and it goes on after the install answers, since Jev takes seconds
-//! and an app's change may not. Advisory: what it says is kept for the app (`PlatformStore::save_module_review`), and it
-//! never refuses or holds an install. A caller that answers with all of it waits (`InstallResult::with_reviews_read`).
+//! The install's review of its app's modules ([`crate::module_review`]).
+//!
+//! A module whose code is new or changed is reviewed before the install writes anything, and a finding refuses the
+//! install ([`super::module_review_gate::refuse_findings`]): a module computes, and the spec decides the move, where the checker proves it, so a
+//! module that decides out of the spec's sight is not let in. Only new or changed code is held to it, so an app that
+//! runs keeps installing until someone changes that module.
+//!
+//! The rest is advice. It starts when the install starts, so Jev reads beside the install's own proofs and writes, and
+//! it goes on after the install answers. What it says is kept for the app (`PlatformStore::save_module_review`). A
+//! caller that answers with all of it waits (`InstallResult::with_reviews_read`).
 //!
 //! A module is read again when its code changed or when a spec that runs it changed, since Jev reads a module against
-//! the specs that run it: a new guard or a split state can answer a finding, or make one.
+//! the specs that run it: a new guard or a split state can answer a finding, or make one. A module read again only for
+//! its spec is advised on, never refused: its code is what was let in before.
 
 use std::path::{Component, Path};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -117,6 +124,14 @@ impl PendingReview {
     }
 }
 
+pub(super) fn specs_of(bundle: &AppBundle) -> Vec<SpecSource> {
+    bundle
+        .specs
+        .iter()
+        .map(|(entity_type, source)| SpecSource::new(entity_type, source))
+        .collect()
+}
+
 /// Start reviewing the modules of `bundle` whose code or running specs differ from what `tenant` has, when the
 /// install puts modules (`wasm`).
 pub(super) async fn start(
@@ -130,12 +145,12 @@ pub(super) async fn start(
     if !wasm || bundle.wasm_modules.is_empty() {
         return PendingReview::default();
     }
-    let specs: Vec<SpecSource> = bundle
-        .specs
-        .iter()
-        .map(|(entity_type, source)| SpecSource::new(entity_type, source))
+    let specs = specs_of(bundle);
+    let changed: Vec<String> = changed_modules(state, tenant, bundle, &specs)
+        .await
+        .into_iter()
+        .map(|(module, _)| module)
         .collect();
-    let changed = changed_modules(state, tenant, bundle, &specs).await;
     if changed.is_empty() {
         return PendingReview::default();
     }
@@ -249,13 +264,13 @@ fn version_of(app_dir: &Path, tenant: &str, app_name: &str, bundle: &AppBundle) 
 }
 
 /// The modules whose code differs from the stored module, or that a changed spec runs (every module, when a changed
-/// spec runs none by name).
-async fn changed_modules(
+/// spec runs none by name), each with whether its code is new or changed.
+pub(super) async fn changed_modules(
     state: &PlatformState,
     tenant: &str,
     bundle: &AppBundle,
     specs: &[SpecSource],
-) -> Vec<String> {
+) -> Vec<(String, bool)> {
     let stored = state
         .server
         .load_wasm_module_sources(tenant)
@@ -279,23 +294,30 @@ async fn changed_modules(
             })
             .collect()
     };
+    // What is installed: the module this process runs, or the one the store keeps for a start that has not loaded it
+    // yet. Either holding these bytes makes its code unchanged.
+    let registry = state
+        .server
+        .wasm_module_registry
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     bundle
         .wasm_modules
         .iter()
-        .filter(|(module, bytes)| {
+        .filter_map(|(module, bytes)| {
             let hash = temper_wasm::WasmEngine::hash_module(bytes);
             let code_changed = stored
-                .get(*module)
-                .is_none_or(|existing| existing.sha256_hash != hash);
+                .get(module)
+                .is_none_or(|existing| existing.sha256_hash != hash)
+                && registry.get_hash(&tenant_id, module) != Some(hash.as_str());
             let runs_it =
-                |spec: &&SpecSource| spec.module_triggers.iter().any(|(_, runs)| runs == *module);
+                |spec: &&SpecSource| spec.module_triggers.iter().any(|(_, runs)| runs == module);
             let named = specs.iter().any(|spec| runs_it(&spec));
-            code_changed
-                || changed_specs
-                    .iter()
-                    .any(|spec| runs_it(spec) || (!named && spec.module_triggers.is_empty()))
+            let spec_changed = changed_specs
+                .iter()
+                .any(|spec| runs_it(spec) || (!named && spec.module_triggers.is_empty()));
+            (code_changed || spec_changed).then(|| (module.clone(), code_changed))
         })
-        .map(|(module, _)| module.clone())
         .collect()
 }
 
@@ -303,7 +325,7 @@ async fn changed_modules(
 /// whatever file it names is sent to Jev, so a path out of the folder (`..`, an absolute path, a link) would send
 /// the server's own files to an outside service. `None` when the manifest names no source and none is at
 /// `wasm/<module>/src/lib.rs`.
-fn read_source(
+pub(super) fn read_source(
     app_dir: &Path,
     module: &str,
     config: Option<&WasmModuleManifest>,

@@ -50,8 +50,8 @@ impl Answers {
     }
 }
 
-/// Why the judge gave no answer. Each is said once in the install result and never retried in a loop: a review is
-/// advice, and an install never waits on it twice.
+/// Why the judge gave no answer. Each is said once in the install result and never retried in a loop, and it refuses
+/// nothing: a Jev outage must not stop every install, and an install never waits on it twice.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum JudgeUnavailable {
     #[error("no Jev key is set on this server")]
