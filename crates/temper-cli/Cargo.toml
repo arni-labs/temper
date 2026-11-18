@@ -16,11 +16,10 @@ temper-spec = { workspace = true }
 temper-codegen = { workspace = true }
 temper-verify = { workspace = true }
 temper-platform = { workspace = true }
-temper-server = { workspace = true, features = ["observe"] }
+temper-server = { workspace = true, features = ["observe", "meaning-model"] }
 temper-mcp = { workspace = true }
 temper-runtime = { workspace = true }
 temper-jit = { workspace = true }
-temper-meaning = { workspace = true }
 temper-observe = { workspace = true }
 temper-store-postgres = { workspace = true }
 temper-store-turso = { workspace = true, features = ["cloud"] }

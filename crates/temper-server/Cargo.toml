@@ -14,6 +14,10 @@ required-features = ["observe"]
 default = []
 observe = ["temper-verify"]
 sim = ["dep:temper-store-sim"]
+# The kernel's meaning model (ADR-0186). Every server binary turns it on. It is off by
+# default so a build that serves nothing (a library user, this crate's own tests, which
+# install a deterministic model) neither fetches nor compiles the model's 235 MB of weights.
+meaning-model = ["dep:temper-meaning"]
 
 [dependencies]
 percent-encoding = "2"
@@ -35,6 +39,7 @@ temper-wasm = { workspace = true }
 temper-sandbox = { workspace = true }
 temper-verify = { workspace = true, optional = true }
 temper-store-sim = { workspace = true, optional = true }
+temper-meaning = { workspace = true, optional = true }
 axum = { workspace = true }
 async-stream = "0.3"
 bytes = "1"

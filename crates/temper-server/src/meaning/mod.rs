@@ -5,15 +5,17 @@
 //! from that text just after the save ([`worker`]). `$search` and `Temper.Nearest`
 //! rank records by those rows ([`rank`]). Apps declare nothing.
 //!
-//! The model is a [`MeaningModel`] the binary installs on the server
-//! ([`crate::ServerState::install_meaning_model`]). This crate never runs one itself,
-//! so simulation-visible code stays deterministic: a simulation installs a
-//! deterministic model, and a server without a model still finds records by their
-//! words.
+//! The model is a [`MeaningModel`] installed on the server
+//! ([`crate::ServerState::install_meaning_model`]). Every Temper server installs the
+//! kernel's model with `model::start` (feature `meaning-model`); simulation and tests
+//! install a deterministic one, so simulation-visible code stays deterministic, and a
+//! server without a model still finds records by their words.
 
 use std::future::Future;
 use std::pin::Pin;
 
+#[cfg(feature = "meaning-model")]
+pub mod model;
 pub mod rank;
 pub mod worker;
 

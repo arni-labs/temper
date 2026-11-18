@@ -1,12 +1,17 @@
 //! The kernel's meaning model (ADR-0186): multilingual-e5-small, run in this
-//! process. Loaded off the boot path; until it is, search ranks by words.
+//! process. Every Temper server starts it once it has booted ([`start`]); until the
+//! model has loaded, search ranks by words.
+//!
+//! It sits behind the `meaning-model` feature, which every server binary turns on: a
+//! build that serves nothing neither fetches nor compiles the model's 235 MB of weights.
 
 use std::sync::Arc;
 
 use temper_meaning::{Embedder, Kind};
-use temper_server::meaning::{Embedding, MeaningKind, MeaningModel, worker::run_meaning_worker};
 
-use crate::serve::PlatformState;
+use super::worker::run_meaning_worker;
+use super::{Embedding, MeaningKind, MeaningModel};
+use crate::state::ServerState;
 
 /// The embedder, called on a blocking thread so a model call never stalls the
 /// async runtime.
@@ -50,15 +55,23 @@ impl MeaningModel for E5 {
     }
 }
 
-/// Load the model in the background, install it, and keep records' meaning up to
-/// date for the life of the server.
-pub(super) fn spawn_meaning(state: &PlatformState) {
-    if state.server.storage_stack.is_none() {
+/// Start search by meaning on a booted server: give records saved before their store
+/// kept meaning rows theirs, load the model in the background, install it, and keep
+/// records' meaning up to date for the life of the server. A server without a store
+/// has nothing to search.
+pub fn start(server: ServerState) {
+    if server.storage_stack.is_none() {
         return;
     }
-    let server = state.server.clone();
     tokio::spawn(async move {
         // determinism-ok: production-only background model
+        let tenants: Vec<_> = match server.registry.read() {
+            Ok(registry) => registry.tenant_ids().into_iter().cloned().collect(),
+            Err(_) => Vec::new(),
+        };
+        for tenant in &tenants {
+            server.populate_meaning_from_snapshots(tenant).await;
+        }
         let started = std::time::Instant::now(); // determinism-ok: production-only model timing
         let rss_before_mb = resident_mb();
         let embedder = match tokio::task::spawn_blocking(Embedder::load).await {
