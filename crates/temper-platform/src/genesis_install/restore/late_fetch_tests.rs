@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use axum::{Json, Router, routing::get};
+use axum::{Json, Router, response::IntoResponse, routing::get};
 use base64::Engine as _;
 use tokio::sync::Notify;
 
@@ -410,5 +410,64 @@ async fn an_install_brings_back_an_installed_dependency_the_boot_could_not_fetch
         ps.get_installed_app(&tenant, "tags").await.unwrap(),
         Some(tags),
         "the dependency's install record is left as it was"
+    );
+}
+
+/// A boot asks its registry for every installed app at once, and a registry
+/// at its export limit answers some with 503 and `Retry-After`. Those apps
+/// must still come back: the fetch waits as asked and asks again.
+#[tokio::test]
+async fn a_boot_fetch_waits_out_a_busy_registry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let remote = tempfile::tempdir().expect("registry files");
+    let ps = Arc::new(store());
+    let platform = server_on(data_dir.path(), &ps);
+    let tenant = format!("{TENANT}-busy-registry");
+    let v1 = "1".repeat(40);
+    write_app(remote.path(), "notes", "notes v1");
+    let served = bundle(remote.path(), "notes", &v1);
+    let asked = Arc::new(AtomicUsize::new(0));
+    let route = format!("/api/genesis/apps/acme/notes/versions/{v1}/bundle");
+    let routes = Router::new().route(
+        &route,
+        get({
+            let asked = asked.clone();
+            move || {
+                let served = served.clone();
+                let asked = asked.clone();
+                async move {
+                    if asked.fetch_add(1, Ordering::SeqCst) < 2 {
+                        let busy = [(axum::http::header::RETRY_AFTER, "0")];
+                        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, busy, "busy")
+                            .into_response();
+                    }
+                    Json(served).into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+    let mut notes = record(remote.path(), &tenant, "notes", &v1);
+    notes.registry_url = url;
+    ps.record_installed_app_metadata(&notes).await.unwrap();
+
+    let recovery = start_genesis_registry_cache_recovery(&platform).await;
+    let summary = tokio::time::timeout(Duration::from_secs(10), recovery.fetching.finished())
+        .await
+        .expect("the fetch ends");
+    server.abort();
+    assert_eq!(summary.failed, 0, "a busy answer is not a failed fetch");
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        3,
+        "asked again after each busy answer"
+    );
+    assert!(
+        crate::os_apps::tenant_app_guide(&tenant, "notes")
+            .unwrap()
+            .contains("notes v1")
     );
 }
