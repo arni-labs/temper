@@ -51,6 +51,11 @@ impl HeldJudge {
         judge
     }
 
+    /// Answers at once, finding nothing.
+    fn clean() -> Arc<Self> {
+        Self::finding(usize::MAX)
+    }
+
     fn down() -> Arc<Self> {
         Arc::new(Self {
             gate: Semaphore::new(1),
@@ -81,11 +86,16 @@ impl Judge for HeldJudge {
             .map(|(key, question)| {
                 let answer = match question {
                     Question::Noul { instructions } => Answer {
-                        noul: Some(if *instructions == ITEMS[self.item].shows {
-                            0.85
-                        } else {
-                            0.1
-                        }),
+                        noul: Some(
+                            if ITEMS
+                                .get(self.item)
+                                .is_some_and(|item| *instructions == item.shows)
+                            {
+                                0.85
+                            } else {
+                                0.1
+                            },
+                        ),
                         choice: None,
                     },
                     Question::Choice { criteria, .. } => Answer {
@@ -526,7 +536,7 @@ async fn a_large_changed_module_with_no_finding_installs() {
     let server = seeded(&tenant).await;
     server
         .state
-        .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::open())));
+        .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::clean())));
     install_over_http(&server.state, &tenant, app_with_module(Some("c1"), 1)).await;
 
     let mut files = app_with_module(Some("c2"), 2);
