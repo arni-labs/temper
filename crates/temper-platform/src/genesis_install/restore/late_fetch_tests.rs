@@ -413,11 +413,12 @@ async fn an_install_brings_back_an_installed_dependency_the_boot_could_not_fetch
     );
 }
 
-/// A boot asks its registry for every installed app at once, and a registry
-/// at its export limit answers some with 503 and `Retry-After`. Those apps
-/// must still come back: the fetch waits as asked and asks again.
+/// A registry answers every request with its export (it queues those past its
+/// export places), so an answer of 503 is the answer, whatever `Retry-After`
+/// says: the fetch asks once and ends, and never spins, even on
+/// `Retry-After: 0`.
 #[tokio::test]
-async fn a_boot_fetch_waits_out_a_busy_registry() {
+async fn a_busy_answer_ends_the_fetch_after_one_ask() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let data_dir = tempfile::tempdir().expect("data dir");
     let remote = tempfile::tempdir().expect("registry files");
@@ -426,7 +427,6 @@ async fn a_boot_fetch_waits_out_a_busy_registry() {
     let tenant = format!("{TENANT}-busy-registry");
     let v1 = "1".repeat(40);
     write_app(remote.path(), "notes", "notes v1");
-    let served = bundle(remote.path(), "notes", &v1);
     let asked = Arc::new(AtomicUsize::new(0));
     let route = format!("/api/genesis/apps/acme/notes/versions/{v1}/bundle");
     let routes = Router::new().route(
@@ -434,15 +434,11 @@ async fn a_boot_fetch_waits_out_a_busy_registry() {
         get({
             let asked = asked.clone();
             move || {
-                let served = served.clone();
                 let asked = asked.clone();
                 async move {
-                    if asked.fetch_add(1, Ordering::SeqCst) < 2 {
-                        let busy = [(axum::http::header::RETRY_AFTER, "0")];
-                        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, busy, "busy")
-                            .into_response();
-                    }
-                    Json(served).into_response()
+                    asked.fetch_add(1, Ordering::SeqCst);
+                    let busy = [(axum::http::header::RETRY_AFTER, "0")];
+                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, busy, "busy").into_response()
                 }
             }
         }),
@@ -457,17 +453,8 @@ async fn a_boot_fetch_waits_out_a_busy_registry() {
     let recovery = start_genesis_registry_cache_recovery(&platform).await;
     let summary = tokio::time::timeout(Duration::from_secs(10), recovery.fetching.finished())
         .await
-        .expect("the fetch ends");
+        .expect("the fetch ends instead of asking again");
     server.abort();
-    assert_eq!(summary.failed, 0, "a busy answer is not a failed fetch");
-    assert_eq!(
-        asked.load(Ordering::SeqCst),
-        3,
-        "asked again after each busy answer"
-    );
-    assert!(
-        crate::os_apps::tenant_app_guide(&tenant, "notes")
-            .unwrap()
-            .contains("notes v1")
-    );
+    assert_eq!(summary.failed, 1, "a 503 is a failed fetch");
+    assert_eq!(asked.load(Ordering::SeqCst), 1, "asked once");
 }

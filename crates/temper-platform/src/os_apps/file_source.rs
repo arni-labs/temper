@@ -43,6 +43,14 @@ impl AppFileSource {
         }
     }
 
+    /// The same files in `dir`: where they are once their folder is moved there.
+    pub(crate) fn moved_to(self, dir: PathBuf) -> Self {
+        match self {
+            Self::Listed(_) => Self::Listed(dir),
+            Self::Written { paths, .. } => Self::Written { dir, paths },
+        }
+    }
+
     /// Whether the app has a file at `path`.
     pub(crate) fn has(&self, path: &str) -> bool {
         match self {

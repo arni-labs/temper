@@ -358,7 +358,7 @@ pub(crate) async fn get_genesis_app_bundle(
     )
     .await
     {
-        Ok(bundle) => (StatusCode::OK, Json(serde_json::json!(bundle))).into_response(),
+        Ok(bundle) => (StatusCode::OK, Json(bundle)).into_response(),
         Err(error) if error.contains("not found") => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": error })),
@@ -388,83 +388,52 @@ async fn anonymous_public_bundle(
     // app that depended on a private one exported the private one too.
     super::auth::validate_tenant_id(tenant)?;
 
-    // Admission bound. This path is reachable with no credential at all, and
-    // exporting a bundle materializes a whole dependency closure — the most
-    // memory an anonymous request can make this kernel spend. The per-bundle
-    // budgets bound ONE export; nothing bounded how many run at once. A small
-    // process-wide cap, refused rather than queued: an anonymous caller gets
-    // 503 and can retry, and a burst cannot pile up materializations. The
-    // answer says it is busy and when to come back (`Retry-After`), which the
-    // install client waits for; it is not a refusal of the caller.
-    let Ok(_permit) = anonymous_bundle_admission().try_acquire() else {
-        tracing::warn!(
+    // An anonymous export holds its whole bundle in memory while it builds
+    // the answer, and the caller presented nothing to charge that to, so the
+    // exports running at once are bounded by this process's memory
+    // ([`bundle_admission`]). One past that waits for a place rather
+    // than being refused, so every request gets one real answer.
+    bundle_admission::admitted(async {
+        match crate::genesis_install::export_genesis_registry_bundle_for(
+            state,
             tenant,
             owner,
             name,
-            "anonymous Genesis bundle export refused: at capacity"
-        );
-        let retry_after = BUSY_RETRY_AFTER_SECS.to_string();
-        let error = "Genesis is exporting all the bundles it can at once; retry shortly";
-        return Ok((
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(axum::http::header::RETRY_AFTER, retry_after)],
-            Json(serde_json::json!({ "error": error })),
+            hash,
+            crate::genesis_install::BundleAudience::Anonymous,
         )
-            .into_response());
-    };
-    match crate::genesis_install::export_genesis_registry_bundle_for(
-        state,
-        tenant,
-        owner,
-        name,
-        hash,
-        crate::genesis_install::BundleAudience::Anonymous,
-    )
-    .await
-    {
-        Ok(bundle) => Ok((StatusCode::OK, Json(serde_json::json!(bundle))).into_response()),
-        Err(error) => {
-            // One answer for every failure. A caller who presented no
-            // credential must not be able to tell "this app is private" from
-            // "this app does not exist" -- that difference is an existence
-            // oracle over private repositories, and the reason to refuse is
-            // exactly the reason not to explain. The detail is logged instead.
-            tracing::info!(
-                tenant,
-                owner,
-                name,
-                hash,
-                error,
-                "anonymous Genesis bundle read refused"
-            );
-            Ok((
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": "no public Genesis app bundle at this reference"
-                })),
-            )
-                .into_response())
+        .await
+        {
+            Ok(bundle) => Ok((StatusCode::OK, Json(bundle)).into_response()),
+            Err(error) => {
+                // One answer for every failure. A caller who presented no
+                // credential must not be able to tell "this app is private" from
+                // "this app does not exist" -- that difference is an existence
+                // oracle over private repositories, and the reason to refuse is
+                // exactly the reason not to explain. The detail is logged instead.
+                tracing::info!(
+                    tenant,
+                    owner,
+                    name,
+                    hash,
+                    error,
+                    "anonymous Genesis bundle read refused"
+                );
+                Ok((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "no public Genesis app bundle at this reference"
+                    })),
+                )
+                    .into_response())
+            }
         }
-    }
+    })
+    .await
 }
 
-/// How many anonymous bundle exports may run at once, process-wide.
-///
-/// Deliberately small. Each export can materialize up to
-/// `MAX_GENESIS_BUNDLE_APPS` app trees, and the caller presented nothing that
-/// would let us charge the cost to anyone. Authenticated exports are governed
-/// by Cedar per caller and are not subject to this cap.
-const MAX_CONCURRENT_ANONYMOUS_BUNDLE_EXPORTS: usize = 4;
-
-fn anonymous_bundle_admission() -> &'static tokio::sync::Semaphore {
-    static ADMISSION: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    ADMISSION.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_ANONYMOUS_BUNDLE_EXPORTS))
-}
-
-/// The seconds a busy anonymous export asks its caller to wait. An export
-/// takes from under a second to about ten, so a caller asking again after one
-/// finds a free place soon without asking much more often than they end.
-const BUSY_RETRY_AFTER_SECS: u64 = 1;
+#[path = "bundle_admission.rs"]
+mod bundle_admission;
 
 #[cfg(test)]
 #[path = "anonymous_bundle_test.rs"]

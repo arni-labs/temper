@@ -112,6 +112,41 @@ pub(super) fn stage_beside(destination: &Path) -> Result<tempfile::TempDir, Stri
         .map_err(|error| format!("create staged Genesis app cache: {error}"))
 }
 
+/// An install's closure, written where only that install looks.
+///
+/// An install's cache directory is shared: every install of one ref into one
+/// tenant has the same one, and the tenant's catalog reads its files from it.
+/// So an install writes its closure here first, outside its turn, and moves it
+/// into place only while it holds the turn ([`temper_server::host_turn`]), as
+/// pushed installs and late fetches publish theirs. Two installs of one app at
+/// once then never move a directory out from under each other. Whatever is
+/// not published is removed on drop.
+pub(super) struct OwnClosure(tempfile::TempDir);
+
+impl OwnClosure {
+    /// A directory of its own beside `cache_root`, on the same filesystem so
+    /// publishing it is a rename.
+    pub(super) fn beside(cache_root: &Path) -> Result<Self, String> {
+        stage_beside(cache_root).map(Self)
+    }
+
+    /// Where the closure is written: each app at `<root>/<name>`, as in the
+    /// cache directory it is published to.
+    pub(super) fn root(&self) -> PathBuf {
+        self.0.path().join("closure")
+    }
+
+    /// Move the closure to `cache_root`, replacing what is there. Only a
+    /// holder of the install turn publishes.
+    pub(super) fn publish(
+        self,
+        cache_root: &Path,
+        _turn: &temper_server::host_turn::Turn,
+    ) -> Result<(), String> {
+        replace_directory(self.root(), cache_root)
+    }
+}
+
 /// A new directory under `base` that only its holder uses, removed on drop.
 ///
 /// For files one request writes and reads back, such as an export's trees:

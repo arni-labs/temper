@@ -34,6 +34,7 @@ use blob_materialization::{
     materialize_blob_content_field, read_canonical_field_bounded,
 };
 use bundle_export::{MaterializeTree, export_closure_files};
+pub(crate) use bundle_transport::BUNDLE_EXPORT_HELD_BYTES;
 use bundles::{
     GenesisBundleBudget, MAX_GENESIS_BUNDLE_APPS, MAX_GENESIS_BUNDLE_FILE_BYTES,
     is_generated_component, materialize_registry_app_closure_via_bundle,
@@ -41,7 +42,7 @@ use bundles::{
 #[cfg(test)]
 use bundles::{collect_bundle_files, safe_bundle_relative_path, write_bundle_app};
 use cache_paths::{
-    CacheOwner, InstallSource, app_cache_dir, genesis_cache_base, genesis_cache_root,
+    CacheOwner, InstallSource, OwnClosure, app_cache_dir, genesis_cache_base, genesis_cache_root,
     replace_directory, sanitize_fragment, scratch_dir, stage_beside, validate_git_object_id,
     validate_identity_component,
 };
@@ -320,19 +321,16 @@ pub async fn install_genesis_app_from_registry(
         },
         &cache_key,
     );
-    std::fs::create_dir_all(&cache_root).map_err(|error| {
-        format!(
-            "create Genesis registry cache '{}': {error}",
-            cache_root.display()
-        )
-    })?;
+    // Fetched outside the turn into a directory of this install's own, and
+    // published to `cache_root` in it ([`OwnClosure`]).
+    let own = OwnClosure::beside(&cache_root)?;
 
     let materialize_started = Instant::now();
     let materialized_apps = match materialize_registry_app_closure_via_bundle(
         &registry,
         &registry_tenant,
         root_ref.clone(),
-        &cache_root,
+        &own.root(),
     )
     .await
     {
@@ -355,7 +353,7 @@ pub async fn install_genesis_app_from_registry(
             );
             let git_started = Instant::now();
             let apps =
-                materialize_registry_app_closure(&registry, root_ref.clone(), &cache_root).await?;
+                materialize_registry_app_closure(&registry, root_ref.clone(), &own.root()).await?;
             log_genesis_install_phase(
                 &request.app_ref,
                 "materialize_git_fallback",
@@ -375,6 +373,17 @@ pub async fn install_genesis_app_from_registry(
     // Every source ends in the same install: parse, register, reconcile,
     // verify, then commit or go back to the version before.
     let turn = temper_server::host_turn::take().await?;
+    own.publish(&cache_root, &turn)?;
+    let materialized_apps = materialized_apps
+        .into_iter()
+        .map(|app| {
+            let dir = app_cache_dir(&cache_root, &app.version.name)?;
+            Ok::<_, String>(closure_install::MaterializedApp {
+                files: app.files.moved_to(dir),
+                version: app.version,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let installed = closure_install::install_materialized_closure(
         platform,
         &request.tenant,
@@ -886,10 +895,13 @@ impl BoundActionHook for GenesisInstallHook {
             },
             &app_ref,
         );
+        // Written outside the turn into a directory of this install's own,
+        // and published to `cache_root` in it ([`OwnClosure`]).
+        let own = OwnClosure::beside(&cache_root)?;
         let written = materialize_app_closure(
             state,
             tenant,
-            &cache_root,
+            &own.root(),
             GenesisAppBundle {
                 owner,
                 name: name.clone(),
@@ -904,7 +916,15 @@ impl BoundActionHook for GenesisInstallHook {
         platform.server = state.clone();
         // Late boot recovery uses the same turn when checking current records
         // and publishing files. Keep publication and provenance in one turn.
-        let _turn = temper_server::host_turn::take().await?;
+        let turn = temper_server::host_turn::take().await?;
+        own.publish(&cache_root, &turn)?;
+        let written = written
+            .into_iter()
+            .map(|(app, files)| {
+                let dir = app_cache_dir(&cache_root, &app)?;
+                Ok::<_, String>((app, files.moved_to(dir)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let written =
             closure_install::uninstalled_apps(&platform, &target_tenant, &name, written, |app| {
                 &app.0

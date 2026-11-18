@@ -22,6 +22,9 @@ use crate::os_apps::{app_files_seam, tenant_os_app};
 use crate::state::PlatformState;
 use crate::tenant_api::tenant_api_router;
 
+#[path = "pushed_test/concurrent_install_test.rs"]
+mod concurrent_install;
+
 #[path = "pushed_test/dry_run_test.rs"]
 mod dry_run;
 

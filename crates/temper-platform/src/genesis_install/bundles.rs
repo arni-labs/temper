@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 use base64::Engine as _;
 
-use super::bundle_transport::decode_bundle_response;
+use super::bundle_transport::{BUNDLE_ANSWER_DEADLINE, decode_bundle_response};
 use super::cache_paths::{
     app_cache_dir, replace_directory, validate_git_object_id, validate_identity_component,
 };
@@ -60,22 +60,19 @@ pub(super) async fn materialize_registry_app_closure_via_bundle(
         root_ref.name,
         version_hash
     );
-    let client = registry_client()?;
-    // A registry exporting all it can at once answers 503 with `Retry-After`:
-    // it is busy, not refusing, so ask again when it says. Any other answer,
-    // a 503 without `Retry-After` among them, is the answer.
-    let response = loop {
-        let response = client
-            .get(&bundle_url)
-            .header("X-Tenant-Id", registry_tenant)
-            .send()
-            .await
-            .map_err(|error| format!("request Genesis bundle {bundle_url}: {error}"))?;
-        match busy_for(&response) {
-            Some(wait) => tokio::time::sleep(wait).await,
-            None => break response,
-        }
-    };
+    let request = registry_client()?
+        .get(&bundle_url)
+        .header("X-Tenant-Id", registry_tenant)
+        .send();
+    let response = tokio::time::timeout(BUNDLE_ANSWER_DEADLINE, request)
+        .await
+        .map_err(|_| {
+            format!(
+                "Genesis bundle {bundle_url} did not start answering within {}s",
+                BUNDLE_ANSWER_DEADLINE.as_secs()
+            )
+        })?
+        .map_err(|error| format!("request Genesis bundle {bundle_url}: {error}"))?;
     let bundle = decode_bundle_response(response, &bundle_url).await?;
     validate_registry_bundle(&bundle, &root_ref, registry_tenant)?;
 
@@ -114,16 +111,6 @@ pub(super) async fn materialize_registry_app_closure_via_bundle(
     written::keep(staged_cache.path(), &written)?;
     replace_directory(staged_cache.keep(), cache_root)?;
     Ok(apps)
-}
-
-/// How long a busy registry asks to be left before it is asked again.
-fn busy_for(response: &reqwest::Response) -> Option<std::time::Duration> {
-    if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
-        return None;
-    }
-    let seconds = response.headers().get(reqwest::header::RETRY_AFTER)?;
-    let seconds: u64 = seconds.to_str().ok()?.trim().parse().ok()?;
-    Some(std::time::Duration::from_secs(seconds))
 }
 
 fn validate_registry_bundle(

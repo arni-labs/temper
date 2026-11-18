@@ -17,9 +17,21 @@ const MAX_BUNDLE_RESPONSE_BYTES: usize = bundle_response_allowance(
     MAX_GENESIS_BUNDLE_FILES,
     MAX_GENESIS_BUNDLE_APPS,
 );
+/// The most memory one bundle export holds while it builds its answer: the
+/// bundle with its files already encoded as they travel, and the JSON body
+/// written from it, both whole until the body is complete.
+pub(crate) const BUNDLE_EXPORT_HELD_BYTES: u64 = 2 * MAX_BUNDLE_RESPONSE_BYTES as u64;
 const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 const BUNDLE_RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const BUNDLE_RESPONSE_TOTAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// How long a registry may take to start answering a bundle request. A
+/// registry sends nothing until its export is built (and, past its export
+/// places, until one is free), and the edge production Genesis answers through
+/// (Railway's) closes a request after 5 minutes with no data: an answer that
+/// has not started by then is not coming. Ending the fetch then turns a hung
+/// registry into a failed fetch instead of a boot or install turn that never
+/// ends.
+pub(super) const BUNDLE_ANSWER_DEADLINE: Duration = Duration::from_secs(5 * 60);
 
 /// The most bytes a JSON bundle response can take to carry `content_bytes` of
 /// file content in `files` files across `apps` apps:
