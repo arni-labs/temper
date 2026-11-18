@@ -166,7 +166,7 @@ async fn check_pushed(
     let written = AppFileSource::written(app_dir.clone(), files.keys().cloned());
     is_the_app(&app_dir, app)?;
     // The author's new or changed modules, as the install that follows would refuse them (os_apps module_review_gate).
-    crate::os_apps::refuse_pushed_findings(platform, tenant, &written)
+    crate::os_apps::refuse_pushed_findings(platform, tenant, app, &written)
         .await
         .map_err(PushRefused::Install)?;
     let app_ref = pushed_ref(app, &digest);
@@ -239,7 +239,9 @@ async fn install_in_turn(
         return Err(refused);
     }
     // A push is its author's change: a new or changed module with a finding is refused (os_apps module_review_gate).
-    if let Err(refused) = crate::os_apps::refuse_pushed_findings(platform, tenant, &written).await {
+    if let Err(refused) =
+        crate::os_apps::refuse_pushed_findings(platform, tenant, app, &written).await
+    {
         discard();
         return Err(PushRefused::Install(refused));
     }

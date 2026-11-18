@@ -1,9 +1,10 @@
 //! The install's review of its app's modules ([`crate::module_review`]).
 //!
-//! A push whose module code is new or changed is reviewed before it installs anything, and a finding refuses it
-//! ([`super::module_review_gate`]): a module computes, and the spec decides the move, where the checker proves it, so
-//! a module that decides out of the spec's sight is not let in. Only an author's new or changed code is held to it, so
-//! an app that runs keeps installing until someone changes that module, and a published version always installs.
+//! A module whose code is new, or whose sentence (`does`) changed, is reviewed before the install writes anything, and
+//! a finding refuses it ([`super::module_review_gate`]): a module computes, and the spec decides the move, where the
+//! checker proves it, so a module that decides out of the spec's sight is not let in. Code is new when this server runs
+//! it nowhere: not the tenant's module of that name, and no other tenant's module. An app that runs keeps installing
+//! its modules as they are, and a tenant taking an app this server already runs takes code already let in.
 //!
 //! The rest is advice. It starts when the install starts, so Jev reads beside the install's own proofs and writes, and
 //! it goes on after the install answers. What it says is kept for the app (`PlatformStore::save_module_review`). A
@@ -22,6 +23,7 @@ use temper_runtime::tenant::TenantId;
 use tokio::sync::{oneshot, watch};
 use tokio::task::AbortHandle;
 
+use super::module_review_gate::{SENTENCES, kept_sentences, sentences_of};
 use super::reconcile;
 use super::types::{AppBundle, InstallWarning, WasmModuleManifest};
 use crate::module_review::{
@@ -146,7 +148,7 @@ pub(super) async fn start(
         return PendingReview::default();
     }
     let specs = specs_of(bundle);
-    let changed: Vec<String> = changed_modules(state, tenant, bundle, &specs)
+    let changed: Vec<String> = changed_modules(state, tenant, app_name, bundle, &specs)
         .await
         .into_iter()
         .map(|(module, _)| module)
@@ -182,6 +184,7 @@ pub(super) async fn start(
     }
     let asked: Vec<String> = modules.iter().map(|module| module.module.clone()).collect();
     let version = version_of(app_dir, tenant, app_name, bundle);
+    let sentences = sentences_of(bundle);
     let store = state
         .server
         .storage_stack
@@ -207,8 +210,9 @@ pub(super) async fn start(
             if installed.await.is_err() {
                 return Ok(());
             }
-            let kept =
+            let mut kept =
                 json!({ "warnings": outcome.warnings, "modules_reviewed": outcome.reviewed });
+            kept[SENTENCES] = json!(sentences);
             // Startup and Genesis wait for Jev, never for the store's write gate.
             // HTTP callers may already have dropped their receivers.
             let _ = tell.send(Some(outcome));
@@ -263,11 +267,13 @@ fn version_of(app_dir: &Path, tenant: &str, app_name: &str, bundle: &AppBundle) 
         })
 }
 
-/// The modules whose code differs from the stored module, or that a changed spec runs (every module, when a changed
-/// spec runs none by name), each with whether its code is new or changed.
+/// The modules whose code is new to this server or whose sentence changed, or that a changed spec runs (every
+/// module, when a changed spec runs none by name), each with whether it is held to the review: its code is new, or its
+/// sentence differs from the one the app's last kept review was of.
 pub(super) async fn changed_modules(
     state: &PlatformState,
     tenant: &str,
+    app_name: &str,
     bundle: &AppBundle,
     specs: &[SpecSource],
 ) -> Vec<(String, bool)> {
@@ -276,6 +282,8 @@ pub(super) async fn changed_modules(
         .load_wasm_module_sources(tenant)
         .await
         .unwrap_or_default();
+    let said_before = kept_sentences(state, tenant, app_name).await;
+    let sentences = sentences_of(bundle);
     let tenant_id = TenantId::new(tenant);
     let changed_specs: Vec<&SpecSource> = {
         let registry = state
@@ -294,8 +302,9 @@ pub(super) async fn changed_modules(
             })
             .collect()
     };
-    // What is installed: the module this process runs, or the one the store keeps for a start that has not loaded it
-    // yet. Either holding these bytes makes its code unchanged.
+    // What is installed: the module this process runs, the one the store keeps for a start that has not loaded it yet,
+    // or the same bytes another tenant here runs (a tenant taking an app this server already serves). Any of them
+    // holding these bytes makes its code not new.
     let registry = state
         .server
         .wasm_module_registry
@@ -309,14 +318,20 @@ pub(super) async fn changed_modules(
             let code_changed = stored
                 .get(module)
                 .is_none_or(|existing| existing.sha256_hash != hash)
-                && registry.get_hash(&tenant_id, module) != Some(hash.as_str());
+                && registry.get_hash(&tenant_id, module) != Some(hash.as_str())
+                && !registry.names_hash(&hash);
+            // Before any review kept its sentences, a sentence is not known to have changed.
+            let sentence_changed = said_before
+                .as_ref()
+                .is_some_and(|before| before.get(module) != sentences.get(module));
+            let held = code_changed || sentence_changed;
             let runs_it =
                 |spec: &&SpecSource| spec.module_triggers.iter().any(|(_, runs)| runs == module);
             let named = specs.iter().any(|spec| runs_it(&spec));
             let spec_changed = changed_specs
                 .iter()
                 .any(|spec| runs_it(spec) || (!named && spec.module_triggers.is_empty()));
-            (code_changed || spec_changed).then(|| (module.clone(), code_changed))
+            (held || spec_changed).then(|| (module.clone(), held))
         })
         .collect()
 }

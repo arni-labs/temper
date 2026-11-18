@@ -932,6 +932,13 @@ async fn install_once(
         ControlFlow::Continue(proof) => return Ok(ControlFlow::Continue(proof)),
         ControlFlow::Break(found) => warnings.extend(found),
     }
+    // A module whose code is new, or whose sentence changed, and that Jev finds deciding what the spec should is
+    // refused, by a check too, before anything is written; a boot replay or a rollback brings back what was already let
+    // in. It waits on Jev only once no proof is left to wait for, so a try that waits pays for nothing.
+    if origin == InstallOrigin::Request {
+        module_review_gate::refuse_findings(state, tenant, app_name, app_dir, &bundle, plan.wasm)
+            .await?;
+    }
     // Every check has answered, and nothing is written yet: a check ends here.
     if let Run::Check(_) = run {
         return Ok(ControlFlow::Break(InstallResult {

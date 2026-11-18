@@ -7,10 +7,11 @@
 //! sentence on what it computes (`does`), Jev is also asked whether its code does that, and a sentence it does not is a
 //! finding too.
 //!
-//! Enforced for an author's new and changed code: a push whose new or changed module gets a finding is refused
-//! (`os_apps::module_review_gate`). A module whose code is as installed, and any version installed as published
-//! (Genesis registry, a start's `--app`, a restore), is only advised on, so the apps that run now are not blocked until
-//! someone changes that module. A Jev that does not answer refuses nothing and
+//! Enforced for new and rewritten code on every install a request makes (a push, a start's `--app`, a Genesis registry
+//! install): a module whose code this server runs nowhere, or whose sentence changed, and that gets a finding is
+//! refused (`os_apps::module_review_gate`). A module whose code is as installed, and a boot replay or rollback, is only
+//! advised on, so the apps that run now are not blocked until someone changes that module. A Jev that does not answer
+//! refuses nothing and
 //! is said once in what the review keeps, never retried in a loop: a Jev outage must not stop every install.
 
 mod excerpt;

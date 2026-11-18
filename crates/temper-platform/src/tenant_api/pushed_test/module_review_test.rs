@@ -1,6 +1,7 @@
 //! A module whose code is as installed is reviewed as advice: an install answers without waiting for it, what the
-//! review found stays readable, and a caller that answers with all of it still can. A new or changed module with a
-//! finding, its author's sentence on what it does among them, is refused.
+//! review found stays readable, and a caller that answers with all of it still can. A module whose code is new, or
+//! whose sentence changed, and that has a finding (its sentence not being what it does among them) is refused, on a
+//! push and on a Genesis install alike. Code another tenant on the server already runs is not new.
 
 use std::time::Duration;
 
@@ -400,14 +401,14 @@ async fn a_caller_that_answers_with_all_of_it_can_wait_for_it() {
     assert!(found_first_item(&warnings), "{warnings}");
 }
 
+/// A Genesis install is held to the same rule as a push: its version's changed module, with a finding, is refused.
 #[tokio::test]
-async fn a_genesis_install_still_answers_with_what_the_review_found() {
+async fn a_genesis_install_of_a_changed_module_with_a_finding_is_refused() {
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
-    // The first version installs the module with no Jev; the second changes its code. A Genesis install takes a
-    // published version, so its review is advice and never refuses it.
+    // The first version installs the module with no Jev; the second changes its code.
     const FIRST: &str = "0123456789abcdef0123456789abcdef01234567";
     const HASH: &str = "89abcdef0123456789abcdef0123456789abcdef";
     let tenant = unique_tenant("review-genesis");
@@ -465,13 +466,17 @@ async fn a_genesis_install_still_answers_with_what_the_review_found() {
         .state
         .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::open())));
 
-    let installed = install(HASH)
+    let refused = install(HASH)
         .await
-        .expect("the Genesis install should succeed");
+        .expect_err("a changed module with a finding is refused");
 
-    assert_eq!(installed.modules_reviewed, vec![MODULE.to_string()]);
-    let warnings = serde_json::to_value(&installed.warnings).expect("warnings serialize");
-    assert!(found_first_item(&warnings), "{warnings}");
+    let said = format!("{refused:?}");
+    for words in [
+        "Refused: Jev's review found work in a new or changed module",
+        &format!("({}) in module answer", ITEMS[0].kind),
+    ] {
+        assert!(said.contains(words), "{words}: {said}");
+    }
 }
 
 /// A new or changed module with a finding is refused, naming the finding, its line and what to move into the spec;
@@ -581,6 +586,67 @@ async fn a_changed_module_whose_sentence_is_not_what_it_does_is_refused() {
     ] {
         assert!(said.contains(words), "{words}: {said}");
     }
+}
+
+/// A module whose code is as installed, given a sentence for the first time, is read again and refused when its code
+/// does not do what the sentence says.
+#[tokio::test]
+async fn an_unchanged_module_whose_sentence_changed_is_refused_on_a_mismatch() {
+    let tenant = unique_tenant("review-sentence");
+    let server = seeded(&tenant).await;
+    server
+        .state
+        .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::clean())));
+
+    // The module's code is as installed; only its sentence is new.
+    let mut files = app_with_module(Some("c1"), 1);
+    let manifest = files["app.toml"].as_str().expect("text").to_string()
+        + "does = \"Sends the morning's orders to the bakery.\"\n";
+    files["app.toml"] = manifest.into();
+    let (status, body) = send(
+        &server.state,
+        push(&tenant, serde_json::json!({ "files": files })),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.to_string()
+            .contains("(does_mismatch) in module answer"),
+        "{body}"
+    );
+}
+
+/// A tenant taking an app whose module another tenant on the server already runs takes code already let in: its
+/// finding is advice, and the install goes on.
+#[tokio::test]
+async fn code_another_tenant_already_runs_is_not_new() {
+    let tenant = unique_tenant("review-shipped");
+    let server = seeded(&tenant).await;
+    server
+        .state
+        .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::open())));
+    let fresh = unique_tenant("review-fresh");
+    server
+        .state
+        .server
+        .authz
+        .reload_tenant_policies(
+            &fresh,
+            r#"permit(principal, action == Action::"install_app", resource is App);
+permit(principal, action == Action::"read_app_installs", resource is AppInstall);"#,
+        )
+        .expect("install policy should parse");
+
+    // The same module code, in a tenant that has never had it.
+    let (status, body) = send(
+        &server.state,
+        push(
+            &fresh,
+            serde_json::json!({ "files": app_with_module(Some("c1"), 1) }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]

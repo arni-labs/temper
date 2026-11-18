@@ -1,10 +1,14 @@
-//! The refusal half of the install's module review ([`super::module_review_step`]): a push whose new or changed
-//! module gets a finding is not let in.
+//! The refusal half of the install's module review ([`super::module_review_step`]): a module whose code is new, or
+//! whose sentence changed, and that gets a finding is not let in.
 //!
-//! Only a push is refused, its check too: its files are its author's change. A Genesis registry install, a start's
-//! `--app` from the catalog and a restore install a version already published, and a refusal there would fall on
-//! whoever installs it, such as a fresh tenant taking an app as shipped, never on the author. Those are advised on.
+//! Rita, 18 Nov 2026: refuse new modules and rewritten ones, on every path; an app already there is fine. So every
+//! install a request makes is held to it: a push and its check, a start's `--app`, a Genesis registry install and a
+//! first install. A boot replay or a rollback brings back an install already made and is never refused. Code is new
+//! when this server runs it nowhere ([`super::module_review_step::changed_modules`]): a restart, a version whose
+//! module is as the app had it, and a tenant taking an app another tenant here already runs install as they are. A
+//! module whose code is as installed keeps any finding as advice.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::file_source::AppFileSource;
@@ -13,29 +17,28 @@ use super::types::AppBundle;
 use crate::module_review::{Finding, ModuleSource};
 use crate::state::PlatformState;
 
-/// Refuse the install when Jev finds, in a module of `bundle` whose code is new or differs from what `tenant` has,
-/// something the spec should do: each finding is named with its line and what to move into the spec. It uses the
-/// review's own rules (an item rated at [`crate::module_review::FOUND_AT`] or more, or a sentence under `does` that its
-/// code does not do), and its cache, so the advisory review after it reads nothing twice.
-///
-/// Rita, 17 Nov 2026: every Jev module check belongs to Temper, and a module that decides is refused. Untouched code is
-/// never refused for it, so the apps that run now are not blocked until someone changes that module.
-/// Refuse a pushed version of an app (`files`, as its author sent them) as [`refuse_findings`] does. Files that do not
-/// read as an app are left to the install, which says why.
+/// Refuse a pushed version of an app (`files`, as its author sent them) before its files are kept, as the install
+/// that follows would ([`refuse_findings`]). Files that do not read as an app are left to the install, which says why.
 pub(crate) async fn refuse_pushed_findings(
     state: &PlatformState,
     tenant: &str,
+    app_name: &str,
     files: &AppFileSource,
 ) -> Result<(), String> {
     let Ok(bundle) = super::load_app_bundle(files) else {
         return Ok(());
     };
-    refuse_findings(state, tenant, files.dir(), &bundle, true).await
+    refuse_findings(state, tenant, app_name, files.dir(), &bundle, true).await
 }
 
-async fn refuse_findings(
+/// Refuse the install when Jev finds, in a module of `bundle` whose code is new to this server or whose sentence
+/// changed, something the spec should do, or a sentence its code does not do: each finding is named with its line and
+/// what to do instead. It uses the review's own rules (an item rated at [`crate::module_review::FOUND_AT`] or more, or
+/// a `does_mismatch`) and its cache, so the advisory review after it reads nothing twice.
+pub(super) async fn refuse_findings(
     state: &PlatformState,
     tenant: &str,
+    app_name: &str,
     app_dir: &Path,
     bundle: &AppBundle,
     wasm: bool,
@@ -47,10 +50,10 @@ async fn refuse_findings(
         return Ok(());
     }
     let specs = specs_of(bundle);
-    let modules: Vec<ModuleSource> = changed_modules(state, tenant, bundle, &specs)
+    let modules: Vec<ModuleSource> = changed_modules(state, tenant, app_name, bundle, &specs)
         .await
         .into_iter()
-        .filter(|(_, code_changed)| *code_changed)
+        .filter(|(_, held)| *held)
         // A module with no source, or one that cannot be read, is said by the advisory review.
         .filter_map(|(module, _)| {
             read_source(app_dir, &module, bundle.wasm_module_configs.get(&module))
@@ -99,4 +102,40 @@ fn refusal_line(module: &str, finding: &Finding) -> String {
         "- {} ({}) in module {module} at {}{line}: {} {}",
         finding.title, finding.kind, finding.location, finding.why, finding.instead
     )
+}
+
+/// Where a kept review keeps the sentences of the version it read ([`sentences_of`]).
+pub(super) const SENTENCES: &str = "does";
+
+/// Each module's sentence on what it computes (`does` in the app's manifest), by module, as a review keeps it.
+pub(super) fn sentences_of(bundle: &AppBundle) -> BTreeMap<String, String> {
+    bundle
+        .wasm_modules
+        .keys()
+        .filter_map(|module| {
+            let does = bundle
+                .wasm_module_configs
+                .get(module)?
+                .does
+                .as_deref()?
+                .trim();
+            (!does.is_empty()).then(|| (module.clone(), does.to_string()))
+        })
+        .collect()
+}
+
+/// The sentences the app's last kept review was of ([`sentences_of`]), or None when no review kept them.
+pub(super) async fn kept_sentences(
+    state: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+) -> Option<BTreeMap<String, String>> {
+    let store = state
+        .server
+        .storage_stack
+        .as_ref()
+        .and_then(|stack| stack.platform.clone())?;
+    let row = store.load_module_review(tenant, app_name).await.ok()??;
+    let kept: serde_json::Value = serde_json::from_str(&row.result).ok()?;
+    serde_json::from_value(kept.get(SENTENCES)?.clone()).ok()
 }
