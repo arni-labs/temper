@@ -16,6 +16,7 @@ use temper_server::platform_store::InstalledAppRecord;
 use temper_server::state::{BoundActionHook, BoundActionHookContext, DispatchCommand, ServerState};
 
 mod blob_materialization;
+mod bundle_export;
 mod bundle_transport;
 mod bundles;
 mod cache_paths;
@@ -32,15 +33,17 @@ use blob_materialization::{
     MAX_GENESIS_TREE_CANONICAL_BYTES, blob_content_len, canonical_field_len, git_object_body,
     materialize_blob_content_field, read_canonical_field_bounded,
 };
+use bundle_export::{MaterializeTree, export_closure_files};
 use bundles::{
     GenesisBundleBudget, MAX_GENESIS_BUNDLE_APPS, MAX_GENESIS_BUNDLE_FILE_BYTES,
-    collect_bundle_files, is_generated_component, materialize_registry_app_closure_via_bundle,
+    is_generated_component, materialize_registry_app_closure_via_bundle,
 };
 #[cfg(test)]
-use bundles::{safe_bundle_relative_path, write_bundle_app};
+use bundles::{collect_bundle_files, safe_bundle_relative_path, write_bundle_app};
 use cache_paths::{
-    CacheOwner, InstallSource, app_cache_dir, genesis_cache_root, replace_directory,
-    sanitize_fragment, validate_git_object_id, validate_identity_component,
+    CacheOwner, InstallSource, app_cache_dir, genesis_cache_base, genesis_cache_root,
+    replace_directory, sanitize_fragment, scratch_dir, stage_beside, validate_git_object_id,
+    validate_identity_component,
 };
 use closure_install::CheckRefused;
 use object_lookup::load_genesis_object;
@@ -1325,11 +1328,6 @@ pub async fn export_genesis_registry_bundle_for(
         root.name,
         root.version_hash.trim_start_matches('@')
     );
-    let cache_root = genesis_cache_root(
-        &platform.server,
-        CacheOwner::Export { registry_tenant },
-        &app_ref,
-    );
     let closure = resolve_genesis_app_closure(&platform.server, &tenant, root, audience).await?;
     if closure.len() > MAX_GENESIS_BUNDLE_APPS {
         return Err(format!(
@@ -1337,45 +1335,48 @@ pub async fn export_genesis_registry_bundle_for(
             closure.len()
         ));
     }
-    let mut apps = Vec::new();
-    let mut bundle_budget = GenesisBundleBudget::new();
-    let mut materialization_budget = GenesisBundleBudget::new();
-
-    for app in closure {
-        let app_dir = app_cache_dir(&cache_root, &app.name)?;
-        let started = Instant::now();
-        let paths = materialize_commit_tree(
-            &platform.server,
-            &tenant,
-            &app.repository_id,
-            &app.version_hash,
-            &app_dir,
-            TreeSelection::Source,
-            &mut materialization_budget,
-        )
-        .await?;
-        let files = collect_bundle_files(&app_dir, &paths, &mut bundle_budget)?;
-        tracing::info!(
-            registry_tenant = %registry_tenant,
-            app = %app.name,
-            version_hash = %app.version_hash,
-            duration_ms = started.elapsed().as_millis() as u64,
-            files = files.len(),
-            "Exported Genesis app bundle files"
-        );
-        apps.push(GenesisRegistryBundleApp {
-            owner: app.owner,
-            name: app.name,
-            version_hash: app.version_hash.trim_start_matches('@').to_string(),
-            files,
-        });
-    }
+    let source = RegistrySource {
+        state: &platform.server,
+        tenant: &tenant,
+    };
+    let apps = export_closure_files(
+        &genesis_cache_base(&platform.server),
+        registry_tenant,
+        closure,
+        &source,
+    )
+    .await?;
 
     Ok(GenesisRegistryBundleResponse {
         app_ref,
         registry_tenant: registry_tenant.to_string(),
         apps,
     })
+}
+
+/// A registry tenant's own Genesis rows, as the trees an export reads.
+struct RegistrySource<'a> {
+    state: &'a ServerState,
+    tenant: &'a TenantId,
+}
+
+impl MaterializeTree for RegistrySource<'_> {
+    fn materialize<'a>(
+        &'a self,
+        app: &'a GenesisAppBundle,
+        app_dir: &'a Path,
+        budget: &'a mut GenesisBundleBudget,
+    ) -> impl Future<Output = Result<BTreeSet<String>, String>> + Send + 'a {
+        materialize_commit_tree(
+            self.state,
+            self.tenant,
+            &app.repository_id,
+            &app.version_hash,
+            app_dir,
+            TreeSelection::Source,
+            budget,
+        )
+    }
 }
 
 async fn resolve_genesis_app_by_ref(
@@ -1431,6 +1432,10 @@ async fn resolve_genesis_app_closure(
     let mut admission = GenesisClosureAdmission::default();
     let mut closure = Vec::new();
     let mut materialization_budget = GenesisBundleBudget::new();
+    // Manifests are read from a directory of this walk's own, removed when it
+    // returns, so concurrent exports of one bundle never replace a manifest
+    // another is still reading.
+    let manifests = scratch_dir(&genesis_cache_base(state), ".genesis-manifests-")?;
 
     while let Some(app) = queue.pop_front() {
         if !admission.admit(&app)? {
@@ -1438,22 +1443,10 @@ async fn resolve_genesis_app_closure(
         }
         if audience == BundleAudience::Anonymous {
             // Before materialize_commit_tree, which writes this repository's
-            // manifest to the cache in order to read it.
+            // manifest to disk in order to read it.
             refuse_unless_repository_is_public(state, tenant, &app).await?;
         }
-        let cache_root = genesis_cache_root(
-            state,
-            CacheOwner::DependencyRead {
-                tenant: tenant.as_str(),
-            },
-            &format!(
-                "{}-{}-dependency-read-{}",
-                app.owner,
-                app.name,
-                app.version_hash.trim_start_matches('@')
-            ),
-        );
-        let app_dir = app_cache_dir(&cache_root, &app.name)?;
+        let app_dir = app_cache_dir(manifests.path(), &app.name)?;
         materialize_commit_tree(
             state,
             tenant,
@@ -1698,22 +1691,7 @@ async fn materialize_commit_tree(
         .ok_or_else(|| format!("Genesis commit {commit_id} not found for {repository_id}"))?;
     let tree_sha = string_field(&commit.state.fields, "TreeSha")
         .ok_or_else(|| format!("Genesis commit {commit_id} is missing TreeSha"))?;
-    let parent = app_dir.parent().ok_or_else(|| {
-        format!(
-            "Genesis app cache '{}' has no parent directory",
-            app_dir.display()
-        )
-    })?;
-    std::fs::create_dir_all(parent).map_err(|error| {
-        format!(
-            "create Genesis app cache parent '{}': {error}",
-            parent.display()
-        )
-    })?;
-    let staged = tempfile::Builder::new()
-        .prefix(".genesis-tree-")
-        .tempdir_in(parent)
-        .map_err(|error| format!("create staged Genesis app cache: {error}"))?;
+    let staged = stage_beside(app_dir)?;
     let paths = materialize_tree(
         state,
         tenant,
@@ -2127,18 +2105,6 @@ mod tests {
             genesis_cache_root(
                 &state,
                 install("tenant-a", InstallSource::Local("default")),
-                app_ref,
-            ),
-            genesis_cache_root(
-                &state,
-                CacheOwner::Export {
-                    registry_tenant: "default",
-                },
-                app_ref,
-            ),
-            genesis_cache_root(
-                &state,
-                CacheOwner::DependencyRead { tenant: "default" },
                 app_ref,
             ),
         ];

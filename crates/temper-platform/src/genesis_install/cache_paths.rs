@@ -91,6 +91,40 @@ pub(super) fn replace_directory(staged: PathBuf, destination: &Path) -> Result<(
     Ok(())
 }
 
+/// A fresh staging directory beside `destination`, to be moved into place with
+/// [`replace_directory`] once it is complete.
+pub(super) fn stage_beside(destination: &Path) -> Result<tempfile::TempDir, String> {
+    let parent = destination.parent().ok_or_else(|| {
+        format!(
+            "Genesis app cache '{}' has no parent directory",
+            destination.display()
+        )
+    })?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "create Genesis app cache parent '{}': {error}",
+            parent.display()
+        )
+    })?;
+    tempfile::Builder::new()
+        .prefix(".genesis-tree-")
+        .tempdir_in(parent)
+        .map_err(|error| format!("create staged Genesis app cache: {error}"))
+}
+
+/// A new directory under `base` that only its holder uses, removed on drop.
+///
+/// For files one request writes and reads back, such as an export's trees:
+/// a directory two requests share lets one replace what the other is reading.
+pub(super) fn scratch_dir(base: &Path, prefix: &str) -> Result<tempfile::TempDir, String> {
+    std::fs::create_dir_all(base)
+        .map_err(|error| format!("create Genesis cache '{}': {error}", base.display()))?;
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(base)
+        .map_err(|error| format!("create Genesis scratch directory: {error}"))
+}
+
 fn cleanup_staged_directory(staged: &Path) -> String {
     match std::fs::remove_dir_all(staged) {
         Ok(()) => String::new(),
@@ -107,10 +141,6 @@ pub(super) enum CacheOwner<'a> {
         tenant: &'a str,
         source: InstallSource<'a>,
     },
-    /// A bundle this registry exports from `registry_tenant`'s Genesis rows.
-    Export { registry_tenant: &'a str },
-    /// A dependency read while resolving a closure in `tenant`.
-    DependencyRead { tenant: &'a str },
 }
 
 /// Where an install's files come from.
@@ -139,8 +169,6 @@ impl CacheOwner<'_> {
                 tenant,
                 source: InstallSource::Pushed,
             } => format!("install\n{tenant}\npushed"),
-            Self::Export { registry_tenant } => format!("export\n{registry_tenant}"),
-            Self::DependencyRead { tenant } => format!("dependency-read\n{tenant}"),
         }
     }
 }
@@ -168,7 +196,7 @@ pub(super) fn legacy_genesis_cache_root(state: &ServerState, app_ref: &str) -> P
     genesis_cache_base(state).join(format!("{}-{}", sanitize_fragment(app_ref), &digest[..16]))
 }
 
-fn genesis_cache_base(state: &ServerState) -> PathBuf {
+pub(super) fn genesis_cache_base(state: &ServerState) -> PathBuf {
     if state.data_dir.as_os_str().is_empty() {
         std::env::temp_dir().join("temper-genesis-app-cache")
     } else {
