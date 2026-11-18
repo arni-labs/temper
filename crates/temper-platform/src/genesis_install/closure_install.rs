@@ -346,14 +346,11 @@ pub(super) async fn uninstalled_apps<T>(
 /// Bring back the files of each installed app the closure of `written`
 /// depends on that this process does not hold, so the closure resolves.
 ///
-/// A dependency left installed resolves at the version its record names, from
-/// the files this process holds for it. A boot that could not fetch those
-/// files (its registry did not answer) leaves the app running on its stored
-/// specs but without them, and every install of an app that needs it would
-/// then be refused. So the install brings them back first, as a boot does,
-/// and each dependency they name in turn. One whose files cannot be brought
-/// back is named by the resolution that follows. The caller holds the install
-/// turn.
+/// A dependency left installed resolves from the files this process holds for
+/// its recorded version. A boot whose registry did not answer holds none, and
+/// every install needing that app would be refused. So the install brings them
+/// back first, as a boot does; resolution names any still missing. The caller
+/// holds the install turn.
 async fn hold_installed_dependencies(
     platform: &PlatformState,
     tenant: &str,
@@ -369,7 +366,11 @@ async fn hold_installed_dependencies(
         if unheld.is_empty() {
             return;
         }
-        super::restore::hold_installed_apps_in_turn(platform, tenant, &unheld).await;
+        // Boxed: bringing an app back can replay its install, a future like this one.
+        Box::pin(super::restore::hold_installed_apps_in_turn(
+            platform, tenant, &unheld,
+        ))
+        .await;
     }
 }
 
