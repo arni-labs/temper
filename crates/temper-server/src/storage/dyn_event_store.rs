@@ -108,43 +108,63 @@ pub trait DynEventStore: Send + Sync {
         arm_id: &'a str,
     ) -> EventStoreFuture<'a, Result<(), PersistenceError>>;
 
-    fn backfill_entity_vectors<'a>(
+    fn write_meaning<'a>(
         &'a self,
         tenant: &'a str,
         entity_type: &'a str,
         entity_id: &'a str,
-        vector_rows: &'a [temper_runtime::persistence::EntityVectorRow],
+        text: Option<&'a str>,
     ) -> EventStoreFuture<'a, Result<(), PersistenceError>>;
 
-    fn vector_candidates<'a>(
+    fn meaning_rows<'a>(
         &'a self,
         tenant: &'a str,
         entity_type: &'a str,
-        decl_name: &'a str,
+        after: Option<&'a str>,
+        limit: usize,
+    ) -> EventStoreFuture<'a, Result<Vec<temper_runtime::persistence::MeaningRow>, PersistenceError>>;
+
+    fn meaning_row<'a>(
+        &'a self,
+        tenant: &'a str,
+        entity_type: &'a str,
+        entity_id: &'a str,
+    ) -> EventStoreFuture<
+        'a,
+        Result<Option<temper_runtime::persistence::MeaningRow>, PersistenceError>,
+    >;
+
+    fn meaning_pending<'a>(
+        &'a self,
+        tenant: &'a str,
         model_tag: &'a str,
         limit: usize,
     ) -> EventStoreFuture<
         'a,
-        Result<Vec<temper_runtime::persistence::EntityVectorCandidate>, PersistenceError>,
+        Result<Vec<temper_runtime::persistence::MeaningPending>, PersistenceError>,
     >;
 
-    fn mark_vector_index_backfilled<'a>(
+    fn set_meaning_vector<'a>(
         &'a self,
         tenant: &'a str,
         entity_type: &'a str,
-        vector_set: &'a str,
+        entity_id: &'a str,
+        text_hash: &'a str,
+        model_tag: &'a str,
+        vector: &'a [f32],
+    ) -> EventStoreFuture<'a, Result<bool, PersistenceError>>;
+
+    fn mark_meaning_backfilled<'a>(
+        &'a self,
+        tenant: &'a str,
+        entity_type: &'a str,
+        rule: &'a str,
     ) -> EventStoreFuture<'a, Result<(), PersistenceError>>;
 
-    fn vector_index_backfilled_types<'a>(
+    fn meaning_backfilled_types<'a>(
         &'a self,
         tenant: &'a str,
     ) -> EventStoreFuture<'a, Result<Vec<(String, String)>, PersistenceError>>;
-
-    fn vectored_entity_ids_for_type<'a>(
-        &'a self,
-        tenant: &'a str,
-        entity_type: &'a str,
-    ) -> EventStoreFuture<'a, Result<Vec<String>, PersistenceError>>;
 
     fn lookup_by_key<'a>(
         &'a self,

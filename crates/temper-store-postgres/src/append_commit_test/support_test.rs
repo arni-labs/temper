@@ -8,7 +8,7 @@ use super::*;
 pub(super) fn assert_first_move_rows(snapshot: &BTreeMap<&'static str, Vec<String>>) {
     for table in [
         "entity_key_index",
-        "entity_vector_index",
+        "entity_meaning",
         "scheduled_actions",
         "entity_catalog",
         "entity_field_index",
@@ -26,7 +26,7 @@ pub(super) const TABLES: [&str; 9] = [
     "events",
     "event_segments",
     "entity_key_index",
-    "entity_vector_index",
+    "entity_meaning",
     "scheduled_actions",
     "entity_catalog",
     "entity_field_index",
@@ -118,11 +118,10 @@ pub(super) async fn count(store: &PostgresEventStore, pool: &PgPool, table: &'st
     sqlx::query_scalar(&sql).fetch_one(pool).await.unwrap()
 }
 
-/// The record's rows besides its events: one key, one vector, one
+/// The record's rows besides its events: one key, one meaning row, one
 /// scheduled action, a timer, and its projection.
 pub(super) struct Rows {
     pub(super) key: Vec<EntityKeyRow>,
-    pub(super) vector: Vec<EntityVectorRow>,
     pub(super) scheduled: Vec<ScheduledActionRecord>,
     pub(super) timer: StateTimerRecord,
     pub(super) fields: serde_json::Value,
@@ -135,11 +134,6 @@ impl Rows {
             key: vec![EntityKeyRow {
                 key_name: "slug".into(),
                 key_hash: format!("slug-{sequence_nr}"),
-            }],
-            vector: vec![EntityVectorRow {
-                decl_name: "body".into(),
-                model_tag: "m1".into(),
-                vector: vec![sequence_nr as f32, 1.0],
             }],
             scheduled: vec![ScheduledActionRecord {
                 tenant: TENANT.into(),
@@ -170,8 +164,6 @@ impl Rows {
     pub(super) fn commit(&self) -> CommitRows<'_> {
         CommitRows {
             key_rows: &self.key,
-            vector_rows: &self.vector,
-            reconcile_vectors: true,
             scheduled_actions: &self.scheduled,
             fired_scheduled_action: None,
             projection: Some(ProjectionRow::Upsert {

@@ -2,16 +2,33 @@
 
 use crate::driver::{Value, params};
 use temper_runtime::persistence::{
-    CommitRows, EntityVectorCandidate, EntityVectorRow, EventMetadata, EventStore,
-    PersistenceAppend, PersistenceAppendResult, PersistenceEnvelope, PersistenceError,
-    ScheduledActionRecord, pack_f32_le, storage_error, unpack_f32_le,
+    CommitRows, EventMetadata, EventStore, MeaningPending, MeaningRow, PersistenceAppend,
+    PersistenceAppendResult, PersistenceEnvelope, PersistenceError, ScheduledActionRecord,
+    pack_f32_le, storage_error, unpack_f32_le,
 };
 use temper_runtime::tenant::parse_persistence_id_parts;
 use tracing::instrument;
 
 use super::TursoEventStore;
 use super::append_commit::OwnedAppend;
+use super::projection_rows::{remove_meaning, upsert_meaning};
 use super::write_gate::WritePriority;
+
+/// A meaning row from `(entity_id, text, model_tag, vector)`; an empty or corrupt
+/// vector blob reads as no vector.
+fn meaning_from_row(row: &crate::driver::Row) -> Result<MeaningRow, PersistenceError> {
+    let bytes: Vec<u8> = row.get(3).map_err(storage_error)?;
+    Ok(MeaningRow {
+        entity_id: row.get(0).map_err(storage_error)?,
+        text: row.get(1).map_err(storage_error)?,
+        model_tag: row.get(2).map_err(storage_error)?,
+        vector: if bytes.is_empty() {
+            None
+        } else {
+            unpack_f32_le(&bytes)
+        },
+    })
+}
 
 /// Every live `(entity_type, entity_id)` of a tenant. The `NOT EXISTS` probe is
 /// served by `idx_events_deleted`; see `schema::CREATE_EVENTS_DELETED_INDEX`.
@@ -172,7 +189,7 @@ impl EventStore for TursoEventStore {
     // (completing ADR-0153 phase 2 for Turso) — tracked separately.
 
     // One transaction per move: the event, its scheduled actions, and the
-    // entity's query-plane, timer and vector rows (ADR-0155) commit together,
+    // entity's query-plane, timer and meaning rows commit together,
     // so an event never lands without them and a move pays one write lock.
     // Keys are not maintained on Turso, per the note above.
     async fn append_with_rows(
@@ -195,110 +212,159 @@ impl EventStore for TursoEventStore {
         true
     }
 
-    async fn backfill_entity_vectors(
+    async fn write_meaning(
         &self,
         tenant: &str,
         entity_type: &str,
         entity_id: &str,
-        vector_rows: &[EntityVectorRow],
+        text: Option<&str>,
     ) -> Result<(), PersistenceError> {
-        // Reconcile: DELETE all of the entity's rows, then insert the current ones.
-        // Empty `vector_rows` purges the entity (deleted / un-embedded). Always runs
-        // the delete so a purge is honored.
         let conn = self
-            .write_connection("turso.backfill_entity_vectors", WritePriority::Low)
+            .write_connection("turso.write_meaning", WritePriority::Low)
             .await?;
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
-        tx.execute(
-            // The entity's index (driver/plan_check.rs).
-            "DELETE FROM entity_vector_index INDEXED BY idx_evi_entity \
-             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
-            params![tenant, entity_type, entity_id],
-        )
-        .await
-        .map_err(storage_error)?;
-        for row in vector_rows {
-            tx.execute(
-                "INSERT INTO entity_vector_index \
-                 (tenant, entity_type, decl_name, model_tag, entity_id, vector, sequence_nr) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-                params![
-                    tenant,
-                    entity_type,
-                    row.decl_name.as_str(),
-                    row.model_tag.as_str(),
-                    entity_id,
-                    Value::Blob(pack_f32_le(&row.vector)),
-                ],
-            )
-            .await
-            .map_err(storage_error)?;
+        let ids = [tenant, entity_type, entity_id];
+        match text {
+            Some(text) => upsert_meaning(&tx, ids, text).await?,
+            None => remove_meaning(&tx, ids).await?,
         }
         tx.commit().await.map_err(storage_error)?;
         Ok(())
     }
 
-    async fn vector_candidates(
+    async fn meaning_rows(
         &self,
         tenant: &str,
         entity_type: &str,
-        decl_name: &str,
-        model_tag: &str,
+        after: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<EntityVectorCandidate>, PersistenceError> {
+    ) -> Result<Vec<MeaningRow>, PersistenceError> {
         let conn = self.configured_connection().await?;
         let mut rows = conn
             .query(
-                // The partition's index (driver/plan_check.rs).
-                "SELECT entity_id, vector FROM entity_vector_index INDEXED BY idx_evi_partition \
-                 WHERE tenant = ?1 AND entity_type = ?2 AND decl_name = ?3 AND model_tag = ?4 \
-                 ORDER BY entity_id LIMIT ?5",
-                params![tenant, entity_type, decl_name, model_tag, limit as i64],
+                "SELECT entity_id, text, model_tag, vector FROM entity_meaning \
+                 WHERE tenant = ?1 AND entity_type = ?2 AND entity_id > ?3 \
+                 ORDER BY entity_id LIMIT ?4",
+                params![tenant, entity_type, after.unwrap_or(""), limit as i64],
             )
             .await
             .map_err(storage_error)?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.map_err(storage_error)? {
-            let entity_id: String = row.get(0).map_err(storage_error)?;
-            let bytes: Vec<u8> = row.get(1).map_err(storage_error)?;
-            if let Some(vector) = unpack_f32_le(&bytes) {
-                out.push(EntityVectorCandidate { entity_id, vector });
-            }
+            out.push(meaning_from_row(&row)?);
         }
         Ok(out)
     }
 
-    async fn mark_vector_index_backfilled(
+    async fn meaning_row(
         &self,
         tenant: &str,
         entity_type: &str,
-        vector_set: &str,
+        entity_id: &str,
+    ) -> Result<Option<MeaningRow>, PersistenceError> {
+        let conn = self.configured_connection().await?;
+        let mut rows = conn
+            .query(
+                "SELECT entity_id, text, model_tag, vector FROM entity_meaning \
+                 WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
+                params![tenant, entity_type, entity_id],
+            )
+            .await
+            .map_err(storage_error)?;
+        match rows.next().await.map_err(storage_error)? {
+            Some(row) => Ok(Some(meaning_from_row(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn meaning_pending(
+        &self,
+        tenant: &str,
+        model_tag: &str,
+        limit: usize,
+    ) -> Result<Vec<MeaningPending>, PersistenceError> {
+        let conn = self.configured_connection().await?;
+        let mut rows = conn
+            .query(
+                "SELECT entity_type, entity_id, text, text_hash FROM entity_meaning \
+                 WHERE tenant = ?1 AND model_tag <> ?2 \
+                 ORDER BY entity_type, entity_id LIMIT ?3",
+                params![tenant, model_tag, limit as i64],
+            )
+            .await
+            .map_err(storage_error)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(storage_error)? {
+            out.push(MeaningPending {
+                entity_type: row.get(0).map_err(storage_error)?,
+                entity_id: row.get(1).map_err(storage_error)?,
+                text: row.get(2).map_err(storage_error)?,
+                text_hash: row.get(3).map_err(storage_error)?,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn set_meaning_vector(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        text_hash: &str,
+        model_tag: &str,
+        vector: &[f32],
+    ) -> Result<bool, PersistenceError> {
+        let conn = self
+            .write_connection("turso.set_meaning_vector", WritePriority::Low)
+            .await?;
+        let changed = conn
+            .execute(
+                "UPDATE entity_meaning SET model_tag = ?1, vector = ?2 \
+                 WHERE tenant = ?3 AND entity_type = ?4 AND entity_id = ?5 AND text_hash = ?6",
+                params![
+                    model_tag,
+                    Value::Blob(pack_f32_le(vector)),
+                    tenant,
+                    entity_type,
+                    entity_id,
+                    text_hash,
+                ],
+            )
+            .await
+            .map_err(storage_error)?;
+        Ok(changed > 0)
+    }
+
+    async fn mark_meaning_backfilled(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        rule: &str,
     ) -> Result<(), PersistenceError> {
         let conn = self
-            .write_connection("turso.mark_vector_index_backfilled", WritePriority::Low)
+            .write_connection("turso.mark_meaning_backfilled", WritePriority::Low)
             .await?;
         let completed_at = temper_runtime::scheduler::sim_now().to_rfc3339();
         conn.execute(
-            "INSERT INTO vector_index_backfill_watermark (tenant, entity_type, vector_set, completed_at) \
+            "INSERT INTO entity_meaning_backfill (tenant, entity_type, rule, completed_at) \
              VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT(tenant, entity_type) \
-             DO UPDATE SET vector_set = excluded.vector_set, completed_at = excluded.completed_at",
-            params![tenant, entity_type, vector_set, completed_at.as_str()],
+             DO UPDATE SET rule = excluded.rule, completed_at = excluded.completed_at",
+            params![tenant, entity_type, rule, completed_at.as_str()],
         )
         .await
         .map_err(storage_error)?;
         Ok(())
     }
 
-    async fn vector_index_backfilled_types(
+    async fn meaning_backfilled_types(
         &self,
         tenant: &str,
     ) -> Result<Vec<(String, String)>, PersistenceError> {
         let conn = self.configured_connection().await?;
         let mut rows = conn
             .query(
-                "SELECT entity_type, vector_set FROM vector_index_backfill_watermark \
-                 WHERE tenant = ?1",
+                "SELECT entity_type, rule FROM entity_meaning_backfill WHERE tenant = ?1",
                 params![tenant],
             )
             .await
@@ -306,29 +372,8 @@ impl EventStore for TursoEventStore {
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.map_err(storage_error)? {
             let entity_type: String = row.get(0).map_err(storage_error)?;
-            let vector_set: String = row.get(1).map_err(storage_error)?;
-            out.push((entity_type, vector_set));
-        }
-        Ok(out)
-    }
-
-    async fn vectored_entity_ids_for_type(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-    ) -> Result<Vec<String>, PersistenceError> {
-        let conn = self.configured_connection().await?;
-        let mut rows = conn
-            .query(
-                "SELECT DISTINCT entity_id FROM entity_vector_index \
-                 WHERE tenant = ?1 AND entity_type = ?2",
-                params![tenant, entity_type],
-            )
-            .await
-            .map_err(storage_error)?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await.map_err(storage_error)? {
-            out.push(row.get::<String>(0).map_err(storage_error)?);
+            let rule: String = row.get(1).map_err(storage_error)?;
+            out.push((entity_type, rule));
         }
         Ok(out)
     }

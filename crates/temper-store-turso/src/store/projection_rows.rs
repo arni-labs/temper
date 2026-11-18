@@ -48,8 +48,8 @@ pub(super) async fn existing_projection(
     }
 }
 
-/// Write `row` in `tx`: its catalog row, and its field-index rows when its
-/// indexed values changed. A row already at a later sequence is kept.
+/// Write `row` in `tx`: its catalog row, its meaning row, and its field-index rows
+/// when its indexed values changed. A row already at a later sequence is kept.
 pub(super) async fn write_projection(
     tx: &Transaction<'_>,
     row: &ProjectionWrite<'_>,
@@ -80,6 +80,14 @@ pub(super) async fn write_projection(
     {
         return Ok(());
     }
+    // The meaning row follows the query-plane row (ADR-0186); an unchanged text
+    // leaves it, and its vector, as they are.
+    upsert_meaning(
+        tx,
+        [tenant, entity_type, entity_id],
+        &temper_runtime::persistence::record_text(fields),
+    )
+    .await?;
 
     if let Some(existing) = existing
         .as_ref()
@@ -143,6 +151,42 @@ pub(super) async fn write_projection(
     .await
 }
 
+/// Keep `text` as the entity's meaning row (ADR-0186): the same text leaves the row
+/// and its vector, new text clears the vector for the model to fill.
+pub(super) async fn upsert_meaning(
+    tx: &Transaction<'_>,
+    [tenant, entity_type, entity_id]: [&str; 3],
+    text: &str,
+) -> Result<(), PersistenceError> {
+    let hash = temper_runtime::persistence::text_hash(text);
+    tx.execute(
+        "INSERT INTO entity_meaning \
+         (tenant, entity_type, entity_id, text, text_hash, model_tag, vector) \
+         VALUES (?1, ?2, ?3, ?4, ?5, '', x'') \
+         ON CONFLICT (tenant, entity_type, entity_id) DO UPDATE SET \
+             text = excluded.text, text_hash = excluded.text_hash, model_tag = '', vector = x'' \
+         WHERE entity_meaning.text_hash <> excluded.text_hash",
+        params![tenant, entity_type, entity_id, text, hash.as_str()],
+    )
+    .await
+    .map_err(storage_error)?;
+    Ok(())
+}
+
+/// Remove the entity's meaning row in `tx`.
+pub(super) async fn remove_meaning(
+    tx: &Transaction<'_>,
+    [tenant, entity_type, entity_id]: [&str; 3],
+) -> Result<(), PersistenceError> {
+    tx.execute(
+        "DELETE FROM entity_meaning WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
+        params![tenant, entity_type, entity_id],
+    )
+    .await
+    .map_err(storage_error)?;
+    Ok(())
+}
+
 /// Remove an entity's query-plane rows in `tx`.
 pub(super) async fn remove_projection(
     tx: &Transaction<'_>,
@@ -160,6 +204,7 @@ pub(super) async fn remove_projection(
     )
     .await
     .map_err(storage_error)?;
+    remove_meaning(tx, [tenant, entity_type, entity_id]).await?;
     drop_event_counters(tx, [tenant, entity_type, entity_id]).await?;
     super::projection_delta::mark_removed(tx, [tenant, entity_type, entity_id]).await?;
     Ok(())

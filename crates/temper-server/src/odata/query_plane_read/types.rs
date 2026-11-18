@@ -34,32 +34,20 @@ impl QueryPlaneReadBudget {
             .max(self.default_page_size)
     }
 
-    /// The candidate budget a kNN scan charges (ADR-0155): the same bound the
-    /// query-plane scan uses, exposed to the `Temper.Nearest` handler.
-    pub(in crate::odata) fn candidate_budget(self) -> usize {
-        self.scan_candidate_budget()
-    }
-
-    /// The cap on `k` (and the default when `k` is absent) for a kNN read: the
-    /// max page size any OData read may return.
+    /// The cap on `k` for a `Temper.Nearest` read: the max page size any OData
+    /// read may return.
     pub(in crate::odata) fn max_result_k(self) -> usize {
         self.max_entities
     }
 
-    pub(in crate::odata::query_plane_read) fn requested_top(
-        self,
-        query_options: &QueryOptions,
-    ) -> usize {
+    pub(in crate::odata) fn requested_top(self, query_options: &QueryOptions) -> usize {
         query_options
             .top
             .unwrap_or(self.default_page_size)
             .min(self.max_entities)
     }
 
-    pub(in crate::odata::query_plane_read) fn scan_page_size(
-        self,
-        query_options: &QueryOptions,
-    ) -> usize {
+    pub(in crate::odata) fn scan_page_size(self, query_options: &QueryOptions) -> usize {
         self.default_page_size
             .max(self.requested_top(query_options))
             .min(self.scan_candidate_budget())
@@ -74,6 +62,8 @@ pub(in crate::odata::query_plane_read) enum QueryPlaneReadStrategy {
     NativePagePushdown,
     /// Entity IDs came from the runtime read-source union.
     ReadSourceCursor,
+    /// Entity IDs came ranked from the meaning rows (`$search`, ADR-0186).
+    MeaningSearch,
 }
 
 impl QueryPlaneReadStrategy {
@@ -81,6 +71,7 @@ impl QueryPlaneReadStrategy {
         match self {
             Self::NativePagePushdown => "native_page_pushdown",
             Self::ReadSourceCursor => "read_source_cursor",
+            Self::MeaningSearch => "meaning_search",
         }
     }
 }
@@ -237,6 +228,8 @@ pub(in crate::odata) enum QueryPlaneReadError {
     /// A candidate known to be ahead of its projection could not be read
     /// authoritatively. Never turn this into a stale or incomplete success.
     ReadUnavailable,
+    /// The request combines query options this read cannot serve together.
+    Unsupported(&'static str),
 }
 
 impl QueryPlaneReadError {
@@ -244,7 +237,7 @@ impl QueryPlaneReadError {
         match self {
             Self::AuthorizationDenied(_) => {}
             Self::QueryTooLarge { telemetry, .. } => telemetry.record(span),
-            Self::InvalidContinuation | Self::ReadUnavailable => {}
+            Self::InvalidContinuation | Self::ReadUnavailable | Self::Unsupported(_) => {}
         }
     }
 
@@ -262,6 +255,9 @@ impl QueryPlaneReadError {
                 "ReadUnavailable",
                 "A committed entity could not be read authoritatively. Retry this request.",
             ).into_response(),
+            Self::Unsupported(message) => {
+                odata_error(StatusCode::BAD_REQUEST, "UnsupportedQuery", message).into_response()
+            }
             Self::InvalidContinuation => odata_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidSkipToken",

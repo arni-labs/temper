@@ -2,8 +2,7 @@
 
 use crate::driver::params;
 use temper_runtime::persistence::{
-    EntityVectorRow, EventMetadata, EventStore, PersistenceAppend, PersistenceEnvelope,
-    PersistenceError,
+    EventMetadata, EventStore, PersistenceAppend, PersistenceEnvelope, PersistenceError,
 };
 
 use super::{PublishedArtifactUpsert, QueryProjectionUpsert, TursoEventStore};
@@ -200,165 +199,148 @@ async fn append_and_read_events_roundtrip() {
     assert_eq!(events[1].event_type, "OrderApproved");
 }
 
-#[tokio::test]
-async fn vector_index_write_behind_candidates_and_partitioning() {
-    // ADR-0155: Turso maintains entity_vector_index write-behind (event first, index
-    // follows). A candidate scan returns the partition's vectors in entity_id order,
-    // partitioned by model tag; a raw kNN read never sees another model's vectors.
-    let store = make_store("vector-index").await;
-    let row = |decl: &str, model: &str, v: Vec<f32>| EntityVectorRow {
-        decl_name: decl.to_string(),
-        model_tag: model.to_string(),
-        vector: v,
-    };
-
+/// Commit an upsert of `fields` for `t:Item:<id>` at `seq`.
+async fn commit_item(store: &TursoEventStore, id: &str, seq: u64, fields: &serde_json::Value) {
+    let state = serde_json::json!({});
     store
         .append_with_rows(
-            "t:Item:item-b",
-            0,
-            &[test_envelope("Create", serde_json::json!({}))],
+            &format!("t:Item:{id}"),
+            seq,
+            &[test_envelope("Save", serde_json::json!({}))],
             temper_runtime::persistence::CommitRows {
-                vector_rows: &[row("embed", "m1", vec![0.0, 1.0])],
-                reconcile_vectors: true,
+                projection: Some(temper_runtime::persistence::ProjectionRow::Upsert {
+                    status: "Open",
+                    fields,
+                    state: &state,
+                }),
                 ..temper_runtime::persistence::CommitRows::default()
             },
         )
         .await
         .unwrap();
-    store
-        .append_with_rows(
-            "t:Item:item-a",
-            0,
-            &[test_envelope("Create", serde_json::json!({}))],
-            temper_runtime::persistence::CommitRows {
-                vector_rows: &[row("embed", "m1", vec![1.0, 0.0])],
-                reconcile_vectors: true,
-                ..temper_runtime::persistence::CommitRows::default()
-            },
-        )
-        .await
-        .unwrap();
-    // A different model tag — must not appear in an m1 scan.
-    store
-        .append_with_rows(
-            "t:Item:item-c",
-            0,
-            &[test_envelope("Create", serde_json::json!({}))],
-            temper_runtime::persistence::CommitRows {
-                vector_rows: &[row("embed", "m2", vec![1.0, 0.0])],
-                reconcile_vectors: true,
-                ..temper_runtime::persistence::CommitRows::default()
-            },
-        )
-        .await
-        .unwrap();
-
-    let candidates = store
-        .vector_candidates("t", "Item", "embed", "m1", 1000)
-        .await
-        .unwrap();
-    // Two m1 items, in entity_id order (a before b) with their vectors intact.
-    assert_eq!(candidates.len(), 2);
-    assert_eq!(candidates[0].entity_id, "item-a");
-    assert_eq!(candidates[0].vector, vec![1.0, 0.0]);
-    assert_eq!(candidates[1].entity_id, "item-b");
-    assert_eq!(candidates[1].vector, vec![0.0, 1.0]);
-
-    // Upsert: re-writing item-a's vector replaces (no duplicate row).
-    store
-        .backfill_entity_vectors("t", "Item", "item-a", &[row("embed", "m1", vec![0.5, 0.5])])
-        .await
-        .unwrap();
-    let candidates = store
-        .vector_candidates("t", "Item", "embed", "m1", 1000)
-        .await
-        .unwrap();
-    assert_eq!(candidates.len(), 2);
-    assert_eq!(candidates[0].vector, vec![0.5, 0.5]);
-
-    // Watermark roundtrip + resumable id listing.
-    store
-        .mark_vector_index_backfilled("t", "Item", "embed")
-        .await
-        .unwrap();
-    assert_eq!(
-        store.vector_index_backfilled_types("t").await.unwrap(),
-        vec![("Item".to_string(), "embed".to_string())]
-    );
-    let mut ids = store
-        .vectored_entity_ids_for_type("t", "Item")
-        .await
-        .unwrap();
-    ids.sort();
-    assert_eq!(ids, vec!["item-a", "item-b", "item-c"]);
 }
 
 #[tokio::test]
-async fn vector_index_reconcile_purges_on_delete_and_empty_rows() {
-    // ADR-0155: a delete/clear reconciles to an empty row set, purging the entity's
-    // vector rows (the turso-side "remove" cleanup) so it is never ranked again.
-    let store = make_store("vector-purge").await;
-    let row = |v: Vec<f32>| EntityVectorRow {
-        decl_name: "embed".to_string(),
-        model_tag: "m1".to_string(),
-        vector: v,
-    };
+async fn meaning_row_is_written_with_the_projection_without_a_vector() {
+    let store = make_store("meaning-write").await;
+    commit_item(
+        &store,
+        "a",
+        0,
+        &serde_json::json!({"title": "Ferry", "count": 3}),
+    )
+    .await;
 
-    // Write-behind reconcile with a row, then a delete transition (empty rows).
+    let row = store.meaning_row("t", "Item", "a").await.unwrap().unwrap();
+    assert_eq!(row.text, "Ferry");
+    assert_eq!(row.model_tag, "");
+    assert_eq!(row.vector, None);
+    let pending = store.meaning_pending("t", "m1", 10).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].text_hash,
+        temper_runtime::persistence::text_hash("Ferry")
+    );
+}
+
+#[tokio::test]
+async fn meaning_vector_survives_same_text_and_clears_on_new_text() {
+    let store = make_store("meaning-vector").await;
+    let ferry = serde_json::json!({"title": "Ferry"});
+    commit_item(&store, "a", 0, &ferry).await;
+    let hash = temper_runtime::persistence::text_hash("Ferry");
+
+    // A stale hash is refused; the current hash keeps the vector.
+    assert!(
+        !store
+            .set_meaning_vector("t", "Item", "a", "stale", "m1", &[1.0, 0.0])
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .set_meaning_vector("t", "Item", "a", &hash, "m1", &[1.0, 0.0])
+            .await
+            .unwrap()
+    );
+    let rows = store.meaning_rows("t", "Item", None, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].model_tag, "m1");
+    assert_eq!(rows[0].vector, Some(vec![1.0, 0.0]));
+    assert!(
+        store
+            .meaning_pending("t", "m1", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .meaning_rows("t", "Item", Some("a"), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // The same fields again leave the vector.
+    commit_item(&store, "a", 1, &ferry).await;
+    let row = store.meaning_row("t", "Item", "a").await.unwrap().unwrap();
+    assert_eq!(row.vector, Some(vec![1.0, 0.0]));
+
+    // New text clears it and the row waits for the model.
+    commit_item(&store, "a", 2, &serde_json::json!({"title": "Bridge"})).await;
+    let row = store.meaning_row("t", "Item", "a").await.unwrap().unwrap();
+    assert_eq!(row.text, "Bridge");
+    assert_eq!(row.vector, None);
+    let pending = store.meaning_pending("t", "m1", 10).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].entity_id, "a");
+}
+
+#[tokio::test]
+async fn projection_remove_deletes_the_meaning_row() {
+    let store = make_store("meaning-remove").await;
+    commit_item(&store, "a", 0, &serde_json::json!({"title": "Ferry"})).await;
     store
         .append_with_rows(
-            "t:Item:item-a",
-            0,
-            &[test_envelope("Create", serde_json::json!({}))],
+            "t:Item:a",
+            1,
+            &[test_envelope("Delete", serde_json::json!({}))],
             temper_runtime::persistence::CommitRows {
-                vector_rows: std::slice::from_ref(&row(vec![1.0, 0.0])),
-                reconcile_vectors: true,
+                projection: Some(temper_runtime::persistence::ProjectionRow::Remove),
                 ..temper_runtime::persistence::CommitRows::default()
             },
         )
+        .await
+        .unwrap();
+    assert!(store.meaning_row("t", "Item", "a").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn meaning_backfill_marks_round_trip() {
+    let store = make_store("meaning-backfill").await;
+    store
+        .write_meaning("t", "Item", "a", Some("hello"))
         .await
         .unwrap();
     assert_eq!(
         store
-            .vector_candidates("t", "Item", "embed", "m1", 10)
+            .meaning_row("t", "Item", "a")
             .await
             .unwrap()
-            .len(),
-        1
+            .unwrap()
+            .text,
+        "hello"
     );
-    // A Deleted transition emits no vector rows but still reconciles (purge).
+    store.write_meaning("t", "Item", "a", None).await.unwrap();
+    assert!(store.meaning_row("t", "Item", "a").await.unwrap().is_none());
     store
-        .append_with_rows(
-            "t:Item:item-a",
-            1,
-            &[test_envelope("Delete", serde_json::json!({}))],
-            temper_runtime::persistence::CommitRows {
-                reconcile_vectors: true,
-                ..temper_runtime::persistence::CommitRows::default()
-            },
-        )
+        .mark_meaning_backfilled("t", "Item", "text-v1")
         .await
         .unwrap();
-    assert!(
-        store
-            .vector_candidates("t", "Item", "embed", "m1", 10)
-            .await
-            .unwrap()
-            .is_empty(),
-        "the deleted entity's vector row must be purged"
-    );
-
-    // The explicit backfill purge (empty rows) is idempotent.
-    store
-        .backfill_entity_vectors("t", "Item", "item-a", &[])
-        .await
-        .unwrap();
-    assert!(
-        store
-            .vector_candidates("t", "Item", "embed", "m1", 10)
-            .await
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        store.meaning_backfilled_types("t").await.unwrap(),
+        vec![("Item".to_string(), "text-v1".to_string())]
     );
 }
 

@@ -822,6 +822,9 @@ async fn file_point_lookup_with_status_ne_uses_lossless_equality_candidates() {
         Err(QueryPlaneReadError::InvalidContinuation) => {
             panic!("no $skiptoken was supplied")
         }
+        Err(QueryPlaneReadError::Unsupported(message)) => {
+            panic!("no $search was supplied: {message}")
+        }
     };
 
     assert_eq!(result.entities.len(), 1);

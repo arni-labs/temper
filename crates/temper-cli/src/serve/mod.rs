@@ -15,6 +15,7 @@ mod installed_apps;
 mod later;
 mod loader;
 mod local_sandbox;
+mod meaning;
 mod observe_ui;
 pub(crate) mod options;
 #[cfg(test)]
@@ -296,6 +297,7 @@ pub async fn run(
     }
     spawn_optimization_loop(&state);
     spawn_actor_passivation_loop(&state);
+    meaning::spawn_meaning(&state);
     temper_server::profiling::spawn_continuous_profiler();
     let _pg_actor_runtime_cancel = pg_actor_runtime_cancel;
 

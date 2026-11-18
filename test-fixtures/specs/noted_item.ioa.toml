@@ -1,0 +1,46 @@
+# Noted Item: minimal fixture for the ADR-0186 meaning DST and OData tests.
+#
+# A note has text fields (Title, Body, Category) and a create, edit and delete
+# path. It declares nothing for search: every record is searchable by its text.
+
+[automaton]
+name = "NotedItem"
+states = ["New", "Ready", "Deleted"]
+initial = "New"
+
+[[state]]
+name = "Title"
+type = "string"
+initial = ""
+
+[[state]]
+name = "Body"
+type = "string"
+initial = ""
+
+[[state]]
+name = "Category"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Create"
+kind = "input"
+from = ["New"]
+to = "Ready"
+params = ["Title", "Body", "Category"]
+hint = "Create the note with its text."
+
+[[action]]
+name = "Edit"
+kind = "input"
+from = ["Ready"]
+to = "Ready"
+params = ["Title", "Body"]
+hint = "Change the note's text."
+
+[[action]]
+name = "Delete"
+kind = "input"
+from = ["Ready"]
+to = "Deleted"

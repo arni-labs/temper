@@ -1,6 +1,6 @@
 //! One append and every row its commit writes, in one SQL statement.
 //!
-//! A move writes its events, its declared keys, its vector rows, the scheduled
+//! A move writes its events, its declared keys, its meaning row, the scheduled
 //! actions it arms and fires, the record's catalog row and field-index rows,
 //! its timer row and its projection-gap mark in a single data-modifying CTE.
 //! The statement is its own transaction: it commits all of them or none, in one
@@ -40,7 +40,7 @@
 //! same row twice, so each table's writes touch disjoint rows: the field-index
 //! delete takes the names the record no longer indexes and the upsert the names
 //! it does, the key delete takes a name's old hash and the insert its new one,
-//! and so on for segments, vectors, scheduled actions and the gap mark.
+//! and so on for segments, meaning rows, scheduled actions and the gap mark.
 //!
 //! The rows are the ones the projection writer
 //! (`PostgresEventStore::upsert_query_projection_with_state`) writes, byte for

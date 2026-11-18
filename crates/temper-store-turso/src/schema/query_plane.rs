@@ -107,7 +107,8 @@ pub const CREATE_ENTITY_KEY_INDEX_ENTITY: &str = "\
 CREATE INDEX IF NOT EXISTS idx_eki_entity
     ON entity_key_index(tenant, entity_type, entity_id);";
 
-/// ADR-0155: declared vector access path — the exact-scan kNN index. One row per
+/// Unused since ADR-0186, kept so an older build can still roll back onto the
+/// database. ADR-0155: declared vector access path — the exact-scan kNN index. One row per
 /// (declared vector path, model tag, entity). `vector` is packed little-endian
 /// f32; `model_tag` partitions the space. Unlike keys, Turso maintains this
 /// **write-behind** (the event append is followed by the index write, not
@@ -144,6 +145,35 @@ CREATE TABLE IF NOT EXISTS vector_index_backfill_watermark (
     tenant       TEXT NOT NULL,
     entity_type  TEXT NOT NULL,
     vector_set   TEXT NOT NULL DEFAULT '',
+    completed_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (tenant, entity_type)
+);";
+
+/// A record's meaning row (ADR-0186): its text, the text's hash, and the vector
+/// the kernel's model made from it (empty until made; `model_tag` names the model).
+pub const CREATE_ENTITY_MEANING_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS entity_meaning (
+    tenant      TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id   TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    text_hash   TEXT NOT NULL,
+    model_tag   TEXT NOT NULL DEFAULT '',
+    vector      BLOB NOT NULL DEFAULT x'',
+    PRIMARY KEY (tenant, entity_type, entity_id)
+);";
+
+/// Finds the rows that wait for a model.
+pub const CREATE_ENTITY_MEANING_PENDING: &str = "\
+CREATE INDEX IF NOT EXISTS idx_entity_meaning_pending
+    ON entity_meaning (tenant, model_tag, entity_type, entity_id);";
+
+/// Which types have all their meaning rows, by which text rule.
+pub const CREATE_ENTITY_MEANING_BACKFILL: &str = "\
+CREATE TABLE IF NOT EXISTS entity_meaning_backfill (
+    tenant       TEXT NOT NULL,
+    entity_type  TEXT NOT NULL,
+    rule         TEXT NOT NULL,
     completed_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (tenant, entity_type)
 );";

@@ -300,6 +300,9 @@ pub(in crate::odata) async fn read_entity_set_from_query_plane(
     request: QueryPlaneReadRequest<'_>,
 ) -> Result<QueryPlaneReadResult, QueryPlaneReadError> {
     let query_options = request.query_options;
+    if let Some(search) = query_options.search.as_deref() {
+        return super::search::read_by_search(request, search).await;
+    }
     let page_size = request.budget.requested_top(query_options);
     let order = canonical_pagination_order(query_options.orderby.as_deref());
 
@@ -390,6 +393,7 @@ pub(in crate::odata) async fn read_entity_set_from_query_plane(
             query_options.count
         },
         skiptoken: None,
+        search: None,
     };
     let page_request = QueryPlaneReadRequest {
         query_options: &page_options,

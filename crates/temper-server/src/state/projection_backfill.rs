@@ -9,12 +9,12 @@ use super::ServerState;
 
 mod boot_repair;
 mod key_index;
+mod meaning;
 mod replay_parity;
-mod vector_index;
 
 pub(super) use key_index::populate_key_index_from_snapshots;
+pub(super) use meaning::populate_meaning_from_snapshots;
 pub(super) use replay_parity::verify_query_projection_replay_parity;
-pub(super) use vector_index::populate_vector_index_from_snapshots;
 
 pub(super) fn transition_table_for(
     state: &ServerState,
@@ -36,7 +36,7 @@ pub(super) fn transition_table_for(
 }
 
 /// Outcome of loading one entity's current state for an index backfill (ADR-0153,
-/// ADR-0155). Shared by the key and vector backfills so they classify entities the
+/// ADR-0186). Shared by the key and meaning backfills so they classify entities the
 /// same way — the distinction is the watermark soundness gate.
 pub(super) enum EntityLoadOutcome {
     /// Loaded — index it from these fields.

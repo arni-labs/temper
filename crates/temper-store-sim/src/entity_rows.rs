@@ -1,5 +1,6 @@
-//! The rows an entity keeps beside its journal: its query-plane row and its
-//! state-timer row, and a count of the commits that wrote it.
+//! The rows an entity keeps beside its journal: its query-plane row, its
+//! meaning row (ADR-0186) and its state-timer row, and a count of the commits
+//! that wrote it.
 //!
 //! An append writes them under the same lock as the journal when its
 //! [`CommitRows`] carries them, as a real store writes them in the journal's
@@ -7,7 +8,9 @@
 //! ([`SimEventStore::upsert_state_timer`]), as a server that does not commit
 //! it with the event does; that is a commit of its own, and counted as one.
 
-use temper_runtime::persistence::{CommitRows, ProjectionRow, StateTimerRecord, StateTimerRow};
+use temper_runtime::persistence::{
+    CommitRows, MeaningRow, ProjectionRow, StateTimerRecord, StateTimerRow, record_text, text_hash,
+};
 use temper_runtime::tenant::parse_persistence_id_parts;
 
 use super::{SimEventStore, SimEventStoreInner};
@@ -21,6 +24,30 @@ pub struct SimProjection {
     pub fields: serde_json::Value,
     /// The journal sequence the row reflects.
     pub sequence_nr: u64,
+}
+
+/// An entity's meaning row: its text, and the vector the model made from it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimMeaning {
+    /// The entity's text, by `record_text`.
+    pub text: String,
+    /// The hash of `text`.
+    pub text_hash: String,
+    /// The model that made `vector`; empty while it waits.
+    pub model_tag: String,
+    /// The meaning; empty while it waits.
+    pub vector: Vec<f32>,
+}
+
+impl SimMeaning {
+    pub(super) fn as_row(&self, entity_id: &str) -> MeaningRow {
+        MeaningRow {
+            entity_id: entity_id.to_string(),
+            text: self.text.clone(),
+            model_tag: self.model_tag.clone(),
+            vector: (!self.vector.is_empty()).then(|| self.vector.clone()),
+        }
+    }
 }
 
 type EntityKey = (String, String, String);
@@ -57,6 +84,7 @@ impl SimEventStoreInner {
         };
         match rows.projection {
             Some(ProjectionRow::Upsert { status, fields, .. }) => {
+                self.keep_meaning(key.clone(), Some(&record_text(fields)));
                 self.projections.insert(
                     persistence_id.to_string(),
                     SimProjection {
@@ -67,6 +95,7 @@ impl SimEventStoreInner {
                 );
             }
             Some(ProjectionRow::Remove) => {
+                self.keep_meaning(key.clone(), None);
                 self.projections.remove(persistence_id);
             }
             None => {}
@@ -78,6 +107,32 @@ impl SimEventStoreInner {
             }
             None => {}
         }
+    }
+
+    /// Keep the entity's text as its meaning row: a new text clears the vector, the
+    /// same text leaves the row; None removes it.
+    pub(super) fn keep_meaning(&mut self, key: EntityKey, text: Option<&str>) {
+        let Some(text) = text else {
+            self.meaning.remove(&key);
+            return;
+        };
+        let hash = text_hash(text);
+        if self
+            .meaning
+            .get(&key)
+            .is_some_and(|row| row.text_hash == hash)
+        {
+            return;
+        }
+        self.meaning.insert(
+            key,
+            SimMeaning {
+                text: text.to_string(),
+                text_hash: hash,
+                model_tag: String::new(),
+                vector: Vec::new(),
+            },
+        );
     }
 
     /// Keep `row` unless the entity's row is from a later sequence.

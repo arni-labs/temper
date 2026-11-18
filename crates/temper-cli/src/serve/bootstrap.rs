@@ -413,11 +413,10 @@ pub(super) async fn hydrate_tenants(state: &PlatformState, all_tenants: Vec<Tena
         for tenant_id in &all_tenants {
             server.populate_key_index_from_snapshots(tenant_id).await;
         }
-        // ADR-0155: backfill the declared-vector index (parse + upsert one row per
-        // declared path per entity), so pre-existing / write-behind entities are
-        // rankable by Temper.Nearest and the per-type watermark is set.
+        // ADR-0186: give records saved before their store kept meaning rows theirs,
+        // so $search finds them; each type is marked once done.
         for tenant_id in &all_tenants {
-            server.populate_vector_index_from_snapshots(tenant_id).await;
+            server.populate_meaning_from_snapshots(tenant_id).await;
         }
         // Then the broad field index for OData filter push-down.
         for tenant_id in all_tenants {

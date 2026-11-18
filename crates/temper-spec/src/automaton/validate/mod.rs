@@ -1,5 +1,5 @@
 //! Checks a parsed spec must pass before it is installed: declared states,
-//! predicates and effects, state timeouts, triggers, webhooks, vectors and
+//! predicates and effects, state timeouts, triggers, webhooks and
 //! the statechart labels.
 
 mod carries;
@@ -172,12 +172,6 @@ pub(super) fn validate(automaton: &Automaton) -> Result<(), AutomatonParseError>
     triggers::validate_timeout_args(automaton)?;
     webhooks::validate_webhooks(automaton, &action_names)?;
 
-    // 7. Validate [[vector]] access-path declarations (ADR-0155).
-    //    - `property` and `model_property` must be declared state variables.
-    //    - `dims` must be > 0.
-    //    - `metric` must be one of cosine | dot | l2.
-    //    - names must be unique (each identifies one index partition + `decl=`).
-    validate_vector_decls(automaton)?;
     carries::validate_carries(automaton)?;
 
     // 8. Statechart labels: `says` is one line; `[[group]]` boxes form a tree.
@@ -427,47 +421,6 @@ fn validate_can_reach(automaton: &Automaton, live: &Liveness) -> Result<(), Stri
             .find(|place| !automaton.automaton.states.contains(place))
         {
             return Err(format!("`{key}` names no place '{place}'"));
-        }
-    }
-    Ok(())
-}
-
-/// Validate all `[[vector]]` access-path declarations per ADR-0155.
-fn validate_vector_decls(automaton: &Automaton) -> Result<(), AutomatonParseError> {
-    const METRICS: [&str; 3] = ["cosine", "dot", "l2"];
-    let state_var_names: std::collections::BTreeSet<&str> =
-        automaton.state.iter().map(|sv| sv.name.as_str()).collect();
-    let mut seen_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for vec_decl in &automaton.vectors {
-        if !seen_names.insert(vec_decl.name.as_str()) {
-            return Err(AutomatonParseError::Validation(format!(
-                "vector path '{}' declared twice",
-                vec_decl.name
-            )));
-        }
-        if !state_var_names.contains(vec_decl.property.as_str()) {
-            return Err(AutomatonParseError::Validation(format!(
-                "vector path '{}' references undeclared property state variable '{}'",
-                vec_decl.name, vec_decl.property
-            )));
-        }
-        if !state_var_names.contains(vec_decl.model_property.as_str()) {
-            return Err(AutomatonParseError::Validation(format!(
-                "vector path '{}' references undeclared model_property state variable '{}'",
-                vec_decl.name, vec_decl.model_property
-            )));
-        }
-        if vec_decl.dims == 0 {
-            return Err(AutomatonParseError::Validation(format!(
-                "vector path '{}' must declare dims > 0",
-                vec_decl.name
-            )));
-        }
-        if !METRICS.contains(&vec_decl.metric.as_str()) {
-            return Err(AutomatonParseError::Validation(format!(
-                "vector path '{}' has unknown metric '{}' (expected one of cosine, dot, l2)",
-                vec_decl.name, vec_decl.metric
-            )));
         }
     }
     Ok(())

@@ -180,6 +180,8 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
+          # The model's weights (crates/temper-meaning/build.rs), fetched once.
+          cache-directories: ~/.cargo/temper-meaning-cache
           save-if: ${{ env.SAVE_RUST_CACHE }}
 
       - name: cargo fmt --check
@@ -352,6 +354,8 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
+          # The model's weights (crates/temper-meaning/build.rs), fetched once.
+          cache-directories: ~/.cargo/temper-meaning-cache
           shared-key: test
           save-if: false
 
@@ -510,6 +514,8 @@ jobs:
         if: needs.changes.outputs.lane == 'full'
         uses: Swatinem/rust-cache@v2
         with:
+          # The model's weights (crates/temper-meaning/build.rs), fetched once.
+          cache-directories: ~/.cargo/temper-meaning-cache
           shared-key: test
           save-if: ${{ env.SAVE_RUST_CACHE }}
 
@@ -648,6 +654,8 @@ jobs:
         if: steps.select.outputs.args != ''
         uses: Swatinem/rust-cache@v2
         with:
+          # The model's weights (crates/temper-meaning/build.rs), fetched once.
+          cache-directories: ~/.cargo/temper-meaning-cache
           shared-key: test
           save-if: false
 
@@ -730,6 +738,8 @@ jobs:
         if: env.DST_NEEDED == 'true'
         uses: Swatinem/rust-cache@v2
         with:
+          # The model's weights (crates/temper-meaning/build.rs), fetched once.
+          cache-directories: ~/.cargo/temper-meaning-cache
           shared-key: test
           save-if: false
 
@@ -798,6 +808,8 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
+          # The model's weights (crates/temper-meaning/build.rs), fetched once.
+          cache-directories: ~/.cargo/temper-meaning-cache
           save-if: ${{ env.SAVE_RUST_CACHE }}
 
       # Source collections include partial fixtures and examples whose Rust
@@ -868,6 +880,8 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
+          # The model's weights (crates/temper-meaning/build.rs), fetched once.
+          cache-directories: ~/.cargo/temper-meaning-cache
           shared-key: test
           save-if: false
 

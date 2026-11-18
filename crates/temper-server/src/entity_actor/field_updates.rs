@@ -67,8 +67,8 @@ pub(super) async fn commit_field_update(
     // `parse_json_body_or_400` accepts any valid JSON, so a `PUT` body of
     // `[1,2,3]` reaches here. With `replace`, `apply_field_update` would set
     // `fields` to the array and then fail to restore `Id`/`Status` — there is no
-    // object to insert into — and the append would co-commit zero key and zero
-    // vector rows, purging the entity's index. Before field updates were
+    // object to insert into — and the append would co-commit zero key rows,
+    // purging the entity's index. Before field updates were
     // journaled that corruption was in-memory and healed on restart; persisting
     // it would make it permanent.
     if !fields.is_object() {
@@ -97,7 +97,7 @@ pub(super) async fn commit_field_update(
         effects::FIELDS_UPDATED_EVENT
     };
 
-    // Apply speculatively so the append co-commits key/vector index rows derived
+    // Apply speculatively so the append co-commits the key and meaning rows derived
     // from the NEW fields, then journal fail-closed: an update that is not
     // durable must not be acknowledged. Rolled back on failure.
     let mut previous_fields = state.fields.clone();
