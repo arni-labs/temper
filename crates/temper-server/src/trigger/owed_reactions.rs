@@ -109,7 +109,7 @@ async fn try_reaction(state: &ServerState, reaction: &Reaction) -> ReactionTry {
     if let Ok(response) = &reply
         && response.refused
     {
-        reaction.record_refused(state, response);
+        reaction.record_refused(state, response, snapshot.exists);
     }
     ReactionTry::Sent(Box::new(reply))
 }

@@ -24,6 +24,7 @@ mod error;
 pub use error::DispatchError;
 pub(crate) mod entity_rows;
 mod generated_callbacks;
+mod missing_record;
 mod outside_write;
 mod overdue_timer_rows;
 pub(crate) use overdue_timer_rows::OverdueTimer;

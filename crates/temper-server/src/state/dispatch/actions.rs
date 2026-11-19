@@ -269,7 +269,7 @@ impl crate::state::ServerState {
             self.reject_action_supplied_sub_writes(entity_type, action, &params)?;
         }
 
-        let response = self
+        let mut response = self
             .dispatch_tenant_action_core(
                 tenant,
                 entity_type,
@@ -304,7 +304,7 @@ impl crate::state::ServerState {
                 let action = response.action(action);
                 let to_state = response.state.status.clone();
                 let fields = serde_json::to_value(&response.state.fields).unwrap_or_default();
-                if await_reactions {
+                let reacted = if await_reactions {
                     dispatcher
                         .dispatch_reactions(
                             self,
@@ -321,7 +321,7 @@ impl crate::state::ServerState {
                             // can elevate deterministically.
                             agent_ctx,
                         )
-                        .await;
+                        .await
                 } else if let Some(background) =
                     self.try_spawn_background_reactions(BackgroundReactionDispatch {
                         dispatcher: Arc::clone(&dispatcher),
@@ -353,8 +353,24 @@ impl crate::state::ServerState {
                             0,
                             agent_ctx,
                         )
-                        .await;
-                }
+                        .await
+                } else {
+                    // They run in the background and cannot reach this answer:
+                    // each failure is on the source record's observe stream,
+                    // in the log and counted (`Reaction::record_refused`).
+                    Vec::new()
+                };
+                // The action is committed: a trigger that then failed is said
+                // beside it instead of being thrown away.
+                self.say_failed_reactions(
+                    &format!("{tenant}:{entity_type}:{entity_id}"),
+                    reaction_ctx
+                        .idempotency_key
+                        .as_ref()
+                        .map(crate::idempotency::IdempotencyKey::as_str),
+                    &mut response,
+                    &reacted,
+                );
             }
         }
 
@@ -518,40 +534,28 @@ impl crate::state::ServerState {
         // Entry points retain their authorization boundary. Invalid first inputs
         // must not materialize an actor; existing actors validate hydrated state.
         let table = self.transition_table_for_dispatch(tenant, entity_type)?;
-        if table.has_input_contracts() && !self.entity_exists(tenant, entity_type, entity_id) {
-            let snapshot = self
-                .load_authz_resource_snapshot(tenant, entity_type, entity_id)
-                .await?;
-            if !snapshot.exists {
-                let response = snapshot.current_state;
-                if let Err(error) = table.validate_action_params(
-                    action,
-                    &params,
-                    &response.state.fields,
-                    &response.state.counters,
-                    &response.state.booleans,
-                ) {
-                    let mut response = response;
-                    response.refusal = error.refusal;
-                    response.refused = true;
-                    let ctx = PostDispatchContext {
-                        tenant,
-                        entity_type,
-                        entity_id,
-                        action,
-                        agent_ctx,
-                        dispatch_idempotency_key: agent_ctx
-                            .idempotency_key
-                            .as_ref()
-                            .map(crate::idempotency::IdempotencyKey::as_str),
-                        action_params: &params,
-                        await_integration,
-                    };
-                    return Ok(self
-                        .refuse_before_actor(&ctx, response, error.message)
-                        .await);
-                }
-            }
+        // Nor does a move that cannot make the record, aimed at one that does
+        // not exist (`missing_record.rs`).
+        if let Some((mut response, message, refusal)) = self
+            .refused_before_record(&table, tenant, entity_type, entity_id, action, &params)
+            .await?
+        {
+            response.refusal = refusal;
+            response.refused = true;
+            let ctx = PostDispatchContext {
+                tenant,
+                entity_type,
+                entity_id,
+                action,
+                agent_ctx,
+                dispatch_idempotency_key: agent_ctx
+                    .idempotency_key
+                    .as_ref()
+                    .map(crate::idempotency::IdempotencyKey::as_str),
+                action_params: &params,
+                await_integration,
+            };
+            return Ok(self.refuse_before_actor(&ctx, response, message).await);
         }
 
         // W2 phase: actor_spawn — registry lookup / actor-creation path.

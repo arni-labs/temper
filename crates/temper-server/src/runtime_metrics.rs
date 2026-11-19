@@ -37,6 +37,7 @@ struct RuntimeMetrics {
     // --- ADR-0049: state-entry timeouts -----------------------------------
     state_timeout_fired_total: Counter<u64>,
     reaction_withheld_total: Counter<u64>,
+    reaction_refused_total: Counter<u64>,
     state_timeout_cancelled_total: Counter<u64>,
     state_timeout_reset_total: Counter<u64>,
     // A timer acts with its setter's current standing.
@@ -188,6 +189,13 @@ fn metrics() -> &'static RuntimeMetrics {
             reaction_withheld_total: meter
                 .u64_counter("temper_reaction_withheld_total")
                 .with_description("Reactions withheld because Cedar refused the move on their target.")
+                .build(),
+            reaction_refused_total: meter
+                .u64_counter("temper_reaction_refused_total")
+                .with_description(
+                    "Reactions whose move was not made: the target does not exist, its state \
+                     or guard refused it, or its id could not be resolved.",
+                )
                 .build(),
             state_timeout_fired_total: meter
                 .u64_counter("temper_state_timeout_fired_total")
@@ -712,6 +720,31 @@ pub fn record_reaction_withheld(tenant: &str, entity_type: &str, action: &str) {
             KeyValue::new("tenant", tenant.to_string()),
             KeyValue::new("entity_type", entity_type.to_string()),
             KeyValue::new("action", action.to_string()),
+        ],
+    );
+}
+
+/// Record a reaction whose move its target did not make. The work the
+/// trigger was to start did not start. `reason` says why, one of:
+/// `missing` (the target record does not exist), `unresolved` (the trigger's
+/// id field was empty), `state` (the target is not where the move starts
+/// from), `guard` (its guard refused) and `other`. An app may refuse by state
+/// or guard on purpose, to drop a repeated event; `missing` and `unresolved`
+/// are a trigger aimed at nothing. Identity belongs in the warning, not these
+/// bounded labels; `entity_type` and `action` are the target's.
+pub fn record_reaction_refused(
+    tenant: &str,
+    entity_type: &str,
+    action: &str,
+    reason: &'static str,
+) {
+    metrics().reaction_refused_total.add(
+        1,
+        &[
+            KeyValue::new("tenant", tenant.to_string()),
+            KeyValue::new("entity_type", entity_type.to_string()),
+            KeyValue::new("action", action.to_string()),
+            KeyValue::new("reason", reason),
         ],
     );
 }

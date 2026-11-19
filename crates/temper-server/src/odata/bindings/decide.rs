@@ -184,6 +184,26 @@ pub(super) async fn decide(request: &BoundAction<'_>, first: bool) -> Result<Dec
         return Err(resp.into());
     }
 
+    if !authz_snapshot.exists
+        && let Ok(table) = state.transition_table_for_dispatch(tenant, entity_type)
+        && let Some((message, refusal)) = crate::entity_actor::no_record_refusal(
+            &table,
+            entity_type,
+            key_str,
+            action.rsplit('.').next().unwrap_or(action),
+        )
+    {
+        // No record is made for a move that cannot make one.
+        action_span.set_status(Status::error(message.clone()));
+        return Err(odata_refusal(
+            StatusCode::CONFLICT,
+            "ActionFailed",
+            &message,
+            Some(&refusal),
+        )
+        .into_response()
+        .into());
+    }
     if !authz_snapshot.exists {
         let validation = state
             .transition_table_for_dispatch(tenant, entity_type)

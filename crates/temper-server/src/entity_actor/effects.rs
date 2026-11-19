@@ -329,6 +329,49 @@ pub(crate) fn move_refusal(
     }
 }
 
+/// The action the kernel itself uses to make a record: a composite's
+/// sub-write and a create over HTTP name it, whether or not the spec has a
+/// rule for it.
+const CREATE_ACTION: &str = "Create";
+
+/// Whether `action` can make a record that does not exist yet: it starts
+/// from the type's initial state, or it is the kernel's own [`CREATE_ACTION`].
+pub(crate) fn makes_record(table: &TransitionTable, action: &str) -> bool {
+    action == CREATE_ACTION || table.starts_from(action, &table.initial_state)
+}
+
+/// Why `action` cannot be made on a record of `entity_type` that does not
+/// exist, or `None` when it can: a record is made by a move that starts from
+/// its type's initial state, or by the kernel's own [`CREATE_ACTION`], and by
+/// no other. Any other move aimed at a record that is not there is refused
+/// before a record is made, so a wrong id leaves no empty record behind and
+/// the refusal says what is wrong: the record is missing, not in the wrong
+/// state.
+///
+/// The message keeps the words of a refusal by state, which callers already
+/// read, and says the rest after them.
+pub(crate) fn no_record_refusal(
+    table: &TransitionTable,
+    entity_type: &str,
+    entity_id: &str,
+    action: &str,
+) -> Option<(String, Refusal)> {
+    let initial = table.initial_state.as_str();
+    if makes_record(table, action) {
+        return None;
+    }
+    Some((
+        format!(
+            "Action '{action}' not valid from state '{initial}': {entity_type} '{entity_id}' \
+             does not exist, and {action} does not make one"
+        ),
+        Refusal::InvalidState {
+            state: initial.to_string(),
+            from: table.source_states(action),
+        },
+    ))
+}
+
 /// Process an action with the related entities' statuses resolved.
 ///
 /// Same as [`process_action`] but with the related entities' statuses the

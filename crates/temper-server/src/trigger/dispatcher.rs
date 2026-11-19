@@ -182,8 +182,19 @@ impl ReactionDispatcher {
                     None => {
                         target_resolve_error_count += 1;
                         tracing::warn!(
+                            tenant = %tenant,
                             rule = rule.name,
+                            source_entity_type = entity_type,
+                            source_entity_id = entity_id,
+                            target_entity_type = rule.then.entity_type,
+                            target_action = rule.then.action,
                             "Could not resolve target entity ID for reaction"
+                        );
+                        crate::runtime_metrics::record_reaction_refused(
+                            tenant.as_str(),
+                            &rule.then.entity_type,
+                            &rule.then.action,
+                            "unresolved",
                         );
                         results.push(ReactionResult {
                             rule_name: rule.name.clone(),

@@ -87,7 +87,16 @@ impl Reaction {
     /// Say so on the source record's observe stream, where the app and its
     /// agents watch it, as well as in the log. The refused dispatch wrote its
     /// own trajectory entry.
-    pub(super) fn record_refused(&self, state: &ServerState, response: &EntityResponse) {
+    ///
+    /// `target_existed`: whether the target record existed when the reaction
+    /// was tried. A move that cannot make the record, aimed at one that does
+    /// not exist, is counted as `missing`.
+    pub(super) fn record_refused(
+        &self,
+        state: &ServerState,
+        response: &EntityResponse,
+        target_existed: bool,
+    ) {
         let sent = &self.sent;
         let cause = self
             .authorized_as
@@ -134,6 +143,18 @@ impl Reaction {
             depth = cause.depth,
             reason,
             "reaction refused"
+        );
+        let why = match &response.refusal {
+            Some(temper_jit::table::Refusal::InvalidState { .. }) if !target_existed => "missing",
+            Some(temper_jit::table::Refusal::InvalidState { .. }) => "state",
+            Some(temper_jit::table::Refusal::GuardFailed { .. }) => "guard",
+            _ => "other",
+        };
+        crate::runtime_metrics::record_reaction_refused(
+            tenant,
+            &sent.entity_type,
+            &sent.action,
+            why,
         );
     }
 }
