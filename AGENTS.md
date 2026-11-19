@@ -11,6 +11,12 @@ If Stack AGENTS.md is already loaded by the harness, use that copy. Otherwise re
 
 The Temper kernel: specs, verification, runtime, server, stores, observe, evolution. **Kernel code only** - app and agent logic belongs in temperpaw; if you find it mixed in here, flag it, do not silently relocate it. Global rules (worktrees, PRs, reviews, Definition of Done) come from the stack layer; this file is what is temper-specific.
 
+Three working rules (Rita, 19 Nov 2026; Stack's No Layer Around Temper and Subtract Before You Add):
+
+- **The kernel verifies and executes apps, and that is all it knows.** UniKon concerns stay out of it: apps as people know them, their owners and sharing belong in the UniKon connector and control plane (in katagami), never in kernel types, fields or routes.
+- **A kernel limit is fixed here.** UniKon does not cover Temper's limits with a layer of its own. When a caller hits something the kernel can't do (page, order, filter or count a read, or get what it needs from a stream), the fix is a general kernel capability, written with no app or owner in it.
+- **Before fixing a bug, ask whether the code it sits in should exist at all.** Look for the simpler design where the bug can't happen, and prefer removing to fixing.
+
 Worktrees live under `~/Development/temper-worktrees/` (the primary at `~/Development/temper` is bare on purpose).
 
 ## Repo map
