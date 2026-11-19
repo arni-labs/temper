@@ -86,7 +86,10 @@ pub(super) fn sanitize_internal_headers(headers: &[(String, String)]) -> Vec<(St
 fn internal_header_allowed(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     if name.starts_with("x-temper-") {
-        return name.starts_with("x-temper-workflow-") || name.starts_with("x-temper-observe-");
+        // The call's own timeout is a directive the send takes off again.
+        return name.starts_with("x-temper-workflow-")
+            || name.starts_with("x-temper-observe-")
+            || name == super::redirects::CALL_TIMEOUT_HEADER;
     }
     !matches!(
         name.as_str(),
