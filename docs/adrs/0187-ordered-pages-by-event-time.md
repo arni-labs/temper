@@ -228,8 +228,10 @@ expression column (no `= ?` can supply an expression).
 ## Rollback Policy
 
 Reverting the code is enough: the old planner never orders by the key, so the
-indexes go unused. They can be dropped with
-`DROP INDEX IF EXISTS idx_entity_catalog_{last,first}_event_{asc,desc}` on each
-store to recover the write cost; Postgres also needs a down migration if the
-migration history must stay additive (`scripts/check-additive-migrations.sh`
-forbids editing `0029` once landed).
+indexes go unused, and an older release runs on a database that has them
+(migration `0029` is additive; an older Turso release ignores indexes it does
+not know). To recover the write cost later, a new Postgres migration and the
+Turso schema can `DROP INDEX IF EXISTS
+idx_entity_catalog_{last,first}_event_{asc,desc}`, marked `additive-ok` (no
+release relies on the indexes for correctness). `0029` itself is never edited
+once released.
