@@ -184,6 +184,17 @@ pub(super) async fn handle_put_secret(
             .into_response();
     }
 
+    // A vault made without a key stores nothing: said as what it is, not as
+    // an encryption failure.
+    if !vault.has_key() {
+        tracing::warn!("secret not stored: the vault has no key");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            crate::secrets::vault::NO_VAULT_KEY,
+        )
+            .into_response();
+    }
+
     // Encrypt the value.
     let (ciphertext, nonce) = match vault.encrypt(value.as_bytes()) {
         Ok(pair) => pair,

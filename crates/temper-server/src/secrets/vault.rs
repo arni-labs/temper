@@ -15,6 +15,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use aes_gcm::aead::{Aead, OsRng}; // determinism-ok: cryptographic nonce generation, not simulation-visible
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
 
+/// Why a vault made without a key seals and opens nothing.
+pub const NO_VAULT_KEY: &str = "no vault key: TEMPER_VAULT_KEY is not set, and none is made, since a secret sealed under a key made for one run could be opened by no later one";
+
 /// Maximum secret value size in bytes (TigerStyle budget).
 pub const MAX_SECRET_VALUE_BYTES: usize = 8192;
 
@@ -24,8 +27,9 @@ pub const MAX_SECRET_VALUE_BYTES: usize = 8192;
 /// of decrypted secrets per tenant. The cache is populated from the
 /// persistence layer on startup and kept in sync on writes.
 pub struct SecretsVault {
-    /// AES-256-GCM cipher of the current master key: seals and opens.
-    cipher: Arc<Aes256Gcm>,
+    /// AES-256-GCM cipher of the current master key: seals and opens. `None`
+    /// in a vault made without a key ([`Self::without_key`]).
+    cipher: Option<Arc<Aes256Gcm>>,
     /// Cipher of the previous master key during a rotation: opens only.
     previous: Option<Arc<Aes256Gcm>>,
     /// Shared platform secrets available to every tenant.
@@ -44,12 +48,34 @@ impl SecretsVault {
         let key = Key::<Aes256Gcm>::from_slice(master_key);
         let cipher = Aes256Gcm::new(key);
         Self {
-            cipher: Arc::new(cipher),
+            cipher: Some(Arc::new(cipher)),
             previous: None,
             platform: Arc::new(RwLock::new(BTreeMap::new())),
             cache: Arc::new(RwLock::new(BTreeMap::new())),
             turns: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// A vault with no master key. It holds the platform's and the tenants'
+    /// values in memory, and seals and opens nothing: a secret cannot be
+    /// stored through it, and a stored row is not opened.
+    ///
+    /// A server started without `TEMPER_VAULT_KEY` runs on one. It used to
+    /// make a throwaway key for the run instead, and whatever was stored
+    /// under that key could be opened by no later start.
+    pub fn without_key() -> Self {
+        Self {
+            cipher: None,
+            previous: None,
+            platform: Arc::new(RwLock::new(BTreeMap::new())),
+            cache: Arc::new(RwLock::new(BTreeMap::new())),
+            turns: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// Whether this vault holds a master key, and so can store a secret.
+    pub fn has_key(&self) -> bool {
+        self.cipher.is_some()
     }
 
     /// Also open rows sealed under `previous_key`, the master key this one
@@ -74,9 +100,11 @@ impl SecretsVault {
             plaintext.len(),
             MAX_SECRET_VALUE_BYTES
         );
+        let Some(cipher) = &self.cipher else {
+            return Err(NO_VAULT_KEY.to_string());
+        };
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // determinism-ok: cryptographic nonce generation
-        let ciphertext = self
-            .cipher
+        let ciphertext = cipher
             .encrypt(&nonce, plaintext)
             .map_err(|e| format!("encryption failed: {e}"))?;
         Ok((ciphertext, nonce.to_vec()))
@@ -84,7 +112,10 @@ impl SecretsVault {
 
     /// Decrypt a ciphertext with the given nonce under the current key.
     pub fn decrypt(&self, ciphertext: &[u8], nonce_bytes: &[u8]) -> Result<Vec<u8>, String> {
-        decrypt_with(&self.cipher, ciphertext, nonce_bytes)
+        let Some(cipher) = &self.cipher else {
+            return Err(NO_VAULT_KEY.to_string());
+        };
+        decrypt_with(cipher, ciphertext, nonce_bytes)
     }
 
     /// Open a stored row with the current key, or else the previous one.
@@ -241,6 +272,32 @@ mod tests {
 
     fn test_key() -> [u8; 32] {
         [0x42u8; 32]
+    }
+
+    /// A vault made without a key keeps values in memory and seals nothing:
+    /// no key is made for the run, so nothing is stored that a later start
+    /// could not open.
+    #[test]
+    fn a_vault_with_no_key_holds_values_in_memory_and_seals_nothing() {
+        let vault = SecretsVault::without_key();
+        assert!(!vault.has_key());
+        assert!(SecretsVault::new(&[7u8; 32]).has_key());
+
+        vault.cache_platform_secret("temper_api_url", "http://127.0.0.1:3000".to_string());
+        vault.cache_secret("t1", "token", "held".to_string());
+        assert_eq!(
+            vault.get_secret("t1", "temper_api_url").as_deref(),
+            Some("http://127.0.0.1:3000")
+        );
+        assert_eq!(vault.get_secret("t1", "token").as_deref(), Some("held"));
+
+        assert_eq!(vault.encrypt(b"value").unwrap_err(), NO_VAULT_KEY);
+        let (ciphertext, nonce) = SecretsVault::new(&[7u8; 32]).encrypt(b"value").unwrap();
+        assert_eq!(
+            vault.decrypt(&ciphertext, &nonce).unwrap_err(),
+            NO_VAULT_KEY
+        );
+        assert!(vault.open(&ciphertext, &nonce).is_err());
     }
 
     #[test]
