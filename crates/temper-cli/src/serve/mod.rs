@@ -162,34 +162,31 @@ pub async fn run(
         let current = vault_key_from_env("TEMPER_VAULT_KEY");
         // determinism-ok: read once at startup
         let previous = vault_key_from_env("TEMPER_VAULT_KEY_PREVIOUS");
-        let key_bytes: [u8; 32] = match current {
-            Some(key) => key,
+        // Without a key no vault key is made. One made for this run sealed
+        // what was stored under a key no later start held. The vault then
+        // keeps the platform's and the tenants' values in memory, stores no
+        // secret, and says why to whoever tries.
+        let mut vault = match current {
+            Some(key) => temper_server::secrets::vault::SecretsVault::new(&key),
             None => {
-                // Rows opened with the previous key are sealed again under the
-                // current one; an ephemeral current key would lose them on the
-                // next restart.
                 assert!(
                     previous.is_none(),
-                    "TEMPER_VAULT_KEY_PREVIOUS needs TEMPER_VAULT_KEY: rows would be re-sealed under a throwaway key"
+                    "TEMPER_VAULT_KEY_PREVIOUS needs TEMPER_VAULT_KEY: there is no current key to seal its rows under"
                 );
-                // No explicit key — generate an ephemeral one for in-memory secret caching.
-                // determinism-ok: OsRng used once at startup for vault key generation
-                use rand::RngCore as _;
-                let mut key = [0u8; 32];
-                rand::rngs::OsRng.fill_bytes(&mut key);
-                key
+                temper_server::secrets::vault::SecretsVault::without_key()
             }
         };
-        let mut vault = temper_server::secrets::vault::SecretsVault::new(&key_bytes);
         if let Some(previous) = previous {
             vault = vault.with_previous_key(&previous);
         }
-        let rotating = if vault.has_previous_key() {
-            ", with a previous key to re-seal from"
+        let said = if !vault.has_key() {
+            "no key (TEMPER_VAULT_KEY is not set); secrets are held in memory and none is stored"
+        } else if vault.has_previous_key() {
+            "configured, with a previous key to re-seal from"
         } else {
-            ""
+            "configured"
         };
-        println!("  Secrets vault: configured{rotating}");
+        println!("  Secrets vault: {said}");
         state.server.secrets_vault = Some(std::sync::Arc::new(vault));
     }
 

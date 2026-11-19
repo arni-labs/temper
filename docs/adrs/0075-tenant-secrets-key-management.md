@@ -24,7 +24,7 @@ Tenant secrets are encrypted in application code before database persistence. Po
 - nonce bytes
 - timestamps
 
-The master key is provided through `TEMPER_VAULT_KEY` as base64-encoded 32 bytes in production. If absent, local development may generate an ephemeral in-memory key, but that mode is not valid for production because persisted secrets cannot be decrypted across restarts.
+The master key is provided through `TEMPER_VAULT_KEY` as base64-encoded 32 bytes. If absent, no key is made: the vault holds the platform's and the tenants' values in memory, and a write of a secret is refused with the reason (503), since a secret sealed under a key made for one run could be opened by no later one. Until 19 Nov 2026 a server without the variable generated an in-memory key and stored secrets under it.
 
 Secret injection into WASM remains filtered by authorization before constructing the guest environment. Storage migration does not change the Cedar surface.
 
