@@ -824,3 +824,107 @@ fn guest_metric_tags_drop_llm_content_for_non_opted_in_tenant() {
         Some(&"COMPLETION".to_string())
     );
 }
+
+/// A peer that takes the request and never answers, and what it was sent.
+fn silent_peer() -> (
+    std::net::SocketAddr,
+    std::sync::mpsc::Receiver<String>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+    let addr = listener.local_addr().expect("listener addr");
+    let (heard, head) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("bound request header read");
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            if stream.read_exact(&mut byte).is_err() {
+                break;
+            }
+            headers.push(byte[0]);
+        }
+        let _ = heard.send(String::from_utf8_lossy(&headers).to_ascii_lowercase());
+        // Hold the connection open without a response until the test is done.
+        let _ = released.recv_timeout(std::time::Duration::from_secs(20));
+    });
+    (addr, head, release)
+}
+
+#[test]
+fn a_call_with_its_own_timeout_fails_after_it_and_the_directive_is_not_sent() {
+    let (addr, head, release) = silent_peer();
+    tokio_test::block_on(async {
+        // The invocation's own timeout is far longer than the call's.
+        let host =
+            ProductionWasmHost::with_timeout(BTreeMap::new(), std::time::Duration::from_secs(15));
+        let started = std::time::Instant::now();
+        let result = host
+            .http_call(
+                "GET",
+                &format!("http://{addr}/never"),
+                &[("X-Temper-Timeout-Ms".to_string(), "300".to_string())],
+                "",
+            )
+            .await;
+        let waited = started.elapsed();
+        assert!(result.is_err(), "a peer that never answers fails the call");
+        assert!(
+            waited >= std::time::Duration::from_millis(250)
+                && waited < std::time::Duration::from_secs(5),
+            "the call ends at its own timeout, not the invocation's: {waited:?}"
+        );
+    });
+    let sent = head
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the peer read the request");
+    assert!(
+        !sent.contains("x-temper-timeout-ms"),
+        "the directive stays in the host: {sent}"
+    );
+    let _ = release.send(());
+}
+
+#[test]
+fn a_calls_own_timeout_only_shortens_and_a_bad_one_changes_nothing() {
+    // The invocation has two seconds; the peer never answers.
+    for (named, at_most_ms) in [
+        ("600000", 2_900),
+        ("soon", 2_900),
+        ("0", 2_900),
+        ("200", 1_500),
+    ] {
+        let (addr, head, release) = silent_peer();
+        tokio_test::block_on(async {
+            let host = ProductionWasmHost::with_timeout(
+                BTreeMap::new(),
+                std::time::Duration::from_secs(2),
+            );
+            let started = std::time::Instant::now();
+            let result = host
+                .http_call(
+                    "GET",
+                    &format!("http://{addr}/never"),
+                    &[("x-temper-timeout-ms".to_string(), named.to_string())],
+                    "",
+                )
+                .await;
+            let waited = started.elapsed().as_millis();
+            assert!(result.is_err(), "{named}: the call fails");
+            let at_least_ms = if named == "200" { 150 } else { 1_900 };
+            assert!(
+                waited >= at_least_ms && waited < at_most_ms,
+                "{named}: waited {waited} ms"
+            );
+        });
+        let sent = head
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the peer read the request");
+        assert!(!sent.contains("x-temper-timeout-ms"), "{named}: {sent}");
+        let _ = release.send(());
+    }
+}

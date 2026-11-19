@@ -99,7 +99,8 @@ impl Redirects {
         builder: reqwest::RequestBuilder,
         operation: &str,
     ) -> Result<reqwest::Response, OutboundError> {
-        let request = builder.build().map_err(OutboundError::transport)?;
+        let mut request = builder.build().map_err(OutboundError::transport)?;
+        take_call_timeout(&mut request, self.timeout);
         let (gate, ctx) = match &self.gate {
             Some((gate, ctx)) if !self.is_internal(request.url()) => (gate, ctx),
             _ => {
@@ -112,7 +113,12 @@ impl Redirects {
         // The chain shares one timeout, as it did when reqwest followed it. A
         // timeout past the clock's range has no deadline: each hop keeps the
         // client's own, which waits as long.
-        let deadline = Instant::now().checked_add(self.timeout);
+        // A request with a shorter timeout of its own (`take_call_timeout`)
+        // shares that one instead.
+        let timeout = request
+            .timeout()
+            .map_or(self.timeout, |own| (*own).min(self.timeout));
+        let deadline = Instant::now().checked_add(timeout);
         let mut hop = Hop::of(&request);
         let mut response = client
             .execute(request)
@@ -151,6 +157,33 @@ impl Redirects {
             url.as_str(),
             self.internal_api_base_url.iter().map(String::as_str),
         )
+    }
+}
+
+/// The header a guest gives one outgoing call its own timeout with, in
+/// milliseconds.
+pub(super) const CALL_TIMEOUT_HEADER: &str = "x-temper-timeout-ms";
+
+/// Apply the guest's own timeout for this call, when it names one, and take
+/// the header off the request: it is a directive to the host, as
+/// `X-Temper-Span-*` is, and is never sent.
+///
+/// A guest that makes a call it can go on without (an optional read, a
+/// best-effort report) names a time shorter than its invocation's, so a peer
+/// that never answers costs it that time and not the whole invocation. It can
+/// only shorten: `most`, the invocation's own timeout, stays the most any call
+/// gets, and a value that is not a whole number above zero is ignored.
+fn take_call_timeout(request: &mut reqwest::Request, most: Duration) {
+    let Some(value) = request.headers_mut().remove(CALL_TIMEOUT_HEADER) else {
+        return;
+    };
+    let own = value
+        .to_str()
+        .ok()
+        .and_then(|ms| ms.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0);
+    if let Some(ms) = own {
+        *request.timeout_mut() = Some(Duration::from_millis(ms).min(most));
     }
 }
 
