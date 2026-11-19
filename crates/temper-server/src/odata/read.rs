@@ -15,7 +15,9 @@ use temper_runtime::tenant::TenantId;
 use temper_wasm::{StreamRegistry, WasmInvocationContext};
 use tracing::instrument;
 
-use super::authz::{READ_ACTION, authorize_read, require_authenticated_context};
+use super::authz::{
+    READ_ACTION, authorize_read, entity_id_from_body, require_authenticated_context,
+};
 use super::blob_media::handle_blob_primitive_stream;
 use super::common::{
     check_has_stream_or_400, extract_key, has_expand_options, resolve_entity_type,
@@ -490,14 +492,7 @@ async fn build_entity_body(
     let mut body = annotate_entity(state_json, options.context, options.odata_id);
 
     if options.enrich {
-        enrich_entity_response(
-            &mut body,
-            entity_type,
-            set_name,
-            key,
-            context.state,
-            context.tenant,
-        );
+        enrich_entity_response(&mut body, entity_type, set_name, key, context).await;
     }
 
     if let Some(name) = options.function
@@ -516,67 +511,27 @@ async fn build_entity_body(
     .await
 }
 
-/// Enrich an entity response with `@odata.actions` and `@odata.children`.
+/// Enrich an entity response with `@odata.actions`, `@temper.refused` and
+/// `@odata.children`.
 ///
-/// - `@odata.actions`: Actions available from the entity's current state,
-///   computed from the [`TransitionTable`].
+/// - `@odata.actions` and `@temper.refused`: the actions the reader could
+///   make on the entity now and those it could not ([`annotate_moves`]).
 /// - `@odata.children`: Navigation properties from the CSDL, with types and
 ///   target OData paths.
-fn enrich_entity_response(
+async fn enrich_entity_response(
     body: &mut serde_json::Value,
     entity_type: &str,
     entity_set: &str,
     entity_key: &str,
-    state: &ServerState,
-    tenant: &TenantId,
+    context: ReadContext<'_>,
 ) {
-    let registry = state
+    annotate_moves(context, entity_type, entity_set, entity_key, body).await;
+    let registry = context
+        .state
         .registry
         .read()
         .expect("registry lock should not be poisoned"); // ci-ok: infallible lock
-    let tenant_config = registry.get_tenant(tenant);
-
-    // --- @odata.actions: actions available from current state ---
-    let current_status = body
-        .get("status")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            body.get("fields")
-                .and_then(|f| f.get("Status"))
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or("");
-
-    let mut actions = Vec::new();
-    if let Some(tc) = tenant_config
-        && let Some(spec) = tc.entities.get(entity_type)
-    {
-        let table = spec.table();
-        for rule in &table.rules {
-            if !temper_spec::automaton::is_carry_move(&rule.name)
-                && rule.from_states.iter().any(|s| s == current_status)
-            {
-                // Look up hint from automaton actions
-                let hint = spec
-                    .automaton
-                    .actions
-                    .iter()
-                    .find(|a| a.name == rule.name)
-                    .and_then(|a| a.hint.clone());
-                let action_entry = serde_json::json!({
-                    "name": rule.name,
-                    "target": format!("{entity_set}('{entity_key}')/Temper.{}", rule.name),
-                    "hint": hint,
-                });
-                // Avoid duplicate action names (multiple rules for same action)
-                if !actions.iter().any(|a: &serde_json::Value| {
-                    a.get("name").and_then(|n| n.as_str()) == Some(&rule.name)
-                }) {
-                    actions.push(action_entry);
-                }
-            }
-        }
-    }
+    let tenant_config = registry.get_tenant(context.tenant);
 
     // --- @odata.children: navigation properties from CSDL ---
     let mut children = serde_json::Map::new();
@@ -598,12 +553,94 @@ fn enrich_entity_response(
 
     if let Some(obj) = body.as_object_mut() {
         obj.insert(
+            "@odata.children".to_string(),
+            serde_json::Value::Object(children),
+        );
+    }
+}
+
+/// The custom query option that asks a list read for each row's moves:
+/// `GET /tdata/Tasks?actions=true`. An OData custom option names no system
+/// option (no `$`), is ignored by a reader that does not know it, and is
+/// carried by `@odata.nextLink` to the pages after.
+const ROW_ACTIONS_OPTION: &str = "actions";
+
+/// Write on an entity body the moves its reader could make on it now, as
+/// `@odata.actions` (each with its bound action path and the spec's hint),
+/// and those that start from its status and the reader could not make, as
+/// `@temper.refused` (each with why, and the typed refusal a dispatch of it
+/// gets when the record's guard is why).
+///
+/// Both come from the check every move goes through
+/// ([`ServerState::moves_of_record`]): the status, the guard, a guard that
+/// reads another record included, and Cedar for this reader. An action in
+/// neither list does not start from the record's status. An entity of a type
+/// without a spec carries two empty lists.
+///
+/// They say what a dispatch would at the time of the read; a move that is
+/// sent is decided again.
+async fn annotate_moves(
+    context: ReadContext<'_>,
+    entity_type: &str,
+    entity_set: &str,
+    entity_key: &str,
+    body: &mut serde_json::Value,
+) {
+    let moves = context
+        .state
+        .moves_of_record(
+            context.tenant,
+            context.security,
+            entity_type,
+            entity_key,
+            body,
+        )
+        .await
+        .unwrap_or_default();
+    let hints: std::collections::BTreeMap<String, Option<String>> = {
+        let registry = context
+            .state
+            .registry
+            .read()
+            .expect("registry lock should not be poisoned"); // ci-ok: infallible lock
+        registry
+            .get_tenant(context.tenant)
+            .and_then(|tenant| tenant.entities.get(entity_type))
+            .map(|spec| {
+                spec.automaton
+                    .actions
+                    .iter()
+                    .map(|action| (action.name.clone(), action.hint.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let actions: Vec<serde_json::Value> = moves
+        .possible
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": name,
+                "target": format!("{entity_set}('{entity_key}')/Temper.{name}"),
+                "hint": hints.get(name).cloned().flatten(),
+            })
+        })
+        .collect();
+    let refused: Vec<serde_json::Value> = moves
+        .refused
+        .iter()
+        .map(|(name, reason, refusal)| {
+            serde_json::json!({"name": name, "reason": reason, "refusal": refusal})
+        })
+        .collect();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
             "@odata.actions".to_string(),
             serde_json::Value::Array(actions),
         );
         obj.insert(
-            "@odata.children".to_string(),
-            serde_json::Value::Object(children),
+            "@temper.refused".to_string(),
+            serde_json::Value::Array(refused),
         );
     }
 }
@@ -805,13 +842,24 @@ async fn handle_entity_set(
     };
     let span = tracing::Span::current();
     span.record("entity_type", entity_type.as_str());
+    // The custom option `actions=true` asks for each row's moves, as a read
+    // of one entity always carries them. A move's guard is judged on the
+    // whole record, so such a read takes whole rows and `$select` is applied
+    // here, after the moves are written; the rows and the page are the same.
+    let with_moves = query_params
+        .get(ROW_ACTIONS_OPTION)
+        .is_some_and(|v| v == "true");
+    let whole_rows = with_moves.then(|| QueryOptions {
+        select: None,
+        ..query_options.clone()
+    });
     let read_result = match read_entity_set_from_query_plane(QueryPlaneReadRequest {
         state,
         tenant,
         security_ctx,
         entity_type: &entity_type,
         entity_set_name: name,
-        query_options,
+        query_options: whole_rows.as_ref().unwrap_or(query_options),
         budget: QueryPlaneReadBudget::from_config(),
     })
     .await
@@ -825,6 +873,18 @@ async fn handle_entity_set(
     read_result.telemetry.record(&span);
 
     let mut result = read_result.entities;
+    if with_moves {
+        let context = ReadContext::new(state, tenant, security_ctx, hydration_budget);
+        for entity in &mut result {
+            let Some(id) = entity_id_from_body(entity).map(str::to_string) else {
+                continue;
+            };
+            annotate_moves(context, &entity_type, name, &id, entity).await;
+        }
+        if let Some(select) = query_options.select.as_deref() {
+            result = select_fields(result, select);
+        }
+    }
     for entity in &mut result {
         hydrate_blob_refs_for_tenant_with_budget(state, tenant, entity, hydration_budget).await;
     }

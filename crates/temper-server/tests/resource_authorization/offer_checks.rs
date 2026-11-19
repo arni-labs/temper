@@ -473,6 +473,78 @@ async fn make(
     (status, serde_json::from_slice(&body).unwrap_or_default())
 }
 
+/// What agent-1 reads at `uri`.
+async fn read_json(app: &axum::Router, uri: &str) -> serde_json::Value {
+    let read = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            uri,
+            serde_json::json!({}),
+            TENANT,
+            "agent-1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK, "{uri}");
+    serde_json::from_slice(
+        &axum::body::to_bytes(read.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+/// An app of waiting tasks ([`WAITING_TASK`]) holding `ids`, each Ready,
+/// under the Cedar `policy`.
+async fn waiting_tasks(
+    name: &str,
+    policy: &str,
+    ids: &[&str],
+) -> (axum::Router, TursoEventStore, tempfile::TempDir) {
+    use temper_server::registry::{EntityVerificationResult, VerificationStatus};
+    let (state, store, temp) = state_with_turso(name).await;
+    let csdl = include_str!("../../../../test-fixtures/specs/model.csdl.xml");
+    {
+        let mut registry = state.registry.write().unwrap();
+        registry.register_tenant(
+            TENANT,
+            temper_spec::csdl::parse_csdl(csdl).unwrap(),
+            csdl.to_string(),
+            &[("Order", WAITING_TASK)],
+        );
+        registry.set_verification_status(
+            &TenantId::new(TENANT),
+            "Order",
+            VerificationStatus::Completed(EntityVerificationResult {
+                all_passed: true,
+                levels: vec![],
+                verified_at: "2026-11-19T00:00:00Z".to_string(),
+            }),
+        );
+    }
+    state.authz.reload_tenant_policies(TENANT, policy).unwrap();
+    for id in ids {
+        state
+            .get_or_create_tenant_entity(&TenantId::new(TENANT), "Order", id, serde_json::json!({}))
+            .await
+            .unwrap();
+    }
+    (build_router(state), store, temp)
+}
+
+/// Take the Ready task `id` to Done.
+async fn finish(app: &axum::Router, id: &str) {
+    for (action, params) in [
+        ("Claim", serde_json::json!({"worker": "w1"})),
+        ("Renew", serde_json::json!({"worker": "w1"})),
+        ("Complete", serde_json::json!({})),
+    ] {
+        let made = make(app, id, action, params).await;
+        assert_eq!(made.0, StatusCode::OK, "{id} {action}: {}", made.1);
+    }
+}
+
 /// What agent-1 is offered on `Orders('{id}')` for `actions`, asked as a page
 /// asks: the record is read, and the row read is sent back as its snapshot,
 /// with `claims` written over what was read.
@@ -482,24 +554,7 @@ async fn offered(
     actions: &[&str],
     claims: &[(&str, &str)],
 ) -> Vec<serde_json::Value> {
-    let read = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            &format!("/tdata/Orders('{id}')"),
-            serde_json::json!({}),
-            TENANT,
-            "agent-1",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(read.status(), StatusCode::OK);
-    let row: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(read.into_body(), 1024 * 1024)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let row = read_json(app, &format!("/tdata/Orders('{id}')")).await;
     let mut context = serde_json::Map::new();
     for part in ["fields", "counters", "booleans", "lists"] {
         if let Some(values) = row.get(part).and_then(|values| values.as_object()) {
@@ -530,52 +585,13 @@ async fn offered(
 /// move here, so only the record decides.
 #[tokio::test]
 async fn an_offer_is_refused_as_the_move_would_be_by_state_and_guard() {
-    use temper_server::registry::{EntityVerificationResult, VerificationStatus};
-    let (state, _store, _temp) = state_with_turso("offer-state-and-guard").await;
-    let csdl = include_str!("../../../../test-fixtures/specs/model.csdl.xml");
-    {
-        let mut registry = state.registry.write().unwrap();
-        registry.register_tenant(
-            TENANT,
-            temper_spec::csdl::parse_csdl(csdl).unwrap(),
-            csdl.to_string(),
-            &[("Order", WAITING_TASK)],
-        );
-        registry.set_verification_status(
-            &TenantId::new(TENANT),
-            "Order",
-            VerificationStatus::Completed(EntityVerificationResult {
-                all_passed: true,
-                levels: vec![],
-                verified_at: "2026-11-19T00:00:00Z".to_string(),
-            }),
-        );
-    }
-    state
-        .authz
-        .reload_tenant_policies(TENANT, "permit(principal, action, resource);")
-        .unwrap();
-    for id in ["first", "other", "dep", "held"] {
-        state
-            .get_or_create_tenant_entity(&TenantId::new(TENANT), "Order", id, serde_json::json!({}))
-            .await
-            .unwrap();
-    }
-    let app = build_router(state);
-    let finish = |id: &'static str| {
-        let app = app.clone();
-        async move {
-            for (action, params) in [
-                ("Claim", serde_json::json!({"worker": "w1"})),
-                ("Renew", serde_json::json!({"worker": "w1"})),
-                ("Complete", serde_json::json!({})),
-            ] {
-                let made = make(&app, id, action, params).await;
-                assert_eq!(made.0, StatusCode::OK, "{id} {action}: {}", made.1);
-            }
-        }
-    };
-    finish("other").await;
+    let (app, _store, _temp) = waiting_tasks(
+        "offer-state-and-guard",
+        "permit(principal, action, resource);",
+        &["first", "other", "dep", "held"],
+    )
+    .await;
+    finish(&app, "other").await;
     let waits = make(&app, "dep", "Wait", serde_json::json!({"needs": "first"})).await;
     assert_eq!(waits.0, StatusCode::OK, "{}", waits.1);
 
@@ -605,7 +621,7 @@ async fn an_offer_is_refused_as_the_move_would_be_by_state_and_guard() {
     }
 
     // Once `first` is Done the same move is offered, and can be made.
-    finish("first").await;
+    finish(&app, "first").await;
     let offers = offered(&app, "dep", &["Unlock"], &[]).await;
     assert_eq!(
         offers[0],
@@ -638,4 +654,90 @@ async fn an_offer_is_refused_as_the_move_would_be_by_state_and_guard() {
         bare,
         serde_json::json!({"allowed": true, "reason": null, "refusal": null})
     );
+}
+
+/// The names in one of a body's move lists (`@odata.actions`, `@temper.refused`).
+fn names(body: &serde_json::Value, list: &str) -> Vec<String> {
+    body[list]
+        .as_array()
+        .unwrap_or_else(|| panic!("{list} is a list: {body}"))
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// A read tells its reader which moves it could make on the record now, and
+/// which of the moves that start from where the record is it could not, with
+/// why: what a dispatch of each would answer. A list read says the same of
+/// each row when asked with `actions=true`.
+#[tokio::test]
+async fn a_read_lists_the_moves_its_reader_could_make_now() {
+    let (app, _store, _temp) = waiting_tasks(
+        "read-moves",
+        r#"permit(principal, action, resource);
+forbid(principal, action == Action::"Claim", resource) when { resource.id == "barred" };"#,
+        &["first", "dep", "barred"],
+    )
+    .await;
+    let waits = make(&app, "dep", "Wait", serde_json::json!({"needs": "first"})).await;
+    assert_eq!(waits.0, StatusCode::OK, "{}", waits.1);
+
+    // `dep` waits on `first`, which is not Done. Unlock is its one move from
+    // Waiting and its guard fails: no move is listed, and Unlock is refused
+    // with what a dispatch of it answers.
+    let dep = read_json(&app, "/tdata/Orders('dep')").await;
+    assert_eq!(names(&dep, "@odata.actions"), Vec::<String>::new(), "{dep}");
+    assert_eq!(names(&dep, "@temper.refused"), ["Unlock"], "{dep}");
+    let (status, body) = make(&app, "dep", "Unlock", serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let mut refused = body["error"].clone();
+    let message = refused.as_object_mut().unwrap().remove("message");
+    assert_eq!(
+        dep["@temper.refused"][0],
+        serde_json::json!({"name": "Unlock", "reason": message, "refusal": refused})
+    );
+
+    // Cedar forbids this reader Claim on `barred`: Wait is listed with its
+    // path, and Claim is refused with Cedar's reason and no typed refusal.
+    let barred = read_json(&app, "/tdata/Orders('barred')").await;
+    assert_eq!(names(&barred, "@odata.actions"), ["Wait"], "{barred}");
+    assert_eq!(
+        barred["@odata.actions"][0]["target"],
+        "Orders('barred')/Temper.Wait"
+    );
+    assert_eq!(names(&barred, "@temper.refused"), ["Claim"], "{barred}");
+    let claim = &barred["@temper.refused"][0];
+    assert!(claim["reason"].as_str().is_some_and(|why| !why.is_empty()));
+    assert_eq!(claim["refusal"], serde_json::Value::Null);
+
+    // A list read carries no moves unless asked, and then the same ones on
+    // each row, whichever fields it selects.
+    let plain = read_json(&app, "/tdata/Orders").await;
+    for row in plain["value"].as_array().unwrap() {
+        assert!(row.get("@odata.actions").is_none(), "{row}");
+        assert!(row.get("@temper.refused").is_none(), "{row}");
+    }
+    let asked = read_json(&app, "/tdata/Orders?actions=true&$select=status").await;
+    let rows = asked["value"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{asked}");
+    let row = |id: &str| {
+        let odata_id = format!("Orders('{id}')");
+        rows.iter()
+            .find(|row| row["@odata.id"] == odata_id.as_str())
+            .unwrap_or_else(|| panic!("a row for {id}: {asked}"))
+    };
+    assert!(row("dep").get("fields").is_none(), "only what was selected");
+    assert_eq!(row("dep")["@odata.actions"], dep["@odata.actions"]);
+    assert_eq!(row("dep")["@temper.refused"], dep["@temper.refused"]);
+    assert_eq!(row("barred")["@odata.actions"], barred["@odata.actions"]);
+    assert_eq!(row("barred")["@temper.refused"], barred["@temper.refused"]);
+    assert_eq!(names(row("first"), "@odata.actions"), ["Wait", "Claim"]);
+
+    // Once `first` is Done, Unlock is listed, and can be made.
+    finish(&app, "first").await;
+    let dep = read_json(&app, "/tdata/Orders('dep')").await;
+    assert_eq!(names(&dep, "@odata.actions"), ["Unlock"], "{dep}");
+    assert_eq!(names(&dep, "@temper.refused"), Vec::<String>::new());
+    let unlocked = make(&app, "dep", "Unlock", serde_json::json!({})).await;
+    assert_eq!(unlocked.0, StatusCode::OK, "{}", unlocked.1);
 }

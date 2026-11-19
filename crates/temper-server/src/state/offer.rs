@@ -117,17 +117,7 @@ impl ServerState {
             Err(error) => return unread(error.to_string()),
         };
         let record = &stored.current_state.state;
-        let mut refs: Vec<(String, String)> = Vec::new();
-        for rule in &table.rules {
-            if !actions.contains(&rule.name) || !starts_from(rule, &record.status) {
-                continue;
-            }
-            for reference in rule.guard.cross_refs() {
-                if !refs.contains(&reference) {
-                    refs.push(reference);
-                }
-            }
-        }
+        let refs = guard_refs(&table, &record.status, actions);
         let related = self
             .related_statuses_of(tenant, &table, refs, &record.fields)
             .await;
@@ -152,6 +142,137 @@ impl ServerState {
             })
             .collect()
     }
+
+    /// The moves `security_ctx` could make now on the record `body` holds,
+    /// an entity body as a read returns it, and those it could not: what a
+    /// read tells its reader beside the record (`@odata.actions`).
+    ///
+    /// Only the moves that start from the record's status are answered; a
+    /// move that starts elsewhere is in neither list. Each is decided in a
+    /// dispatch's order: Cedar on the record's attributes as a dispatch
+    /// builds them, then the state and the guard, with the statuses of the
+    /// related records the guard reads resolved from the record's own
+    /// references. A guard that reads the caller's parameters is decided by
+    /// its parts that read none.
+    ///
+    /// `None` when `entity_type` has no spec in `tenant` or `body` has no
+    /// status: there are no moves to speak of.
+    ///
+    /// Cost: one Cedar evaluation per move that starts from the status, and
+    /// one status lookup for each related record the guards of the moves
+    /// Cedar lets through read, from the status cache when it holds it. The
+    /// record itself is not read again and nothing is written.
+    pub(crate) async fn moves_of_record(
+        &self,
+        tenant: &TenantId,
+        security_ctx: &SecurityContext,
+        entity_type: &str,
+        entity_id: &str,
+        body: &Value,
+    ) -> Option<RecordMoves> {
+        let table = self
+            .registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_table(tenant, entity_type)?;
+        let status = body.get("status").and_then(Value::as_str)?;
+        let starting: Vec<String> = table
+            .caller_moves()
+            .into_iter()
+            .filter(|action| table.starts_from(action, status))
+            .map(str::to_string)
+            .collect();
+        let mut moves = RecordMoves::default();
+        if starting.is_empty() {
+            return Some(moves);
+        }
+        let no_fields = Value::Object(Default::default());
+        let fields = body.get("fields").unwrap_or(&no_fields);
+        let denied: Vec<Option<String>> = match self
+            .build_authz_resource_attrs(tenant, entity_type, entity_id, status, fields)
+            .await
+        {
+            Ok(attrs) => starting
+                .iter()
+                .map(|action| {
+                    self.authorize_offer_with_context(
+                        security_ctx,
+                        action,
+                        entity_type,
+                        &attrs,
+                        tenant.as_str(),
+                    )
+                    .err()
+                    .map(|denial| denial.to_string())
+                })
+                .collect(),
+            // Nothing is offered on attributes Cedar could not be given.
+            Err(why) => {
+                let why = format!("{entity_type} '{entity_id}' could not be put to Cedar: {why}");
+                starting.iter().map(|_| Some(why.clone())).collect()
+            }
+        };
+        let let_through: Vec<String> = starting
+            .iter()
+            .zip(&denied)
+            .filter(|(_, denial)| denial.is_none())
+            .map(|(action, _)| action.clone())
+            .collect();
+        // The record's values under every kind the body keeps them by.
+        let mut values: BTreeMap<String, Value> = BTreeMap::new();
+        for part in ["fields", "counters", "booleans", "lists"] {
+            if let Some(held) = body.get(part).and_then(Value::as_object) {
+                values.extend(
+                    held.iter()
+                        .map(|(name, value)| (name.clone(), value.clone())),
+                );
+            }
+        }
+        let mut ctx = table.stored_context(&values);
+        let refs = guard_refs(&table, status, &let_through);
+        if !refs.is_empty() {
+            ctx.related = self.related_statuses_of(tenant, &table, refs, fields).await;
+        }
+        for (action, denial) in starting.into_iter().zip(denied) {
+            match denial {
+                Some(why) => moves.refused.push((action, why, None)),
+                None => match refusal(&table, status, &ctx, &action) {
+                    Some((why, refusal)) => moves.refused.push((action, why, Some(refusal))),
+                    None => moves.possible.push(action),
+                },
+            }
+        }
+        Some(moves)
+    }
+}
+
+/// The moves of one record for its reader ([`ServerState::moves_of_record`]),
+/// each list in the spec's order.
+#[derive(Debug, Default)]
+pub(crate) struct RecordMoves {
+    /// The moves the reader could make now.
+    pub(crate) possible: Vec<String>,
+    /// The moves that start from the record's status and the reader could
+    /// not make now: the move, why, and the typed refusal when the record's
+    /// guard is why (none when Cedar is).
+    pub(crate) refused: Vec<(String, String, Option<Refusal>)>,
+}
+
+/// The related records `(type, id field)` whose statuses the guards of
+/// `actions` read, for the rules that start from `status`.
+fn guard_refs(table: &TransitionTable, status: &str, actions: &[String]) -> Vec<(String, String)> {
+    let mut refs: Vec<(String, String)> = Vec::new();
+    for rule in &table.rules {
+        if !actions.contains(&rule.name) || !starts_from(rule, status) {
+            continue;
+        }
+        for reference in rule.guard.cross_refs() {
+            if !refs.contains(&reference) {
+                refs.push(reference);
+            }
+        }
+    }
+    refs
 }
 
 /// Whether `rule` starts from `status`: a rule that names no state starts
