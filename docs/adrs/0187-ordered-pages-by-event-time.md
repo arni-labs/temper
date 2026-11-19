@@ -159,6 +159,14 @@ equality columns would sort every match. The check now holds a statement that
 names its index to that index, and an index's column list stops at its first
 expression column (no `= ?` can supply an expression).
 
+The check also showed what the new indexes cost elsewhere: with them, turso_core
+0.7.2 planned the catalog row delete (`DELETE FROM entity_catalog WHERE tenant =
+?1 AND entity_type = ?2 AND entity_id = ?3`) as a search of an event-time index
+by tenant and type, reading every row of the type to delete one. That statement
+now names the primary-key index, as the store's other keyed catalog writes
+already do. The other catalog statements were compared on the same database
+before and after: none searches by fewer columns than before.
+
 ## Consequences
 
 ### Positive

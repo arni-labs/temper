@@ -7,7 +7,8 @@ use super::*;
 use temper_odata::query::types::parse_query_options;
 use temper_runtime::persistence::{MISSING_EVENT_TIME_KEY, event_time_key};
 
-const ROWS: usize = 240;
+/// Large enough that two of the three statuses (220 rows) pass the budget.
+const ROWS: usize = 330;
 const STATUSES: [&str; 3] = ["Open", "Done", "Held"];
 const BUDGET: QueryPlaneReadBudget = QueryPlaneReadBudget {
     default_page_size: 20,

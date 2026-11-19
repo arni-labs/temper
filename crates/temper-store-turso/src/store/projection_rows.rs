@@ -193,8 +193,12 @@ pub(super) async fn remove_projection(
     tx: &Transaction<'_>,
     [tenant, entity_type, entity_id]: [&str; 3],
 ) -> Result<(), PersistenceError> {
+    // Named: with the event-time indexes (`schema/event_time_order.rs`) the
+    // engine otherwise searches one of them by tenant and type alone, reading
+    // every row of the type to delete one (`driver/plan_check.rs`).
     tx.execute(
-        "DELETE FROM entity_catalog WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
+        "DELETE FROM entity_catalog INDEXED BY sqlite_autoindex_entity_catalog_1 \
+         WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
         params![tenant, entity_type, entity_id],
     )
     .await
