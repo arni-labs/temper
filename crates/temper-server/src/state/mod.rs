@@ -16,6 +16,7 @@ mod file_reads;
 mod file_writes;
 mod host_metrics;
 pub mod metrics;
+pub(crate) mod offer;
 pub mod pending_decisions;
 mod persistence;
 pub mod policy_suggestions;
@@ -34,6 +35,7 @@ pub(crate) mod wasm_log_pruner;
 pub(crate) mod write_record;
 
 pub use admission::{AdmissionController, AdmissionOutcome, AdmissionPermit};
+pub(crate) use dispatch::OverdueTimer;
 pub(crate) use dispatch::authorized_http_endpoint_host;
 #[cfg(feature = "observe")]
 pub(crate) use dispatch::internal_http_capability_issuer;
