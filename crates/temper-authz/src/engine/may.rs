@@ -136,7 +136,11 @@ type ByRequest<T> = Arc<Mutex<HashMap<(String, String), T>>>;
 /// [`SendAnalysis::may`].
 #[derive(Debug, Clone)]
 pub struct SendAnalysis {
-    policies: Vec<(Effect, Json)>,
+    /// Shared by every clone, so a policy's parts keep their place for as
+    /// long as `patterns` names them.
+    policies: Arc<[(Effect, Json)]>,
+    /// Each `like` pattern of `policies`, printed once.
+    patterns: Arc<request::Patterns>,
     /// The kinds found for each set of questions: the proofs of one app ask
     /// the same ones again ([`SendAnalysis::outside_kinds`]).
     kinds: Arc<Mutex<HashMap<String, Vec<Answered>>>>,
@@ -148,6 +152,14 @@ pub struct SendAnalysis {
     /// a request ([`SendAnalysis::may_request`]): the proofs of one app ask
     /// the same ones again.
     someone: ByRequest<bool>,
+    /// What the policies test of a sender, read once: every partition
+    /// starts from it.
+    tests: Arc<kinds::Tests>,
+    /// Every attribute name the policies read; None when a policy may read
+    /// any ([`SendAnalysis::reads_attr`]).
+    attrs: Option<Arc<BTreeSet<String>>>,
+    /// Each policy as [`SendAnalysis::fitting`] gives it, printed once.
+    texts: Arc<[String]>,
 }
 
 impl SendAnalysis {
@@ -165,9 +177,26 @@ impl SendAnalysis {
                 let json = policy.to_json().unwrap_or(Json::Null);
                 (policy.effect(), json)
             })
+            .collect::<Arc<[_]>>();
+        let patterns = Arc::new(request::Patterns::read(&policies));
+        let tests = Arc::new(kinds::Tests::read(&policies));
+        let attrs = (!policies.iter().any(|(_, policy)| policy.is_null())).then(|| {
+            let mut names = BTreeSet::new();
+            for (_, policy) in policies.iter() {
+                json::attr_names(policy, &mut names);
+            }
+            Arc::new(names)
+        });
+        let texts = policies
+            .iter()
+            .map(|(effect, policy)| format!("{effect:?} {policy}"))
             .collect();
         Ok(Self {
             policies,
+            patterns,
+            tests,
+            attrs,
+            texts,
             kinds: Arc::default(),
             scoped: Arc::default(),
             someone: Arc::default(),
@@ -199,6 +228,7 @@ impl SendAnalysis {
                 resource_type,
                 record,
                 cause,
+                patterns: &self.patterns,
             };
             decide(scoped.iter().map(|&at| {
                 let (effect, policy) = &self.policies[at];
@@ -234,6 +264,7 @@ impl SendAnalysis {
                     resource_type,
                     record: &BTreeMap::new(),
                     cause: None,
+                    patterns: &self.patterns,
                 };
                 (0..self.policies.len())
                     .filter(|&at| fits.scope_fits(&self.policies[at].1))
@@ -256,6 +287,7 @@ impl SendAnalysis {
             resource_type,
             record: &record,
             cause: None,
+            patterns: &self.patterns,
         };
         let mut applicable: Vec<String> = self
             .scoped(action, resource_type)
@@ -275,10 +307,7 @@ impl SendAnalysis {
         let mut fitting: Vec<String> = self
             .scoped(action, resource_type)
             .iter()
-            .map(|&at| {
-                let (effect, policy) = &self.policies[at];
-                format!("{effect:?} {policy}")
-            })
+            .map(|&at| self.texts[at].clone())
             .collect();
         fitting.sort();
         fitting
@@ -288,9 +317,7 @@ impl SendAnalysis {
     /// record, the context or the principal. A policy with no JSON form
     /// (template-linked) may read anything.
     pub fn reads_attr(&self, name: &str) -> bool {
-        self.policies
-            .iter()
-            .any(|(_, policy)| policy.is_null() || json::names_attr(policy, name))
+        self.attrs.as_ref().is_none_or(|names| names.contains(name))
     }
 
     /// Whether some policy can tell a move in a timer's chain from the same
@@ -306,7 +333,7 @@ impl SendAnalysis {
     /// ([`compared`]).
     pub fn compared(&self) -> Vec<Vec<Read>> {
         let mut found = Vec::new();
-        for (_, policy) in &self.policies {
+        for (_, policy) in self.policies.iter() {
             compared::comparisons(&policy["conditions"], &mut found);
         }
         found

@@ -14,8 +14,8 @@ use serde_json::Value as Json;
 
 use super::super::json::single;
 use super::super::profile::UNKNOWN;
-use super::super::request::{Results, TRUE};
-use super::{Asker, May, Place, Profile, Question, Test, ask, facts, place};
+use super::super::request::{Leaves, Patterns, Request, Results, TRUE};
+use super::{Asker, May, Place, Profile, Question, Test, facts, place};
 
 /// What one policy leaves of a question for one kind.
 #[derive(Clone)]
@@ -48,18 +48,19 @@ pub(super) struct Classes {
 
 impl Classes {
     pub(super) fn read(
-        policies: &[(Effect, Json)],
+        (policies, patterns): (&[(Effect, Json)], &Patterns),
         questions: &[Question<'_>],
         candidates: &[Vec<usize>],
     ) -> Self {
         let none = BTreeMap::new();
         let anyone = Asker::Outside;
         let mut numbers: HashMap<String, usize> = HashMap::new();
+        let leaves = Leaves::default();
         let of = questions
             .iter()
             .zip(candidates)
             .map(|(question, candidates)| {
-                let request = ask(&anyone, &UNKNOWN, question, &none);
+                let request = ask((&anyone, patterns), &UNKNOWN, question, &none);
                 candidates
                     .iter()
                     .map(|&at| {
@@ -69,7 +70,7 @@ impl Classes {
                         // that leaves the same: no part the question
                         // decides is read again.
                         let conditions = request
-                            .residual(policy, &|_| false)
+                            .residual(policy, &|_| false, &leaves)
                             .unwrap_or_else(|| policy["conditions"].to_string());
                         let action = if conditions.contains(r#"{"Var":"action"}"#) {
                             question.action
@@ -197,4 +198,23 @@ pub(super) fn reads_of(profile: &Profile, reads: &BTreeSet<Test>, whole: bool) -
         ));
     }
     text
+}
+
+/// `question` as `asker`, of whom `profile` is known, asks it of a record
+/// of which `record` is known.
+pub(super) fn ask<'a>(
+    (asker, patterns): (&'a Asker, &'a Patterns),
+    profile: &'a Profile,
+    question: &'a Question<'_>,
+    record: &'a BTreeMap<String, super::super::Attr>,
+) -> Request<'a> {
+    Request {
+        patterns,
+        asker,
+        profile,
+        action: question.action,
+        resource_type: question.resource_type,
+        record,
+        cause: Some(&question.cause),
+    }
 }

@@ -12,6 +12,9 @@ use sender::fact_equal;
 
 mod attribute;
 mod residual;
+pub(super) use patterns::Patterns;
+pub(super) use residual::Leaves;
+mod patterns;
 mod sender;
 use super::{Asker, Attr, Cause};
 
@@ -119,6 +122,8 @@ enum Val<'e> {
 
 pub(super) struct Request<'a> {
     pub(super) asker: &'a Asker,
+    /// The `like` patterns of the policies asked, printed.
+    pub(super) patterns: &'a Patterns,
     /// What is known of the sender, when it is someone outside.
     pub(super) profile: &'a Profile,
     pub(super) action: &'a str,
@@ -282,7 +287,8 @@ impl<'a> Request<'a> {
                     string: Some(false),
                     ..
                 } => ERROR,
-                Val::Other { like, .. } => match like.get(&at(arg, "pattern").to_string()) {
+                Val::Other { like, .. } => match like.get(&*self.patterns.text(at(arg, "pattern")))
+                {
                     Some(matches) => Results::of(*matches),
                     None => ANY,
                 },

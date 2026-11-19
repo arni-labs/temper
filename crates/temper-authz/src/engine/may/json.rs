@@ -1,5 +1,7 @@
 //! Reading the JSON form of Cedar policies and values.
 
+use std::collections::BTreeSet;
+
 use serde_json::Value as Json;
 
 /// `value[key]`: Null when `value` is not an object or lacks `key`. Read by
@@ -86,14 +88,16 @@ pub(super) fn like(text: &str, pattern: &[Json]) -> bool {
     matched[text.len()]
 }
 
-/// Whether `expr` reads or tests an attribute named `name`.
-pub(super) fn names_attr(expr: &Json, name: &str) -> bool {
+/// Every name an `attr` in `expr` reads.
+pub(super) fn attr_names(expr: &Json, names: &mut BTreeSet<String>) {
     match expr {
         Json::Object(fields) => {
-            fields.get("attr").and_then(Json::as_str) == Some(name)
-                || fields.values().any(|value| names_attr(value, name))
+            if let Some(name) = fields.get("attr").and_then(Json::as_str) {
+                names.insert(name.to_string());
+            }
+            fields.values().for_each(|value| attr_names(value, names));
         }
-        Json::Array(items) => items.iter().any(|item| names_attr(item, name)),
-        _ => false,
+        Json::Array(items) => items.iter().for_each(|item| attr_names(item, names)),
+        _ => {}
     }
 }
