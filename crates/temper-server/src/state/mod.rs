@@ -16,6 +16,7 @@ mod file_reads;
 mod file_writes;
 mod host_metrics;
 pub mod metrics;
+pub(crate) mod offer;
 pub mod pending_decisions;
 mod persistence;
 pub mod policy_suggestions;

@@ -301,6 +301,34 @@ fn render_guard_failure(action: &str, from_state: &str, failure: &GuardFailure) 
     msg
 }
 
+/// What a move the table rejects answers with, as a message and as typed
+/// data: the failing part of its guard when one failed, otherwise that no
+/// rule for it starts from `status`. A move that is made and the answer to
+/// whether it could be made (`crate::state::offer`) both say it with this.
+pub(crate) fn move_refusal(
+    table: &TransitionTable,
+    action: &str,
+    status: &str,
+    guard_failure: Option<GuardFailure>,
+) -> (String, Refusal) {
+    match guard_failure {
+        Some(failure) => (
+            render_guard_failure(action, status, &failure),
+            Refusal::GuardFailed {
+                guard: failure.expr,
+                conditions: failure.conditions,
+            },
+        ),
+        None => (
+            format!("Action '{action}' not valid from state '{status}'"),
+            Refusal::InvalidState {
+                state: status.to_string(),
+                from: table.source_states(action),
+            },
+        ),
+    }
+}
+
 /// Process an action with the related entities' statuses resolved.
 ///
 /// Same as [`process_action`] but with the related entities' statuses the
@@ -465,25 +493,11 @@ pub(crate) fn process_action_with_xref_and_field_mode(
         // field/ref, and required-vs-found so an in-session agent can
         // self-heal. A from-state miss carries no guard failure and keeps the
         // generic message. Both carry the same facts as a typed refusal.
-        Some(rejected) => match rejected.guard_failure {
-            Some(failure) => ProcessResult::refused_with(
-                render_guard_failure(action, &state.status, &failure),
-                Some(Refusal::GuardFailed {
-                    guard: failure.expr,
-                    conditions: failure.conditions,
-                }),
-            ),
-            None => ProcessResult::refused_with(
-                format!(
-                    "Action '{}' not valid from state '{}'",
-                    action, state.status
-                ),
-                Some(Refusal::InvalidState {
-                    state: state.status.clone(),
-                    from: table.source_states(action),
-                }),
-            ),
-        },
+        Some(rejected) => {
+            let (message, refusal) =
+                move_refusal(table, action, &state.status, rejected.guard_failure);
+            ProcessResult::refused_with(message, Some(refusal))
+        }
         None => ProcessResult::refused(format!("Unknown action: {}", action)),
     }
 }

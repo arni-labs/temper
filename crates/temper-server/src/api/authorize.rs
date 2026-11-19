@@ -8,6 +8,7 @@ use temper_runtime::scheduler::sim_now;
 use tracing::instrument;
 
 use crate::authz::require_authenticated_context;
+use crate::state::offer::OnSnapshot;
 use crate::state::{ServerState, TrajectoryEntry, TrajectorySource};
 
 /// One record snapshot, shared by all its requested moves.
@@ -49,16 +50,23 @@ pub(crate) enum AuthorizeRequest {
     Single(AuthorizeSingle),
 }
 
-/// Ask Cedar without requesting a move. A question is a read and writes
-/// nothing: no decision, denial pattern or trajectory row, however many
-/// records and moves a page asks about. Each answer is counted as
-/// `check:offer` in `temper_cedar_evaluations_total`, apart from the
-/// `check:gate` refusals of requests, and stays visible as the authz wide
+/// Ask whether moves could be made, without requesting one. A question is a
+/// read and writes nothing: no decision, denial pattern or trajectory row,
+/// however many records and moves a page asks about.
+///
+/// A move is allowed when the record's state and the move's guard let it be
+/// made (the check every move goes through, see [`crate::state::offer`]) and
+/// Cedar lets this principal make it. A move its state or guard rules out
+/// answers with the refusal a dispatch of it would get. Each Cedar answer is
+/// counted as `check:offer` in `temper_cedar_evaluations_total`, apart from
+/// the `check:gate` refusals of requests, and stays visible as the authz wide
 /// event every check emits.
 ///
 /// Each record's caller-supplied snapshot is decoded once and shared across its
-/// actions, exactly as for the original single check. Cost: one Cedar evaluation
-/// per pair, zero store reads and zero writes.
+/// actions; a move whose guard reads another record is decided on the stored
+/// record instead, as a dispatch decides it. Cost: at most one Cedar evaluation
+/// per pair and zero writes; one read of a record only when an asked move's
+/// guard reads another record, plus one status lookup per such record.
 /// There is no item-count cap: the router's request-body byte limit bounds input.
 /// These are offers against a snapshot, not grants; dispatch authorizes again.
 #[instrument(skip_all, fields(otel.name = "POST /api/authorize"))]
@@ -117,19 +125,57 @@ pub(crate) async fn handle_authorize(
         };
         // Caller context cannot replace the canonical Cedar UID.
         attrs.insert("id".to_string(), serde_json::json!(record.resource_id));
-        let mut actions = Vec::with_capacity(record.actions.len());
-        for action in record.actions {
-            let reason = state
-                .authorize_offer_with_context(
+        // A move the snapshot's state or guard rules out is refused whoever
+        // asks, so Cedar is asked only about the moves it could make.
+        let on_snapshot =
+            state.offers_on_snapshot(tenant, &record.resource_type, &attrs, &record.actions);
+        // A guard that reads another record is decided on the stored record.
+        let reads_related: Vec<String> = record
+            .actions
+            .iter()
+            .zip(&on_snapshot)
+            .filter(|(_, says)| matches!(says, OnSnapshot::ReadsRelated))
+            .map(|(action, _)| action.clone())
+            .collect();
+        let mut on_stored = if reads_related.is_empty() {
+            Vec::new()
+        } else {
+            state
+                .offers_on_stored(
+                    tenant,
                     security_ctx,
-                    &action,
                     &record.resource_type,
-                    &attrs,
-                    tenant.as_str(),
+                    &record.resource_id,
+                    &reads_related,
                 )
-                .err()
-                .map(|denial| denial.to_string());
-            actions.push(serde_json::json!({"action": action, "allowed": reason.is_none(), "reason": reason}));
+                .await
+        }
+        .into_iter();
+        let mut actions = Vec::with_capacity(record.actions.len());
+        for (action, says) in record.actions.into_iter().zip(on_snapshot) {
+            let (reason, refusal) = match says {
+                OnSnapshot::Refused(message, refusal) => (Some(message), Some(refusal)),
+                // One stored answer per such move; a missing one offers nothing.
+                OnSnapshot::ReadsRelated => on_stored.next().unwrap_or_else(|| {
+                    (Some("the stored record gave no answer".to_string()), None)
+                }),
+                OnSnapshot::Free => (
+                    state
+                        .authorize_offer_with_context(
+                            security_ctx,
+                            &action,
+                            &record.resource_type,
+                            &attrs,
+                            tenant.as_str(),
+                        )
+                        .err()
+                        .map(|denial| denial.to_string()),
+                    None,
+                ),
+            };
+            actions.push(serde_json::json!({
+                "action": action, "allowed": reason.is_none(), "reason": reason, "refusal": refusal
+            }));
         }
         answers.push(serde_json::json!({
             "resource_type": record.resource_type, "resource_id": record.resource_id, "actions": actions
