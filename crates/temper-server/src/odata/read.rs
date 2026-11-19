@@ -36,7 +36,7 @@ use super::stream_fast_path::{file_link_response, try_file_stream_fast_path};
 use crate::blobs::{BlobHydrationBudget, hydrate_blob_refs_for_tenant_with_budget};
 use crate::query_eval::{expand_entity, select_fields};
 use crate::response::{ODataResponse, ODataStreamResponse, ODataXmlResponse, odata_error};
-use crate::state::ServerState;
+use crate::state::{OverdueTimer, ServerState};
 use crate::storage::{QueryFieldIndexOrder, QueryFieldIndexOrderDirection};
 
 /// Recursively resolve an OData path to its parent entity's
@@ -526,6 +526,17 @@ async fn enrich_entity_response(
     context: ReadContext<'_>,
 ) {
     annotate_moves(context, entity_type, entity_set, entity_key, body).await;
+    let timeouts = timeout_actions(context, entity_type);
+    let overdue = match timeouts.get(status_of(body)) {
+        Some(_) => {
+            context
+                .state
+                .overdue_state_timer(context.tenant, entity_type, entity_key)
+                .await
+        }
+        None => None,
+    };
+    annotate_overdue(body, &timeouts, overdue.as_ref());
     let registry = context
         .state
         .registry
@@ -556,6 +567,60 @@ async fn enrich_entity_response(
             "@odata.children".to_string(),
             serde_json::Value::Object(children),
         );
+    }
+}
+
+/// An entity body's status, or "" when it has none.
+fn status_of(body: &serde_json::Value) -> &str {
+    body.get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
+/// The action each timed state of `entity_type` fires when its time runs
+/// out (`[[state_timeout]]`), by state.
+fn timeout_actions(
+    context: ReadContext<'_>,
+    entity_type: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let registry = context
+        .state
+        .registry
+        .read()
+        .expect("registry lock should not be poisoned"); // ci-ok: infallible lock
+    registry
+        .get_tenant(context.tenant)
+        .and_then(|tenant| tenant.entities.get(entity_type))
+        .map(|spec| {
+            spec.automaton
+                .state_timeouts
+                .iter()
+                .map(|timeout| (timeout.state.clone(), timeout.on_timeout.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Write `@temper.overdue` on an entity body: null, or, when the record sits
+/// in a timed state and its timer is past due, the action that should have
+/// run, when it was due and how many seconds ago that was
+/// ([`ServerState::overdue_state_timer`]). The kernel says it from its own
+/// timer rows, so a reader computes no clock of its own.
+fn annotate_overdue(
+    body: &mut serde_json::Value,
+    timeouts: &std::collections::BTreeMap<String, String>,
+    overdue: Option<&OverdueTimer>,
+) {
+    let told = match (timeouts.get(status_of(body)), overdue) {
+        (Some(action), Some(overdue)) => serde_json::json!({
+            "action": action,
+            "due_at": overdue.due_at,
+            "late_seconds": overdue.late_seconds,
+        }),
+        _ => serde_json::Value::Null,
+    };
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("@temper.overdue".to_string(), told);
     }
 }
 
@@ -875,11 +940,19 @@ async fn handle_entity_set(
     let mut result = read_result.entities;
     if with_moves {
         let context = ReadContext::new(state, tenant, security_ctx, hydration_budget);
+        // One read of the timers past due for the page, when the type has any.
+        let timeouts = timeout_actions(context, &entity_type);
+        let overdue = if timeouts.is_empty() {
+            Default::default()
+        } else {
+            state.overdue_state_timers(tenant, &entity_type).await
+        };
         for entity in &mut result {
             let Some(id) = entity_id_from_body(entity).map(str::to_string) else {
                 continue;
             };
             annotate_moves(context, &entity_type, name, &id, entity).await;
+            annotate_overdue(entity, &timeouts, overdue.get(&id));
         }
         if let Some(select) = query_options.select.as_deref() {
             result = select_fields(result, select);

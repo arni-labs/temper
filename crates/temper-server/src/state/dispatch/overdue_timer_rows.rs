@@ -123,6 +123,104 @@ impl ServerState {
     }
 }
 
+/// A record's state timer past its due time, as a read says it
+/// (`@temper.overdue`): the timer should have fired and has not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OverdueTimer {
+    /// When the timer was due, RFC 3339 in UTC.
+    pub(crate) due_at: String,
+    /// How long ago that was, in whole seconds.
+    pub(crate) late_seconds: u64,
+}
+
+impl ServerState {
+    /// The record's state timer, when its row is past due now. It reads the
+    /// row, as the gauge of rows past due does
+    /// ([`Self::record_overdue_timer_rows`]), so a row no process armed, or
+    /// whose fire never landed, is told too; a repeating timer waiting for
+    /// its next look is not late.
+    ///
+    /// `None` when the record has no timer row, the row is not yet due, or
+    /// it could not be read (logged).
+    ///
+    /// Cost: one read of the record's timer row.
+    pub(crate) async fn overdue_state_timer(
+        &self,
+        tenant: &temper_runtime::tenant::TenantId,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Option<OverdueTimer> {
+        let row = self
+            .stored_state_timer_row(tenant, entity_type, entity_id)
+            .await
+            .ok()
+            .flatten()?;
+        let timer = TimerRef::State {
+            tenant: tenant.to_string(),
+            entity_type: entity_type.to_string(),
+            entity_id: entity_id.to_string(),
+        };
+        self.late(&timer, row.due_at.as_deref()?, sim_now())
+    }
+
+    /// The state timers of `entity_type`'s records that are past due now, by
+    /// record id, as [`Self::overdue_state_timer`] tells one: for a page of
+    /// records, one read of the due-time index and not one per record.
+    /// Empty when the rows could not be read (logged).
+    pub(crate) async fn overdue_state_timers(
+        &self,
+        tenant: &temper_runtime::tenant::TenantId,
+        entity_type: &str,
+    ) -> std::collections::BTreeMap<String, OverdueTimer> {
+        let now = sim_now();
+        let Some(store) = self.timer_rows_for_tenant(tenant.as_str()).await else {
+            return Default::default();
+        };
+        let rows = match store
+            .overdue_timer_rows(tenant.as_str(), &now.to_rfc3339())
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(tenant = %tenant, entity_type, %error,
+                    "timer rows past due not readable for a read");
+                return Default::default();
+            }
+        };
+        rows.state_timers
+            .iter()
+            .filter(|row| row.entity_type == entity_type)
+            .filter_map(|row| {
+                let timer = TimerRef::State {
+                    tenant: tenant.to_string(),
+                    entity_type: row.entity_type.clone(),
+                    entity_id: row.entity_id.clone(),
+                };
+                Some((row.entity_id.clone(), self.late(&timer, &row.due_at, now)?))
+            })
+            .collect()
+    }
+
+    /// How late `timer` is at `now`, when its row says it was due at
+    /// `row_due` and that has passed: due when this process armed it for,
+    /// when that is later, as [`Self::past_due`] counts it. `None` when it
+    /// is not late or `row_due` cannot be read.
+    fn late(&self, timer: &TimerRef, row_due: &str, now: DateTime<Utc>) -> Option<OverdueTimer> {
+        let row_due = DateTime::parse_from_rfc3339(row_due)
+            .ok()?
+            .with_timezone(&Utc);
+        let due = self
+            .due_times
+            .armed_for(timer)
+            .map_or(row_due, |armed_for| armed_for.max(row_due));
+        let late = (now - due).to_std().ok()?;
+        Some(OverdueTimer {
+            due_at: due.to_rfc3339(),
+            late_seconds: late.as_secs(),
+        })
+    }
+}
+
 /// Write the due time on each row an older release wrote without one (or
 /// under another budget), so the gauge of timers past due sees it. An update
 /// only: a row whose timer fired and removed it meanwhile stays removed.

@@ -42,6 +42,22 @@ They describe the record as read. A move that is sent is decided again, so a
 listed move can still be refused when the record or a record it reads has
 changed since.
 
+## A timer past due
+
+The same read says when the record's state timer (`[[state_timeout]]`) should
+have fired and has not:
+
+```json
+"@temper.overdue": {"action": "Expire", "due_at": "2026-11-18T09:00:00+00:00", "late_seconds": 86412}
+```
+
+It is null when the record's state has no timer or the timer still has time
+left. The kernel says it from its own timer row, the row its gauge of timers
+past due reads (`temper_timer_rows_overdue`), so a row no process armed or
+whose fire never landed is told, and a repeating timer waiting for its next
+look is not late. A reader keeps no clock of its own and reads no history to
+know it.
+
 ## On list reads
 
 A list read carries no moves unless asked: every row would pay for them. The
@@ -51,7 +67,8 @@ custom query option `actions=true` asks for them:
 GET /tdata/Tasks?actions=true&$top=50
 ```
 
-Each row then carries the same two lists as a read of that entity. The option
+Each row then carries the same two lists and `@temper.overdue` as a read of
+that entity does. The option
 is carried by `@odata.nextLink` to the pages after. `$select` still shapes
 the rows: the moves are judged on the whole record before the selection is
 applied, so a read that selects two fields is answered about all of them.
@@ -64,6 +81,10 @@ lookup for each related record that the guards of the moves Cedar lets through
 read, from the status cache when it holds it. The record is not read again and
 nothing is written. A list read asked with `actions=true` reads whole rows
 even when it selects fields.
+
+For a record in a timed state, one read of its timer row; for a list page of a
+type with timed states, one read of the due-time index for the page. A type
+without `[[state_timeout]]` costs no read for it.
 
 `POST /api/authorize` ([authorize.md](authorize.md)) answers the same question
 for a caller that holds a record's values and no read of its own, and for a

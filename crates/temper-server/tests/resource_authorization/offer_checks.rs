@@ -741,3 +741,148 @@ forbid(principal, action == Action::"Claim", resource) when { resource.id == "ba
     let unlocked = make(&app, "dep", "Unlock", serde_json::json!({})).await;
     assert_eq!(unlocked.0, StatusCode::OK, "{}", unlocked.1);
 }
+
+/// A `Payment` waits a day in `Waiting`, then lapses back to `Open`.
+const DAY_TIMER: &str = r#"
+[automaton]
+name = "Payment"
+states = ["Open", "Waiting"]
+initial = "Open"
+allow_indefinite_states = ["Open"]
+
+[[action]]
+name = "Wait"
+kind = "input"
+from = ["Open"]
+to = "Waiting"
+
+[[action]]
+name = "Lapse"
+kind = "internal"
+from = ["Waiting"]
+to = "Open"
+
+[[state_timeout]]
+state = "Waiting"
+after_seconds = 86400
+on_timeout = "Lapse"
+"#;
+
+/// Give `state` the day-timer payments ([`DAY_TIMER`]), open to every caller.
+fn register_day_timer(state: &ServerState) {
+    use temper_server::registry::{EntityVerificationResult, VerificationStatus};
+    let csdl = include_str!("../../../../test-fixtures/specs/model.csdl.xml");
+    let mut registry = state.registry.write().unwrap();
+    registry.register_tenant(
+        TENANT,
+        temper_spec::csdl::parse_csdl(csdl).unwrap(),
+        csdl.to_string(),
+        &[("Payment", DAY_TIMER)],
+    );
+    registry.set_verification_status(
+        &TenantId::new(TENANT),
+        "Payment",
+        VerificationStatus::Completed(EntityVerificationResult {
+            all_passed: true,
+            levels: vec![],
+            verified_at: "2026-11-19T00:00:00Z".to_string(),
+        }),
+    );
+    drop(registry);
+    state
+        .authz
+        .reload_tenant_policies(TENANT, "permit(principal, action, resource);")
+        .unwrap();
+}
+
+/// A read says when a record's timer is past due, from the kernel's own
+/// timer row: the action that should have run, when it was due and how long
+/// ago. A record whose timer has time left says null, on a read of one and
+/// on a list row alike.
+#[tokio::test]
+async fn a_read_says_when_a_records_timer_is_past_due() {
+    use temper_runtime::persistence::StateTimerRecord;
+    let (first, store, temp) = state_with_turso("read-overdue-first").await;
+    register_day_timer(&first);
+    for id in ["late", "fresh"] {
+        first
+            .get_or_create_tenant_entity(
+                &TenantId::new(TENANT),
+                "Payment",
+                id,
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+    }
+    let app = build_router(first);
+    for id in ["late", "fresh"] {
+        let waited = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/tdata/Payments('{id}')/Temper.Wait"),
+                serde_json::json!({}),
+                TENANT,
+                "agent-1",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(waited.status(), StatusCode::OK, "{id}");
+    }
+    drop(app);
+
+    // `late`'s day ran out a day ago: its row as a timer that never fired
+    // leaves it.
+    let armed = store
+        .state_timer_row(TENANT, "Payment", "late")
+        .await
+        .expect("row reads")
+        .expect("Wait armed a timer row");
+    let started = chrono::Utc::now() - chrono::Duration::days(2);
+    let due = started + chrono::Duration::days(1);
+    store
+        .upsert_state_timer(&StateTimerRecord {
+            started_at: started.to_rfc3339(),
+            due_at: Some(due.to_rfc3339()),
+            ..armed
+        })
+        .await
+        .expect("row rewritten");
+
+    // Another process on the same store armed neither timer: the rows are
+    // all it has, as after a restart whose timers did not come back.
+    let mut second =
+        ServerState::from_registry(ActorSystem::new("read-overdue-second"), SpecRegistry::new());
+    second.data_dir = temp.path().join("data");
+    second.set_storage_stack(StorageStack::from_turso(store.clone()));
+    register_day_timer(&second);
+    let app = build_router(second);
+
+    let late = read_json(&app, "/tdata/Payments('late')").await;
+    let told = &late["@temper.overdue"];
+    assert_eq!(told["action"], "Lapse", "{late}");
+    let told_due = chrono::DateTime::parse_from_rfc3339(told["due_at"].as_str().unwrap()).unwrap();
+    assert_eq!(told_due.timestamp(), due.timestamp(), "{late}");
+    let seconds = told["late_seconds"].as_u64().unwrap();
+    assert!((86_400..86_400 + 600).contains(&seconds), "{late}");
+
+    let fresh = read_json(&app, "/tdata/Payments('fresh')").await;
+    assert_eq!(fresh["@temper.overdue"], serde_json::Value::Null, "{fresh}");
+
+    let plain = read_json(&app, "/tdata/Payments").await;
+    for row in plain["value"].as_array().unwrap() {
+        assert!(row.get("@temper.overdue").is_none(), "{row}");
+    }
+    let asked = read_json(&app, "/tdata/Payments?actions=true").await;
+    let rows = asked["value"].as_array().unwrap();
+    let row = |id: &str| {
+        let odata_id = format!("Payments('{id}')");
+        rows.iter()
+            .find(|row| row["@odata.id"] == odata_id.as_str())
+            .unwrap_or_else(|| panic!("a row for {id}: {asked}"))
+    };
+    assert_eq!(row("late")["@temper.overdue"]["action"], "Lapse");
+    assert_eq!(row("late")["@temper.overdue"]["due_at"], told["due_at"]);
+    assert_eq!(row("fresh")["@temper.overdue"], serde_json::Value::Null);
+}
