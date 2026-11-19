@@ -43,6 +43,14 @@ GET /tdata/Jobs?$orderby=last_event_at desc
 GET /tdata/Jobs?$filter=last_event_via eq 'timer'
 ```
 
+An order by `first_event_at` or `last_event_at`, with or without a filter on
+`entity_id` or `status`, is read from an index in both stores (ADR-0187). Such a
+list pages through `@odata.nextLink` to its last record however many there are,
+`$count=true` is one count in SQL, and a range filter on either time (`ge`, `gt`,
+`le`, `lt`, `eq`, against any UTC offset) narrows the read in SQL. The times
+order by instant, ties by `entity_id`; a record with no time sorts last
+ascending and first descending.
+
 These names are reserved: a spec cannot declare them as state or action
 parameters. Client-supplied values are removed by the existing kernel field
 sanitizer. Application fields such as `moved_at`, `moved_via`, and `moved_by` remain
