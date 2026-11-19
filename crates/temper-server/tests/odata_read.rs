@@ -4,6 +4,8 @@
 //! service document, and error responses via the axum router.
 
 mod common;
+#[path = "odata_read/event_time_pages.rs"]
+mod event_time_pages;
 #[path = "odata_read/filter_literals.rs"]
 mod filter_literals;
 #[path = "odata_read/list_context_owner.rs"]

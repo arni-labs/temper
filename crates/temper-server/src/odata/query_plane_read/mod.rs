@@ -15,17 +15,18 @@ pub(in crate::odata) use types::{
 };
 
 use super::authz::{LIST_ACTION, authorize_read};
+#[cfg(test)]
+use scan::native_candidate_page_plan;
 use scan::{
-    ScanCounters, budget_rejection, native_candidate_page_plan, read_from_source_cursor,
-    try_native_page_read,
+    ScanCounters, SqlKeyset, budget_rejection, read_from_source_cursor, try_native_page_read,
 };
 use types::{QueryPlaneCoverageReport, QueryPlaneFallbackReason, QueryPlaneReadStrategy};
 
-fn should_try_native_page_first(
-    request: &QueryPlaneReadRequest<'_>,
-    plan: &scan::NativeCandidatePagePlan,
-) -> bool {
-    plan.filter_pushdown && request.query_options.count != Some(true)
+/// The store's page answers the read before any id list is read when SQL
+/// narrows it: a filter pushed down, or none at all. Its order, keyset and
+/// count are then SQL's, with no scan budget (ADR-0187).
+fn should_try_native_page_first(plan: &scan::NativeCandidatePagePlan) -> bool {
+    plan.filter_pushdown || plan.unfiltered
 }
 
 /// ADR-0153: when the read's `$filter` is exactly a declared `[[key]]`, resolve
@@ -207,6 +208,16 @@ fn should_check_source_cursor_catalog_coverage(
 pub(in crate::odata) async fn read_entity_set_page(
     request: QueryPlaneReadRequest<'_>,
 ) -> Result<QueryPlaneReadResult, QueryPlaneReadError> {
+    read_entity_set_page_with(request, None).await
+}
+
+/// [`read_entity_set_page`] for a continuation whose keyset the store can
+/// resume in SQL. The request's `$filter` still carries the keyset, so every
+/// other path, and the in-memory recheck, narrows the same rows.
+pub(in crate::odata::query_plane_read) async fn read_entity_set_page_with(
+    request: QueryPlaneReadRequest<'_>,
+    keyset: Option<&SqlKeyset>,
+) -> Result<QueryPlaneReadResult, QueryPlaneReadError> {
     if let Err(response) = authorize_read(
         request.state,
         request.tenant,
@@ -219,7 +230,7 @@ pub(in crate::odata) async fn read_entity_set_page(
         return Err(QueryPlaneReadError::AuthorizationDenied(response));
     }
 
-    let native_plan = native_candidate_page_plan(&request);
+    let native_plan = scan::native_candidate_page_plan_after(&request, keyset);
     // ADR-0153 fast path: if the filter is exactly a declared `[[key]]` (the
     // shape behind the agents' 413: `Files?$filter=WorkspaceId eq … and Path eq …`),
     // probe `entity_key_index` for the one matching entity_id instead of listing the
@@ -255,7 +266,7 @@ pub(in crate::odata) async fn read_entity_set_page(
     let mut reconciling_exact_match_lag = false;
     if !keyed_authoritative_absent
         && let Some(plan) = native_plan.clone()
-        && should_try_native_page_first(&request, &plan)
+        && should_try_native_page_first(&plan)
     {
         let indexed_entity_ids = request
             .state

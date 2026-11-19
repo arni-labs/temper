@@ -1,56 +1,100 @@
 //! Native bounded query-page reads for the Postgres query projection.
+//!
+//! A page ordered by an event time orders by the expression
+//! [`event_time_key_sql`] gives, the one its index (migration 0029) is
+//! built on, and resumes a keyset continuation with a range on it instead
+//! of an `OFFSET` (ADR-0187).
 
-use temper_runtime::persistence::PersistenceError;
+use temper_runtime::persistence::{
+    CatalogOrderKey, EventTimeColumn, MISSING_EVENT_TIME_KEY, PersistenceError,
+    QueryFieldIndexPageQuery,
+};
 
 use crate::platform::{postgres_placeholders, storage_error};
 use crate::store::PostgresEventStore;
 
+/// The sort key of `column` on an `entity_catalog` row, compared byte by
+/// byte: the event time's text as the fixed-width
+/// `YYYY-MM-DDTHH:MM:SS.nnnnnnnnn`, or `MISSING_EVENT_TIME_KEY` without
+/// one. `first_event_at` is read from its column, which is what a catalog
+/// read shows (`selected_catalog.rs`).
+pub(crate) fn event_time_key_sql(column: EventTimeColumn) -> String {
+    let text = match column {
+        EventTimeColumn::First => "first_event_at",
+        EventTimeColumn::Last => "(state ->> 'last_event_at')",
+    };
+    format!(
+        "(COALESCE(substr({text}, 1, 19) || '.' || \
+         substr(rtrim(substr({text}, 21), 'Z') || '000000000', 1, 9), \
+         '{MISSING_EVENT_TIME_KEY}') COLLATE \"C\")"
+    )
+}
+
 impl PostgresEventStore {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "bounded projection page query boundary"
-    )]
+    /// Return a bounded page of entity IDs matching a translated query-plane
+    /// filter, and their count when asked.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the SQL fails, or when `page.after` does
+    /// not fit the page's order.
     pub async fn query_field_index_page(
         &self,
         tenant: &str,
         entity_type: &str,
-        where_clause: &str,
-        params: Vec<String>,
-        order_by: &[(String, bool)],
-        skip: usize,
-        top: usize,
-        include_count: bool,
+        page: &QueryFieldIndexPageQuery,
     ) -> Result<(Vec<String>, Option<usize>), PersistenceError> {
-        if top == 0 {
-            return Ok((Vec::new(), if include_count { Some(0) } else { None }));
+        let (conditions, condition_params) =
+            page.catalog_conditions(page.params.len() + 3, &event_time_key_sql)?;
+        let mut params = page.params.clone();
+        params.extend(condition_params);
+        let filter = format!("({}) AND {conditions}", page.where_clause);
+        let clause = postgres_placeholders(&filter, params.len() + 2);
+        if page.top == 0 {
+            let count = if page.include_count {
+                Some(
+                    self.query_field_index_count(tenant, entity_type, &clause, params)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            return Ok((Vec::new(), count));
         }
 
-        let clause = postgres_placeholders(where_clause, params.len() + 2);
-        let order_sql = postgres_query_field_order_sql(order_by);
-        let limit_param = params.len() + 3;
-        let offset_param = params.len() + 4;
+        let window_count = page.include_count && !page.uses_event_time();
         let sql = postgres_query_field_page_sql(
             self.schema.prefix(),
             &clause,
-            &order_sql,
-            limit_param,
-            offset_param,
-            include_count,
+            &postgres_query_field_order_sql(page),
+            params.len(),
+            page.skip > 0,
+            window_count,
         );
         let tagged_sql = crate::dbm::tag_sql(&sql);
-        if !include_count {
+        let limit = page.top.min(i64::MAX as usize) as i64;
+        let skip = page.skip.min(i64::MAX as usize) as i64;
+        if !window_count {
             let mut query = sqlx::query_scalar::<_, String>(tagged_sql.as_ref())
                 .bind(tenant)
                 .bind(entity_type);
             for param in params.iter().cloned() {
                 query = query.bind(param);
             }
-            query = query
-                .bind(top.min(i64::MAX as usize) as i64)
-                .bind(skip.min(i64::MAX as usize) as i64);
-
+            query = query.bind(limit);
+            if page.skip > 0 {
+                query = query.bind(skip);
+            }
             let entity_ids = query.fetch_all(self.pool()).await.map_err(storage_error)?;
-            return Ok((entity_ids, None));
+            let total_count = if page.include_count {
+                Some(
+                    self.query_field_index_count(tenant, entity_type, &clause, params)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            return Ok((entity_ids, total_count));
         }
 
         let mut query = sqlx::query_as::<_, (String, i64)>(tagged_sql.as_ref())
@@ -59,22 +103,19 @@ impl PostgresEventStore {
         for param in params.iter().cloned() {
             query = query.bind(param);
         }
-        query = query
-            .bind(top.min(i64::MAX as usize) as i64)
-            .bind(skip.min(i64::MAX as usize) as i64);
+        query = query.bind(limit);
+        if page.skip > 0 {
+            query = query.bind(skip);
+        }
 
         let rows = query.fetch_all(self.pool()).await.map_err(storage_error)?;
-        let total_count = if include_count {
-            if let Some((_, count)) = rows.first() {
-                Some((*count).max(0) as usize)
-            } else {
-                Some(
-                    self.query_field_index_count(tenant, entity_type, &clause, params)
-                        .await?,
-                )
-            }
+        let total_count = if let Some((_, count)) = rows.first() {
+            Some((*count).max(0) as usize)
         } else {
-            None
+            Some(
+                self.query_field_index_count(tenant, entity_type, &clause, params)
+                    .await?,
+            )
         };
         let entity_ids = rows
             .into_iter()
@@ -109,26 +150,35 @@ impl PostgresEventStore {
     }
 }
 
+/// The page's statement. `params` is how many filter, bound and keyset
+/// parameters follow the tenant and type; `LIMIT` comes next, then `OFFSET`
+/// only when the page skips rows.
 fn postgres_query_field_page_sql(
     schema: &str,
     clause: &str,
     order_sql: &str,
-    limit_param: usize,
-    offset_param: usize,
-    include_count: bool,
+    params: usize,
+    skips: bool,
+    window_count: bool,
 ) -> String {
-    let select = if include_count {
+    let select = if window_count {
         "entity_id, COUNT(*) OVER() AS total_count"
     } else {
         "entity_id"
     };
     let index_cte = field_index_cte(schema);
+    let limit_param = params + 3;
+    let offset = if skips {
+        format!(" OFFSET ${}", limit_param + 1)
+    } else {
+        String::new()
+    };
     format!(
         "{index_cte}SELECT {select} \
          FROM {schema}entity_catalog \
          WHERE tenant = $1 AND entity_type = $2 AND ({clause}) \
          ORDER BY {order_sql} \
-         LIMIT ${limit_param} OFFSET ${offset_param}"
+         LIMIT ${limit_param}{offset}"
     )
 }
 
@@ -145,35 +195,42 @@ pub(crate) fn field_index_cte(schema: &str) -> String {
     )
 }
 
-fn postgres_query_field_order_sql(order_by: &[(String, bool)]) -> String {
+fn postgres_query_field_order_sql(page: &QueryFieldIndexPageQuery) -> String {
     let mut clauses = Vec::new();
-    for (field_name, descending) in order_by {
-        let direction = if *descending { "DESC" } else { "ASC" };
-        let nulls = if *descending {
+    for (key, descending) in page.total_order() {
+        let direction = if descending { "DESC" } else { "ASC" };
+        let nulls = if descending {
             "NULLS FIRST"
         } else {
             "NULLS LAST"
         };
-        if field_name == "entity_id" || field_name == "Id" || field_name == "id" {
-            clauses.push(format!("entity_id {direction}"));
-        } else if field_name == "status" || field_name == "Status" {
-            clauses.push(format!("status {direction} {nulls}"));
-        } else {
-            let field = postgres_string_literal(field_name);
-            clauses.push(format!(
-                "CASE WHEN jsonb_typeof(fields -> {field}) = 'number' \
-                 THEN (fields ->> {field})::numeric END {direction} {nulls}"
-            ));
-            clauses.push(format!(
-                "CASE WHEN jsonb_typeof(fields -> {field}) <> 'number' \
-                 THEN fields ->> {field} END {direction} {nulls}"
-            ));
+        match key {
+            CatalogOrderKey::EntityId => clauses.push(format!("entity_id {direction}")),
+            CatalogOrderKey::Status => clauses.push(format!("status {direction} {nulls}")),
+            // Never null, so the index's own null order is never asked for.
+            CatalogOrderKey::EventTime(column) => {
+                clauses.push(format!("{} {direction}", event_time_key_sql(column)));
+            }
+            CatalogOrderKey::Field(field_name) => {
+                let field = postgres_string_literal(field_name);
+                clauses.push(format!(
+                    "CASE WHEN jsonb_typeof(fields -> {field}) = 'number' \
+                     THEN (fields ->> {field})::numeric END {direction} {nulls}"
+                ));
+                clauses.push(format!(
+                    "CASE WHEN jsonb_typeof(fields -> {field}) <> 'number' \
+                     THEN fields ->> {field} END {direction} {nulls}"
+                ));
+            }
         }
     }
-    clauses.push("entity_id ASC".to_string());
     clauses.join(", ")
 }
 
 fn postgres_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
+
+#[cfg(test)]
+#[path = "query_page_test.rs"]
+mod tests;

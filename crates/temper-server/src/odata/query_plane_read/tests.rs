@@ -25,6 +25,7 @@ mod equality_delta;
 mod equality_delta_postgres;
 mod equality_probe;
 mod event_metadata;
+mod event_time_pages;
 mod keyed_existence;
 mod paging;
 mod proof;
@@ -109,7 +110,7 @@ fn scan_candidate_budget_matches_existing_odata_cap() {
 }
 
 #[test]
-fn native_catalog_coverage_short_circuit_requires_pushdown_without_count() {
+fn the_native_page_answers_first_when_sql_narrows_the_read() {
     let state = build_order_state("query-plane-native-coverage-short-circuit");
     let tenant = TenantId::default();
     let security_ctx = SecurityContext::system();
@@ -137,12 +138,9 @@ fn native_catalog_coverage_short_circuit_requires_pushdown_without_count() {
         },
     };
     let filtered_plan = native_candidate_page_plan(&filtered_request).expect("native plan");
+    assert!(should_try_native_page_first(&filtered_plan));
 
-    assert!(should_try_native_page_first(
-        &filtered_request,
-        &filtered_plan
-    ));
-
+    // A count is one SQL count, so it no longer sends the read to the id list.
     let count_options = QueryOptions {
         count: Some(true),
         ..filtered_options.clone()
@@ -152,10 +150,14 @@ fn native_catalog_coverage_short_circuit_requires_pushdown_without_count() {
         ..filtered_request
     };
     let count_plan = native_candidate_page_plan(&count_request).expect("native count plan");
-    assert!(!should_try_native_page_first(&count_request, &count_plan));
+    assert!(should_try_native_page_first(&count_plan));
 
     let unfiltered_options = QueryOptions {
         top: Some(1),
+        orderby: Some(vec![OrderByClause {
+            property: "last_event_at".to_string(),
+            direction: OrderDirection::Desc,
+        }]),
         ..QueryOptions::default()
     };
     let unfiltered_request = QueryPlaneReadRequest {
@@ -163,10 +165,25 @@ fn native_catalog_coverage_short_circuit_requires_pushdown_without_count() {
         ..count_request
     };
     let unfiltered_plan = native_candidate_page_plan(&unfiltered_request).expect("native plan");
-    assert!(!should_try_native_page_first(
-        &unfiltered_request,
-        &unfiltered_plan
-    ));
+    assert!(should_try_native_page_first(&unfiltered_plan));
+
+    // A filter SQL cannot narrow keeps the id list's budget proof first.
+    let unpushed_options = QueryOptions {
+        filter: Some(FilterExpr::BinaryOp {
+            left: Box::new(FilterExpr::Property("status".to_string())),
+            op: BinaryOperator::Ne,
+            right: Box::new(FilterExpr::Literal(ODataValue::String(
+                "Created".to_string(),
+            ))),
+        }),
+        ..unfiltered_options.clone()
+    };
+    let unpushed_request = QueryPlaneReadRequest {
+        query_options: &unpushed_options,
+        ..unfiltered_request
+    };
+    let unpushed_plan = native_candidate_page_plan(&unpushed_request).expect("native plan");
+    assert!(!should_try_native_page_first(&unpushed_plan));
 }
 
 #[test]

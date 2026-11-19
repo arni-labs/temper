@@ -3,6 +3,7 @@
 use crate::driver::params;
 use temper_runtime::persistence::{
     EventMetadata, EventStore, PersistenceAppend, PersistenceEnvelope, PersistenceError,
+    QueryFieldIndexOrder, QueryFieldIndexOrderDirection, QueryFieldIndexPageQuery,
 };
 
 use super::{PublishedArtifactUpsert, QueryProjectionUpsert, TursoEventStore};
@@ -13,6 +14,7 @@ mod catalog_row_writes;
 mod commit_outcome;
 mod commit_transport;
 mod event_pages;
+mod event_time_pages;
 mod evolution_tenant;
 mod field_index_writes;
 mod first_event;
@@ -1006,6 +1008,24 @@ async fn query_projection_roundtrip_updates_catalog_and_field_index() {
     );
 }
 
+/// The newest `Sequence` of session `ss-bounded`, one row.
+fn sequence_page(include_count: bool) -> QueryFieldIndexPageQuery {
+    QueryFieldIndexPageQuery {
+        where_clause: "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 \
+             AND field_name = ?3 AND field_value = ?4)"
+            .to_string(),
+        params: vec!["SessionId".to_string(), "ss-bounded".to_string()],
+        order_by: vec![QueryFieldIndexOrder {
+            field_name: "Sequence".to_string(),
+            direction: QueryFieldIndexOrderDirection::Desc,
+        }],
+        top: 1,
+        include_count,
+        ..QueryFieldIndexPageQuery::default()
+    }
+}
+
 #[tokio::test]
 async fn query_field_index_page_orders_and_limits_inside_turso() {
     let store = make_store("query-field-index-page").await;
@@ -1041,18 +1061,7 @@ async fn query_field_index_page_orders_and_limits_inside_turso() {
     }
 
     let (ids, count) = store
-        .query_field_index_page(
-            &tenant,
-            entity_type,
-            "entity_id IN (SELECT entity_id FROM entity_field_index \
-             WHERE tenant = ?1 AND entity_type = ?2 \
-             AND field_name = ?3 AND field_value = ?4)",
-            vec!["SessionId".to_string(), "ss-bounded".to_string()],
-            &[("Sequence".to_string(), true)],
-            0,
-            1,
-            true,
-        )
+        .query_field_index_page(&tenant, entity_type, &sequence_page(true))
         .await
         .unwrap();
 
@@ -1060,18 +1069,7 @@ async fn query_field_index_page_orders_and_limits_inside_turso() {
     assert_eq!(count, Some(3));
 
     let (ids, count) = store
-        .query_field_index_page(
-            &tenant,
-            entity_type,
-            "entity_id IN (SELECT entity_id FROM entity_field_index \
-             WHERE tenant = ?1 AND entity_type = ?2 \
-             AND field_name = ?3 AND field_value = ?4)",
-            vec!["SessionId".to_string(), "ss-bounded".to_string()],
-            &[("Sequence".to_string(), true)],
-            0,
-            1,
-            false,
-        )
+        .query_field_index_page(&tenant, entity_type, &sequence_page(false))
         .await
         .unwrap();
 
@@ -1104,18 +1102,7 @@ async fn query_field_index_page_orders_and_limits_inside_turso() {
         .unwrap();
 
     let (ids, count) = store
-        .query_field_index_page(
-            &tenant,
-            entity_type,
-            "entity_id IN (SELECT entity_id FROM entity_field_index \
-             WHERE tenant = ?1 AND entity_type = ?2 \
-             AND field_name = ?3 AND field_value = ?4)",
-            vec!["SessionId".to_string(), "ss-bounded".to_string()],
-            &[("Sequence".to_string(), true)],
-            0,
-            1,
-            true,
-        )
+        .query_field_index_page(&tenant, entity_type, &sequence_page(true))
         .await
         .unwrap();
 

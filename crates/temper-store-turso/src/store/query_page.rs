@@ -1,9 +1,29 @@
 //! Native query-plane page reads over the durable Turso catalog.
+//!
+//! A page ordered by an event time names the index that holds that order
+//! (`schema/event_time_order.rs`), so it reads its rows in order and stops
+//! after `LIMIT`: a keyset continuation seeks to the cursor in that index
+//! instead of passing over the earlier rows (ADR-0187).
 
-use temper_runtime::persistence::{PersistenceError, storage_error};
+use temper_runtime::persistence::{
+    CatalogOrderKey, PersistenceError, QueryFieldIndexPageQuery, storage_error,
+};
 use tracing::instrument;
 
 use super::TursoEventStore;
+use super::instrumentation::WriteConnection;
+use crate::schema::{create_event_time_indexes as event_time_indexes, event_time_key_sql};
+
+/// Create the catalog's event-time indexes. Building one evaluates its key
+/// for every existing row; a failure leaves reads of that order to sort in
+/// SQL, so it is reported and startup goes on.
+pub(super) async fn create_event_time_indexes(conn: &WriteConnection) {
+    for statement in event_time_indexes() {
+        if let Err(error) = conn.execute(&statement, ()).await {
+            tracing::error!(%error, statement, "event-time catalog index was not created");
+        }
+    }
+}
 
 impl TursoEventStore {
     /// Return a bounded page of entity IDs matching a translated query-plane filter.
@@ -11,10 +31,11 @@ impl TursoEventStore {
     /// The returned count is the storage candidate count, before Cedar row
     /// authorization. Server read code must still materialize and authorize
     /// rows before using the count as an OData result count.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "bounded projection page query boundary"
-    )]
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the SQL fails, or when `page.after` does
+    /// not fit the page's order.
     #[instrument(skip_all, fields(
         otel.name = "turso.query_field_index_page",
         tenant, entity_type,
@@ -23,39 +44,40 @@ impl TursoEventStore {
         &self,
         tenant: &str,
         entity_type: &str,
-        where_clause: &str,
-        params: Vec<String>,
-        order_by: &[(String, bool)],
-        skip: usize,
-        top: usize,
-        include_count: bool,
+        page: &QueryFieldIndexPageQuery,
     ) -> Result<(Vec<String>, Option<usize>), PersistenceError> {
-        if top == 0 {
-            return Ok((Vec::new(), if include_count { Some(0) } else { None }));
+        let (where_clause, params) = page_where(page)?;
+        if page.top == 0 {
+            let count = if page.include_count {
+                Some(
+                    self.query_field_index_count(tenant, entity_type, &where_clause, params)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            return Ok((Vec::new(), count));
         }
 
-        let conn = self.configured_connection().await?;
-        let order_sql = turso_query_field_order_sql(order_by);
-        let limit_param = params.len() + 3;
-        let offset_param = params.len() + 4;
-        let sql = turso_query_field_page_sql(
-            where_clause,
-            &order_sql,
-            limit_param,
-            offset_param,
-            include_count,
-        );
-
+        // A window count over a page in an index's order would sort every
+        // match by its key; a separate count reads only the filter.
+        let window_count = page.include_count && !page.uses_event_time();
+        let sql = turso_query_field_page_sql(page, &where_clause, params.len(), window_count);
         let mut all_params: Vec<crate::driver::Value> = vec![
             crate::driver::Value::from(tenant.to_string()),
             crate::driver::Value::from(entity_type.to_string()),
         ];
         all_params.extend(params.iter().cloned().map(crate::driver::Value::from));
-        all_params.push(crate::driver::Value::from(top.min(i64::MAX as usize) as i64));
         all_params.push(crate::driver::Value::from(
-            skip.min(i64::MAX as usize) as i64
+            page.top.min(i64::MAX as usize) as i64
         ));
+        if page.skip > 0 {
+            all_params.push(crate::driver::Value::from(
+                page.skip.min(i64::MAX as usize) as i64
+            ));
+        }
 
+        let conn = self.configured_connection().await?;
         let mut rows = conn
             .query(&sql, crate::driver::params_from_iter(all_params))
             .await
@@ -65,16 +87,16 @@ impl TursoEventStore {
         let mut total_count = None;
         while let Some(row) = rows.next().await.map_err(storage_error)? {
             let entity_id: String = row.get(0).map_err(storage_error)?;
-            if include_count && total_count.is_none() {
+            if window_count && total_count.is_none() {
                 let count: i64 = row.get(1).map_err(storage_error)?;
                 total_count = Some(count.max(0) as usize);
             }
             ids.push(entity_id);
         }
 
-        if include_count && total_count.is_none() {
+        if page.include_count && total_count.is_none() {
             total_count = Some(
-                self.query_field_index_count(tenant, entity_type, where_clause, params)
+                self.query_field_index_count(tenant, entity_type, &where_clause, params)
                     .await?,
             );
         }
@@ -114,62 +136,90 @@ impl TursoEventStore {
     }
 }
 
-fn turso_query_field_page_sql(
+/// The page's filter with its event-time bounds and keyset, and every
+/// parameter after the tenant and type (`?3` on).
+pub(super) fn page_where(
+    page: &QueryFieldIndexPageQuery,
+) -> Result<(String, Vec<String>), PersistenceError> {
+    let (conditions, condition_params) =
+        page.catalog_conditions(page.params.len() + 3, &event_time_key_sql)?;
+    let mut params = page.params.clone();
+    params.extend(condition_params);
+    Ok((format!("({}) AND {conditions}", page.where_clause), params))
+}
+
+/// The page's statement. `params` is how many filter, bound and keyset
+/// parameters follow the tenant and type; `LIMIT` comes next, then
+/// `OFFSET` only when the page skips rows.
+pub(super) fn turso_query_field_page_sql(
+    page: &QueryFieldIndexPageQuery,
     where_clause: &str,
-    order_sql: &str,
-    limit_param: usize,
-    offset_param: usize,
-    include_count: bool,
+    params: usize,
+    window_count: bool,
 ) -> String {
-    let select = if include_count {
+    let select = if window_count {
         "entity_id, COUNT(*) OVER() AS total_count"
     } else {
         "entity_id"
     };
-    let index = super::field_index::catalog_filter_index(where_clause);
+    let index = match page.leading_event_time() {
+        Some((column, descending)) => format!(
+            "INDEXED BY {} ",
+            crate::schema::event_time_index_name(column, descending)
+        ),
+        None => super::field_index::catalog_filter_index(where_clause).to_string(),
+    };
+    let order_sql = turso_query_field_order_sql(page);
+    let limit_param = params + 3;
+    let offset = if page.skip > 0 {
+        format!(" OFFSET ?{}", limit_param + 1)
+    } else {
+        String::new()
+    };
     format!(
         "SELECT {select} \
          FROM entity_catalog {index}\
          WHERE tenant = ?1 AND entity_type = ?2 AND ({where_clause}) \
          ORDER BY {order_sql} \
-         LIMIT ?{limit_param} OFFSET ?{offset_param}"
+         LIMIT ?{limit_param}{offset}"
     )
 }
 
-fn turso_query_field_order_sql(order_by: &[(String, bool)]) -> String {
+fn turso_query_field_order_sql(page: &QueryFieldIndexPageQuery) -> String {
     let mut clauses = Vec::new();
-    for (field_name, descending) in order_by {
-        let direction = if *descending { "DESC" } else { "ASC" };
-        let null_direction = if *descending { "DESC" } else { "ASC" };
-        if field_name == "entity_id" || field_name == "Id" || field_name == "id" {
-            clauses.push(format!("entity_id {direction}"));
-        } else if field_name == "status" || field_name == "Status" {
-            clauses.push(format!("status IS NULL {null_direction}"));
-            clauses.push(format!("status {direction}"));
-        } else {
-            let path = turso_json_path_literal(field_name);
-            clauses.push(format!(
-                "json_extract(fields, {path}) IS NULL {null_direction}"
-            ));
-            clauses.push(format!(
-                "CASE WHEN json_type(fields, {path}) IN ('integer', 'real') \
-                 THEN CAST(json_extract(fields, {path}) AS REAL) END IS NULL ASC"
-            ));
-            clauses.push(format!(
-                "CASE WHEN json_type(fields, {path}) IN ('integer', 'real') \
-                 THEN CAST(json_extract(fields, {path}) AS REAL) END {direction}"
-            ));
-            clauses.push(format!(
-                "CASE WHEN json_type(fields, {path}) NOT IN ('integer', 'real') \
-                 THEN json_extract(fields, {path}) END IS NULL ASC"
-            ));
-            clauses.push(format!(
-                "CASE WHEN json_type(fields, {path}) NOT IN ('integer', 'real') \
-                 THEN json_extract(fields, {path}) END {direction}"
-            ));
+    for (key, descending) in page.total_order() {
+        let direction = if descending { "DESC" } else { "ASC" };
+        match key {
+            CatalogOrderKey::EntityId => clauses.push(format!("entity_id {direction}")),
+            CatalogOrderKey::Status => {
+                clauses.push(format!("status IS NULL {direction}"));
+                clauses.push(format!("status {direction}"));
+            }
+            CatalogOrderKey::EventTime(column) => {
+                clauses.push(format!("{} {direction}", event_time_key_sql(column)));
+            }
+            CatalogOrderKey::Field(field_name) => {
+                let path = turso_json_path_literal(field_name);
+                clauses.push(format!("json_extract(fields, {path}) IS NULL {direction}"));
+                clauses.push(format!(
+                    "CASE WHEN json_type(fields, {path}) IN ('integer', 'real') \
+                     THEN CAST(json_extract(fields, {path}) AS REAL) END IS NULL ASC"
+                ));
+                clauses.push(format!(
+                    "CASE WHEN json_type(fields, {path}) IN ('integer', 'real') \
+                     THEN CAST(json_extract(fields, {path}) AS REAL) END {direction}"
+                ));
+                clauses.push(format!(
+                    "CASE WHEN json_type(fields, {path}) NOT IN ('integer', 'real') \
+                     THEN json_extract(fields, {path}) END IS NULL ASC"
+                ));
+                clauses.push(format!(
+                    "CASE WHEN json_type(fields, {path}) NOT IN ('integer', 'real') \
+                     THEN json_extract(fields, {path}) END {direction}"
+                ));
+            }
         }
     }
-    clauses.push("entity_id ASC".to_string());
     clauses.join(", ")
 }
 

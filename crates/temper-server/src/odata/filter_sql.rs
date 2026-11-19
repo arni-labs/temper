@@ -17,8 +17,10 @@ use std::collections::BTreeSet;
 use temper_odata::query::types::{BinaryOperator, FilterExpr, ODataValue, UnaryOperator};
 
 mod equality;
+mod event_time;
 
 pub(super) use equality::equality_field_predicates;
+pub(super) use event_time::split_event_time_bounds;
 
 const MAX_INDEXABLE_FIELD_VALUE_BYTES: usize = 2000;
 

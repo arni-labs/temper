@@ -11,14 +11,20 @@
 //! Canonical ordering = the request's `$orderby` clauses followed by `entity_id`
 //! ascending as a total-order tiebreaker (the id both the native SQL page and the
 //! in-memory sort already order by). The cursor records the ordering values of the
-//! last returned row; the next page keeps only rows that sort strictly after it,
-//! expressed as an ordinary `$filter` predicate so the existing read plan (native
-//! pushdown narrowing + in-memory re-check) honors it unchanged.
+//! last returned row; the next page keeps only rows that sort strictly after it.
 //!
-//! Null ordering matches the backends' `NULLS LAST` for ascending / `NULLS FIRST`
-//! for descending, which is also what the in-memory sort produces (present values
-//! sort before absent for ascending). The final `entity_id` key is never null, so
-//! the tuple comparison always resolves to a strict order between distinct rows.
+//! That keyset is always folded into the read's `$filter`, so every path narrows
+//! the same rows and the in-memory re-check honors it. When every ordering clause
+//! is a catalog key (`entity_id`, `status`, or an event time), the store also
+//! resumes it in SQL (ADR-0187): the page seeks to the cursor in an index and
+//! reads about `$top` rows however deep the continuation is.
+//!
+//! Absent values sort last ascending and first descending, which is what the
+//! in-memory sort produces for kernel event times (present values sort before
+//! absent for ascending). The stores give a record without an event time the key
+//! `MISSING_EVENT_TIME_KEY`, which sorts after every time, so SQL agrees. The
+//! final `entity_id` key is never null, so the tuple comparison always resolves
+//! to a strict order between distinct rows.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -26,10 +32,12 @@ use temper_odata::query::types::{
     BinaryOperator, FilterExpr, ODataValue, OrderByClause, OrderDirection, QueryOptions,
 };
 
-use super::scan;
+use temper_runtime::persistence::{CatalogOrderKey, MISSING_EVENT_TIME_KEY, event_time_key};
+
+use super::scan::{self, SqlKeyset};
 use super::{
     QueryPlaneReadBudget, QueryPlaneReadError, QueryPlaneReadRequest, QueryPlaneReadResult,
-    read_entity_set_page,
+    read_entity_set_page, read_entity_set_page_with,
 };
 use crate::query_eval::resolve_property;
 
@@ -278,6 +286,40 @@ fn literal_false() -> FilterExpr {
     }
 }
 
+/// The cursor as the keys the stores compare, one per clause of `order`, or
+/// `None` when a clause is not a catalog key the store can seek by. An event
+/// time is its instant's key and an absent one sorts as
+/// `MISSING_EVENT_TIME_KEY`; an id or a status is its text. `Id` and `id` are
+/// read from the record's body, which need not hold its id, so they fold.
+fn sql_keyset(cursor: &Cursor, order: &[OrderByClause]) -> Option<Vec<String>> {
+    if cursor.keys.len() != order.len() {
+        return None;
+    }
+    order
+        .iter()
+        .zip(&cursor.keys)
+        .map(
+            |(clause, key)| match CatalogOrderKey::of(&clause.property) {
+                CatalogOrderKey::EntityId if clause.property == ID_PROPERTY => key
+                    .value
+                    .as_str()
+                    .filter(|_| key.present)
+                    .map(str::to_string),
+                CatalogOrderKey::Status => key
+                    .value
+                    .as_str()
+                    .filter(|_| key.present)
+                    .map(str::to_string),
+                CatalogOrderKey::EventTime(_) if key.present => {
+                    key.value.as_str().and_then(event_time_key)
+                }
+                CatalogOrderKey::EventTime(_) => Some(MISSING_EVENT_TIME_KEY.to_string()),
+                CatalogOrderKey::EntityId | CatalogOrderKey::Field(_) => None,
+            },
+        )
+        .collect()
+}
+
 /// Combine a caller's optional `$filter` with the keyset predicate.
 fn and_filter(base: Option<FilterExpr>, keyset: FilterExpr) -> FilterExpr {
     match base {
@@ -293,7 +335,8 @@ fn and_filter(base: Option<FilterExpr>, keyset: FilterExpr) -> FilterExpr {
 /// an `@odata.nextLink`, and an incoming `$skiptoken` is honored by folding a
 /// keyset `$filter` predicate + canonical `$orderby` into the read so the
 /// existing plan (native narrowing + in-memory re-check) resumes exactly after
-/// the previous page. `$select` is applied here, after the continuation cursor is
+/// the previous page. The store also seeks to the cursor in SQL when it can
+/// ([`sql_keyset`]). `$select` is applied here, after the continuation cursor is
 /// taken, so a projected read returns the same entity set as the canonical read —
 /// only the field shape differs (ARN-97).
 pub(in crate::odata) async fn read_entity_set_from_query_plane(
@@ -308,15 +351,18 @@ pub(in crate::odata) async fn read_entity_set_from_query_plane(
 
     // Decode an incoming continuation, if any, into the keyset predicate that
     // resumes after the previous page's last row.
-    let resume_predicate = match query_options.skiptoken.as_deref() {
+    let (resume_predicate, sql_resume) = match query_options.skiptoken.as_deref() {
         Some(token) => {
             let cursor = decode_cursor(token).ok_or(QueryPlaneReadError::InvalidContinuation)?;
-            Some(
-                keyset_after_predicate(&cursor, &order)
-                    .ok_or(QueryPlaneReadError::InvalidContinuation)?,
-            )
+            let predicate = keyset_after_predicate(&cursor, &order)
+                .ok_or(QueryPlaneReadError::InvalidContinuation)?;
+            let sql_resume = sql_keyset(&cursor, &order).map(|after| SqlKeyset {
+                filter: query_options.filter.clone(),
+                after,
+            });
+            (Some(predicate), sql_resume)
         }
-        None => None,
+        None => (None, None),
     };
 
     // `$select` is applied again after the cursor is taken. A select-only read
@@ -400,7 +446,7 @@ pub(in crate::odata) async fn read_entity_set_from_query_plane(
         budget: page_budget,
         ..request
     };
-    let mut page_result = read_entity_set_page(page_request).await;
+    let mut page_result = read_entity_set_page_with(page_request, sql_resume.as_ref()).await;
     if let Some(count_result) = count_result {
         match &mut page_result {
             Ok(result) => {

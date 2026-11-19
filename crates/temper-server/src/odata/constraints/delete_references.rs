@@ -218,12 +218,12 @@ impl<'a> ReferenceFinder<'a> {
             .query_field_index_page(
                 self.tenant.as_str(),
                 &edge.from_entity,
-                &predicate.where_clause,
-                predicate.params,
-                &[],
-                0,
-                top,
-                false,
+                &crate::storage::QueryFieldIndexPageQuery {
+                    where_clause: predicate.where_clause,
+                    params: predicate.params,
+                    top,
+                    ..Default::default()
+                },
             )
             .await
         {

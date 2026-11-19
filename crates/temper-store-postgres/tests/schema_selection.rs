@@ -32,7 +32,9 @@ async fn store_uses_selected_schema_without_connection_search_path() {
     pool.close().await;
 }
 
-use temper_runtime::persistence::{EventMetadata, EventStore, PersistenceEnvelope};
+use temper_runtime::persistence::{
+    EventMetadata, EventStore, PersistenceEnvelope, QueryFieldIndexPageQuery,
+};
 
 fn envelope(value: &str) -> PersistenceEnvelope {
     PersistenceEnvelope {
@@ -174,12 +176,14 @@ async fn schemas_share_a_pool_without_sharing_data_or_changing_defaults() {
             .query_field_index_page(
                 "tenant",
                 "Counter",
-                clause,
-                vec!["color".into(), value.into()],
-                &[],
-                0,
-                10,
-                true,
+                &QueryFieldIndexPageQuery {
+                    where_clause: clause.to_string(),
+                    params: vec!["color".into(), value.into()],
+                    skip: 0,
+                    top: 10,
+                    include_count: true,
+                    ..QueryFieldIndexPageQuery::default()
+                },
             )
             .await
             .unwrap();
@@ -188,12 +192,14 @@ async fn schemas_share_a_pool_without_sharing_data_or_changing_defaults() {
             .query_field_index_page(
                 "tenant",
                 "Counter",
-                clause,
-                vec!["color".into(), value.into()],
-                &[],
-                10,
-                10,
-                true,
+                &QueryFieldIndexPageQuery {
+                    where_clause: clause.to_string(),
+                    params: vec!["color".into(), value.into()],
+                    skip: 10,
+                    top: 10,
+                    include_count: true,
+                    ..QueryFieldIndexPageQuery::default()
+                },
             )
             .await
             .unwrap();

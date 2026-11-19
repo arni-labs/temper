@@ -582,6 +582,7 @@ impl TursoEventStore {
         conn.execute(schema::CREATE_ENTITY_CATALOG_CHECKPOINT_INDEX, ())
             .await
             .map_err(storage_error)?;
+        query_page::create_event_time_indexes(&conn).await;
 
         // Entity field index — EAV table for OData filter push-down.
         conn.execute(schema::CREATE_ENTITY_FIELD_INDEX_TABLE, ())

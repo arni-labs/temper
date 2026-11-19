@@ -419,6 +419,27 @@ fn load_selected_entity_catalog_rows_pg_returns_sparse_json_values() {
     });
 }
 
+/// The first entry of session `ss-bounded` by `Sequence` descending.
+fn sequence_page(include_count: bool) -> temper_runtime::persistence::QueryFieldIndexPageQuery {
+    use temper_runtime::persistence::{
+        QueryFieldIndexOrder, QueryFieldIndexOrderDirection, QueryFieldIndexPageQuery,
+    };
+    QueryFieldIndexPageQuery {
+        where_clause: "entity_id IN (SELECT entity_id FROM entity_field_index \
+                       WHERE tenant = ?1 AND entity_type = ?2 \
+                       AND field_name = ?3 AND field_value = ?4)"
+            .to_string(),
+        params: vec!["SessionId".to_string(), "ss-bounded".to_string()],
+        order_by: vec![QueryFieldIndexOrder {
+            field_name: "Sequence".to_string(),
+            direction: QueryFieldIndexOrderDirection::Desc,
+        }],
+        top: 1,
+        include_count,
+        ..QueryFieldIndexPageQuery::default()
+    }
+}
+
 #[test]
 fn query_field_index_page_orders_and_limits_inside_postgres() {
     let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
@@ -461,18 +482,7 @@ fn query_field_index_page_orders_and_limits_inside_postgres() {
         }
 
         let (ids, count) = store
-            .query_field_index_page(
-                &tenant,
-                entity_type,
-                "entity_id IN (SELECT entity_id FROM entity_field_index \
-                 WHERE tenant = ?1 AND entity_type = ?2 \
-                 AND field_name = ?3 AND field_value = ?4)",
-                vec!["SessionId".to_string(), "ss-bounded".to_string()],
-                &[("Sequence".to_string(), true)],
-                0,
-                1,
-                true,
-            )
+            .query_field_index_page(&tenant, entity_type, &sequence_page(true))
             .await
             .unwrap();
 
@@ -480,18 +490,7 @@ fn query_field_index_page_orders_and_limits_inside_postgres() {
         assert_eq!(count, Some(3));
 
         let (ids, count) = store
-            .query_field_index_page(
-                &tenant,
-                entity_type,
-                "entity_id IN (SELECT entity_id FROM entity_field_index \
-                 WHERE tenant = ?1 AND entity_type = ?2 \
-                 AND field_name = ?3 AND field_value = ?4)",
-                vec!["SessionId".to_string(), "ss-bounded".to_string()],
-                &[("Sequence".to_string(), true)],
-                0,
-                1,
-                false,
-            )
+            .query_field_index_page(&tenant, entity_type, &sequence_page(false))
             .await
             .unwrap();
 
@@ -524,18 +523,7 @@ fn query_field_index_page_orders_and_limits_inside_postgres() {
             .unwrap();
 
         let (ids, count) = store
-            .query_field_index_page(
-                &tenant,
-                entity_type,
-                "entity_id IN (SELECT entity_id FROM entity_field_index \
-                 WHERE tenant = ?1 AND entity_type = ?2 \
-                 AND field_name = ?3 AND field_value = ?4)",
-                vec!["SessionId".to_string(), "ss-bounded".to_string()],
-                &[("Sequence".to_string(), true)],
-                0,
-                1,
-                true,
-            )
+            .query_field_index_page(&tenant, entity_type, &sequence_page(true))
             .await
             .unwrap();
 

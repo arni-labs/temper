@@ -3,7 +3,7 @@
 //! the storage boundary; no separate model of filtering/counting is involved.
 use super::*;
 use crate::storage::{
-    EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexPage, QueryPlaneStore,
+    EntityCatalogRow, QueryFieldIndexPage, QueryFieldIndexPageQuery, QueryPlaneStore,
     QueryProjectionFieldsRow,
 };
 use std::sync::Arc;
@@ -96,30 +96,15 @@ impl QueryPlaneStore for WriteBeforeCount {
         &self,
         tenant: &str,
         entity_type: &str,
-        where_clause: &str,
-        params: Vec<String>,
-        order_by: &[QueryFieldIndexOrder],
-        skip: usize,
-        top: usize,
-        include_count: bool,
+        page: &QueryFieldIndexPageQuery,
     ) -> Result<Option<QueryFieldIndexPage>, PersistenceError> {
-        if include_count && self.write_pending.swap(false, Ordering::SeqCst) {
+        if page.include_count && self.write_pending.swap(false, Ordering::SeqCst) {
             // All earlier completeness probes saw an indexed EUR. The write
             // removes that index entry without making the row match USD.
             write_projection(self.store.as_ref(), tenant, "ord-99", &self.replacement, 2).await;
         }
-        QueryPlaneStore::query_field_index_page(
-            self.store.as_ref(),
-            tenant,
-            entity_type,
-            where_clause,
-            params,
-            order_by,
-            skip,
-            top,
-            include_count,
-        )
-        .await
+        QueryPlaneStore::query_field_index_page(self.store.as_ref(), tenant, entity_type, page)
+            .await
     }
 
     async fn load_projection_fields_many(

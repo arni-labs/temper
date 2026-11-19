@@ -35,7 +35,9 @@ use crate::blobs::{BlobHydrationBudget, hydrate_blob_refs_for_tenant_with_budget
 use crate::query_eval::{expand_entity, select_fields};
 use crate::response::{ODataResponse, ODataStreamResponse, ODataXmlResponse, odata_error};
 use crate::state::ServerState;
-use crate::storage::{QueryFieldIndexOrder, QueryFieldIndexOrderDirection};
+use crate::storage::{
+    QueryFieldIndexOrder, QueryFieldIndexOrderDirection, QueryFieldIndexPageQuery,
+};
 
 /// Recursively resolve an OData path to its parent entity's
 /// (entity_type, entity_id, entity_set_name).
@@ -342,21 +344,18 @@ async fn try_resolve_composite_entity_key(
     let query_plane = state.query_plane_store()?;
     let filter = composite_key_filter(key_pairs)?;
     let translated = filter_sql::try_translate_candidate_filter(&filter)?;
-    let order_by = [QueryFieldIndexOrder {
-        field_name: "entity_id".to_string(),
-        direction: QueryFieldIndexOrderDirection::Asc,
-    }];
+    let page_query = QueryFieldIndexPageQuery {
+        where_clause: translated.where_clause,
+        params: translated.params,
+        order_by: vec![QueryFieldIndexOrder {
+            field_name: "entity_id".to_string(),
+            direction: QueryFieldIndexOrderDirection::Asc,
+        }],
+        top: 2,
+        ..QueryFieldIndexPageQuery::default()
+    };
     let page = match query_plane
-        .query_field_index_page(
-            tenant.as_str(),
-            entity_type,
-            &translated.where_clause,
-            translated.params,
-            &order_by,
-            0,
-            2,
-            false,
-        )
+        .query_field_index_page(tenant.as_str(), entity_type, &page_query)
         .await
     {
         Ok(Some(page)) => page,

@@ -1,7 +1,12 @@
 mod native;
+mod native_plan;
 mod read_source;
+mod uniform;
 
-pub(super) use native::{native_candidate_page_plan, try_native_page_read};
+pub(super) use native::try_native_page_read;
+#[cfg(test)]
+pub(super) use native_plan::native_candidate_page_plan;
+pub(super) use native_plan::{SqlKeyset, native_candidate_page_plan_after};
 pub(super) use read_source::read_from_source_cursor;
 
 use std::collections::{BTreeSet, HashMap};
@@ -20,13 +25,25 @@ use super::types::{
 };
 use crate::query_eval::apply_query_options;
 use crate::storage::QueryFieldIndexOrder;
+use temper_runtime::persistence::EventTimeBound;
 
 #[derive(Clone, Debug)]
 pub(super) struct NativeCandidatePagePlan {
     pub(super) where_clause: String,
     pub(super) params: Vec<String>,
+    /// Event-time conjuncts of the filter, compared in SQL (ADR-0187).
+    pub(super) event_time_bounds: Vec<EventTimeBound>,
     pub(super) order_by: Vec<QueryFieldIndexOrder>,
+    /// Start after a continuation's cursor in SQL: one key per clause of the
+    /// page's total order (ADR-0187). `None` on page one, and when the
+    /// continuation's keyset is folded into the filter instead.
+    pub(super) after: Option<Vec<String>>,
     pub(super) filter_pushdown: bool,
+    /// The read has no filter at all (a continuation's keyset is not one).
+    pub(super) unfiltered: bool,
+    /// The SQL predicate selects exactly the rows the filter does, so every
+    /// candidate matches and the store's count is the filter's count.
+    pub(super) filter_exact: bool,
     /// Fields whose absent index entries require candidate rechecking.
     pub(super) filter_missing_fields: Vec<String>,
 }

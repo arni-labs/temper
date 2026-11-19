@@ -338,16 +338,13 @@ fn evaluate_function(entity: &serde_json::Value, name: &str, args: &[FilterExpr]
 
 // Fixed UTC precision orders instants correctly, including a whole second
 // before a fractional second. This applies only to the kernel's typed clock.
+// It is the key the stores order and bound event times by (ADR-0187), so a
+// page read in memory and one read from SQL agree.
 fn normalize_event_time(value: serde_json::Value) -> serde_json::Value {
     value
         .as_str()
-        .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
-        .map(|time| {
-            serde_json::Value::String(
-                time.with_timezone(&chrono::Utc)
-                    .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-            )
-        })
+        .and_then(temper_runtime::persistence::event_time_key)
+        .map(serde_json::Value::String)
         .unwrap_or(value)
 }
 

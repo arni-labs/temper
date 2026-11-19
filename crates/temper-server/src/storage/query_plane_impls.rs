@@ -3,8 +3,8 @@ use temper_store_postgres::PostgresEventStore;
 use temper_store_turso::TursoEventStore;
 
 use super::{
-    CatalogGroup, CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder,
-    QueryFieldIndexOrderDirection, QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow,
+    CatalogGroup, CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexPage,
+    QueryFieldIndexPageQuery, QueryPlaneStore, QueryProjectionFieldsRow,
 };
 
 pub(super) fn catalog_freshness(
@@ -24,18 +24,6 @@ pub(super) fn catalog_freshness(
 /// is evidence only about the store's own journal.
 fn journal_is<T>(store: &T, journal: &super::BoxedEventStore) -> bool {
     std::ptr::addr_eq(store as *const T, std::sync::Arc::as_ptr(&journal.store))
-}
-
-pub(super) fn storage_order_by(order_by: &[QueryFieldIndexOrder]) -> Vec<(String, bool)> {
-    order_by
-        .iter()
-        .map(|order| {
-            (
-                order.field_name.clone(),
-                order.direction == QueryFieldIndexOrderDirection::Desc,
-            )
-        })
-        .collect()
 }
 
 #[async_trait::async_trait]
@@ -139,26 +127,10 @@ impl QueryPlaneStore for PostgresEventStore {
         &self,
         tenant: &str,
         entity_type: &str,
-        where_clause: &str,
-        params: Vec<String>,
-        order_by: &[QueryFieldIndexOrder],
-        skip: usize,
-        top: usize,
-        include_count: bool,
+        page: &QueryFieldIndexPageQuery,
     ) -> Result<Option<QueryFieldIndexPage>, PersistenceError> {
-        let order_by = storage_order_by(order_by);
-        let (entity_ids, total_count) = PostgresEventStore::query_field_index_page(
-            self,
-            tenant,
-            entity_type,
-            where_clause,
-            params,
-            &order_by,
-            skip,
-            top,
-            include_count,
-        )
-        .await?;
+        let (entity_ids, total_count) =
+            PostgresEventStore::query_field_index_page(self, tenant, entity_type, page).await?;
         Ok(Some(QueryFieldIndexPage {
             entity_ids,
             total_count,
@@ -351,26 +323,10 @@ impl QueryPlaneStore for TursoEventStore {
         &self,
         tenant: &str,
         entity_type: &str,
-        where_clause: &str,
-        params: Vec<String>,
-        order_by: &[QueryFieldIndexOrder],
-        skip: usize,
-        top: usize,
-        include_count: bool,
+        page: &QueryFieldIndexPageQuery,
     ) -> Result<Option<QueryFieldIndexPage>, PersistenceError> {
-        let order_by = storage_order_by(order_by);
-        let (entity_ids, total_count) = TursoEventStore::query_field_index_page(
-            self,
-            tenant,
-            entity_type,
-            where_clause,
-            params,
-            &order_by,
-            skip,
-            top,
-            include_count,
-        )
-        .await?;
+        let (entity_ids, total_count) =
+            TursoEventStore::query_field_index_page(self, tenant, entity_type, page).await?;
         Ok(Some(QueryFieldIndexPage {
             entity_ids,
             total_count,

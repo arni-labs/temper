@@ -417,7 +417,7 @@ fn native_plan_pushes_file_lookup_equalities_with_status_ne_recheck() {
         plan.params,
         vec!["Path", "/proofs/live.txt", "WorkspaceId", "ws-1"]
     );
-    assert!(should_try_native_page_first(&request, &plan));
+    assert!(should_try_native_page_first(&plan));
 }
 
 #[tokio::test]
@@ -787,12 +787,12 @@ async fn file_point_lookup_with_status_ne_uses_lossless_equality_candidates() {
         .query_field_index_page(
             tenant.as_str(),
             "Order",
-            &native_plan.where_clause,
-            native_plan.params.clone(),
-            &[],
-            0,
-            10,
-            false,
+            &temper_runtime::persistence::QueryFieldIndexPageQuery {
+                where_clause: native_plan.where_clause.clone(),
+                params: native_plan.params.clone(),
+                top: 10,
+                ..Default::default()
+            },
         )
         .await
         .expect("native candidate query should execute");

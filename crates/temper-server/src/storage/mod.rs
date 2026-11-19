@@ -62,7 +62,8 @@ pub use write_room::{STORAGE_FLOOR_BYTES, StorageRoom, WriteHealth};
 mod query_plane;
 pub use query_plane::{
     CatalogGroup, CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder,
-    QueryFieldIndexOrderDirection, QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow,
+    QueryFieldIndexOrderDirection, QueryFieldIndexPage, QueryFieldIndexPageQuery, QueryPlaneStore,
+    QueryProjectionFieldsRow,
 };
 pub(crate) use query_plane_read::{
     CatalogRowsLoad, load_catalog_rows_by_id, load_selected_catalog_rows_by_id,

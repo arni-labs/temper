@@ -73,7 +73,15 @@ pub(super) async fn check(conn: &turso::Connection, sql: &str) {
             .split(" AND ")
             .filter(|term| term.ends_with("=?"))
             .count();
+        // A statement that names the index this line reads has chosen it,
+        // for its order: a page read in an index's order stops after its
+        // `LIMIT`, where one by more `= ?` columns would sort every match.
+        // Its plan is held to that index alone.
+        let chosen = named_index(sql).filter(|index| uses_index(detail, index));
         for (index, columns) in indexes(conn, table).await {
+            if chosen.is_some_and(|chosen| chosen != index.as_str()) {
+                continue;
+            }
             let given = columns
                 .iter()
                 .take_while(|column| {
@@ -128,12 +136,49 @@ async fn indexes(conn: &turso::Connection, table: &str) -> Vec<(String, Vec<Stri
     }
     let mut out = Vec::new();
     for name in names {
-        let columns = rows(conn, &format!("PRAGMA index_info({name})"), 2)
-            .await
-            .unwrap_or_default();
-        out.push((name, columns));
+        out.push((name.clone(), leading_columns(conn, &name).await));
     }
     out
+}
+
+/// An index's columns in order, up to its first expression: no `column = ?`
+/// gives an expression, so the columns after it cannot be given either.
+async fn leading_columns(conn: &turso::Connection, index: &str) -> Vec<String> {
+    let Ok(mut info) = conn.query(&format!("PRAGMA index_info({index})"), ()).await else {
+        return Vec::new();
+    };
+    let mut columns = Vec::new();
+    while let Ok(Some(row)) = info.next().await {
+        match row.get_value(2) {
+            Ok(turso::Value::Text(column)) => columns.push(column),
+            _ => break,
+        }
+    }
+    columns
+}
+
+/// The index `sql` names with `INDEXED BY`, if one.
+fn named_index(sql: &str) -> Option<&str> {
+    let upper = sql.to_ascii_uppercase();
+    let at = find_word(&upper, "INDEXED")?;
+    let rest = sql[at + "INDEXED".len()..].trim_start();
+    let rest = rest
+        .get(..2)
+        .filter(|by| by.eq_ignore_ascii_case("BY"))
+        .map(|_| rest[2..].trim_start())?;
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    (end > 0).then(|| &rest[..end])
+}
+
+/// Whether the plan line `detail` reads through `index`.
+fn uses_index(detail: &str, index: &str) -> bool {
+    detail
+        .split_once("USING INDEX ")
+        .or_else(|| detail.split_once("USING COVERING INDEX "))
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        == Some(index)
 }
 
 /// From a plan line such as `SEARCH c USING INDEX i (tenant=? AND
@@ -273,6 +318,22 @@ mod tests {
             table_names("DELETE FROM entity_field_index WHERE tenant = ?").len(),
             1
         );
+    }
+
+    #[test]
+    fn a_statement_names_the_index_its_plan_line_reads() {
+        let sql = "SELECT entity_id FROM entity_catalog INDEXED BY idx_entity_catalog_last_event_desc \
+                   WHERE tenant = ?1 AND entity_type = ?2 AND (status = ?3)";
+        assert_eq!(named_index(sql), Some("idx_entity_catalog_last_event_desc"));
+        assert_eq!(named_index("SELECT 1 FROM t WHERE indexed = ?1"), None);
+        assert!(uses_index(
+            "SEARCH entity_catalog USING INDEX idx_entity_catalog_last_event_desc (tenant=? AND entity_type=?)",
+            "idx_entity_catalog_last_event_desc"
+        ));
+        assert!(!uses_index(
+            "SEARCH entity_catalog USING INDEX idx_entity_catalog_status (tenant=?)",
+            "idx_entity_catalog_last_event_desc"
+        ));
     }
 
     #[test]

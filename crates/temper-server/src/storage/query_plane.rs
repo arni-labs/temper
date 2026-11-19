@@ -3,6 +3,9 @@
 use std::collections::BTreeMap;
 
 use temper_runtime::persistence::{CatalogGroupRow, PersistenceError};
+pub use temper_runtime::persistence::{
+    QueryFieldIndexOrder, QueryFieldIndexOrderDirection, QueryFieldIndexPageQuery,
+};
 
 /// Backend-neutral projection row returned by [`QueryPlaneStore`].
 #[derive(Clone, Debug, PartialEq)]
@@ -10,24 +13,6 @@ pub struct QueryProjectionFieldsRow {
     pub entity_id: String,
     pub status: String,
     pub fields: BTreeMap<String, Option<String>>,
-}
-
-/// Sort direction for a storage-pushed query-field page.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QueryFieldIndexOrderDirection {
-    /// Ascending order.
-    Asc,
-    /// Descending order.
-    Desc,
-}
-
-/// One storage-pushed query-field page order clause.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueryFieldIndexOrder {
-    /// Projection field, `status`, or `entity_id` to order by.
-    pub field_name: String,
-    /// Sort direction.
-    pub direction: QueryFieldIndexOrderDirection,
 }
 
 /// Bounded page of entity IDs returned by the query projection.
@@ -193,20 +178,14 @@ pub trait QueryPlaneStore: Send + Sync {
         params: Vec<String>,
     ) -> Result<Option<Vec<String>>, PersistenceError>;
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "bounded projection page query boundary"
-    )]
+    /// One bounded page of the entity ids `page` selects, in its order and
+    /// after its keyset, with their count when asked. `None` when the backend
+    /// cannot read pages.
     async fn query_field_index_page(
         &self,
         _tenant: &str,
         _entity_type: &str,
-        _where_clause: &str,
-        _params: Vec<String>,
-        _order_by: &[QueryFieldIndexOrder],
-        _skip: usize,
-        _top: usize,
-        _include_count: bool,
+        _page: &QueryFieldIndexPageQuery,
     ) -> Result<Option<QueryFieldIndexPage>, PersistenceError> {
         Ok(None)
     }

@@ -3,10 +3,10 @@
 use temper_runtime::persistence::PersistenceError;
 use temper_store_turso::{TenantStoreRouter, TursoEventStore};
 
-use super::query_plane_impls::{catalog_freshness, storage_order_by};
+use super::query_plane_impls::catalog_freshness;
 use super::{
-    CatalogGroup, CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexPage,
-    QueryPlaneStore, QueryProjectionFieldsRow,
+    CatalogGroup, CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexPage,
+    QueryFieldIndexPageQuery, QueryPlaneStore, QueryProjectionFieldsRow,
 };
 
 #[async_trait::async_trait]
@@ -108,26 +108,11 @@ impl QueryPlaneStore for TenantStoreRouter {
         &self,
         tenant: &str,
         entity_type: &str,
-        where_clause: &str,
-        params: Vec<String>,
-        order_by: &[QueryFieldIndexOrder],
-        skip: usize,
-        top: usize,
-        include_count: bool,
+        page: &QueryFieldIndexPageQuery,
     ) -> Result<Option<QueryFieldIndexPage>, PersistenceError> {
         let store = self.store_for_tenant(tenant).await?;
-        let order_by = storage_order_by(order_by);
         let (entity_ids, total_count) = store
-            .query_field_index_page(
-                tenant,
-                entity_type,
-                where_clause,
-                params,
-                &order_by,
-                skip,
-                top,
-                include_count,
-            )
+            .query_field_index_page(tenant, entity_type, page)
             .await?;
         Ok(Some(QueryFieldIndexPage {
             entity_ids,
