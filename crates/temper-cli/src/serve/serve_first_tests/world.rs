@@ -28,6 +28,7 @@ use temper_server::storage::{PolicyStore, StorageStack};
 use temper_store_turso::TursoEventStore;
 
 use super::super::boot;
+use super::super::later::Later;
 use super::gate::{Gate, GatedPolicies};
 
 /// Time for work already under way to end: a request reaching the point
@@ -166,6 +167,18 @@ impl World {
         runtime
     }
 
+    /// A process's runtime on the real clock, its clock started: for a test
+    /// that talks to the server over a socket, where a paused clock would
+    /// jump past a wait for the network.
+    pub(super) fn live_process(&self) -> tokio::runtime::Runtime {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async { self.clock.begin() });
+        runtime
+    }
+
     /// End a process: its clock stops and every task it ran stops.
     pub(super) fn end(&self, runtime: tokio::runtime::Runtime) {
         runtime.block_on(async { self.clock.end() });
@@ -206,6 +219,17 @@ impl World {
     /// Boot a server on this world's store the way `temper serve` does,
     /// its policy reads going through `gate`. Returns once it would answer.
     pub(super) async fn boot(&self, gate: Arc<Gate>) -> PlatformState {
+        let (state, later) = self.restore(gate.clone()).await;
+        boot::start_serving(&state, later).await;
+        gate.serving();
+        state
+    }
+
+    /// Restore a server's own tenants on this world's store the way `temper
+    /// serve` does, its policy reads going through `gate`, up to the start of
+    /// its runtime ([`boot::start_serving`]). Returns the server and what it
+    /// leaves for after it serves.
+    pub(super) async fn restore(&self, gate: Arc<Gate>) -> (PlatformState, Later) {
         let mut stack = StorageStack::from_turso(
             TursoEventStore::new(&self.url(), None)
                 .await
@@ -232,9 +256,7 @@ impl World {
         boot::restore_own(&state, policy_seed, &[], &[], &mut later)
             .await
             .expect("restore the own tenants");
-        boot::start_serving(&state, later).await;
-        gate.serving();
-        state
+        (state, later)
     }
 }
 

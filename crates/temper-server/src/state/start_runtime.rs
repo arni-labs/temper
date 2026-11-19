@@ -1,4 +1,5 @@
-//! The one call every embedder makes to start a server's background work.
+//! The one call every embedder makes to start a server's background work, and
+//! whether the server is still starting.
 
 use std::sync::atomic::Ordering;
 
@@ -34,6 +35,32 @@ impl ServerState {
         self.due_times.start();
         self.spawn_carry_stranded(self.tenants_with_carries());
         Some(boot)
+    }
+
+    /// Mark this server starting: its embedder answers before its boot ends,
+    /// and holds every request but `/healthz` until [`Self::mark_serving`].
+    /// A server never marked starting has served since its embedder first
+    /// answered.
+    pub fn mark_starting(&self) {
+        self.starting.send_replace(true);
+    }
+
+    /// Mark this server serving: its runtime has started and its embedder's
+    /// boot has ended, so requests act on its records from now on.
+    pub fn mark_serving(&self) {
+        self.starting.send_replace(false);
+    }
+
+    /// Whether this server is still starting (see [`Self::mark_starting`]).
+    pub fn is_starting(&self) -> bool {
+        *self.starting.borrow()
+    }
+
+    /// Wait until this server is no longer starting.
+    pub async fn until_serving(&self) {
+        let mut serving = self.starting.subscribe();
+        // The sender lives in this server's state, so it outlives the wait.
+        let _ = serving.wait_for(|starting| !*starting).await;
     }
 
     /// Start the runtime of `tenant`, restored after this server serves (see

@@ -148,9 +148,23 @@ impl OtelGuard {
 /// When `LOGFIRE_TOKEN` is set, an `Authorization: Bearer <token>` header
 /// is injected into all OTLP exporters regardless of which endpoint is used.
 pub fn init_observability(service_name: &str) -> Option<OtelGuard> {
+    init_observability_with(service_name, None)
+}
+
+/// A tracing layer of the embedder's own, put on the subscriber first, so it
+/// sees every span the filter lets through, whether or not OTEL exports.
+pub type EmbedderLayer =
+    Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>;
+
+/// [`init_observability`], with `layer` on the subscriber too.
+pub fn init_observability_with(
+    service_name: &str,
+    layer: Option<EmbedderLayer>,
+) -> Option<OtelGuard> {
+    let mut layer = layer;
     let Some(config) = resolve_otel_config() else {
         eprintln!("OTEL export disabled: no endpoint configured.");
-        init_stderr_only();
+        stderr_only(layer);
         return None;
     };
 
@@ -162,7 +176,7 @@ pub fn init_observability(service_name: &str) -> Option<OtelGuard> {
     );
 
     let settings = ExportSettings::from_env();
-    match init_pipeline(&config.endpoint, service_name, &settings) {
+    match init_pipeline(&config.endpoint, service_name, &settings, &mut layer) {
         Ok(guard) => {
             tracing::info!(
                 endpoint = %config.endpoint,
@@ -175,7 +189,7 @@ pub fn init_observability(service_name: &str) -> Option<OtelGuard> {
         }
         Err(e) => {
             eprintln!("Failed to initialize OTEL: {e}");
-            init_stderr_only();
+            stderr_only(layer);
             None
         }
     }
@@ -190,13 +204,21 @@ pub fn init_tracing(
     endpoint: &str,
     service_name: &str,
 ) -> Result<OtelGuard, Box<dyn std::error::Error>> {
-    init_pipeline(endpoint, service_name, &ExportSettings::from_env())
+    init_pipeline(
+        endpoint,
+        service_name,
+        &ExportSettings::from_env(),
+        &mut None,
+    )
 }
 
+/// `layer` is taken when the subscriber is built, so a pipeline that fails
+/// before then leaves it for the stderr subscriber.
 fn init_pipeline(
     endpoint: &str,
     service_name: &str,
     settings: &ExportSettings,
+    layer: &mut Option<EmbedderLayer>,
 ) -> Result<OtelGuard, Box<dyn std::error::Error>> {
     let service_name = settings.service_name(service_name);
 
@@ -394,6 +416,7 @@ fn init_pipeline(
     };
 
     tracing_subscriber::registry()
+        .with(layer.take())
         .with(env_filter)
         .with(fmt_layer)
         .with(otel_trace_layer)
@@ -440,6 +463,10 @@ fn init_pipeline(
 /// Called when no OTLP endpoint is configured so `tracing::info!`
 /// calls still produce output to the terminal.
 pub fn init_stderr_only() {
+    stderr_only(None);
+}
+
+fn stderr_only(layer: Option<EmbedderLayer>) {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,hyper=warn,h2=warn"));
 
@@ -460,6 +487,7 @@ pub fn init_stderr_only() {
     };
 
     if let Err(e) = tracing_subscriber::registry()
+        .with(layer)
         .with(env_filter)
         .with(fmt_layer)
         .try_init()
