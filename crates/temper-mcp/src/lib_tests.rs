@@ -62,6 +62,7 @@ permit(principal == Agent::"operator", action == Action::"read", resource is Ord
 permit(principal == Agent::"operator", action == Action::"list", resource is Order);
 permit(principal == Agent::"operator", action == Action::"CancelOrder", resource is Order);
 permit(principal == Agent::"operator", action == Action::"read_specs", resource is Spec);
+permit(principal == Agent::"operator", action == Action::"manage_policies", resource == PolicySet::"demo");
 "#;
 
 /// Build a RuntimeContext pointing at a local port.
@@ -204,6 +205,7 @@ async fn register_test_operator(state: &PlatformState) {
     bootstrap_operator_credential(state, TEST_OPERATOR_KEY, TEST_TENANT)
         .await
         .expect("operator credential bootstrap should succeed");
+    decision::issue_test_agent_credential(state).await;
     state
         .server
         .authz
@@ -521,153 +523,6 @@ async fn execute_specs_returns_data() {
     );
 }
 
-/// End-to-end governance flow: agent denied -> get decision -> human approves
-/// directly (not via agent sandbox) -> agent retries -> success.
-#[tokio::test]
-#[ignore = "requires Cedar agent default-deny policy in test server setup"]
-async fn e2e_agent_denial_human_approve_retry() {
-    let (port, shutdown) = start_test_temper_server().await;
-
-    // Use agent identity so Cedar authorization applies (default-deny for agents).
-    let mut ctx = RuntimeContext::from_config(&McpConfig {
-        temper_port: Some(port),
-        temper_url: None,
-        agent_id: Some("checkout-bot".to_string()),
-        agent_type: Some("claude-code".to_string()),
-        session_id: None,
-        api_key: None,
-    })
-    .expect("ctx");
-
-    // Step 0: Create entity first (creation bypasses Cedar).
-    let response = rpc(
-        &mut ctx,
-        call_tool_request(
-            20,
-            "execute",
-            "return await temper.create('demo', 'Orders', {'id': 'agent-e2e-1', 'customer': 'Alice'})",
-        ),
-    )
-    .await;
-    let (_, is_error) = tool_text(&response);
-    assert!(
-        !is_error,
-        "create should succeed (no Cedar on create): {response:#}"
-    );
-
-    // Step 1: Agent tries a bound action — should be denied (403).
-    let response = rpc(
-        &mut ctx,
-        call_tool_request(
-            21,
-            "execute",
-            "return await temper.action('demo', 'Orders', 'agent-e2e-1', 'CancelOrder', {'Reason': 'test'})",
-        ),
-    )
-    .await;
-    let (text, is_error) = tool_text(&response);
-    assert!(
-        !is_error,
-        "agent action should return structured denial (not error): {response:#}"
-    );
-    assert!(
-        text.contains("authorization_denied"),
-        "should get structured authorization_denied status, got: {text}"
-    );
-    assert!(
-        text.contains("poll_decision"),
-        "denial response should mention poll_decision, got: {text}"
-    );
-
-    // Step 2: Agent lists ALL decisions (no status filter) to debug.
-    let response = rpc(
-        &mut ctx,
-        call_tool_request(22, "execute", "return await temper.get_decisions('demo')"),
-    )
-    .await;
-    let (text, is_error) = tool_text(&response);
-    assert!(!is_error, "get_decisions should succeed: {response:#}");
-    let decisions: Value = serde_json::from_str(text).expect("json");
-    let decisions_arr = decisions
-        .get("decisions")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("decisions should have 'decisions' array, got: {text}"));
-    assert!(
-        !decisions_arr.is_empty(),
-        "should have at least one pending decision"
-    );
-    let decision_id = decisions_arr[0]["id"]
-        .as_str()
-        .expect("decision should have id");
-    assert!(
-        decision_id.starts_with("PD-"),
-        "decision ID should start with PD-: {decision_id}"
-    );
-
-    // Step 2b: Verify agent cannot self-approve.
-    let approve_code = format!(
-        "return await temper.approve_decision('demo', '{}', 'broad')",
-        decision_id
-    );
-    let response = rpc(&mut ctx, call_tool_request(22, "execute", &approve_code)).await;
-    let (text, is_error) = tool_text(&response);
-    assert!(is_error, "approve_decision should be blocked: {response:#}");
-    assert!(
-        text.contains("not available to agents"),
-        "should get governance write blocked message, got: {text}"
-    );
-
-    // Step 3: Human approves directly via HTTP (simulating Observe UI / temper decide).
-    let http = reqwest::Client::new();
-    let approve_url =
-        format!("http://127.0.0.1:{port}/api/tenants/demo/decisions/{decision_id}/approve");
-    let approve_resp = http
-        .post(&approve_url)
-        .header("X-Temper-Principal-Kind", "admin")
-        .header("X-Temper-Principal-Id", "human-test")
-        .json(&json!({
-            "scope": {
-                "principal": "any_agent",
-                "action": "all_actions",
-                "resource": "any_resource",
-                "duration": "always"
-            },
-            "decided_by": "human-test"
-        }))
-        .send()
-        .await
-        .expect("approve request");
-    assert!(
-        approve_resp.status().is_success(),
-        "human approval should succeed: {:?}",
-        approve_resp.status()
-    );
-
-    // Step 4: Retry the action — should now succeed (Cedar policy was hot-loaded).
-    let response = rpc(
-        &mut ctx,
-        call_tool_request(
-            24,
-            "execute",
-            r#"
-result = await temper.action('demo', 'Orders', 'agent-e2e-1', 'CancelOrder', {'Reason': 'approved'})
-return result['status']
-"#,
-        ),
-    )
-    .await;
-
-    let _ = shutdown.send(());
-
-    let (text, is_error) = tool_text(&response);
-    assert!(
-        !is_error,
-        "retry action after human approval should succeed: {response:#}"
-    );
-    let parsed: Value = serde_json::from_str(text).expect("json");
-    assert_eq!(parsed, Value::String("Cancelled".to_string()));
-}
-
 #[test]
 fn format_authz_denied_with_decision_id() {
     let body = r#"{"decision_id":"PD-abc123","error":{"code":"AuthorizationDenied","message":"Authorization denied for AddItem on Order('order-123'). Decision PD-abc123 created."}}"#;
@@ -764,80 +619,6 @@ fn format_authz_denied_structured_json_without_decision() {
     assert!(
         poll_hint.contains("poll_decision"),
         "poll_hint should still mention poll_decision"
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires Cedar agent default-deny policy in test server setup"]
-async fn get_decision_status_returns_decision() {
-    let (port, shutdown) = start_test_temper_server().await;
-
-    // Use agent identity so Cedar authorization applies (default-deny for agents).
-    let mut ctx = RuntimeContext::from_config(&McpConfig {
-        temper_port: Some(port),
-        temper_url: None,
-        agent_id: Some("status-bot".to_string()),
-        agent_type: Some("claude-code".to_string()),
-        session_id: None,
-        api_key: None,
-    })
-    .expect("ctx");
-
-    // Create entity first (creation bypasses Cedar).
-    let response = rpc(
-        &mut ctx,
-        call_tool_request(
-            60,
-            "execute",
-            "return await temper.create('demo', 'Orders', {'id': 'status-test-1', 'customer': 'Bob'})",
-        ),
-    )
-    .await;
-    let (_, is_error) = tool_text(&response);
-    assert!(!is_error, "create should succeed: {response:#}");
-
-    // Agent tries an action -- should be denied.
-    let response = rpc(
-        &mut ctx,
-        call_tool_request(
-            61,
-            "execute",
-            "return await temper.action('demo', 'Orders', 'status-test-1', 'CancelOrder', {'Reason': 'test'})",
-        ),
-    )
-    .await;
-    let (text, is_error) = tool_text(&response);
-    assert!(!is_error, "should get structured denial: {response:#}");
-    let denial: Value = serde_json::from_str(text).expect("json");
-    let decision_id = denial["pending_decision"]
-        .as_str()
-        .or_else(|| denial["decision_id"].as_str())
-        .expect("should have decision ID");
-
-    // Use get_decision_status to check.
-    let status_code = format!(
-        "return await temper.get_decision_status('demo', '{}')",
-        decision_id
-    );
-    let response = rpc(&mut ctx, call_tool_request(62, "execute", &status_code)).await;
-
-    let _ = shutdown.send(());
-
-    let (text, is_error) = tool_text(&response);
-    assert!(
-        !is_error,
-        "get_decision_status should succeed: {response:#}"
-    );
-    let status_result: Value = serde_json::from_str(text).expect("json");
-    assert_eq!(
-        status_result["decision_id"].as_str().unwrap(), // ci-ok: test assertion
-        decision_id,
-        "should return the correct decision ID"
-    );
-    assert_eq!(
-        status_result["status"].as_str().unwrap(), // ci-ok: test assertion
-        "pending",
-        "status should be pending"
     );
 }
 
@@ -968,3 +749,6 @@ async fn amendment_tool_exposes_exact_edits_without_consent_argument() {
     assert_eq!(tool["inputSchema"]["properties"]["edits"]["maxItems"], 16);
     assert_eq!(tool["inputSchema"]["additionalProperties"], false);
 }
+
+#[path = "decision_test.rs"]
+mod decision;
