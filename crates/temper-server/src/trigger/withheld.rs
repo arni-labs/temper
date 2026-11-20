@@ -145,6 +145,7 @@ impl Reaction {
             "reaction refused"
         );
         let why = match &response.refusal {
+            _ if response.state.is_tombstoned() => "missing",
             Some(temper_jit::table::Refusal::InvalidState { .. }) if !target_existed => "missing",
             Some(temper_jit::table::Refusal::InvalidState { .. }) => "state",
             Some(temper_jit::table::Refusal::GuardFailed { .. }) => "guard",

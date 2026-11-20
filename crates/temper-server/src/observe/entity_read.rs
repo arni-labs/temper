@@ -88,7 +88,9 @@ pub(super) fn authorize_entity_state(
     entity_id: &str,
     entity: &EntityResponse,
 ) -> Result<(), StatusCode> {
-    if entity.state.status == "Deleted" {
+    // Only a record the kernel deleted is not found; a spec state named
+    // `Deleted` is a state like any other.
+    if entity.state.is_tombstoned() {
         return Err(StatusCode::NOT_FOUND);
     }
     let body =

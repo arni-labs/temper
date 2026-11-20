@@ -195,6 +195,52 @@ async fn a_spec_deleted_record_keeps_its_catalog_row() {
     let _ = std::fs::remove_file(db_path);
 }
 
+/// A read by key answers a spec-Deleted record the same way whichever step
+/// serves it: from its catalog row, and from its actor when the row gives
+/// nothing (no row, a read that failed, a row one commit behind). The actor
+/// step used to answer not found and forget the record, so the same record
+/// read as `Deleted` or as gone by chance. Only a record the kernel deleted
+/// is not found.
+#[tokio::test]
+async fn a_spec_deleted_record_reads_the_same_with_or_without_its_catalog_row() {
+    let (store, db_path) = new_store("spec-deleted-read").await;
+    let state = state_on(&store, "query-plane-spec-deleted-read");
+    six_orders_one_discarded(&state).await;
+    let tenant = TenantId::default();
+
+    assert_eq!(status_by_key(&state, "ord-05").await, "Deleted");
+    store
+        .remove_query_projection(tenant.as_str(), "Order", "ord-05")
+        .await
+        .expect("take ord-05's catalog row away");
+    assert!(!has_catalog_row(&state, "ord-05").await);
+    assert_eq!(
+        status_by_key(&state, "ord-05").await,
+        "Deleted",
+        "its actor answers as its row did"
+    );
+    assert!(
+        state.entity_exists(&tenant, "Order", "ord-05"),
+        "and the read did not forget a record that exists"
+    );
+
+    // The kernel's own delete is the one thing a read does not find.
+    state
+        .delete_tenant_entity(&tenant, "Order", "ord-04")
+        .await
+        .expect("delete ord-04");
+    let gone = crate::odata::read::load_existing_entity_descriptor_body(
+        &state, &tenant, "Order", "Orders", "ord-04",
+    )
+    .await;
+    assert_eq!(
+        gone.err().map(|response| response.status()),
+        Some(axum::http::StatusCode::NOT_FOUND)
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
 /// A Temper written before this fix removed ord-05's catalog row when it was
 /// discarded. On restart boot repair replays that record from its journal
 /// before the server serves and puts the row back, writing nothing to the
