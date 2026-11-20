@@ -79,8 +79,9 @@ ARN-97 structurally: `$select` can no longer condition membership.
   result set with no duplicates or gaps, proven by tests on Turso and the sim
   store (union of pages == one big `$top` read), for unfiltered, filtered, and
   `$orderby` reads.
-- Deep pagination is still bounded by the existing scan-candidate budget
-  (`max_entities * 10`): resuming past the budget returns `413 QueryTooLarge`
+- (Superseded by ADR-0187 and ADR-0188: continuations resume in SQL and no
+  read answers 413.) Deep pagination is still bounded by the existing
+  scan-candidate budget (`max_entities * 10`): resuming past the budget returns `413 QueryTooLarge`
   rather than an unbounded scan — the same contract as a large filtered/counted
   read. A future optimization can push the keyset predicate into SQL to make deep
   pages cheap; today they re-materialize within the budget, matching the cost of

@@ -144,6 +144,8 @@ Under per-row Cedar policies the native page still supplies candidates in SQL
 order, resuming from the cursor; the per-row loop advances its own offset
 relative to that cursor within one request. Its count is still the bounded
 authorized count, so a per-row `$count` above the budget still answers 413.
+(Superseded by ADR-0188: a per-row count or page walks every row, with no
+budget.)
 
 ### Sub-Decision 7: The simulation store keeps the in-memory path
 
@@ -185,7 +187,8 @@ before and after: none searches by fewer columns than before.
 - The sentinel is visible only inside SQL; a reader of the SQL has to know it
   stands for "no time".
 - A filter `ne` on status is still not pushed down (it is not lossless against
-  NULL), so `status ne 'X'` on a large type still answers 413.
+  NULL), so `status ne 'X'` on a large type still answers 413. (Superseded by
+  ADR-0188: the catalog's status is never NULL, so `status != ?` is exact.)
 
 ### Risks
 - **Index build at boot.** Turso builds the indexes during store schema setup
@@ -213,9 +216,10 @@ before and after: none searches by fewer columns than before.
 
 ## Non-Goals
 - Pushing down `ne`, `or` across different properties, or functions on event
-  times.
+  times. (`ne`: superseded by ADR-0188.)
 - Native ordering by application fields, or seeking on their keyset.
-- Unbounded per-row-authorized counts.
+  (Superseded by ADR-0188 for declared non-nullable numbers and strings.)
+- Unbounded per-row-authorized counts. (Superseded by ADR-0188.)
 - Changing the continuation token format.
 
 ## Alternatives Considered

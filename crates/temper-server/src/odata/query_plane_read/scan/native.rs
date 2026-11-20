@@ -226,9 +226,11 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
     // each page starting after the last row of the one before (a keyset the
     // store seeks to), keeping only the requested page and a running count,
     // until the page is full or, for `$count`, the last row is judged. What
-    // bounds the walk is time. Measured 2026-11-19 on an Apple M-series Mac
-    // (release build, Turso file store, 12,000 records, a forbid policy
-    // hiding half): see ADR-0188 for the rows judged per second.
+    // bounds the walk is time: on 2026-11-19 an Apple M3 Max (16 cores,
+    // 128 GB, macOS 26.5, not idle) running a release build on a Turso file
+    // store judged about 4,350 rows a second, a `$count` of 12,000 records
+    // whose policy hides 6,000 taking 2.76 s (median of 7) as a non-admin
+    // reader. A million such rows is about four minutes (ADR-0188).
     let page_size = request.budget.scan_page_size(request.query_options);
     let mut walk = plan.clone();
     let mut storage_skip = 0;

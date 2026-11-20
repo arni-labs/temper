@@ -61,7 +61,8 @@ requested response:
 - With `$count=true`, it must evaluate every matching candidate row so the
   count is exact.
 - If the proof would exceed the configured scan budget, the response is a
-  typed `413 QueryTooLarge`.
+  typed `413 QueryTooLarge`. (Superseded by ADR-0188: there is no scan budget;
+  the read walks every candidate.)
 
 **Why this approach**: Silent truncation is worse than a hard bounded error.
 The planner either knows the row-authenticated page/count is complete or tells
@@ -104,7 +105,8 @@ materialization makes dashboards lie.
 
 - No row-authorized path returns a 200 response after truncating candidates.
 - Native storage pages are used when the backend supports them.
-- `$count=true` is exact or the response is `413 QueryTooLarge`.
+- `$count=true` is exact or the response is `413 QueryTooLarge`. (Since
+  ADR-0188, always exact.)
 - Sparse projection telemetry reports actual use, not just `$select` presence.
 - Existing public OData response shape is preserved for successful reads.
 
