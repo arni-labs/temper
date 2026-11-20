@@ -1,15 +1,18 @@
-//! An entity action takes a body up to what one integration may read back of it (16 MiB), and refuses one past it.
+//! A record write takes a body up to `WASM_FIELD_READ_BUDGET_BYTES`, what a module may read of the record's fields,
+//! and refuses one past it. That a field this large reaches a module whole is `blobs/read_budget_tests.rs`.
 use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
 use serde_json::{Value, json};
 use temper_runtime::{ActorSystem, tenant::TenantId};
-use temper_server::registry::{EntityVerificationResult, SpecRegistry, VerificationStatus};
-use temper_server::{ServerState, StorageStack, build_router};
 use temper_spec::csdl::parse_csdl;
 use temper_store_turso::TursoEventStore;
 use tower::ServiceExt;
+
+use crate::blobs::WASM_FIELD_READ_BUDGET_BYTES;
+use crate::registry::{EntityVerificationResult, SpecRegistry, VerificationStatus};
+use crate::{ServerState, StorageStack, build_router};
 
 const CSDL: &str = r#"<?xml version="1.0"?>
 <edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
@@ -67,8 +70,16 @@ async fn request(
     (status, bytes.to_vec())
 }
 
+/// A body of exactly `len` bytes writing `text` with `Temper.Write`.
+fn write_body_of_len(len: usize) -> String {
+    let envelope = json!({"text": ""}).to_string().len();
+    let body = json!({"text": "b".repeat(len - envelope)}).to_string();
+    assert_eq!(body.len(), len);
+    body
+}
+
 #[tokio::test]
-async fn an_action_takes_a_body_past_two_megabytes_and_refuses_one_past_sixteen_mebibytes() {
+async fn an_action_takes_a_body_up_to_what_a_module_may_read_and_refuses_one_past_it() {
     let dir = tempfile::tempdir().unwrap();
     let store = TursoEventStore::new(
         &format!("file:{}", dir.path().join("body.db").display()),
@@ -109,7 +120,7 @@ async fn an_action_takes_a_body_past_two_megabytes_and_refuses_one_past_sixteen_
         String::from_utf8_lossy(&body)
     );
 
-    // 3 MiB: past axum's default of 2 MB, which this route had before, and well within 16 MiB.
+    // 3 MiB: past axum's default of 2 MB, which this route had before.
     let text = "a".repeat(3 * 1024 * 1024);
     let (status, body) = post(
         &state,
@@ -132,11 +143,25 @@ async fn an_action_takes_a_body_past_two_megabytes_and_refuses_one_past_sixteen_
         "the whole value is kept"
     );
 
-    // Past 16 MiB: refused as too large, nothing written.
+    // At the limit: taken.
+    let (status, body) = post(
+        &state,
+        "/tdata/Pages('p1')/Temper.Write",
+        write_body_of_len(WASM_FIELD_READ_BUDGET_BYTES),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body[..body.len().min(500)])
+    );
+
+    // One byte past it: refused as too large, before any write.
     let (status, _) = post(
         &state,
         "/tdata/Pages('p1')/Temper.Write",
-        json!({"text": "b".repeat(16 * 1024 * 1024 + 1)}).to_string(),
+        write_body_of_len(WASM_FIELD_READ_BUDGET_BYTES + 1),
     )
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);

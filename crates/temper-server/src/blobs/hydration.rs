@@ -16,9 +16,16 @@ use crate::state::ServerState;
 
 const GENERIC_INLINE_HYDRATION_BUDGET_BYTES: usize = 1024 * 1024;
 const GENERIC_MAX_INLINE_FIELD_BYTES: usize = 128 * 1024;
-/// What one WASM call may read of an entity's overflowed fields in all; the largest `/tdata` body follows it (router.rs).
-pub(crate) const WASM_DEFERRED_BLOB_BUDGET_BYTES: usize = 16 * 1024 * 1024;
-const WASM_MAX_DEFERRED_BLOB_BYTES: usize = 8 * 1024 * 1024;
+/// What one WASM call may read of a record's large (overflowed) fields: 16 MiB in all, and so also the most one field
+/// may be. It is the one limit on the size of what a module reads and of what a record write takes: the largest
+/// `/tdata` body is this too (router.rs), so no single write can carry a field larger than a module may read. The
+/// 16 MiB is shared by all the record's large fields in one call, read in field order.
+///
+/// The reason for the number is memory. A module reads a field into a buffer of the field's size in its own linear
+/// memory, which is 64 MiB by default (`temper_wasm::WasmResourceLimits::max_memory`); 16 MiB is a quarter of it,
+/// leaving the rest for the module's code, its invocation context and a decoded copy of what it read. The host holds
+/// the same bytes in the call's blob cache until the call ends, so this also bounds the host memory one call takes.
+pub(crate) const WASM_FIELD_READ_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BLOB_REFS_PER_VALUE: usize = 1024;
 const MAX_BLOB_READ_ATTEMPTS_PER_RESPONSE: usize = 64;
 
@@ -65,8 +72,8 @@ impl BlobHydrationBudget {
         Self::new(
             GENERIC_INLINE_HYDRATION_BUDGET_BYTES,
             GENERIC_MAX_INLINE_FIELD_BYTES,
-            WASM_DEFERRED_BLOB_BUDGET_BYTES,
-            WASM_MAX_DEFERRED_BLOB_BYTES,
+            WASM_FIELD_READ_BUDGET_BYTES,
+            WASM_FIELD_READ_BUDGET_BYTES,
         )
     }
 
@@ -404,8 +411,8 @@ pub(crate) async fn hydrate_comparison_fields(
         return Ok(());
     }
     let budget = BlobHydrationBudget::new(
-        WASM_DEFERRED_BLOB_BUDGET_BYTES,
-        WASM_DEFERRED_BLOB_BUDGET_BYTES,
+        WASM_FIELD_READ_BUDGET_BYTES,
+        WASM_FIELD_READ_BUDGET_BYTES,
         0,
         0,
     );

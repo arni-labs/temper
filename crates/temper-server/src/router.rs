@@ -23,11 +23,6 @@ use temper_authz::AuthenticatedRequestContext;
 
 const TEMPER_CLIENT_JS: &str = include_str!("../static/temper-client.js");
 const INTERNAL_BLOB_BODY_LIMIT_BYTES: usize = 128 * 1024 * 1024;
-/// The largest body an entity write or action takes (`/tdata/{*path}`): 16 MiB, what one WASM call may read of an
-/// entity's overflowed fields in all (`blobs::hydration`, `WASM_DEFERRED_BLOB_BUDGET_BYTES`). A write whose values
-/// together pass it would store what no integration reacting to it can read back whole. Before 20 Nov 2026 this
-/// route had axum's default of 2 MB, a limit with no reason of Temper's, which callers kept their own caps under.
-const TDATA_BODY_LIMIT_BYTES: usize = crate::blobs::WASM_DEFERRED_BLOB_BUDGET_BYTES;
 
 async fn serve_temper_client() -> (
     StatusCode,
@@ -88,7 +83,11 @@ pub fn build_routes(state: ServerState) -> Router {
                 .patch(odata::handle_odata_patch)
                 .put(odata::handle_odata_put)
                 .delete(odata::handle_odata_delete)
-                .layer(DefaultBodyLimit::max(TDATA_BODY_LIMIT_BYTES)),
+                // A record write takes a body up to what a module may read of the record's fields, so no write
+                // stores a field a module reacting to it cannot read whole; a larger body is refused 413.
+                .layer(DefaultBodyLimit::max(
+                    crate::blobs::WASM_FIELD_READ_BUDGET_BYTES,
+                )),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -281,6 +280,8 @@ mod guest_headers;
 pub(crate) use guest_headers::GUEST_FORBIDDEN_CREDENTIAL_HEADERS;
 pub(crate) use guest_headers::{guest_visible_headers, is_credential_header};
 
+#[cfg(test)]
+mod body_limit_test;
 #[cfg(test)]
 #[path = "router_test.rs"]
 mod tests;

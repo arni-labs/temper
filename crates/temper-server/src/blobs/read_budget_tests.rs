@@ -4,7 +4,8 @@ use sha2::{Digest as _, Sha256};
 use super::BlobReadSource;
 use super::hydration::hydrate_blob_refs_with_source;
 use super::{
-    BlobHydrationBudget, FIELD_OVERFLOW_REF_KEY, blob_ref_value, field_overflow_descriptor,
+    BlobHydrationBudget, FIELD_OVERFLOW_REF_KEY, WASM_FIELD_READ_BUDGET_BYTES, blob_ref_value,
+    field_overflow_descriptor,
 };
 use crate::blob_store::BlobStore;
 
@@ -16,6 +17,41 @@ async fn store_json(store: &BlobStore, value: &serde_json::Value) -> (String, us
         .await
         .expect("store overflow JSON");
     (key, bytes.len())
+}
+
+/// The largest field a record write can carry is as large as the largest `/tdata` body, which is
+/// `WASM_FIELD_READ_BUDGET_BYTES` (router.rs; a body one byte past it is refused there, see
+/// `router/body_limit_test.rs`). A field that large reaches a module whole: the WASM dispatch budget hands it to the
+/// call's blob cache, which `host_read_field` answers from.
+#[tokio::test]
+async fn a_field_as_large_as_the_largest_record_write_reaches_a_module_whole() {
+    let dir = tempfile::tempdir().expect("blob dir");
+    let store = BlobStore::local_fs(dir.path());
+    // A JSON string serializes as its text between two quotes.
+    let text = "a".repeat(WASM_FIELD_READ_BUDGET_BYTES - 2);
+    let (key, len) = store_json(&store, &json!(text)).await;
+    assert_eq!(len, WASM_FIELD_READ_BUDGET_BYTES);
+    let mut entity_state = json!({
+        "status": "Ready",
+        "fields": { "text": blob_ref_value(&key, len) },
+    });
+
+    let blob_cache = hydrate_blob_refs_with_source(
+        &BlobReadSource::Store(&store),
+        &mut entity_state,
+        &BlobHydrationBudget::wasm_dispatch(),
+    )
+    .await;
+
+    let read = blob_cache
+        .get(&key)
+        .expect("a field the router accepts is in the module's blob cache");
+    assert_eq!(read.len(), WASM_FIELD_READ_BUDGET_BYTES);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(read).expect("the field's JSON"),
+        json!(text),
+        "the module reads the whole value"
+    );
 }
 
 #[test]
