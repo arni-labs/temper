@@ -15,6 +15,13 @@ use super::{CallerOnly, collect_resource_attrs, json_contains_var};
 /// the policy neither permits nor forbids anything in this read. Such a part
 /// has the same value for every row, so it is evaluated once. `true` keeps
 /// the policy whenever this cannot be shown.
+///
+/// Only a part Cedar reaches before any part that reads the row counts.
+/// Cedar evaluates a policy's conditions in order and each chain left to
+/// right, stopping at the first part that settles it; a part that reads the
+/// row and comes first is evaluated for every row, and one that exhausts
+/// Cedar's stack fails the whole check closed (`evaluate_request`). Leaving
+/// such a policy out would let that row through, so it stays.
 pub(super) fn can_hold_for_some_row(
     policy: &Policy,
     request_fills: &dyn Fn(&str) -> bool,
@@ -39,7 +46,8 @@ pub(super) fn can_hold_for_some_row(
         operands(body, operator, &mut parts);
         for part in parts {
             if !reads_only_the_request(part, request_fills) {
-                continue;
+                // Every row evaluates this part before any later one.
+                return true;
             }
             // `when { P }`: no row passes unless P is true. `unless { P }`:
             // no row passes unless P is false, so ask whether !P is true.
@@ -49,10 +57,13 @@ pub(super) fn can_hold_for_some_row(
                 serde_json::json!({ "!": { "arg": part } })
             };
             let Some(guard) = caller_only_permit(asked) else {
-                continue;
+                return true;
             };
-            if decide(&guard) == Some(false) {
-                return false;
+            match decide(&guard) {
+                Some(false) => return false,
+                Some(true) => {}
+                // The engine could not decide it, so nothing is concluded.
+                None => return true,
             }
         }
     }

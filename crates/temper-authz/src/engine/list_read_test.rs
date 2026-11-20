@@ -133,7 +133,15 @@ const POLICIES: &[&str] = &[
     // skips, beside one that reads the row.
     r#"permit(principal, action == Action::"read", resource is Order);
        forbid(principal, action == Action::"read", resource is Order)
-       when { principal.role == "file-upload" && resource.status == "Closed" };"#,
+       when { principal.role == "file-upload" && resource.status == "Closed" };"#, // The same parts in the other order: every row evaluates the row's part
+    // first, so the forbid stays in each row's check.
+    r#"permit(principal, action == Action::"read", resource is Order);
+       forbid(principal, action == Action::"read", resource is Order)
+       when { resource.status == "Closed" && principal.role == "file-upload" };"#,
+    // A caller-only unless that a row's part precedes.
+    r#"permit(principal, action == Action::"read", resource is Order);
+       forbid(principal, action == Action::"read", resource is Order)
+       unless { resource.status == "Open" || principal is Customer };"#,
 ];
 
 #[test]
@@ -186,6 +194,17 @@ fn a_rule_for_another_caller_leaves_the_read_whole() {
     assert_eq!(decisions(POLICIES[10], &uploader).2, "per_row");
     // A part that reads a context key a row can fill is never decided once.
     assert_eq!(decisions(POLICIES[0], &customer).2, "per_row");
+}
+
+/// A caller-only part that comes after a part reading the row decides
+/// nothing: every row evaluates the row's part first, and a failure there
+/// (one that exhausts Cedar's stack fails the whole check closed) must still
+/// keep that row out.
+#[test]
+fn a_rule_whose_row_part_comes_first_stays_in_each_rows_check() {
+    let customer = reader(PrincipalKind::Customer, None);
+    assert_eq!(decisions(POLICIES[11], &customer).2, "per_row");
+    assert_eq!(decisions(POLICIES[12], &customer).2, "per_row");
 }
 
 /// A row is checked only against the policies that can tell rows apart.
