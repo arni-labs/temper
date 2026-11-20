@@ -1,4 +1,5 @@
 use super::*;
+use crate::persistence::catalog_field::SketchSql;
 
 #[test]
 fn every_fraction_width_gives_one_fixed_width_key_in_time_order() {
@@ -66,9 +67,7 @@ fn a_keyset_seeks_its_first_key_and_resumes_strictly_after() {
         after: Some(vec!["2026-11-19T10:00:00.000000000".into(), "r-7".into()]),
         ..QueryFieldIndexPageQuery::default()
     };
-    let (sql, params) = page
-        .catalog_conditions(5, &|_| "K".to_string())
-        .expect("keyset");
+    let (sql, params) = page.catalog_conditions(5, &SketchSql("K")).expect("keyset");
     assert_eq!(sql, "K <= ?5 AND (K < ?5 OR (K = ?5 AND entity_id > ?6))");
     assert_eq!(params, vec!["2026-11-19T10:00:00.000000000", "r-7"]);
 }
@@ -83,9 +82,7 @@ fn a_lower_bound_leaves_out_records_without_the_time() {
         }],
         ..QueryFieldIndexPageQuery::default()
     };
-    let (sql, params) = page
-        .catalog_conditions(3, &|_| "F".to_string())
-        .expect("bounds");
+    let (sql, params) = page.catalog_conditions(3, &SketchSql("F")).expect("bounds");
     assert_eq!(sql, format!("F >= ?3 AND F < '{MISSING_EVENT_TIME_KEY}'"));
     assert_eq!(params.len(), 1);
 }
@@ -97,11 +94,99 @@ fn a_keyset_that_does_not_fit_the_order_is_refused() {
         after: Some(vec!["Open".into()]),
         ..QueryFieldIndexPageQuery::default()
     };
-    assert!(short.catalog_conditions(3, &|_| String::new()).is_err());
-    let by_field = QueryFieldIndexPageQuery {
+    assert!(short.catalog_conditions(3, &SketchSql("")).is_err());
+    let field_by_text = QueryFieldIndexPageQuery {
         order_by: vec![order("Total", QueryFieldIndexOrderDirection::Asc)],
         after: Some(vec!["1".into(), "r-1".into()]),
         ..QueryFieldIndexPageQuery::default()
     };
-    assert!(by_field.catalog_conditions(3, &|_| String::new()).is_err());
+    assert!(field_by_text.catalog_conditions(3, &SketchSql("")).is_err());
+    let status_by_field = QueryFieldIndexPageQuery {
+        order_by: vec![order("status", QueryFieldIndexOrderDirection::Asc)],
+        after: Some(vec![KeysetValue::Field(None), "r-1".into()]),
+        ..QueryFieldIndexPageQuery::default()
+    };
+    assert!(
+        status_by_field
+            .catalog_conditions(3, &SketchSql(""))
+            .is_err()
+    );
+}
+
+#[test]
+fn a_field_keyset_puts_rows_without_a_value_last_ascending() {
+    let page = |direction, cursor: Option<FieldLiteral>| QueryFieldIndexPageQuery {
+        order_by: vec![order("rank", direction)],
+        after: Some(vec![KeysetValue::Field(cursor), "r-1".into()]),
+        ..QueryFieldIndexPageQuery::default()
+    };
+    let number = Some(FieldLiteral::Number("3".into()));
+    let sql = |query: QueryFieldIndexPageQuery| {
+        query.catalog_conditions(3, &SketchSql("")).expect("keyset")
+    };
+    let (asc, params) = sql(page(QueryFieldIndexOrderDirection::Asc, number.clone()));
+    assert_eq!(
+        asc,
+        "((Number(rank) > Number(?3) OR NOT present(rank)) \
+         OR (Number(rank) = Number(?3) AND entity_id > ?4))"
+    );
+    assert_eq!(params, vec!["3", "r-1"]);
+    let (desc, _) = sql(page(QueryFieldIndexOrderDirection::Desc, number));
+    assert_eq!(
+        desc,
+        "(Number(rank) < Number(?3) OR (Number(rank) = Number(?3) AND entity_id > ?4))"
+    );
+    let (asc_absent, params) = sql(page(QueryFieldIndexOrderDirection::Asc, None));
+    assert_eq!(asc_absent, "(NOT present(rank) AND entity_id > ?3)");
+    assert_eq!(params, vec!["r-1"]);
+    let (desc_absent, _) = sql(page(QueryFieldIndexOrderDirection::Desc, None));
+    assert_eq!(
+        desc_absent,
+        "(present(rank) OR (NOT present(rank) AND entity_id > ?3))"
+    );
+}
+
+/// Two field keys resume flat: one term for each key, never a term inside
+/// another, so the store plans it no deeper than one key.
+#[test]
+fn a_keyset_of_two_fields_is_one_term_for_each_key() {
+    let page = QueryFieldIndexPageQuery {
+        order_by: vec![
+            order("title", QueryFieldIndexOrderDirection::Asc),
+            order("rank", QueryFieldIndexOrderDirection::Desc),
+        ],
+        after: Some(vec![
+            KeysetValue::Field(Some(FieldLiteral::Text("apple".into()))),
+            KeysetValue::Field(Some(FieldLiteral::Number("3".into()))),
+            "r-1".into(),
+        ]),
+        ..QueryFieldIndexPageQuery::default()
+    };
+    let (sql, params) = page.catalog_conditions(3, &SketchSql("")).expect("keyset");
+    assert_eq!(
+        sql,
+        "((Text(title) > Text(?3) OR NOT present(title)) \
+         OR (Text(title) = Text(?3) AND Number(rank) < Number(?4)) \
+         OR (Text(title) = Text(?3) AND Number(rank) = Number(?4) AND entity_id > ?5))"
+    );
+    assert_eq!(params, vec!["apple", "3", "r-1"]);
+}
+
+#[test]
+fn mistyped_selects_rows_holding_a_value_of_another_class() {
+    let page = QueryFieldIndexPageQuery {
+        mistyped: vec![
+            ("title".into(), FieldClass::Text),
+            ("rank".into(), FieldClass::Number),
+        ],
+        ..QueryFieldIndexPageQuery::default()
+    };
+    let (sql, params) = page
+        .catalog_conditions(3, &SketchSql(""))
+        .expect("mistyped");
+    assert_eq!(
+        sql,
+        "((has(title) AND NOT is_Text(title)) OR (has(rank) AND NOT is_Number(rank)))"
+    );
+    assert!(params.is_empty());
 }

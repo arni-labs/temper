@@ -163,7 +163,10 @@ async fn walk(
         if page_ids.len() < page.top {
             break;
         }
-        page.after = Some(vec![keys[last.as_str()].to_string(), last.clone()]);
+        page.after = Some(vec![
+            keys[last.as_str()].to_string().into(),
+            last.clone().into(),
+        ]);
         assert!(ids.len() <= ROWS, "the keyset did not move on");
     }
     ids
@@ -272,13 +275,13 @@ fn an_event_time_page_reads_its_index_in_order_inside_postgres() {
             where_clause: "status = ?3".to_string(),
             params: vec!["Open".to_string()],
             after: Some(vec![
-                event_time_key("2026-11-19T10:30:11Z").expect("key"),
-                "r-03".to_string(),
+                event_time_key("2026-11-19T10:30:11Z").expect("key").into(),
+                "r-03".into(),
             ]),
             ..ordered_page(EventTimeColumn::Last, true)
         };
         let (conditions, condition_params) = page
-            .catalog_conditions(page.params.len() + 3, &event_time_key_sql)
+            .catalog_conditions(page.params.len() + 3, &PostgresCatalogSql)
             .expect("conditions");
         let mut params = page.params.clone();
         params.extend(condition_params);

@@ -63,7 +63,11 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip: parse every JSON number to the nearest double, as the
+# stores do (Turso with Rust's parser, Postgres with strtod), so an order or a
+# comparison SQL makes on a stored number is the one the in-memory evaluator
+# makes (ADR-0188). Without it serde_json's parse can be one unit off.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 toml = "0.8"
 toml_edit = "0.22"
 

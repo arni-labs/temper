@@ -74,9 +74,6 @@ async fn equality_delta_eleven_matches_and_pending_nonmatch_answer_top_one() {
                 .await
                 .unwrap_or_else(|error| {
                     let detail = match error {
-                        QueryPlaneReadError::QueryTooLarge { telemetry } => {
-                            format!("QueryTooLarge: {telemetry:?}")
-                        }
                         QueryPlaneReadError::ReadUnavailable => "ReadUnavailable".to_string(),
                         _ => "unexpected query error".to_string(),
                     };

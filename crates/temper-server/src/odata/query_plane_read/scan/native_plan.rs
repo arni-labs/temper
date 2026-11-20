@@ -2,7 +2,7 @@
 //! bounds, order, and where a continuation starts (ADR-0187).
 
 use temper_odata::query::types::{FilterExpr, OrderDirection};
-use temper_runtime::persistence::{CatalogOrderKey, EventTimeColumn};
+use temper_runtime::persistence::{CatalogOrderKey, EventTimeColumn, FieldClass, KeysetValue};
 
 use super::super::super::filter_sql;
 use super::NativeCandidatePagePlan;
@@ -14,7 +14,7 @@ use crate::storage::{QueryFieldIndexOrder, QueryFieldIndexOrderDirection};
 /// key for each clause of the page's total order.
 pub(in crate::odata::query_plane_read) struct SqlKeyset {
     pub(in crate::odata::query_plane_read) filter: Option<FilterExpr>,
-    pub(in crate::odata::query_plane_read) after: Vec<String>,
+    pub(in crate::odata::query_plane_read) after: Vec<KeysetValue>,
 }
 
 fn native_order_by(request: &QueryPlaneReadRequest<'_>) -> Option<Vec<QueryFieldIndexOrder>> {
@@ -51,50 +51,52 @@ fn native_order_property_is_lossless(request: &QueryPlaneReadRequest<'_>, proper
     if matches!(property, "entity_id" | "Id" | "id" | "Status" | "status") {
         return true;
     }
+    field_order_class(request, property).is_some()
+}
 
+/// The JSON type an order by app field `property` compares: a number or a
+/// string, for a declared, non-nullable scalar the query projection holds
+/// and the record does not also hold at its top. A boolean is never
+/// ordered: the in-memory sort does not compare booleans.
+pub(in crate::odata::query_plane_read) fn field_order_class(
+    request: &QueryPlaneReadRequest<'_>,
+    property: &str,
+) -> Option<FieldClass> {
+    if filter_sql::is_record_property(property)
+        || !request.state.query_projection_indexes_field(
+            request.tenant,
+            request.entity_type,
+            property,
+        )
+    {
+        return None;
+    }
+    let (class, nullable) = declared_scalar(request, property)?;
+    (!nullable && class != FieldClass::Boolean).then_some(class)
+}
+
+/// The JSON type of `property` and whether it is nullable, when the entity
+/// type declares it as a scalar a comparison reads.
+pub(in crate::odata::query_plane_read) fn declared_scalar(
+    request: &QueryPlaneReadRequest<'_>,
+    property: &str,
+) -> Option<(FieldClass, bool)> {
     let registry = request
         .state
         .registry
         .read()
         .expect("registry lock should not be poisoned"); // ci-ok: infallible lock
-    registry
-        .get_tenant(request.tenant)
-        .and_then(|tenant_config| {
-            tenant_config
-                .csdl
-                .schemas
-                .iter()
-                .flat_map(|schema| &schema.entity_types)
-                .find(|entity_type| entity_type.name == request.entity_type)
-        })
-        .and_then(|entity_type| {
-            entity_type
-                .properties
-                .iter()
-                .find(|candidate| candidate.name == property)
-        })
-        .is_some_and(|property| {
-            !property.nullable && native_order_type_is_lossless(&property.type_name)
-        })
-}
-
-fn native_order_type_is_lossless(type_name: &str) -> bool {
-    matches!(
-        type_name,
-        "Edm.String"
-            | "Edm.Guid"
-            | "Edm.Date"
-            | "Edm.DateTimeOffset"
-            | "Edm.TimeOfDay"
-            | "Edm.Byte"
-            | "Edm.SByte"
-            | "Edm.Int16"
-            | "Edm.Int32"
-            | "Edm.Int64"
-            | "Edm.Decimal"
-            | "Edm.Double"
-            | "Edm.Single"
-    )
+    let declared = registry
+        .get_tenant(request.tenant)?
+        .csdl
+        .schemas
+        .iter()
+        .flat_map(|schema| &schema.entity_types)
+        .find(|entity_type| entity_type.name == request.entity_type)?
+        .properties
+        .iter()
+        .find(|candidate| candidate.name == property)?;
+    filter_sql::edm_class(&declared.type_name).map(|class| (class, declared.nullable))
 }
 
 #[cfg(test)]
@@ -104,25 +106,34 @@ pub(in crate::odata::query_plane_read) fn native_candidate_page_plan(
     native_candidate_page_plan_after(request, None)
 }
 
-/// The page plan, resuming `keyset` in SQL when every clause of the order is
-/// a catalog key. An order with an app field keeps the keyset folded into
-/// the filter, which narrows candidates only in memory.
+/// The page plan, resuming `keyset` in SQL when there is one. An order by an
+/// app field names the field's JSON type, which the reader checks every
+/// candidate holds before it trusts SQL's order (ADR-0188).
 pub(in crate::odata::query_plane_read) fn native_candidate_page_plan_after(
     request: &QueryPlaneReadRequest<'_>,
     keyset: Option<&SqlKeyset>,
 ) -> Option<NativeCandidatePagePlan> {
     let order_by = native_order_by(request)?;
-    let keyset = keyset.filter(|_| {
-        order_by
-            .iter()
-            .all(|clause| CatalogOrderKey::of(&clause.field_name).is_total())
-    });
+    let field_orders = order_by
+        .iter()
+        .filter(|clause| {
+            matches!(
+                CatalogOrderKey::of(&clause.field_name),
+                CatalogOrderKey::Field(_)
+            )
+        })
+        .map(|clause| {
+            field_order_class(request, &clause.field_name)
+                .map(|class| (clause.field_name.clone(), class))
+        })
+        .collect::<Option<Vec<_>>>()?;
     let filter = match keyset {
         Some(keyset) => keyset.filter.as_ref(),
         None => request.query_options.filter.as_ref(),
     };
     let mut plan = filter_plan(request, filter);
     plan.order_by = order_by;
+    plan.field_orders = field_orders;
     plan.after = keyset.map(|keyset| keyset.after.clone());
     Some(plan)
 }
@@ -137,7 +148,9 @@ fn filter_plan(
         where_clause: "TRUE".to_string(),
         params: Vec::new(),
         event_time_bounds: Vec::new(),
+        field_comparisons: Vec::new(),
         order_by: Vec::new(),
+        field_orders: Vec::new(),
         after: None,
         filter_pushdown: false,
         unfiltered: filter.is_none(),
@@ -159,6 +172,14 @@ fn filter_plan(
         request.entity_type,
     )
     .field_values(&serde_json::Value::Null);
+    let fields = filter_sql::split_field_comparisons(&rest, &declared_fields(request, &defaults));
+    plan.filter_pushdown |= !fields.comparisons.is_empty();
+    plan.field_comparisons = fields.comparisons;
+    let mut missing_fields = fields.missing_default_fields;
+    let Some(rest) = fields.rest else {
+        plan.filter_missing_fields = missing_fields.into_iter().collect();
+        return plan;
+    };
     match filter_sql::try_translate_candidate_filter_with_defaults(&rest, &defaults) {
         Some(translated) => {
             // Missing index entries include omitted/oversized stored fields.
@@ -167,9 +188,57 @@ fn filter_plan(
             plan.params = translated.params;
             plan.filter_pushdown = true;
             plan.filter_exact = filter_sql::candidate_filter_is_lossless(&rest);
-            plan.filter_missing_fields = translated.missing_default_fields.into_iter().collect();
+            missing_fields.extend(translated.missing_default_fields);
         }
         None => plan.filter_exact = false,
     }
+    plan.filter_missing_fields = missing_fields.into_iter().collect();
     plan
+}
+
+/// The app fields this type's reads compare on typed values: its declared,
+/// non-nullable scalar properties that the query projection holds, with the
+/// ones a record without the key reads as a declared default.
+fn declared_fields(
+    request: &QueryPlaneReadRequest<'_>,
+    defaults: &serde_json::Value,
+) -> filter_sql::DeclaredFields {
+    let mut declared = filter_sql::DeclaredFields::default();
+    let properties: Vec<(String, String)> = {
+        let registry = request
+            .state
+            .registry
+            .read()
+            .expect("registry lock should not be poisoned"); // ci-ok: infallible lock
+        registry
+            .get_tenant(request.tenant)
+            .into_iter()
+            .flat_map(|tenant| &tenant.csdl.schemas)
+            .flat_map(|schema| &schema.entity_types)
+            .filter(|entity_type| entity_type.name == request.entity_type)
+            .flat_map(|entity_type| &entity_type.properties)
+            .filter(|property| !property.nullable)
+            .map(|property| (property.name.clone(), property.type_name.clone()))
+            .collect()
+    };
+    for (name, type_name) in properties {
+        let indexed = request.state.query_projection_indexes_field(
+            request.tenant,
+            request.entity_type,
+            &name,
+        );
+        if let Some(class) = filter_sql::edm_class(&type_name)
+            && indexed
+        {
+            declared.declare(&name, class);
+        }
+    }
+    for name in defaults
+        .as_object()
+        .into_iter()
+        .flat_map(|object| object.keys())
+    {
+        declared.default_for(name);
+    }
+    declared
 }

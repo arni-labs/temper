@@ -412,10 +412,19 @@ fn native_plan_pushes_file_lookup_equalities_with_status_ne_recheck() {
 
     assert!(plan.filter_pushdown);
     assert!(plan.where_clause.contains("AND"));
-    assert!(!plan.where_clause.contains("status !="));
+    // The catalog's status is never NULL, so `ne` on it is exact in SQL
+    // (ADR-0188) and the whole filter is the store's predicate.
+    assert!(plan.where_clause.contains("status != ?7"));
+    assert!(plan.filter_exact);
     assert_eq!(
         plan.params,
-        vec!["Path", "/proofs/live.txt", "WorkspaceId", "ws-1"]
+        vec![
+            "Path",
+            "/proofs/live.txt",
+            "WorkspaceId",
+            "ws-1",
+            "Archived"
+        ]
     );
     assert!(should_try_native_page_first(&plan));
 }
@@ -578,9 +587,13 @@ async fn nullable_scalar_order_uses_read_source_full_proof() {
         Err(_) => panic!("read-source order proof should succeed"),
     };
 
+    // A JSON null is no value and sorts last ascending (ADR-0188
+    // Sub-Decision 6), as the continuation cursor reads it. Before, the sort
+    // found it equal to "packed" and listed it first by its id, and the
+    // cursor after it (no value, ascending) then had nothing after it.
     assert_eq!(result.entities.len(), 1);
-    assert_eq!(result.entities[0]["Id"].as_str(), Some("ord-null-notes"));
-    assert!(result.entities[0]["Notes"].is_null());
+    assert_eq!(result.entities[0]["Id"].as_str(), Some("ord-text-notes"));
+    assert_eq!(result.entities[0]["Notes"].as_str(), Some("packed"));
     assert_eq!(
         result.telemetry.strategy,
         QueryPlaneReadStrategy::ReadSourceCursor
@@ -796,23 +809,12 @@ async fn file_point_lookup_with_status_ne_uses_lossless_equality_candidates() {
         )
         .await
         .expect("native candidate query should execute");
-    assert_eq!(
-        candidate_ids,
-        vec![
-            "zz-target-archived".to_string(),
-            "zz-target-ready".to_string()
-        ]
-    );
+    // `Status ne 'Archived'` is part of the SQL predicate (ADR-0188), so the
+    // archived file is never a candidate.
+    assert_eq!(candidate_ids, vec!["zz-target-ready".to_string()]);
 
     let result = match read_entity_set_page(request).await {
         Ok(result) => result,
-        Err(QueryPlaneReadError::QueryTooLarge { telemetry }) => panic!(
-            "file point lookup should push down equality candidates: QueryTooLarge filter_pushdown={} fallback={:?} candidates={} pushed={}",
-            telemetry.filter_pushdown,
-            telemetry.fallback_reason,
-            telemetry.candidate_count,
-            telemetry.pushdown_page_count
-        ),
         Err(QueryPlaneReadError::AuthorizationDenied(_)) => {
             panic!("file point lookup should not be denied by read authorization")
         }
@@ -839,9 +841,10 @@ async fn file_point_lookup_with_status_ne_uses_lossless_equality_candidates() {
         QueryPlaneReadStrategy::NativePagePushdown
     );
     assert!(result.telemetry.filter_pushdown);
-    assert_eq!(result.telemetry.candidate_count, 2);
-    assert_eq!(result.telemetry.materialized_count, 2);
-    assert_eq!(result.telemetry.pushdown_page_count, 2);
+    // Only the matching file is read: the archived one is not a candidate.
+    assert_eq!(result.telemetry.candidate_count, 1);
+    assert_eq!(result.telemetry.materialized_count, 1);
+    assert_eq!(result.telemetry.pushdown_page_count, 1);
     assert_eq!(result.telemetry.returned_count, 1);
 
     let _ = std::fs::remove_file(db_path);

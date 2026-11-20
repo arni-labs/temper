@@ -5,12 +5,11 @@ use super::super::types::{
     QueryPlaneCoverageReport, QueryPlaneFallbackReason, QueryPlaneReadError, QueryPlaneReadRequest,
     QueryPlaneReadStrategy,
 };
+use super::walk_page::{FinishedPage, WalkPage, sort_page};
 use super::{
     CandidateScanResult, RowAuthz, ScanCounters, TelemetryInput, apply_select_only, base_telemetry,
-    budget_rejection, decide_row_authz, filter_only_query_options, materialize_and_authorize_ids,
-    query_options_with_default_page,
+    decide_row_authz, materialize_and_authorize_ids, materialize_filter_and_authorize_ids,
 };
-use crate::query_eval::apply_query_options;
 
 /// Selected documents held at once while a per-entity list is filtered.
 ///
@@ -19,103 +18,13 @@ use crate::query_eval::apply_query_options;
 /// dropped; only the allowed ids are kept.
 const SPARSE_DECISION_BATCH: usize = 32;
 
-async fn read_source_cursor_without_filter_or_count(
-    request: &QueryPlaneReadRequest<'_>,
-    all_entity_ids: &[String],
-    coverage: QueryPlaneCoverageReport,
-    fallback_reason: QueryPlaneFallbackReason,
-    authz: &RowAuthz,
-) -> Result<CandidateScanResult, QueryPlaneReadError> {
-    let requested_top = request.budget.requested_top(request.query_options);
-    let skip = request.query_options.skip.unwrap_or(0);
-    if requested_top == 0 {
-        let counters = ScanCounters::empty();
-        let telemetry = base_telemetry(
-            request,
-            TelemetryInput {
-                strategy: QueryPlaneReadStrategy::ReadSourceCursor,
-                fallback_reason,
-                filter_pushdown: false,
-                catalog_materialization: request.state.query_plane_store().is_some(),
-                coverage,
-                counters,
-                returned_count: 0,
-            },
-        );
-        return Ok(CandidateScanResult {
-            entities: Vec::new(),
-            count: None,
-            telemetry,
-        });
-    }
-
-    let scan_budget = request.budget.scan_candidate_budget();
-    let page_size = request.budget.scan_page_size(request.query_options);
-    let mut offset = 0usize;
-    let mut authorized_seen = 0usize;
-    let mut returned_before_select = Vec::new();
-    let mut counters = ScanCounters::empty();
-
-    while offset < all_entity_ids.len() {
-        let remaining_budget = scan_budget.saturating_sub(counters.candidate_count);
-        if remaining_budget == 0 {
-            return Err(budget_rejection(
-                request,
-                QueryPlaneReadStrategy::ReadSourceCursor,
-                false,
-                request.state.query_plane_store().is_some(),
-                coverage,
-                counters,
-            ));
-        }
-
-        let end = all_entity_ids
-            .len()
-            .min(offset + page_size.min(remaining_budget));
-        let authorized = materialize_and_authorize_ids(
-            request,
-            &all_entity_ids[offset..end],
-            request.state.query_plane_store().is_some(),
-            authz,
-            &mut counters,
-        )
-        .await;
-        for entity in authorized {
-            let index = authorized_seen;
-            authorized_seen += 1;
-            if index >= skip && returned_before_select.len() < requested_top {
-                returned_before_select.push(entity);
-            }
-        }
-
-        offset = end;
-        if returned_before_select.len() >= requested_top {
-            break;
-        }
-    }
-
-    let entities = apply_select_only(returned_before_select, request.query_options);
-    let returned_count = entities.len();
-    let telemetry = base_telemetry(
-        request,
-        TelemetryInput {
-            strategy: QueryPlaneReadStrategy::ReadSourceCursor,
-            fallback_reason,
-            filter_pushdown: false,
-            catalog_materialization: request.state.query_plane_store().is_some(),
-            coverage,
-            counters,
-            returned_count,
-        },
-    );
-    Ok(CandidateScanResult {
-        entities,
-        count: None,
-        telemetry,
-    })
-}
-
-async fn read_source_full_proof(
+/// Walk `all_entity_ids` a batch at a time: materialize, filter and
+/// authorize each batch, count what it keeps, and hold only the requested
+/// page ([`WalkPage`], ADR-0188). It holds one batch of documents and the
+/// page's; a sorted walk with a `$skip` also holds the sort keys and ids of
+/// the first `$skip + $top` rows. The id list itself is the one thing held
+/// for every record. There is no scan budget: what bounds the walk is time.
+async fn read_source_walk(
     request: &QueryPlaneReadRequest<'_>,
     all_entity_ids: &[String],
     mut coverage: QueryPlaneCoverageReport,
@@ -123,24 +32,13 @@ async fn read_source_full_proof(
     fallback_reason: QueryPlaneFallbackReason,
     authz: &RowAuthz,
 ) -> Result<CandidateScanResult, QueryPlaneReadError> {
-    let scan_budget = request.budget.scan_candidate_budget();
-    if all_entity_ids.len() > scan_budget {
-        let counters = ScanCounters {
-            candidate_count: all_entity_ids.len(),
-            ..ScanCounters::empty()
-        };
-        return Err(budget_rejection(
-            request,
-            QueryPlaneReadStrategy::ReadSourceCursor,
-            false,
-            request.state.query_plane_store().is_some(),
-            coverage,
-            counters,
-        ));
-    }
-
-    if request.query_options.filter.is_none()
-        && request.query_options.orderby.is_none()
+    let query_options = request.query_options;
+    let requested_top = request.budget.requested_top(query_options);
+    let skip = query_options.skip.unwrap_or(0);
+    let include_count = query_options.count == Some(true);
+    if query_options.filter.is_none()
+        && query_options.orderby.is_none()
+        && include_count
         && let Some(result) =
             try_bounded_unfiltered_page(request, all_entity_ids, coverage, fallback_reason, authz)
                 .await
@@ -148,31 +46,61 @@ async fn read_source_full_proof(
         return result;
     }
 
+    let order = query_options.orderby.as_deref();
+    let walk_all = include_count || order.is_some();
+    let missing: BTreeSet<&str> = missing_ids.iter().map(String::as_str).collect();
+    let prefer_catalog = request.state.query_plane_store().is_some();
+    let page_size = request.budget.scan_page_size(query_options);
     let mut counters = ScanCounters::empty();
-    let authorized = materialize_and_authorize_ids(
-        request,
-        all_entity_ids,
-        request.state.query_plane_store().is_some(),
-        authz,
-        &mut counters,
-    )
-    .await;
-
-    if !missing_ids.is_empty() && request.query_options.filter.is_some() {
-        let missing = missing_ids.iter().cloned().collect::<BTreeSet<_>>();
-        let (matching_missing, _) = apply_query_options(
-            authorized.clone(),
-            &filter_only_query_options(request.query_options),
-        );
-        coverage.matched = matching_missing
-            .iter()
-            .filter_map(entity_id_from_body)
-            .filter(|entity_id| missing.contains(*entity_id))
-            .count();
+    let mut held = WalkPage::new(order, skip, requested_top);
+    let mut seen = 0usize;
+    let nothing_to_read =
+        matches!(authz, RowAuthz::DenyAll) || (requested_top == 0 && !include_count);
+    for batch in all_entity_ids.chunks(page_size) {
+        if nothing_to_read || (!walk_all && held.is_full()) {
+            break;
+        }
+        let authorized = materialize_filter_and_authorize_ids(
+            request,
+            batch,
+            prefer_catalog,
+            authz,
+            &mut counters,
+        )
+        .await;
+        counters.hold(held.documents_held() + authorized.len());
+        seen += authorized.len();
+        if query_options.filter.is_some() {
+            coverage.matched += authorized
+                .iter()
+                .filter_map(entity_id_from_body)
+                .filter(|entity_id| missing.contains(entity_id))
+                .count();
+        }
+        held.add(authorized);
+        super::walk_yield().await;
     }
 
-    let apply_options = query_options_with_default_page(request.query_options, request.budget);
-    let (entities, count) = apply_query_options(authorized, &apply_options);
+    let count = include_count.then_some(seen);
+    let page = match held.finish() {
+        FinishedPage::Documents(page) => page,
+        // The walk kept only the page's ids: read its documents again. A row
+        // that changed since it was judged is judged again here.
+        FinishedPage::Ids(ids) => {
+            let mut page = materialize_filter_and_authorize_ids(
+                request,
+                &ids,
+                prefer_catalog,
+                authz,
+                &mut counters,
+            )
+            .await;
+            counters.hold(page.len());
+            sort_page(&mut page, order.unwrap_or_default());
+            page
+        }
+    };
+    let entities = apply_select_only(page, query_options);
     let returned_count = entities.len();
     let telemetry = base_telemetry(
         request,
@@ -197,7 +125,7 @@ async fn read_source_full_proof(
 ///
 /// `$count` used to mark the read as a full proof and load `fields` and
 /// `state` for every id. Returns `None` when a per-row policy cannot be
-/// decided from a sparse catalog read, so the caller keeps the full proof.
+/// decided from a sparse catalog read, so the caller walks the documents.
 async fn try_bounded_unfiltered_page(
     request: &QueryPlaneReadRequest<'_>,
     all_entity_ids: &[String],
@@ -314,6 +242,7 @@ async fn sparse_allowed_ids<'a>(
                 allowed.push(entity_id);
             }
         }
+        super::walk_yield().await;
     }
     Some(allowed)
 }
@@ -326,27 +255,13 @@ pub(in crate::odata::query_plane_read) async fn read_from_source_cursor(
     fallback_reason: QueryPlaneFallbackReason,
 ) -> Result<CandidateScanResult, QueryPlaneReadError> {
     let authz = decide_row_authz(request);
-    let needs_full_proof = request.query_options.filter.is_some()
-        || request.query_options.orderby.is_some()
-        || request.query_options.count == Some(true);
-    if needs_full_proof {
-        read_source_full_proof(
-            request,
-            all_entity_ids,
-            coverage,
-            missing_ids,
-            fallback_reason,
-            &authz,
-        )
-        .await
-    } else {
-        read_source_cursor_without_filter_or_count(
-            request,
-            all_entity_ids,
-            coverage,
-            fallback_reason,
-            &authz,
-        )
-        .await
-    }
+    read_source_walk(
+        request,
+        all_entity_ids,
+        coverage,
+        missing_ids,
+        fallback_reason,
+        &authz,
+    )
+    .await
 }

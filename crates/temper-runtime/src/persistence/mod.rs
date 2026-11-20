@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 mod projection;
 pub use projection::{JournalHead, ProjectionCheckpoint, ProjectionRepairCandidate};
 
+mod catalog_facet;
+mod catalog_field;
 mod catalog_group;
 mod catalog_page;
 mod catalog_state;
@@ -10,10 +12,14 @@ mod event_time_backfill;
 mod meaning;
 mod secret;
 mod tombstone;
+pub use catalog_facet::{CatalogFacetQuery, FacetAfter, FacetKey};
+pub use catalog_field::{
+    CatalogSql, FieldClass, FieldComparison, FieldComparisonOp, FieldLiteral, field_comparison_sql,
+};
 pub use catalog_group::CatalogGroupRow;
 pub use catalog_page::{
     CatalogOrderKey, EVENT_TIME_KEY_WIDTH, EventTimeBound, EventTimeColumn, KeyComparison,
-    MISSING_EVENT_TIME_KEY, QueryFieldIndexOrder, QueryFieldIndexOrderDirection,
+    KeysetValue, MISSING_EVENT_TIME_KEY, QueryFieldIndexOrder, QueryFieldIndexOrderDirection,
     QueryFieldIndexPageQuery, event_time_key,
 };
 pub use catalog_state::{catalog_state_for_storage, catalog_state_from_storage};

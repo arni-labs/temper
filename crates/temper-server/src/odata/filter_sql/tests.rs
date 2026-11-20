@@ -120,10 +120,18 @@ fn candidate_and_filter_keeps_lossless_equalities_when_status_ne_is_present() {
     assert!(result.where_clause.contains("field_value = ?4"));
     assert!(result.where_clause.contains("field_name = ?5"));
     assert!(result.where_clause.contains("field_value = ?6"));
-    assert!(!result.where_clause.contains("status !="));
+    // The catalog's status is never NULL, so `ne` on it is exact (ADR-0188).
+    assert!(result.where_clause.contains("status != ?7"));
+    assert!(candidate_filter_is_lossless(&filter));
     assert_eq!(
         result.params,
-        vec!["Path", "/proofs/live.txt", "WorkspaceId", "ws-1"]
+        vec![
+            "Path",
+            "/proofs/live.txt",
+            "WorkspaceId",
+            "ws-1",
+            "Archived"
+        ]
     );
 }
 
@@ -139,9 +147,9 @@ fn candidate_or_filter_does_not_drop_non_lossless_branch() {
         }),
         op: BinaryOperator::Or,
         right: Box::new(FilterExpr::BinaryOp {
-            left: Box::new(FilterExpr::Property("Status".into())),
-            op: BinaryOperator::Ne,
-            right: Box::new(FilterExpr::Literal(ODataValue::String("Archived".into()))),
+            left: Box::new(FilterExpr::Property("Notes".into())),
+            op: BinaryOperator::Eq,
+            right: Box::new(FilterExpr::Literal(ODataValue::Null)),
         }),
     };
 

@@ -149,7 +149,7 @@ async fn walk(
         if page_ids.len() < page.top {
             break;
         }
-        page.after = Some(vec![keys[last].clone(), last.clone()]);
+        page.after = Some(vec![keys[last].clone().into(), last.clone().into()]);
         assert!(ids.len() <= ROWS, "the keyset did not move on");
     }
     ids
@@ -370,8 +370,8 @@ async fn a_status_filtered_page_reads_the_event_time_index_in_order() {
     };
     let continuation = QueryFieldIndexPageQuery {
         after: Some(vec![
-            event_time_key("2026-11-19T10:30:11Z").expect("key"),
-            "r-03".to_string(),
+            event_time_key("2026-11-19T10:30:11Z").expect("key").into(),
+            "r-03".into(),
         ]),
         ..first_page.clone()
     };

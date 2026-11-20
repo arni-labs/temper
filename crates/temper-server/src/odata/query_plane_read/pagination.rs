@@ -32,7 +32,9 @@ use temper_odata::query::types::{
     BinaryOperator, FilterExpr, ODataValue, OrderByClause, OrderDirection, QueryOptions,
 };
 
-use temper_runtime::persistence::{CatalogOrderKey, MISSING_EVENT_TIME_KEY, event_time_key};
+mod sql_keyset;
+use sql_keyset::sql_keyset;
+pub(super) use sql_keyset::sql_keyset_for_row;
 
 use super::scan::{self, SqlKeyset};
 use super::{
@@ -286,40 +288,6 @@ fn literal_false() -> FilterExpr {
     }
 }
 
-/// The cursor as the keys the stores compare, one per clause of `order`, or
-/// `None` when a clause is not a catalog key the store can seek by. An event
-/// time is its instant's key and an absent one sorts as
-/// `MISSING_EVENT_TIME_KEY`; an id or a status is its text. `Id` and `id` are
-/// read from the record's body, which need not hold its id, so they fold.
-fn sql_keyset(cursor: &Cursor, order: &[OrderByClause]) -> Option<Vec<String>> {
-    if cursor.keys.len() != order.len() {
-        return None;
-    }
-    order
-        .iter()
-        .zip(&cursor.keys)
-        .map(
-            |(clause, key)| match CatalogOrderKey::of(&clause.property) {
-                CatalogOrderKey::EntityId if clause.property == ID_PROPERTY => key
-                    .value
-                    .as_str()
-                    .filter(|_| key.present)
-                    .map(str::to_string),
-                CatalogOrderKey::Status => key
-                    .value
-                    .as_str()
-                    .filter(|_| key.present)
-                    .map(str::to_string),
-                CatalogOrderKey::EventTime(_) if key.present => {
-                    key.value.as_str().and_then(event_time_key)
-                }
-                CatalogOrderKey::EventTime(_) => Some(MISSING_EVENT_TIME_KEY.to_string()),
-                CatalogOrderKey::EntityId | CatalogOrderKey::Field(_) => None,
-            },
-        )
-        .collect()
-}
-
 /// Combine a caller's optional `$filter` with the keyset predicate.
 fn and_filter(base: Option<FilterExpr>, keyset: FilterExpr) -> FilterExpr {
     match base {
@@ -385,9 +353,9 @@ pub(in crate::odata) async fn read_entity_set_from_query_plane(
     // for a total order). Without `$orderby`, every backend already returns
     // entity_id-ascending, so leaving it unset keeps the cheap unsorted paths.
     let effective_orderby = query_options.orderby.as_ref().map(|_| order.clone());
-    // Fetch one row past the page to detect truncation. The read budget is given
-    // one row of headroom so this probe row can never itself trip a `413` at the
-    // page boundary; the client's page size (`page_size`) is unchanged.
+    // Fetch one row past the page to detect truncation. `max_entities` is given
+    // one row of headroom so the probe row fits a full page; the client's page
+    // size (`page_size`) is unchanged.
     let fetch_top = page_size.saturating_add(1);
     let page_budget = QueryPlaneReadBudget {
         default_page_size: request.budget.default_page_size,
@@ -440,26 +408,18 @@ pub(in crate::odata) async fn read_entity_set_from_query_plane(
         },
         skiptoken: None,
         search: None,
+        apply: None,
     };
     let page_request = QueryPlaneReadRequest {
         query_options: &page_options,
         budget: page_budget,
         ..request
     };
-    let mut page_result = read_entity_set_page_with(page_request, sql_resume.as_ref()).await;
+    let mut result = read_entity_set_page_with(page_request, sql_resume.as_ref()).await?;
     if let Some(count_result) = count_result {
-        match &mut page_result {
-            Ok(result) => {
-                result.count = count_result.count;
-                result.telemetry.add_scan_work(&count_result.telemetry);
-            }
-            Err(QueryPlaneReadError::QueryTooLarge { telemetry }) => {
-                telemetry.add_scan_work(&count_result.telemetry);
-            }
-            Err(_) => {}
-        }
+        result.count = count_result.count;
+        result.telemetry.add_scan_work(&count_result.telemetry);
     }
-    let mut result = page_result?;
 
     // Telemetry is recorded against the original request shape, not the rewritten
     // page read (which strips `$select` and adds the keyset filter).

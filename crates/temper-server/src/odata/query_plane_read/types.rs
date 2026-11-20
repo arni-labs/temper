@@ -87,8 +87,6 @@ pub(in crate::odata::query_plane_read) enum QueryPlaneFallbackReason {
     NativePageUnavailable,
     /// A translated filter could not be pushed into the query projection.
     FilterPushdownUnavailable,
-    /// Candidate evaluation exceeded the bounded proof budget.
-    FallbackCandidateBudget,
     /// An exact-match resolution returned an empty native page that may be a
     /// lagging projection of a just-committed entity, so the read was
     /// reconciled against authoritative state (ARN-89).
@@ -107,7 +105,6 @@ impl QueryPlaneFallbackReason {
             Self::NoFilterPushdown => "no_filter_pushdown",
             Self::NativePageUnavailable => "native_page_unavailable",
             Self::FilterPushdownUnavailable => "filter_pushdown_unavailable",
-            Self::FallbackCandidateBudget => "fallback_candidate_budget",
             Self::ProjectionLagReconcile => "projection_lag_reconcile",
             Self::KeyedAbsence => "keyed_absence",
         }
@@ -142,6 +139,9 @@ pub(in crate::odata) struct QueryPlaneReadTelemetry {
     pub(in crate::odata::query_plane_read) pushdown_sparse_page: bool,
     pub(in crate::odata::query_plane_read) pushdown_sparse_probe_count: usize,
     pub(in crate::odata::query_plane_read) pushdown_page_count: usize,
+    /// The most documents a walk held at once (ADR-0188); zero when the read
+    /// is not a walk.
+    pub(in crate::odata::query_plane_read) held_documents: usize,
 }
 
 impl QueryPlaneReadTelemetry {
@@ -154,6 +154,9 @@ impl QueryPlaneReadTelemetry {
         self.catalog_shadow_check_scheduled += other.catalog_shadow_check_scheduled;
         self.pushdown_sparse_probe_count += other.pushdown_sparse_probe_count;
         self.pushdown_page_count += other.pushdown_page_count;
+        // Two reads made one after the other never hold their documents at
+        // the same time.
+        self.held_documents = self.held_documents.max(other.held_documents);
     }
 
     /// Record this read contract's telemetry onto the current OData span.
@@ -183,6 +186,7 @@ impl QueryPlaneReadTelemetry {
             self.pushdown_sparse_probe_count as u64,
         );
         span.record("pushdown_page_count", self.pushdown_page_count as u64);
+        span.record("held_documents", self.held_documents as u64);
         span.record("pushdown_sparse_skip_reason", self.fallback_reason.as_str());
     }
 }
@@ -220,8 +224,6 @@ pub(in crate::odata) struct QueryPlaneReadResult {
 pub(in crate::odata) enum QueryPlaneReadError {
     /// Cedar denied the collection-level list action.
     AuthorizationDenied(Box<Response>),
-    /// The read would exceed the bounded candidate proof budget.
-    QueryTooLarge { telemetry: QueryPlaneReadTelemetry },
     /// The `$skiptoken` continuation could not be decoded for this request —
     /// malformed, or its key count does not match the request's ordering.
     InvalidContinuation,
@@ -233,23 +235,9 @@ pub(in crate::odata) enum QueryPlaneReadError {
 }
 
 impl QueryPlaneReadError {
-    pub(in crate::odata) fn record_telemetry(&self, span: &Span) {
-        match self {
-            Self::AuthorizationDenied(_) => {}
-            Self::QueryTooLarge { telemetry, .. } => telemetry.record(span),
-            Self::InvalidContinuation | Self::ReadUnavailable | Self::Unsupported(_) => {}
-        }
-    }
-
     pub(in crate::odata) fn into_response(self) -> Response {
         match self {
             Self::AuthorizationDenied(response) => *response,
-            Self::QueryTooLarge { .. } => odata_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "QueryTooLarge",
-                "This query requires evaluating more candidate entities than the bounded OData read budget permits. Use a narrower filter or a smaller page/count request.",
-            )
-            .into_response(),
             Self::ReadUnavailable => odata_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "ReadUnavailable",

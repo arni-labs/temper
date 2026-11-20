@@ -124,12 +124,6 @@ async fn read(
     .await
     {
         Ok(result) => result,
-        Err(QueryPlaneReadError::QueryTooLarge { telemetry }) => {
-            panic!(
-                "{query}: refused as too large after {} candidates",
-                telemetry.candidate_count
-            )
-        }
         Err(_) => panic!("{query}: read failed"),
     }
 }

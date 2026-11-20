@@ -10,6 +10,7 @@ use temper_runtime::persistence::{
     QueryFieldIndexPageQuery,
 };
 
+use crate::catalog_sql::{PostgresCatalogSql, postgres_string_literal};
 use crate::platform::{postgres_placeholders, storage_error};
 use crate::store::PostgresEventStore;
 
@@ -45,7 +46,7 @@ impl PostgresEventStore {
         page: &QueryFieldIndexPageQuery,
     ) -> Result<(Vec<String>, Option<usize>), PersistenceError> {
         let (conditions, condition_params) =
-            page.catalog_conditions(page.params.len() + 3, &event_time_key_sql)?;
+            page.catalog_conditions(page.params.len() + 3, &PostgresCatalogSql)?;
         let mut params = page.params.clone();
         params.extend(condition_params);
         let filter = format!("({}) AND {conditions}", page.where_clause);
@@ -211,24 +212,23 @@ fn postgres_query_field_order_sql(page: &QueryFieldIndexPageQuery) -> String {
             CatalogOrderKey::EventTime(column) => {
                 clauses.push(format!("{} {direction}", event_time_key_sql(column)));
             }
+            // As the in-memory sort compares (ADR-0188): a number as an IEEE
+            // double, a string byte by byte. A row without a value sorts
+            // last ascending and first descending.
             CatalogOrderKey::Field(field_name) => {
                 let field = postgres_string_literal(field_name);
                 clauses.push(format!(
                     "CASE WHEN jsonb_typeof(fields -> {field}) = 'number' \
-                     THEN (fields ->> {field})::numeric END {direction} {nulls}"
+                     THEN CAST(fields ->> {field} AS double precision) END {direction} {nulls}"
                 ));
                 clauses.push(format!(
                     "CASE WHEN jsonb_typeof(fields -> {field}) <> 'number' \
-                     THEN fields ->> {field} END {direction} {nulls}"
+                     THEN (fields ->> {field}) COLLATE \"C\" END {direction} {nulls}"
                 ));
             }
         }
     }
     clauses.join(", ")
-}
-
-fn postgres_string_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(test)]

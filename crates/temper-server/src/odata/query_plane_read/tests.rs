@@ -17,6 +17,7 @@ use temper_runtime::tenant::TenantId;
 use temper_spec::csdl::parse_csdl;
 use temper_store_turso::TursoEventStore;
 
+mod comparisons;
 mod count_telemetry;
 mod declared_default_count;
 mod declared_defaults;
@@ -26,10 +27,16 @@ mod equality_delta_postgres;
 mod equality_probe;
 mod event_metadata;
 mod event_time_pages;
+mod facets;
+mod field_orders;
 mod keyed_existence;
+mod large_set;
+mod ne_filters;
 mod paging;
+mod per_row_walk;
 mod proof;
 mod spec_deleted;
+mod walk_skip;
 
 const CSDL_XML: &str = include_str!("../../../../../test-fixtures/specs/model.csdl.xml");
 const ORDER_IOA: &str = include_str!("../../../../../test-fixtures/specs/order.ioa.toml");
@@ -169,12 +176,12 @@ fn the_native_page_answers_first_when_sql_narrows_the_read() {
 
     // A filter SQL cannot narrow keeps the id list's budget proof first.
     let unpushed_options = QueryOptions {
-        filter: Some(FilterExpr::BinaryOp {
-            left: Box::new(FilterExpr::Property("status".to_string())),
-            op: BinaryOperator::Ne,
-            right: Box::new(FilterExpr::Literal(ODataValue::String(
-                "Created".to_string(),
-            ))),
+        filter: Some(FilterExpr::FunctionCall {
+            name: "endswith".to_string(),
+            args: vec![
+                FilterExpr::Property("Notes".to_string()),
+                FilterExpr::Literal(ODataValue::String("x".to_string())),
+            ],
         }),
         ..unfiltered_options.clone()
     };
@@ -186,25 +193,10 @@ fn the_native_page_answers_first_when_sql_narrows_the_read() {
     assert!(!should_try_native_page_first(&unpushed_plan));
 }
 
-#[test]
-fn source_cursor_catalog_coverage_is_skipped_when_candidate_set_exceeds_budget() {
-    let budget = QueryPlaneReadBudget {
-        default_page_size: 1,
-        max_entities: 1,
-    };
-
-    assert!(should_check_source_cursor_catalog_coverage(
-        budget.scan_candidate_budget(),
-        budget
-    ));
-    assert!(!should_check_source_cursor_catalog_coverage(
-        budget.scan_candidate_budget() + 1,
-        budget
-    ));
-}
-
+/// A count of more records than the old scan budget (10 here) walks them all
+/// and counts them (ADR-0188); it used to answer 413.
 #[tokio::test]
-async fn row_authorized_count_over_budget_returns_413() {
+async fn a_count_past_the_old_scan_budget_walks_every_record() {
     let state = build_order_state("query-plane-budget-count");
     create_orders(&state, 11).await;
     let tenant = TenantId::default();
@@ -214,7 +206,7 @@ async fn row_authorized_count_over_budget_returns_413() {
         ..QueryOptions::default()
     };
 
-    let error = match read_entity_set_page(QueryPlaneReadRequest {
+    let Ok(result) = read_entity_set_page(QueryPlaneReadRequest {
         state: &state,
         tenant: &tenant,
         security_ctx: &security_ctx,
@@ -227,28 +219,12 @@ async fn row_authorized_count_over_budget_returns_413() {
         },
     })
     .await
-    {
-        Ok(_) => panic!("oversized exact count should be rejected"),
-        Err(error) => error,
+    else {
+        panic!("a count past the old scan budget is answered");
     };
 
-    match error {
-        QueryPlaneReadError::QueryTooLarge { telemetry } => {
-            assert_eq!(
-                telemetry.fallback_reason,
-                QueryPlaneFallbackReason::FallbackCandidateBudget
-            );
-            assert_eq!(telemetry.candidate_count, 11);
-        }
-        QueryPlaneReadError::AuthorizationDenied(_) => {
-            panic!("test state should allow collection reads")
-        }
-        QueryPlaneReadError::ReadUnavailable => panic!("authoritative read should be available"),
-        QueryPlaneReadError::InvalidContinuation => {
-            panic!("no $skiptoken was supplied")
-        }
-        QueryPlaneReadError::Unsupported(message) => panic!("no $search was supplied: {message}"),
-    }
+    assert_eq!(result.count, Some(11));
+    assert_eq!(result.entities.len(), 1);
 }
 
 #[tokio::test]

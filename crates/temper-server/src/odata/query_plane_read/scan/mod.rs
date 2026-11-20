@@ -2,11 +2,14 @@ mod native;
 mod native_plan;
 mod read_source;
 mod uniform;
+mod walk_page;
 
-pub(super) use native::try_native_page_read;
+pub(super) use native::{fields_typed, try_native_page_read};
 #[cfg(test)]
 pub(super) use native_plan::native_candidate_page_plan;
-pub(super) use native_plan::{SqlKeyset, native_candidate_page_plan_after};
+pub(super) use native_plan::{
+    SqlKeyset, declared_scalar, field_order_class, native_candidate_page_plan_after,
+};
 pub(super) use read_source::read_from_source_cursor;
 
 use std::collections::{BTreeSet, HashMap};
@@ -20,12 +23,12 @@ use super::super::read_support::{
     catalog_select_projection_fields, materialize_entity_set_entities,
 };
 use super::types::{
-    QueryPlaneCoverageReport, QueryPlaneFallbackReason, QueryPlaneReadBudget, QueryPlaneReadError,
+    QueryPlaneCoverageReport, QueryPlaneFallbackReason, QueryPlaneReadBudget,
     QueryPlaneReadRequest, QueryPlaneReadStrategy, QueryPlaneReadTelemetry,
 };
 use crate::query_eval::apply_query_options;
 use crate::storage::QueryFieldIndexOrder;
-use temper_runtime::persistence::EventTimeBound;
+use temper_runtime::persistence::{EventTimeBound, FieldClass, FieldComparison, KeysetValue};
 
 #[derive(Clone, Debug)]
 pub(super) struct NativeCandidatePagePlan {
@@ -33,11 +36,18 @@ pub(super) struct NativeCandidatePagePlan {
     pub(super) params: Vec<String>,
     /// Event-time conjuncts of the filter, compared in SQL (ADR-0187).
     pub(super) event_time_bounds: Vec<EventTimeBound>,
+    /// App-field conjuncts of the filter, compared on typed values in SQL
+    /// (ADR-0188).
+    pub(super) field_comparisons: Vec<FieldComparison>,
     pub(super) order_by: Vec<QueryFieldIndexOrder>,
+    /// The app fields `order_by` sorts by, each with the JSON type its order
+    /// compares. SQL's order is the in-memory sort's only when no candidate
+    /// holds a value of another type there (ADR-0188).
+    pub(super) field_orders: Vec<(String, FieldClass)>,
     /// Start after a continuation's cursor in SQL: one key per clause of the
     /// page's total order (ADR-0187). `None` on page one, and when the
     /// continuation's keyset is folded into the filter instead.
-    pub(super) after: Option<Vec<String>>,
+    pub(super) after: Option<Vec<KeysetValue>>,
     pub(super) filter_pushdown: bool,
     /// The read has no filter at all (a continuation's keyset is not one).
     pub(super) unfiltered: bool,
@@ -63,6 +73,21 @@ pub(super) struct ScanCounters {
     pub(super) pushdown_sparse_probe_count: usize,
     pub(super) pushdown_page_count: usize,
     pub(super) catalog_select_projection: bool,
+    /// The most documents a walk held at once: the batch being judged and
+    /// the page it keeps (ADR-0188). Zero for a read that is not a walk.
+    pub(super) held_documents: usize,
+}
+
+/// Give the task back to the runtime between two batches of a walk, so a
+/// walk stops when its client goes away. hyper notices a closed connection
+/// only when the connection's task is polled again (`proto/h1/conn.rs`
+/// `mid_message_detect_eof` in hyper 1.8) and then drops the handler's
+/// future with the connection; a Turso page whose rows are cached never
+/// returns `Pending`, so without this a walk ran to its end after the client
+/// left. On 2026-11-19 a release server kept judging rows for 2.3 s after a
+/// reader's `$count` of 12,000 cards was abandoned at 0.4 s.
+pub(in crate::odata::query_plane_read) async fn walk_yield() {
+    tokio::task::yield_now().await;
 }
 
 impl ScanCounters {
@@ -75,7 +100,13 @@ impl ScanCounters {
             pushdown_sparse_probe_count: 0,
             pushdown_page_count: 0,
             catalog_select_projection: false,
+            held_documents: 0,
         }
+    }
+
+    /// Note that a walk holds `documents` now.
+    pub(super) fn hold(&mut self, documents: usize) {
+        self.held_documents = self.held_documents.max(documents);
     }
 }
 
@@ -204,30 +235,7 @@ pub(super) fn base_telemetry(
         pushdown_sparse_page: input.strategy == QueryPlaneReadStrategy::NativePagePushdown,
         pushdown_sparse_probe_count: input.counters.pushdown_sparse_probe_count,
         pushdown_page_count: input.counters.pushdown_page_count,
-    }
-}
-
-pub(super) fn budget_rejection(
-    request: &QueryPlaneReadRequest<'_>,
-    strategy: QueryPlaneReadStrategy,
-    filter_pushdown: bool,
-    catalog_materialization: bool,
-    coverage: QueryPlaneCoverageReport,
-    counters: ScanCounters,
-) -> QueryPlaneReadError {
-    QueryPlaneReadError::QueryTooLarge {
-        telemetry: base_telemetry(
-            request,
-            TelemetryInput {
-                strategy,
-                fallback_reason: QueryPlaneFallbackReason::FallbackCandidateBudget,
-                filter_pushdown,
-                catalog_materialization,
-                coverage,
-                counters,
-                returned_count: 0,
-            },
-        ),
+        held_documents: input.counters.held_documents,
     }
 }
 
@@ -371,6 +379,19 @@ pub(super) async fn materialize_filter_and_authorize_ids(
     authz: &RowAuthz,
     counters: &mut ScanCounters,
 ) -> Vec<serde_json::Value> {
+    let materialized = materialize_ids(request, entity_ids, prefer_catalog, authz, counters).await;
+    filter_and_authorize(request, materialized, authz)
+}
+
+/// The documents of `entity_ids`, before the filter and row authorization;
+/// none when no row may be read.
+pub(super) async fn materialize_ids(
+    request: &QueryPlaneReadRequest<'_>,
+    entity_ids: &[String],
+    prefer_catalog: bool,
+    authz: &RowAuthz,
+    counters: &mut ScanCounters,
+) -> Vec<serde_json::Value> {
     counters.candidate_count += entity_ids.len();
     if matches!(authz, RowAuthz::DenyAll) || entity_ids.is_empty() {
         return Vec::new();
@@ -390,16 +411,21 @@ pub(super) async fn materialize_filter_and_authorize_ids(
     counters.catalog_shadow_check_budget += materialized.catalog_shadow_check_budget;
     counters.catalog_shadow_check_scheduled += materialized.catalog_shadow_check_scheduled;
     counters.catalog_select_projection |= materialized.catalog_select_projection;
+    materialized.entities
+}
 
+/// The documents the read's filter keeps and this list may show.
+pub(super) fn filter_and_authorize(
+    request: &QueryPlaneReadRequest<'_>,
+    entities: Vec<serde_json::Value>,
+    authz: &RowAuthz,
+) -> Vec<serde_json::Value> {
     let entities = if request.query_options.filter.is_some() {
-        let (entities, _) = apply_query_options(
-            materialized.entities,
-            &filter_only_query_options(request.query_options),
-        );
+        let (entities, _) =
+            apply_query_options(entities, &filter_only_query_options(request.query_options));
         entities
     } else {
-        materialized.entities
+        entities
     };
-
     retain_authorized(request, entities, authz)
 }

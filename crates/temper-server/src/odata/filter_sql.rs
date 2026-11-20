@@ -18,9 +18,13 @@ use temper_odata::query::types::{BinaryOperator, FilterExpr, ODataValue, UnaryOp
 
 mod equality;
 mod event_time;
+mod field_compare;
 
 pub(super) use equality::equality_field_predicates;
 pub(super) use event_time::split_event_time_bounds;
+pub(super) use field_compare::{
+    DeclaredFields, edm_class, is_record_property, split_field_comparisons,
+};
 
 const MAX_INDEXABLE_FIELD_VALUE_BYTES: usize = 2000;
 
@@ -303,10 +307,14 @@ pub(super) fn candidate_filter_is_lossless(expr: &FilterExpr) -> bool {
                 candidate_filter_is_lossless(left) && candidate_filter_is_lossless(right)
             }
             BinaryOperator::Eq => lossless_eq_comparison(left, right),
-            BinaryOperator::Gt | BinaryOperator::Ge | BinaryOperator::Lt | BinaryOperator::Le => {
-                status_literal_comparison(left, right)
-            }
-            BinaryOperator::Ne | BinaryOperator::Has => false,
+            // The catalog's status is never NULL and every record reads it,
+            // so `status != ?` keeps exactly the records `ne` keeps.
+            BinaryOperator::Ne
+            | BinaryOperator::Gt
+            | BinaryOperator::Ge
+            | BinaryOperator::Lt
+            | BinaryOperator::Le => status_literal_comparison(left, right),
+            BinaryOperator::Has => false,
         },
         FilterExpr::UnaryOp { .. } | FilterExpr::FunctionCall { .. } => false,
         FilterExpr::Property(_) | FilterExpr::Literal(_) => false,
