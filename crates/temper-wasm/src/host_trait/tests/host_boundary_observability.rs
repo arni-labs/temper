@@ -467,3 +467,59 @@ fn progress_emission_creates_correlated_guest_event() {
         Some("true")
     );
 }
+
+/// Serve one answer with `status` on a fresh port, and return its URL.
+async fn answering_with(status: &'static str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let at = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await;
+        let answer =
+            format!("HTTP/1.1 {status}\r\ncontent-length: 2\r\nconnection: close\r\n\r\nno");
+        let _ = socket.write_all(answer.as_bytes()).await;
+    });
+    format!("http://{at}/files")
+}
+
+/// A service that answers 503 failed the call: its span says so, with the
+/// status where the trace view reads it. A 404 is the module's to judge.
+#[tokio::test]
+async fn a_called_service_that_fails_marks_the_call_span_an_error() {
+    let (spans, _events, _guard) = capture_spans_and_events();
+    let host = ProductionWasmHost::new(BTreeMap::new());
+    for status in ["503 Service Unavailable", "404 Not Found"] {
+        let url = answering_with(status).await;
+        host.http_call("GET", &url, &[], "")
+            .await
+            .expect("the service answered");
+    }
+    let captured = spans.lock().expect("span capture lock poisoned").clone();
+    let calls: Vec<&CapturedSpan> = captured
+        .iter()
+        .filter(|span| span.name == "wasm.host.http_call")
+        .collect();
+    assert_eq!(calls.len(), 2, "{captured:?}");
+    assert_eq!(
+        calls[0].fields.get("http.status_code").map(String::as_str),
+        Some("503")
+    );
+    assert_eq!(
+        calls[0].fields.get("otel.status_code").map(String::as_str),
+        Some("ERROR")
+    );
+    assert_eq!(
+        calls[1].fields.get("http.status_code").map(String::as_str),
+        Some("404")
+    );
+    assert_eq!(
+        calls[1].fields.get("otel.status_code"),
+        None,
+        "{:?}",
+        calls[1]
+    );
+}
