@@ -431,31 +431,53 @@ fn pg_record(next: &temper_actor_runtime::spec_actor::SpecActorState) -> serde_j
     serde_json::Value::Object(record)
 }
 
+/// A Postgres-runtime state's state variables (counters, booleans, lists)
+/// over its fields, with the status beside them: the record as its rules read
+/// it. That actor keeps the variables apart from the fields, which hold the
+/// params it was sent, a param named like a variable among them.
+fn pg_variables(next: &temper_actor_runtime::spec_actor::SpecActorState) -> serde_json::Value {
+    let mut record = pg_record(next);
+    if let Some(record) = record.as_object_mut() {
+        for (name, count) in &next.counters {
+            record.insert(name.clone(), serde_json::Value::from(*count));
+        }
+        for (name, flag) in &next.booleans {
+            record.insert(name.clone(), serde_json::Value::from(*flag));
+        }
+        for (name, items) in &next.lists {
+            record.insert(name.clone(), serde_json::json!(items));
+        }
+    }
+    record
+}
+
 /// The first of the type's invariants a Postgres-runtime write breaks: one
-/// that held on the record its actor stored before the write and does not on
-/// the record it would store, read as the actor stores them (its fields,
-/// with the status beside them, each missing declared value read as its
-/// initial). That actor runs its own move code, which does not hold the
-/// record to them. Invariants that read another record are left out.
+/// that held before the write and does not after it, on the record its actor
+/// stores ([`pg_record`]) or on its state variables ([`pg_variables`]), each
+/// missing declared value read as its initial. That actor runs its own move
+/// code, which does not hold the record to them. Invariants that read
+/// another record are left out.
 fn pg_broken_rule<'t>(
     table: &'t temper_jit::table::TransitionTable,
-    before: &serde_json::Value,
-    after: &serde_json::Value,
+    before: &temper_actor_runtime::spec_actor::SpecActorState,
+    after: &temper_actor_runtime::spec_actor::SpecActorState,
 ) -> Option<&'t temper_jit::table::MoveInvariant> {
     let defaults = crate::odata::read_defaults::ReadDefaults::from_table(table);
-    let (before, after) = (
-        defaults.fields_as_read(before),
-        defaults.fields_as_read(after),
-    );
     let holds = |record: &serde_json::Value, invariant: &temper_jit::table::MoveInvariant| {
         let env = temper_spec::predicate::JsonEnv::new(record);
         temper_spec::predicate::eval(&invariant.assert, &env) == temper_spec::predicate::Truth::True
     };
-    table
-        .invariants
-        .iter()
-        .filter(|invariant| invariant.assert.cross_refs().is_empty())
-        .find(|invariant| holds(&before, invariant) && !holds(&after, invariant))
+    [pg_record, pg_variables].into_iter().find_map(|view| {
+        let (before, after) = (
+            defaults.fields_as_read(&view(before)),
+            defaults.fields_as_read(&view(after)),
+        );
+        table
+            .invariants
+            .iter()
+            .filter(|invariant| invariant.assert.cross_refs().is_empty())
+            .find(|invariant| holds(&before, invariant) && !holds(&after, invariant))
+    })
 }
 
 async fn authorize_existing_mutation(
@@ -1082,8 +1104,7 @@ pub async fn handle_odata_post(
                         Err(response) => return *response,
                     };
                     if let (Some(next), Some(table)) = (&next, &rules)
-                        && let Some(invariant) =
-                            pg_broken_rule(table, &pg_record(&actor_state), &pg_record(next))
+                        && let Some(invariant) = pg_broken_rule(table, &actor_state, next)
                     {
                         let (message, refusal) = if invariant.declared_as
                             == temper_jit::table::DeclaredAs::FieldInvariant
