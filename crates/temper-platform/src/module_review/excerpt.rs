@@ -6,7 +6,7 @@
 //! What does not fit [`SPEC_BYTES`] is left out farthest first (the actions around, then fields, then the answers'
 //! actions) and named, so a review that read part of what it needs says so and never reads as clean.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::source::cut;
 use super::types::SpecSource;
@@ -105,6 +105,32 @@ pub fn excerpt(module: &str, specs: &[SpecSource]) -> Excerpt {
         text,
         left_out,
     }
+}
+
+/// `text` with each module it names (a word of its own) named as `names` gives it, in one pass, so a name inside a
+/// name given is never named again. A module's name may change with its code (an app may name a module by a hash of
+/// its source); its source file does not, so the specs read the same while the module's code changes.
+pub fn renamed(text: &str, names: &BTreeMap<String, String>) -> String {
+    let named = |word: &str| names.get(word).map_or(word, String::as_str).to_string();
+    let mut out = String::with_capacity(text.len());
+    let mut word_from = None;
+    for (at, c) in text.char_indices() {
+        let in_word = c.is_alphanumeric() || c == '_';
+        match (word_from, in_word) {
+            (None, true) => word_from = Some(at),
+            (Some(from), false) => {
+                out.push_str(&named(&text[from..at]));
+                word_from = None;
+                out.push(c);
+            }
+            (None, false) => out.push(c),
+            (Some(_), true) => {}
+        }
+    }
+    if let Some(from) = word_from {
+        out.push_str(&named(&text[from..]));
+    }
+    out
 }
 
 /// `left_out` as a few words: the first five names and how many more.

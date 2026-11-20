@@ -55,10 +55,21 @@ impl ModuleReviewer {
         }
     }
 
-    /// Review `modules` against `specs`, all at once. A module whose review fails is left out and the first reason is
-    /// kept for the install to say; a judge that gives no answer never fails the install.
-    pub async fn review(&self, modules: &[ModuleSource], specs: &[SpecSource]) -> BundleReview {
-        let reviews = join_all(modules.iter().map(|module| self.review_one(module, specs))).await;
+    /// Review `modules` against `specs`, all at once; `names` gives each of the app's modules by the name the specs run
+    /// it by, and the source file the review names it by ([`review_module`]). A module whose review fails is left out
+    /// and the first reason is kept for the install to say; a judge that gives no answer never fails the install.
+    pub async fn review(
+        &self,
+        modules: &[ModuleSource],
+        specs: &[SpecSource],
+        names: &BTreeMap<String, String>,
+    ) -> BundleReview {
+        let reviews = join_all(
+            modules
+                .iter()
+                .map(|module| self.review_one(module, specs, names)),
+        )
+        .await;
         let mut out = BundleReview::default();
         for review in reviews {
             match review {
@@ -76,14 +87,15 @@ impl ModuleReviewer {
         &self,
         module: &ModuleSource,
         specs: &[SpecSource],
+        names: &BTreeMap<String, String>,
     ) -> Result<ModuleReview, JudgeUnavailable> {
-        let key = cache_key(module, specs);
+        let key = cache_key(module, specs, names);
         if let Some(review) = self.cached(&key) {
             return Ok(review);
         }
         let review = tokio::time::timeout(
             MODULE_DEADLINE,
-            review_module(self.judge.as_ref(), module, specs),
+            review_module(self.judge.as_ref(), module, specs, names),
         )
         .await
         .map_err(|_| JudgeUnavailable::Down("deadline".to_string()))??;
@@ -119,8 +131,13 @@ impl ModuleReviewer {
     }
 }
 
-/// What a review read: the question wording, the module's name, path, source and sentence, and the specs that run it.
-fn cache_key(module: &ModuleSource, specs: &[SpecSource]) -> String {
+/// What a review read: the question wording, the module's name, path, source and sentence, the specs that run it, and
+/// the names the specs are read with.
+fn cache_key(
+    module: &ModuleSource,
+    specs: &[SpecSource],
+    names: &BTreeMap<String, String>,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(QUESTION_VERSION.to_le_bytes());
     let does = module.does.clone().unwrap_or_default();
@@ -131,6 +148,10 @@ fn cache_key(module: &ModuleSource, specs: &[SpecSource]) -> String {
     for spec in runners(&module.module, specs).specs {
         hasher.update((spec.source.len() as u64).to_le_bytes());
         hasher.update(spec.source.as_bytes());
+    }
+    for part in names.iter().flat_map(|(name, path)| [name, path]) {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
     }
     format!("{:x}", hasher.finalize())
 }

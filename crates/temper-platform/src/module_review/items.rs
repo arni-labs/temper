@@ -15,7 +15,7 @@ pub struct Item {
 }
 
 /// Raise when a statement or the state's wording changes, so a cached review of the old wording is not reused.
-pub const QUESTION_VERSION: u32 = 2;
+pub const QUESTION_VERSION: u32 = 3;
 
 /// At or above this rating a module is said to show an item: the calibration's gap lies between 0.34 and 0.74.
 pub const FOUND_AT: f64 = 0.5;

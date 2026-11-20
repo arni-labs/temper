@@ -8,12 +8,15 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::source::{self, lines_of, without_comments};
 use super::*;
 
-/// A judge that rates one item's statement high and points at the first line holding `marker`.
+/// A judge that rates one item's statement high and points at the first line holding `marker`, and keeps each state
+/// it was asked about.
+#[derive(Default)]
 struct Stub {
     found: Option<&'static str>,
     marker: &'static str,
     unavailable: Option<JudgeUnavailable>,
     calls: AtomicUsize,
+    states: std::sync::Mutex<Vec<String>>,
 }
 
 impl Stub {
@@ -21,26 +24,18 @@ impl Stub {
         Self {
             found: Some(kind),
             marker,
-            unavailable: None,
-            calls: AtomicUsize::new(0),
+            ..Self::default()
         }
     }
 
     fn clean() -> Self {
-        Self {
-            found: None,
-            marker: "",
-            unavailable: None,
-            calls: AtomicUsize::new(0),
-        }
+        Self::default()
     }
 
     fn down(reason: JudgeUnavailable) -> Self {
         Self {
-            found: None,
-            marker: "",
             unavailable: Some(reason),
-            calls: AtomicUsize::new(0),
+            ..Self::default()
         }
     }
 }
@@ -50,10 +45,14 @@ impl Judge for Stub {
     async fn ask(
         &self,
         _module: &str,
-        _state: &str,
+        state: &str,
         questions: &BTreeMap<String, Question>,
     ) -> Result<Answers, JudgeUnavailable> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(state.to_string());
         if let Some(reason) = &self.unavailable {
             return Err(reason.clone());
         }
@@ -123,6 +122,11 @@ fn test_spec_source_reads_which_action_runs_which_module() {
     );
 }
 
+/// No module renamed: each is read by the name its specs run it by.
+fn names() -> BTreeMap<String, String> {
+    BTreeMap::new()
+}
+
 fn module(name: &str, source: &str) -> ModuleSource {
     ModuleSource {
         module: name.to_string(),
@@ -163,7 +167,7 @@ fn test_without_comments_keeps_lines_and_strings() {
 #[tokio::test]
 async fn test_review_names_item_line_and_runner() {
     let judge = Stub::finding("hidden_states", "ctx.field(\"phase\")");
-    let review = review_module(&judge, &module("steps", PHASED), &specs("steps")).await;
+    let review = review_module(&judge, &module("steps", PHASED), &specs("steps"), &names()).await;
     let review = review.expect("the stub answers");
     assert_eq!(review.findings.len(), 1);
     let finding = &review.findings[0];
@@ -188,7 +192,7 @@ async fn test_review_names_item_line_and_runner() {
 #[tokio::test]
 async fn test_clean_module_has_no_findings() {
     let judge = Stub::clean();
-    let review = review_module(&judge, &module("label", PHASED), &specs("label")).await;
+    let review = review_module(&judge, &module("label", PHASED), &specs("label"), &names()).await;
     assert_eq!(review.expect("the stub answers").findings, Vec::new());
     assert_eq!(
         judge.calls.load(Ordering::SeqCst),
@@ -204,7 +208,7 @@ async fn test_large_module_is_flagged_by_size() {
         .collect();
     let source = format!("fn run(n: i64) -> i64 {{\n{body}    0\n}}\n");
     let judge = Stub::clean();
-    let review = review_module(&judge, &module("big", &source), &specs("big")).await;
+    let review = review_module(&judge, &module("big", &source), &specs("big"), &names()).await;
     let findings = review.expect("the stub answers").findings;
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].kind, "large_module");
@@ -224,7 +228,7 @@ async fn test_large_module_is_flagged_by_size() {
 async fn test_unavailable_judge_is_said_once_and_reviews_nothing() {
     let reviewer = ModuleReviewer::new(Arc::new(Stub::down(JudgeUnavailable::OutOfCredit)));
     let modules = [module("a", PHASED), module("b", PHASED)];
-    let review = reviewer.review(&modules, &specs("a")).await;
+    let review = reviewer.review(&modules, &specs("a"), &names()).await;
     assert!(review.reviews.is_empty());
     assert_eq!(review.unavailable, Some(JudgeUnavailable::OutOfCredit));
 }
@@ -234,9 +238,9 @@ async fn test_reviewer_reuses_a_review_of_the_same_module_and_specs() {
     let judge = Arc::new(Stub::finding("hidden_states", "phase"));
     let reviewer = ModuleReviewer::new(judge.clone());
     let modules = [module("steps", PHASED)];
-    let first = reviewer.review(&modules, &specs("steps")).await;
+    let first = reviewer.review(&modules, &specs("steps"), &names()).await;
     let calls = judge.calls.load(Ordering::SeqCst);
-    let again = reviewer.review(&modules, &specs("steps")).await;
+    let again = reviewer.review(&modules, &specs("steps"), &names()).await;
     assert_eq!(first, again);
     assert_eq!(
         judge.calls.load(Ordering::SeqCst),
@@ -244,7 +248,7 @@ async fn test_reviewer_reuses_a_review_of_the_same_module_and_specs() {
         "a cached review asks nothing"
     );
     let changed = [module("steps", &PHASED.replace("total", "count"))];
-    reviewer.review(&changed, &specs("steps")).await;
+    reviewer.review(&changed, &specs("steps"), &names()).await;
     assert!(
         judge.calls.load(Ordering::SeqCst) > calls,
         "changed source is read again"
@@ -519,6 +523,7 @@ async fn test_review_says_what_it_left_out() {
         &judge,
         &module("steps", "pub fn run() {}\n"),
         &[order_with_a_large_ship()],
+        &names(),
     )
     .await
     .expect("reviewed");
@@ -551,4 +556,79 @@ fn test_a_long_line_is_cut() {
     let read = lines_of(&line);
     assert_eq!(read[0].text.chars().count(), source::LINE_CHARS + 1);
     assert!(read[0].text.ends_with('…'));
+}
+
+#[test]
+fn test_changed_lines_are_the_lines_the_change_added_or_altered() {
+    let installed = "fn a() {\n    let x = 1;\n    x\n}\n";
+    let now = "// new\nfn a() {\n    let x = 2;\n    let y = 3;\n    x\n}\n";
+    assert_eq!(
+        changed_lines(installed, now),
+        [1, 3, 4].into_iter().collect(),
+        "the new comment's line, the altered line and the added one"
+    );
+    // A comment, or the spaces around a line, is not code.
+    assert!(changed_lines("let a = 1; // x\n", "  let a = 1; // y\n").is_empty());
+    assert_eq!(changed_lines("", "let a = 1;\n"), [1].into_iter().collect());
+}
+
+/// A module of two windows, `fn first` and `fn second`, whose first window gains `extra` lines.
+fn two_windows(extra: usize) -> String {
+    let first: String = (0..100 + extra)
+        .map(|n| format!("    let a{n} = {n};\n"))
+        .collect();
+    let second: String = (0..100).map(|n| format!("    let b{n} = {n};\n")).collect();
+    format!("fn first() {{\n{first}}}\n\nfn second() {{\n{second}}}\n")
+}
+
+/// An edit in one window, and a module name that changes with the code (as an app may name it by a hash of its
+/// source), leave the other window's state as it was, so Jev's record of that ask answers it the same; its finding
+/// still names the line where it now is.
+#[tokio::test]
+async fn test_an_unchanged_window_is_asked_in_the_same_words() {
+    let path = "wasm/calc/src/lib.rs";
+    let mut asked = Vec::new();
+    for (name, extra) in [("app_calc_1111111111", 0), ("app_calc_2222222222", 3)] {
+        let judge = Stub::finding("rules", "let b50 =");
+        let source = ModuleSource {
+            path: path.to_string(),
+            ..module(name, &two_windows(extra))
+        };
+        let names = [(name.to_string(), path.to_string())].into_iter().collect();
+        let review = review_module(&judge, &source, &specs(name), &names)
+            .await
+            .expect("the stub answers");
+        let at = two_windows(extra)
+            .lines()
+            .position(|line| line.contains("let b50 ="))
+            .expect("the line is there")
+            + 1;
+        assert!(
+            review
+                .findings
+                .iter()
+                .any(|finding| finding.number == Some(at)
+                    && finding.location == format!("{path}:{at}")),
+            "{:?}",
+            review.findings
+        );
+        let states = judge
+            .states
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            states.iter().all(|state| !state.contains(name)),
+            "the name that changes with the code is not read"
+        );
+        let second: std::collections::BTreeSet<String> = states
+            .into_iter()
+            .filter(|state| state.contains("fn second"))
+            .collect();
+        assert_eq!(second.len(), 1, "one state for the second window");
+        asked.push(second);
+    }
+    assert_eq!(
+        asked[0], asked[1],
+        "the second window is asked in the same words"
+    );
 }

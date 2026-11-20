@@ -1,28 +1,38 @@
-//! Reviewing one module: rate every item in each window, then ask where each found item shows (a part, then a line).
-//! Jev rates and chooses; it writes nothing, so each finding's words are its item's own with the app's names and the
-//! line filled in.
+//! Reviewing one module: rate every item in each window, then ask where each item found in a window shows in it (a
+//! part, then a line). Jev rates and chooses; it writes nothing, so each finding's words are its item's own with the
+//! app's names and the line filled in. Each window is judged on what it reads alone, so a window as it was before gets
+//! the same findings, wherever the rest of the module changed.
+
+use std::collections::BTreeMap;
 
 use futures::future::{join_all, try_join_all};
 
-use super::excerpt::excerpt;
+use super::excerpt::{excerpt, renamed};
 use super::items::{DOES_ITEM, DOES_KEY, DOES_MATCHES_AT, FOUND_AT, ITEMS, Item, LARGE_LINES};
 use super::questions::{
     item_questions, line_key, line_questions, review_state, runners, runs_from, where_key,
     where_questions,
 };
-use super::source::{Line, Part, lines_of, parts_of, said, windows_of};
+use super::source::{Line, Part, from_one, lines_of, parts_of, said, windows_of};
 use super::types::{
     Answers, Finding, Judge, JudgeUnavailable, ModuleReview, ModuleSource, SpecSource,
 };
 
-/// An item Jev rated at or above [`FOUND_AT`], and the window where it rated highest, which is where it is looked for.
+/// An item Jev rated at or above [`FOUND_AT`] in one window, which is where it is looked for.
 struct Found {
     item: &'static Item,
     rating: f64,
     window: usize,
 }
 
-/// Review one module against the specs of its app.
+/// One window of the module as Jev reads it: its lines numbered from 1, and how many lines of the module come before.
+struct Window {
+    before: usize,
+    lines: Vec<Line>,
+}
+
+/// Review one module against the specs of its app. `names` gives each of the app's modules by the name the specs run
+/// it by, and the source file the review names it by.
 ///
 /// # Errors
 ///
@@ -32,14 +42,23 @@ pub async fn review_module(
     judge: &dyn Judge,
     module: &ModuleSource,
     specs: &[SpecSource],
+    names: &BTreeMap<String, String>,
 ) -> Result<ModuleReview, JudgeUnavailable> {
     let lines = lines_of(&module.source);
     let runners = runners(&module.module, specs);
-    let read = excerpt(&module.module, specs);
-    let windows = windows_of(&lines);
+    let mut read = excerpt(&module.module, specs);
+    read.text = renamed(&read.text, names);
+    let windows: Vec<Window> = windows_of(&lines)
+        .iter()
+        .map(|window| {
+            let (before, lines) = from_one(window);
+            Window { before, lines }
+        })
+        .collect();
+    let split = windows.len() > 1;
     let states: Vec<String> = windows
         .iter()
-        .map(|window| review_state(&module.module, window, &read, lines.len()))
+        .map(|window| review_state(&module.path, &window.lines, &read, split))
         .collect();
     debug_assert_eq!(states.len(), windows.len());
 
@@ -59,8 +78,8 @@ pub async fn review_module(
         .map(|found| {
             let line = placed
                 .iter()
-                .find(|(number, _)| *number == found.item.number)
-                .map(|(_, line)| line);
+                .find(|(window, number, _)| *window == found.window && *number == found.item.number)
+                .map(|(_, _, line)| line);
             finding(found.item, found.rating, &module.path, line, &runs)
         })
         .collect();
@@ -86,40 +105,53 @@ pub async fn review_module(
     })
 }
 
-/// The items rated at or above [`FOUND_AT`] in any window, each with its highest rating and that window.
+/// Each item rated at or above [`FOUND_AT`] in a window, once for each such window, item by item.
 fn found_items(ratings: &[Answers]) -> Vec<Found> {
     ITEMS
         .iter()
-        .filter_map(|item| {
-            let (window, rating) = ratings
+        .flat_map(|item| {
+            ratings
                 .iter()
                 .enumerate()
-                .filter_map(|(window, answers)| Some((window, answers.rating(item.kind)?)))
-                .max_by(|a, b| a.1.total_cmp(&b.1))?;
-            (rating >= FOUND_AT).then_some(Found {
-                item,
-                rating,
-                window,
-            })
+                .filter_map(move |(window, answers)| {
+                    let rating = answers.rating(item.kind)?;
+                    (rating >= FOUND_AT).then_some(Found {
+                        item,
+                        rating,
+                        window,
+                    })
+                })
         })
         .collect()
 }
 
-/// The line where each found item shows, by item number, and the tokens asking cost. Windows are asked at once.
+/// The line where each found item shows, by window and item number, numbered in the module, and the tokens asking
+/// cost. Windows are asked at once.
 async fn place(
     judge: &dyn Judge,
     module: &str,
-    windows: &[Vec<Line>],
+    windows: &[Window],
     states: &[String],
     found: &[Found],
-) -> (Vec<(u8, Line)>, u64) {
+) -> (Vec<(usize, u8, Line)>, u64) {
     let asks = windows.iter().enumerate().filter_map(|(index, window)| {
         let here: Vec<&'static Item> = found
             .iter()
             .filter(|f| f.window == index)
             .map(|f| f.item)
             .collect();
-        (!here.is_empty()).then(|| place_in_window(judge, module, window, &states[index], here))
+        (!here.is_empty()).then_some(async move {
+            let (lines, cost) =
+                place_in_window(judge, module, &window.lines, &states[index], here).await;
+            let lines: Vec<(usize, u8, Line)> = lines
+                .into_iter()
+                .map(|(item, line)| {
+                    let number = line.number + window.before;
+                    (index, item, Line { number, ..line })
+                })
+                .collect();
+            (lines, cost)
+        })
     });
     let mut placed = Vec::new();
     let mut tokens = 0;
@@ -206,6 +238,7 @@ fn finding(item: &Item, rating: f64, path: &str, line: Option<&Line>, runs: &str
             || path.to_string(),
             |line| format!("{path}:{}", line.number),
         ),
+        number: line.map(|line| line.number),
         line: line.map(|line| line.text.trim().to_string()),
         why: format!("In this app the module runs from {runs}; {}.", item.why),
         instead: format!("Instead: {}.", item.instead),
@@ -247,6 +280,7 @@ fn does_mismatch(does: &str, ratings: &[Answers], path: &str, runs: &str) -> Opt
         title: "A sentence that is not what the module does".to_string(),
         rating: (rating * 100.0).round() / 100.0,
         location: path.to_string(),
+        number: None,
         line: None,
         why: format!(
             "In this app the module runs from {runs}; its sentence says \"{does}\", and Jev does not read its code as \

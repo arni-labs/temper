@@ -1,19 +1,22 @@
 //! The install's review of its app's modules ([`crate::module_review`]).
 //!
 //! A module whose code is new, or whose sentence (`does`) changed, is reviewed before the install writes anything, and
-//! a finding refuses it ([`super::module_review_gate`]): a module computes, and the spec decides the move, where the
-//! checker proves it, so a module that decides out of the spec's sight is not let in. Code is new when this server runs
-//! it nowhere: not the tenant's module of that name, and no other tenant's module. An app that runs keeps installing
-//! its modules as they are, and a tenant taking an app this server already runs takes code already let in.
+//! a finding on a line the change made refuses it ([`super::module_review_gate`]): a module computes, and the spec
+//! decides the move, where the checker proves it, so new code that decides out of the spec's sight is not let in. Code
+//! is new when this server runs it nowhere: not the tenant's module of that name, and no other tenant's module. An app
+//! that runs keeps installing its modules as they are, and a tenant taking an app this server already runs takes code
+//! already let in.
 //!
 //! The rest is advice. It starts when the install starts, so Jev reads beside the install's own proofs and writes, and
-//! it goes on after the install answers. What it says is kept for the app (`PlatformStore::save_module_review`). A
+//! it goes on after the install answers. What it says is kept for the app (`PlatformStore::save_module_review`), with
+//! the sentences and the sources of the version installed, which the next version's refusal is compared with. A
 //! caller that answers with all of it waits (`InstallResult::with_reviews_read`).
 //!
 //! A module is read again when its code changed or when a spec that runs it changed, since Jev reads a module against
 //! the specs that run it: a new guard or a split state can answer a finding, or make one. A module read again only for
 //! its spec is advised on, never refused: its code is what was let in before.
 
+use std::collections::BTreeMap;
 use std::path::{Component, Path};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -23,7 +26,7 @@ use temper_runtime::tenant::TenantId;
 use tokio::sync::{oneshot, watch};
 use tokio::task::AbortHandle;
 
-use super::module_review_gate::{SENTENCES, kept_sentences, sentences_of};
+use super::module_review_gate::{SENTENCES, SOURCES, kept_sentences, sentences_of, sources_of};
 use super::reconcile;
 use super::types::{AppBundle, InstallWarning, WasmModuleManifest};
 use crate::module_review::{
@@ -185,6 +188,8 @@ pub(super) async fn start(
     let asked: Vec<String> = modules.iter().map(|module| module.module.clone()).collect();
     let version = version_of(app_dir, tenant, app_name, bundle);
     let sentences = sentences_of(bundle);
+    let sources = sources_of(app_dir, bundle);
+    let names = names_of(bundle);
     let store = state
         .server
         .storage_stack
@@ -201,7 +206,9 @@ pub(super) async fn start(
         );
         async move {
             let review = match reviewer {
-                Some(reviewer) if !modules.is_empty() => reviewer.review(&modules, &specs).await,
+                Some(reviewer) if !modules.is_empty() => {
+                    reviewer.review(&modules, &specs, &names).await
+                }
                 _ => BundleReview::default(),
             };
             let outcome = outcome_of(review, said, &asked);
@@ -213,6 +220,7 @@ pub(super) async fn start(
             let mut kept =
                 json!({ "warnings": outcome.warnings, "modules_reviewed": outcome.reviewed });
             kept[SENTENCES] = json!(sentences);
+            kept[SOURCES] = json!(sources);
             // Startup and Genesis wait for Jev, never for the store's write gate.
             // HTTP callers may already have dropped their receivers.
             let _ = tell.send(Some(outcome));
@@ -336,6 +344,30 @@ pub(super) async fn changed_modules(
         .collect()
 }
 
+/// Where a module's Rust source sits in the app: the manifest's `source`, else `wasm/<module>/src/lib.rs`.
+fn source_path(module: &str, config: Option<&WasmModuleManifest>) -> String {
+    config
+        .and_then(|config| config.source.clone())
+        .unwrap_or_else(|| format!("wasm/{module}/src/lib.rs"))
+}
+
+/// Each module of `bundle` by the name its specs run it by, and its source file, which the review names it by: an app
+/// may name a module by a hash of its code, and its file stays put while its code changes.
+pub(super) fn names_of(bundle: &AppBundle) -> BTreeMap<String, String> {
+    bundle
+        .wasm_modules
+        .keys()
+        .map(|module| {
+            (
+                module,
+                source_path(module, bundle.wasm_module_configs.get(module)),
+            )
+        })
+        .filter(|(_, path)| !path.is_empty())
+        .map(|(module, path)| (module.clone(), path))
+        .collect()
+}
+
 /// A module's source, read only from inside the app's folder: a bundle comes from anyone who may publish one, and
 /// whatever file it names is sent to Jev, so a path out of the folder (`..`, an absolute path, a link) would send
 /// the server's own files to an outside service. `None` when the manifest names no source and none is at
@@ -346,9 +378,7 @@ pub(super) fn read_source(
     config: Option<&WasmModuleManifest>,
 ) -> Result<Option<ModuleSource>, String> {
     let named = config.and_then(|config| config.source.clone());
-    let path = named
-        .clone()
-        .unwrap_or_else(|| format!("wasm/{module}/src/lib.rs"));
+    let path = source_path(module, config);
     if named.is_none() && !app_dir.join(&path).exists() {
         return Ok(None);
     }

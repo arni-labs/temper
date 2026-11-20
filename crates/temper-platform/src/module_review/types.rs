@@ -94,8 +94,9 @@ pub trait Judge: Send + Sync {
     ) -> Result<Answers, JudgeUnavailable>;
 }
 
-/// A module to review: its kernel name, where its Rust source sits in the app, that source, and its author's sentence
-/// on what it computes, when the app's manifest gives one.
+/// A module to review: its kernel name (what the specs run and Jev's route is told), where its Rust source sits in the
+/// app (what Jev is told), that source, and its author's sentence on what it computes, when the app's manifest gives
+/// one.
 #[derive(Debug, Clone)]
 pub struct ModuleSource {
     pub module: String,
@@ -153,6 +154,8 @@ pub struct Finding {
     /// `path:line`, or the path alone when Jev did not say where.
     #[serde(rename = "where")]
     pub location: String,
+    /// The line's number in the module, when Jev said where.
+    pub number: Option<usize>,
     /// The line's text, without its comments.
     pub line: Option<String>,
     pub why: String,

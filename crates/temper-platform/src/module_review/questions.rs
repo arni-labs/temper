@@ -8,7 +8,7 @@ use super::items::{DOES_KEY, ITEMS, Item, LEAF, does_statement};
 use super::source::{Line, Part};
 use super::types::{Question, SpecSource};
 
-const INTRO: &str = "An app on Temper. Its records move only through the states and actions written in its spec: guards, timers and Cedar policies decide what happens next, and an action's trigger may run a module (Rust code) between two moves. What the module returns becomes the parameters of the trigger's on_success action.";
+const INTRO: &str = "An app on Temper. Its records move only through the states and actions written in its spec: guards, timers and Cedar policies decide what happens next, and an action's trigger may run a module (Rust code, named by its source file) between two moves. What the module returns becomes the parameters of the trigger's on_success action.";
 
 /// The record types whose triggers run `module`, and the actions on each that run it.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -54,19 +54,14 @@ fn numbered(lines: &[Line]) -> String {
 }
 
 /// The state Jev reads for one window of a module: the intro, the parts of the specs its review reads, and the
-/// window's numbered lines.
-pub fn review_state(
-    module: &str,
-    window: &[Line],
-    excerpt: &Excerpt,
-    total_lines: usize,
-) -> String {
-    let first = window.first().map_or(1, |line| line.number);
-    let last = window.last().map_or(1, |line| line.number);
-    let part = if first > 1 || last < total_lines {
-        format!(" Lines {first} to {last} of its {total_lines}; the rest is read separately.")
+/// window's lines numbered from 1 ([`super::source::from_one`]). The module is named by its source file (`path`), and
+/// nothing in it says where the window sits in the module, so a window whose lines and specs are as before is asked in
+/// the same words, whatever changed elsewhere in the module.
+pub fn review_state(path: &str, window: &[Line], excerpt: &Excerpt, split: bool) -> String {
+    let part = if split {
+        " Part of it, numbered from this part's first line; the rest is read separately."
     } else {
-        String::new()
+        ""
     };
     [
         INTRO.to_string(),
@@ -74,9 +69,7 @@ pub fn review_state(
         excerpt.heading.clone(),
         excerpt.text.clone(),
         String::new(),
-        format!(
-            "The module \"{module}\" (Rust; line numbers on the left; comments removed).{part}"
-        ),
+        format!("The module {path} (Rust; line numbers on the left; comments removed).{part}"),
         numbered(window),
     ]
     .join("\n")

@@ -1,6 +1,8 @@
 //! A module's Rust as Jev reads it: comments removed line for line (so a comment cannot argue the answer and line
 //! numbers stay true), cut into parts of a few lines to point at, and into windows small enough to read whole.
 
+use std::collections::BTreeSet;
+
 /// One line of a module's source, numbered from 1, without its comments.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Line {
@@ -233,4 +235,75 @@ pub fn windows_of(lines: &[Line]) -> Vec<Vec<Line>> {
         windows.push(lines.to_vec());
     }
     windows
+}
+
+/// A window numbered from 1, and how many lines of the module come before it. What Jev reads of a window is then the
+/// same wherever an edit above it moves it, so an unchanged window is asked in the same words as before.
+pub fn from_one(window: &[Line]) -> (usize, Vec<Line>) {
+    let before = window.first().map_or(0, |line| line.number - 1);
+    let lines = window
+        .iter()
+        .map(|line| Line {
+            number: line.number - before,
+            text: line.text.clone(),
+        })
+        .collect();
+    (before, lines)
+}
+
+/// Cells the comparison of two versions of a module holds, two bytes each: 8 MB, about 2,000 lines on each side
+/// between the first and the last line that differ. The largest module in a census of real apps was 1,175 lines (26
+/// Oct 2026). Past it, the lines between are all counted as the change's, as a new module's are.
+const DIFF_CELLS: usize = 4 * 1024 * 1024;
+
+/// The numbers of the lines of `now` that the change from `installed` added or altered: every line outside the longest
+/// run of lines the two versions share in order, compared without comments or the spaces around them.
+pub fn changed_lines(installed: &str, now: &str) -> BTreeSet<usize> {
+    let texts = |source: &str| -> Vec<String> {
+        lines_of(source)
+            .into_iter()
+            .map(|line| line.text.trim().to_string())
+            .collect()
+    };
+    let (old, new) = (texts(installed), texts(now));
+    let start = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let end = old[start..]
+        .iter()
+        .rev()
+        .zip(new[start..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let (old, new) = (&old[start..old.len() - end], &new[start..new.len() - end]);
+    let mut changed: BTreeSet<usize> = (1..=new.len()).map(|k| start + k).collect();
+    let width = new.len() + 1;
+    if old.is_empty() || new.is_empty() || (old.len() + 1) * width > DIFF_CELLS {
+        return changed;
+    }
+    debug_assert!(
+        old.len().min(new.len()) < usize::from(u16::MAX),
+        "a run fits two bytes"
+    );
+    // The longest run each pair of suffixes shares, then walked from the start to the lines it keeps.
+    let mut run = vec![0u16; (old.len() + 1) * width];
+    for i in (0..old.len()).rev() {
+        for j in (0..new.len()).rev() {
+            run[i * width + j] = if old[i] == new[j] {
+                run[(i + 1) * width + j + 1] + 1
+            } else {
+                run[(i + 1) * width + j].max(run[i * width + j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    while i < old.len() && j < new.len() {
+        if old[i] == new[j] {
+            changed.remove(&(start + j + 1));
+            (i, j) = (i + 1, j + 1);
+        } else if run[(i + 1) * width + j] >= run[i * width + j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    changed
 }

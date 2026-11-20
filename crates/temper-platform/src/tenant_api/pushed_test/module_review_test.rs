@@ -1,7 +1,8 @@
 //! A module whose code is as installed is reviewed as advice: an install answers without waiting for it, what the
 //! review found stays readable, and a caller that answers with all of it still can. A module whose code is new, or
-//! whose sentence changed, and that has a finding (its sentence not being what it does among them) is refused, on a
-//! push and on a Genesis install alike. Code another tenant on the server already runs is not new.
+//! whose sentence changed, and that has a finding on a line the change made (or its sentence not being what it does)
+//! is refused, on a push and on a Genesis install alike; a finding on a line as installed is advice. Code another
+//! tenant on the server already runs is not new.
 
 use std::time::Duration;
 
@@ -20,12 +21,16 @@ use crate::os_apps::InstallResult;
 
 const MODULE: &str = "answer";
 
-/// Jev, who answers once the test lets him. Says every module shows one item (the first, unless told), at its first
-/// line.
+/// The line of the module that each version changes ([`app_with_module`]).
+const CHANGED_LINE: &str = "x + ";
+
+/// Jev, who answers once the test lets him. Says every module shows one item (the first, unless told), at the line
+/// holding `at` (the line each version changes, unless told).
 struct HeldJudge {
     gate: Semaphore,
     down: bool,
     item: usize,
+    at: &'static str,
 }
 
 impl HeldJudge {
@@ -34,15 +39,22 @@ impl HeldJudge {
             gate: Semaphore::new(0),
             down: false,
             item: 0,
+            at: CHANGED_LINE,
         })
     }
 
     /// Answers at once, finding `ITEMS[item]`.
     fn finding(item: usize) -> Arc<Self> {
+        Self::finding_at(item, CHANGED_LINE)
+    }
+
+    /// Answers at once, finding `ITEMS[item]` at the line holding `at`.
+    fn finding_at(item: usize, at: &'static str) -> Arc<Self> {
         Arc::new(Self {
             gate: Semaphore::new(1),
             down: false,
             item,
+            at,
         })
     }
 
@@ -62,6 +74,7 @@ impl HeldJudge {
             gate: Semaphore::new(1),
             down: true,
             item: 0,
+            at: CHANGED_LINE,
         })
     }
 
@@ -101,7 +114,11 @@ impl Judge for HeldJudge {
                     },
                     Question::Choice { criteria, .. } => Answer {
                         noul: None,
-                        choice: criteria.keys().next().cloned(),
+                        choice: criteria
+                            .iter()
+                            .find(|(_, text)| text.contains(self.at))
+                            .or_else(|| criteria.iter().next())
+                            .map(|(key, _)| key.clone()),
                     },
                 };
                 (key.clone(), answer)
@@ -472,7 +489,7 @@ async fn a_genesis_install_of_a_changed_module_with_a_finding_is_refused() {
 
     let said = format!("{refused:?}");
     for words in [
-        "Refused: Jev's review found work in a new or changed module",
+        "Refused: Jev's review found, on lines this change added or altered",
         &format!("({}) in module answer", ITEMS[0].kind),
     ] {
         assert!(said.contains(words), "{words}: {said}");
@@ -522,8 +539,8 @@ async fn a_changed_module_with_a_finding_is_refused_and_an_unchanged_one_is_not(
     assert_ne!(status, StatusCode::OK, "{body}");
     let said = body.to_string();
     for words in [
-        "Refused: Jev's review found work in a new or changed module",
-        "(several_concerns) in module answer at wasm/answer/src/lib.rs",
+        "Refused: Jev's review found, on lines this change added or altered",
+        "(several_concerns) in module answer at wasm/answer/src/lib.rs:2 `x + 2`",
         "Instead:",
     ] {
         assert!(said.contains(words), "{words}: {said}");
@@ -531,6 +548,57 @@ async fn a_changed_module_with_a_finding_is_refused_and_an_unchanged_one_is_not(
     assert_eq!(
         review_of(&server.state, &tenant, "c2").await["state"],
         "none"
+    );
+}
+
+/// In a changed module, a finding on a line as the app last installed it is advice: the install goes on, and the
+/// finding is kept with the review. Only the lines the change made are held to the review.
+#[tokio::test]
+async fn a_finding_on_a_line_as_installed_is_advice_in_a_changed_module() {
+    let tenant = unique_tenant("review-installed-line");
+    let server = seeded(&tenant).await;
+    // The module's first line is as version 1 had it; version 2 changes only its second.
+    server
+        .state
+        .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::finding_at(
+            0,
+            "pub fn step",
+        ))));
+
+    let body = install_over_http(&server.state, &tenant, app_with_module(Some("c2"), 2)).await;
+    assert_eq!(body["result"]["reviewing"][0]["version"], "c2", "{body}");
+    let done = finished_review(&server.state, &tenant, "c2").await;
+    assert!(
+        found_first_item(&done["warnings"]),
+        "kept as advice: {done}"
+    );
+    let advice = done["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .find(|warning| warning["detail"]["kind"] == ITEMS[0].kind)
+        .expect("the finding");
+    assert_eq!(
+        advice["detail"]["where"], "wasm/answer/src/lib.rs:1",
+        "{done}"
+    );
+
+    // The next version changes that line, and the same finding on it is refused.
+    let mut files = app_with_module(Some("c3"), 3);
+    files[format!("wasm/{MODULE}/src/lib.rs")] =
+        "pub fn step(x: u64) -> u32 {\n    x + 3\n}\n".into();
+    let (status, body) = send(
+        &server.state,
+        push(&tenant, serde_json::json!({ "files": files })),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.to_string().contains(&format!(
+            "({}) in module answer at wasm/answer/src/lib.rs:1",
+            ITEMS[0].kind
+        )),
+        "{body}"
     );
 }
 
