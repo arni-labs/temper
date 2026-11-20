@@ -10,6 +10,7 @@ use temper_runtime::persistence::{
     QueryFieldIndexPageQuery,
 };
 
+use crate::catalog_sql::{PostgresCatalogSql, postgres_string_literal};
 use crate::platform::{postgres_placeholders, storage_error};
 use crate::store::PostgresEventStore;
 
@@ -45,7 +46,7 @@ impl PostgresEventStore {
         page: &QueryFieldIndexPageQuery,
     ) -> Result<(Vec<String>, Option<usize>), PersistenceError> {
         let (conditions, condition_params) =
-            page.catalog_conditions(page.params.len() + 3, &event_time_key_sql)?;
+            page.catalog_conditions(page.params.len() + 3, &PostgresCatalogSql)?;
         let mut params = page.params.clone();
         params.extend(condition_params);
         let filter = format!("({}) AND {conditions}", page.where_clause);
@@ -225,10 +226,6 @@ fn postgres_query_field_order_sql(page: &QueryFieldIndexPageQuery) -> String {
         }
     }
     clauses.join(", ")
-}
-
-fn postgres_string_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(test)]

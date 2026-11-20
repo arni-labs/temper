@@ -37,6 +37,7 @@ mod authz;
 mod blob_chunks;
 mod blobs;
 mod catalog_groups;
+mod catalog_sql;
 mod commit_probe;
 mod constraints;
 mod entity_listing;

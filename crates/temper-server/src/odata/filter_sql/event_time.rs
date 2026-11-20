@@ -40,7 +40,8 @@ pub(in crate::odata) fn split_event_time_bounds(filter: &FilterExpr) -> SplitFil
     SplitFilter { bounds, rest }
 }
 
-fn collect_conjuncts<'a>(filter: &'a FilterExpr, out: &mut Vec<&'a FilterExpr>) {
+/// The top-level `and` conjuncts of `filter`, in their order.
+pub(super) fn collect_conjuncts<'a>(filter: &'a FilterExpr, out: &mut Vec<&'a FilterExpr>) {
     if let FilterExpr::BinaryOp {
         left,
         op: BinaryOperator::And,

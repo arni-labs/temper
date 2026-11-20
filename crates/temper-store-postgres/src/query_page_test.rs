@@ -278,7 +278,7 @@ fn an_event_time_page_reads_its_index_in_order_inside_postgres() {
             ..ordered_page(EventTimeColumn::Last, true)
         };
         let (conditions, condition_params) = page
-            .catalog_conditions(page.params.len() + 3, &event_time_key_sql)
+            .catalog_conditions(page.params.len() + 3, &PostgresCatalogSql)
             .expect("conditions");
         let mut params = page.params.clone();
         params.extend(condition_params);

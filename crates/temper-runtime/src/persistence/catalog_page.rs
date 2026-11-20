@@ -14,6 +14,7 @@
 //! ascending, first descending, where the in-memory sort puts it.
 
 use super::PersistenceError;
+use super::catalog_field::{CatalogSql, FieldComparison, field_comparison_sql};
 
 /// The length of an event-time sort key, `YYYY-MM-DDTHH:MM:SS.nnnnnnnnn`.
 pub const EVENT_TIME_KEY_WIDTH: usize = 29;
@@ -172,6 +173,9 @@ pub struct QueryFieldIndexPageQuery {
     pub params: Vec<String>,
     /// Event-time bounds every row also meets.
     pub event_time_bounds: Vec<EventTimeBound>,
+    /// App-field comparisons every row also meets, on its typed value
+    /// (ADR-0188).
+    pub field_comparisons: Vec<FieldComparison>,
     /// The order; `entity_id` ascending follows unless it ends with `entity_id`.
     pub order_by: Vec<QueryFieldIndexOrder>,
     /// Start after the row with these keys, one for each clause of
@@ -222,9 +226,9 @@ impl QueryFieldIndexPageQuery {
                 .any(|(key, _)| matches!(key, CatalogOrderKey::EventTime(_)))
     }
 
-    /// The bounds and the keyset as one SQL condition, with parameters
-    /// numbered `?first_param` on, or `TRUE` when the page has neither.
-    /// `event_time_sql` is the store's expression for an event time's key.
+    /// The bounds, the field comparisons and the keyset as one SQL
+    /// condition, with parameters numbered `?first_param` on, or `TRUE` when
+    /// the page has none. `sql` writes the store's expressions.
     ///
     /// # Errors
     ///
@@ -234,8 +238,9 @@ impl QueryFieldIndexPageQuery {
     pub fn catalog_conditions(
         &self,
         first_param: usize,
-        event_time_sql: &dyn Fn(EventTimeColumn) -> String,
+        sql: &dyn CatalogSql,
     ) -> Result<(String, Vec<String>), PersistenceError> {
+        let event_time_sql = |column| sql.event_time_key(column);
         let mut conditions = Vec::new();
         let mut params = Vec::new();
         let next = |value: String, params: &mut Vec<String>| {
@@ -251,6 +256,10 @@ impl QueryFieldIndexPageQuery {
                 // not after one.
                 conditions.push(format!("{key} < '{MISSING_EVENT_TIME_KEY}'"));
             }
+        }
+        for comparison in &self.field_comparisons {
+            let placeholder = next(comparison.literal.param(), &mut params);
+            conditions.push(field_comparison_sql(sql, comparison, &placeholder));
         }
         if let Some(after) = &self.after {
             let order = self.total_order();

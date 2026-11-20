@@ -43,6 +43,7 @@ mod metrics;
 mod namespace;
 pub use namespace::PostgresSchema;
 mod catalog_groups;
+mod catalog_sql;
 pub mod migration;
 pub mod platform;
 mod projection_delta;

@@ -137,6 +137,7 @@ fn filter_plan(
         where_clause: "TRUE".to_string(),
         params: Vec::new(),
         event_time_bounds: Vec::new(),
+        field_comparisons: Vec::new(),
         order_by: Vec::new(),
         after: None,
         filter_pushdown: false,
@@ -159,6 +160,14 @@ fn filter_plan(
         request.entity_type,
     )
     .field_values(&serde_json::Value::Null);
+    let fields = filter_sql::split_field_comparisons(&rest, &declared_fields(request, &defaults));
+    plan.filter_pushdown |= !fields.comparisons.is_empty();
+    plan.field_comparisons = fields.comparisons;
+    let mut missing_fields = fields.missing_default_fields;
+    let Some(rest) = fields.rest else {
+        plan.filter_missing_fields = missing_fields.into_iter().collect();
+        return plan;
+    };
     match filter_sql::try_translate_candidate_filter_with_defaults(&rest, &defaults) {
         Some(translated) => {
             // Missing index entries include omitted/oversized stored fields.
@@ -167,9 +176,57 @@ fn filter_plan(
             plan.params = translated.params;
             plan.filter_pushdown = true;
             plan.filter_exact = filter_sql::candidate_filter_is_lossless(&rest);
-            plan.filter_missing_fields = translated.missing_default_fields.into_iter().collect();
+            missing_fields.extend(translated.missing_default_fields);
         }
         None => plan.filter_exact = false,
     }
+    plan.filter_missing_fields = missing_fields.into_iter().collect();
     plan
+}
+
+/// The app fields this type's reads compare on typed values: its declared,
+/// non-nullable scalar properties that the query projection holds, with the
+/// ones a record without the key reads as a declared default.
+fn declared_fields(
+    request: &QueryPlaneReadRequest<'_>,
+    defaults: &serde_json::Value,
+) -> filter_sql::DeclaredFields {
+    let mut declared = filter_sql::DeclaredFields::default();
+    let properties: Vec<(String, String)> = {
+        let registry = request
+            .state
+            .registry
+            .read()
+            .expect("registry lock should not be poisoned"); // ci-ok: infallible lock
+        registry
+            .get_tenant(request.tenant)
+            .into_iter()
+            .flat_map(|tenant| &tenant.csdl.schemas)
+            .flat_map(|schema| &schema.entity_types)
+            .filter(|entity_type| entity_type.name == request.entity_type)
+            .flat_map(|entity_type| &entity_type.properties)
+            .filter(|property| !property.nullable)
+            .map(|property| (property.name.clone(), property.type_name.clone()))
+            .collect()
+    };
+    for (name, type_name) in properties {
+        let indexed = request.state.query_projection_indexes_field(
+            request.tenant,
+            request.entity_type,
+            &name,
+        );
+        if let Some(class) = filter_sql::edm_class(&type_name)
+            && indexed
+        {
+            declared.declare(&name, class);
+        }
+    }
+    for name in defaults
+        .as_object()
+        .into_iter()
+        .flat_map(|object| object.keys())
+    {
+        declared.default_for(name);
+    }
+    declared
 }

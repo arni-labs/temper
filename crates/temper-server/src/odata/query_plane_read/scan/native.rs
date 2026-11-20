@@ -30,6 +30,7 @@ pub(super) async fn try_query_native_page(
         where_clause: plan.where_clause.clone(),
         params: plan.params.clone(),
         event_time_bounds: plan.event_time_bounds.clone(),
+        field_comparisons: plan.field_comparisons.clone(),
         order_by: plan.order_by.clone(),
         after: plan.after.clone(),
         skip,

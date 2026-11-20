@@ -412,10 +412,19 @@ fn native_plan_pushes_file_lookup_equalities_with_status_ne_recheck() {
 
     assert!(plan.filter_pushdown);
     assert!(plan.where_clause.contains("AND"));
-    assert!(!plan.where_clause.contains("status !="));
+    // The catalog's status is never NULL, so `ne` on it is exact in SQL
+    // (ADR-0188) and the whole filter is the store's predicate.
+    assert!(plan.where_clause.contains("status != ?7"));
+    assert!(plan.filter_exact);
     assert_eq!(
         plan.params,
-        vec!["Path", "/proofs/live.txt", "WorkspaceId", "ws-1"]
+        vec![
+            "Path",
+            "/proofs/live.txt",
+            "WorkspaceId",
+            "ws-1",
+            "Archived"
+        ]
     );
     assert!(should_try_native_page_first(&plan));
 }

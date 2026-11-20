@@ -1,4 +1,5 @@
 use super::*;
+use crate::persistence::catalog_field::SketchSql;
 
 #[test]
 fn every_fraction_width_gives_one_fixed_width_key_in_time_order() {
@@ -66,9 +67,7 @@ fn a_keyset_seeks_its_first_key_and_resumes_strictly_after() {
         after: Some(vec!["2026-11-19T10:00:00.000000000".into(), "r-7".into()]),
         ..QueryFieldIndexPageQuery::default()
     };
-    let (sql, params) = page
-        .catalog_conditions(5, &|_| "K".to_string())
-        .expect("keyset");
+    let (sql, params) = page.catalog_conditions(5, &SketchSql("K")).expect("keyset");
     assert_eq!(sql, "K <= ?5 AND (K < ?5 OR (K = ?5 AND entity_id > ?6))");
     assert_eq!(params, vec!["2026-11-19T10:00:00.000000000", "r-7"]);
 }
@@ -83,9 +82,7 @@ fn a_lower_bound_leaves_out_records_without_the_time() {
         }],
         ..QueryFieldIndexPageQuery::default()
     };
-    let (sql, params) = page
-        .catalog_conditions(3, &|_| "F".to_string())
-        .expect("bounds");
+    let (sql, params) = page.catalog_conditions(3, &SketchSql("F")).expect("bounds");
     assert_eq!(sql, format!("F >= ?3 AND F < '{MISSING_EVENT_TIME_KEY}'"));
     assert_eq!(params.len(), 1);
 }
@@ -97,11 +94,11 @@ fn a_keyset_that_does_not_fit_the_order_is_refused() {
         after: Some(vec!["Open".into()]),
         ..QueryFieldIndexPageQuery::default()
     };
-    assert!(short.catalog_conditions(3, &|_| String::new()).is_err());
+    assert!(short.catalog_conditions(3, &SketchSql("")).is_err());
     let by_field = QueryFieldIndexPageQuery {
         order_by: vec![order("Total", QueryFieldIndexOrderDirection::Asc)],
         after: Some(vec!["1".into(), "r-1".into()]),
         ..QueryFieldIndexPageQuery::default()
     };
-    assert!(by_field.catalog_conditions(3, &|_| String::new()).is_err());
+    assert!(by_field.catalog_conditions(3, &SketchSql("")).is_err());
 }

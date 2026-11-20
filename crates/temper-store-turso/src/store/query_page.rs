@@ -11,6 +11,7 @@ use temper_runtime::persistence::{
 use tracing::instrument;
 
 use super::TursoEventStore;
+use super::catalog_sql::TursoCatalogSql;
 use super::instrumentation::WriteConnection;
 use crate::schema::{create_event_time_indexes as event_time_indexes, event_time_key_sql};
 
@@ -142,7 +143,7 @@ pub(super) fn page_where(
     page: &QueryFieldIndexPageQuery,
 ) -> Result<(String, Vec<String>), PersistenceError> {
     let (conditions, condition_params) =
-        page.catalog_conditions(page.params.len() + 3, &event_time_key_sql)?;
+        page.catalog_conditions(page.params.len() + 3, &TursoCatalogSql)?;
     let mut params = page.params.clone();
     params.extend(condition_params);
     Ok((format!("({}) AND {conditions}", page.where_clause), params))

@@ -27,6 +27,8 @@ mod equality_probe;
 mod event_metadata;
 mod event_time_pages;
 mod keyed_existence;
+mod large_set;
+mod ne_filters;
 mod paging;
 mod proof;
 mod spec_deleted;
@@ -169,12 +171,12 @@ fn the_native_page_answers_first_when_sql_narrows_the_read() {
 
     // A filter SQL cannot narrow keeps the id list's budget proof first.
     let unpushed_options = QueryOptions {
-        filter: Some(FilterExpr::BinaryOp {
-            left: Box::new(FilterExpr::Property("status".to_string())),
-            op: BinaryOperator::Ne,
-            right: Box::new(FilterExpr::Literal(ODataValue::String(
-                "Created".to_string(),
-            ))),
+        filter: Some(FilterExpr::FunctionCall {
+            name: "endswith".to_string(),
+            args: vec![
+                FilterExpr::Property("Notes".to_string()),
+                FilterExpr::Literal(ODataValue::String("x".to_string())),
+            ],
         }),
         ..unfiltered_options.clone()
     };

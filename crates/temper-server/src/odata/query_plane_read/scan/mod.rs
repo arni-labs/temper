@@ -25,7 +25,7 @@ use super::types::{
 };
 use crate::query_eval::apply_query_options;
 use crate::storage::QueryFieldIndexOrder;
-use temper_runtime::persistence::EventTimeBound;
+use temper_runtime::persistence::{EventTimeBound, FieldComparison};
 
 #[derive(Clone, Debug)]
 pub(super) struct NativeCandidatePagePlan {
@@ -33,6 +33,9 @@ pub(super) struct NativeCandidatePagePlan {
     pub(super) params: Vec<String>,
     /// Event-time conjuncts of the filter, compared in SQL (ADR-0187).
     pub(super) event_time_bounds: Vec<EventTimeBound>,
+    /// App-field conjuncts of the filter, compared on typed values in SQL
+    /// (ADR-0188).
+    pub(super) field_comparisons: Vec<FieldComparison>,
     pub(super) order_by: Vec<QueryFieldIndexOrder>,
     /// Start after a continuation's cursor in SQL: one key per clause of the
     /// page's total order (ADR-0187). `None` on page one, and when the
