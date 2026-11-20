@@ -81,7 +81,7 @@ pub(super) async fn load_entity_current_fields(
     .await
     {
         Err(_) => EntityLoadOutcome::LoadFailed,
-        Ok(state) if state.status == "Deleted" => EntityLoadOutcome::Skip,
+        Ok(state) if state.is_tombstoned() => EntityLoadOutcome::Skip,
         Ok(state) if state.total_event_count == 0 => EntityLoadOutcome::Skip,
         Ok(state) => EntityLoadOutcome::Fields(state.fields),
     }

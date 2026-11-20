@@ -64,7 +64,7 @@ pub(super) async fn commit(
         if state.sequence_nr != checked {
             return Ok(Stop::Moved);
         }
-        if state.status == "Deleted" {
+        if state.is_tombstoned() {
             return Err("the record was deleted".to_owned());
         }
         // The budget that keeps the replay tail bounded holds for kernel events too.
