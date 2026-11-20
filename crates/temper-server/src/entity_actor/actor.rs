@@ -1686,8 +1686,11 @@ impl EntityActor {
 
                 // A tombstone is a valid runtime state, but not a spec transition
                 // source. Reject new actions without turning a normal caller
-                // error into an actor-stopping debug assertion.
-                if state.status == "Deleted" {
+                // error into an actor-stopping debug assertion. Only the
+                // kernel's delete ends a record: a state a spec names
+                // `Deleted` is a state like any other, and a move the spec
+                // declares from it runs.
+                if state.is_tombstoned() {
                     ctx.reply(EntityResponse::refused(
                         state.clone(),
                         "cannot execute actions after entity deletion".to_string(),

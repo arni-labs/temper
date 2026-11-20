@@ -31,13 +31,17 @@ fn order_spec_with_discard() -> String {
 }
 
 fn state_on(store: &TursoEventStore, system_name: &str) -> ServerState {
-    let spec = order_spec_with_discard();
+    state_with(store, system_name, &order_spec_with_discard())
+}
+
+/// A server on `store` whose Order follows `spec`.
+fn state_with(store: &TursoEventStore, system_name: &str, spec: &str) -> ServerState {
     let mut registry = SpecRegistry::new();
     registry.register_tenant(
         TenantId::default().as_str(),
         parse_csdl(CSDL_XML).expect("CSDL should parse"),
         CSDL_XML.to_string(),
-        &[("Order", spec.as_str())],
+        &[("Order", spec)],
     );
     let mut state = ServerState::from_registry(ActorSystem::new(system_name), registry);
     state.set_storage_stack(StorageStack::from_turso(store.clone()));
@@ -236,6 +240,68 @@ async fn a_spec_deleted_record_reads_the_same_with_or_without_its_catalog_row() 
     assert_eq!(
         gone.err().map(|response| response.status()),
         Some(axum::http::StatusCode::NOT_FOUND)
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+/// A move a spec declares from a state it names `Deleted` runs: such a state
+/// is a working step like any other (an app's Deletion record is proved or
+/// abandoned from it). The actor used to refuse every move there, as if the
+/// kernel had deleted the record. A record the kernel did delete still
+/// refuses every move.
+#[tokio::test]
+async fn a_move_a_spec_declares_from_deleted_runs_and_a_kernel_deleted_record_refuses() {
+    let (store, db_path) = new_store("spec-deleted-move").await;
+    let spec = format!(
+        "{}\n[[action]]\nname = \"Restore\"\nkind = \"input\"\nfrom = [\"Deleted\"]\nto = \"Draft\"\n",
+        order_spec_with_discard()
+    );
+    let state = state_with(&store, "query-plane-spec-deleted-move", &spec);
+    six_orders_one_discarded(&state).await;
+    let tenant = TenantId::default();
+    let ctx = AgentContext::for_service("query-plane-spec-deleted-move");
+
+    let restored = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Order",
+            "ord-05",
+            "Restore",
+            serde_json::json!({}),
+            &ctx,
+        )
+        .await
+        .expect("Restore answers");
+    assert!(
+        restored.success,
+        "a move from Deleted runs: {:?}",
+        restored.error
+    );
+    assert_eq!(restored.state.status, "Draft");
+
+    state
+        .delete_tenant_entity(&tenant, "Order", "ord-04")
+        .await
+        .expect("delete ord-04");
+    let refused = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Order",
+            "ord-04",
+            "AddItem",
+            serde_json::json!({"ProductId": "p1", "Quantity": 1}),
+            &ctx,
+        )
+        .await
+        .expect("AddItem answers");
+    assert!(
+        !refused.success,
+        "a record the kernel deleted takes no move"
+    );
+    assert_eq!(
+        refused.error.as_deref(),
+        Some("cannot execute actions after entity deletion")
     );
 
     let _ = std::fs::remove_file(db_path);
