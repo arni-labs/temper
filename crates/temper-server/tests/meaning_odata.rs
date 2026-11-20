@@ -71,10 +71,14 @@ const NOTES: [(&str, &str, &str, &str); 6] = [
 /// A server over a sim store, with the word-count model installed or not, and a
 /// handle on the same store.
 fn build_state(with_model: bool) -> (ServerState, BoxedEventStore) {
+    build_state_with_spec(with_model, NOTE_IOA)
+}
+
+fn build_state_with_spec(with_model: bool, ioa: &str) -> (ServerState, BoxedEventStore) {
     let sim = SimEventStore::no_faults(7);
     let mut registry = SpecRegistry::new();
     let csdl = parse_csdl(CSDL_XML).expect("CSDL parse");
-    registry.register_tenant("default", csdl, CSDL_XML.to_string(), &[(TYPE, NOTE_IOA)]);
+    registry.register_tenant("default", csdl, CSDL_XML.to_string(), &[(TYPE, ioa)]);
     let system = ActorSystem::new("meaning-odata");
     let mut state = ServerState::from_registry(system, registry);
     state.set_storage_stack(StorageStack::from_sim(sim.clone(), None));
@@ -502,7 +506,7 @@ async fn nearest_authorizes_reference_and_ranked_rows() {
 }
 
 #[tokio::test]
-async fn nearest_rejects_system_query_options_and_vector() {
+async fn nearest_rejects_system_query_options_and_undeclared_vector() {
     let (state, _store) = ready_state().await;
 
     for option in ["$top=1", "$filter=Category%20eq%20'red'", "$search=ferry"] {
@@ -514,13 +518,58 @@ async fn nearest_rejects_system_query_options_and_vector() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{option}: {body}");
     }
 
-    // The caller no longer supplies a vector; search by words is $search.
+    // A caller supplying a vector must name a declared path and its model.
     let (status, body) = get_json(
         &state,
         "/tdata/NotedItems/Temper.Nearest(vector='%5B1,0,0,0%5D',k=1)",
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+}
+
+#[tokio::test]
+async fn nearest_ranks_raw_vectors_in_the_declared_model_partition() {
+    let ioa = format!(
+        "{NOTE_IOA}{}",
+        r#"
+[[vector]]
+name = "external"
+property = "Body"
+model_property = "Category"
+dims = 2
+metric = "cosine"
+"#
+    );
+    let (state, _) = build_state_with_spec(false, &ioa);
+    for (id, title, vector, model) in [
+        ("hidden", "Public", "[1,0]", "external-model"),
+        ("filtered", "Draft", "[1,0]", "external-model"),
+        ("other-model", "Public", "[1,0]", "another-model"),
+        ("wrong-width", "Public", "[1]", "external-model"),
+        ("far", "Public", "[0,1]", "external-model"),
+        ("close", "Public", "[1,0]", "external-model"),
+    ] {
+        create_note(&state, id, title, vector, model).await;
+    }
+    state
+        .authz
+        .reload_tenant_policies(
+            TenantId::default().as_str(),
+            r#"
+                permit(principal, action in [Action::"list", Action::"read"], resource is NotedItem);
+                forbid(principal, action == Action::"read", resource == NotedItem::"hidden");
+            "#,
+        )
+        .expect("install Cedar policy");
+
+    let (status, body) = get_json(
+        &state,
+        "/tdata/NotedItems/Temper.Nearest(decl='external',vector='%5B1%2C0%5D',model='external-model',k=2,filter='Title%20eq%20''Public''')",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(ids_of(&body), ["close", "far"]);
+    assert_eq!(body["value"][0]["@temper.score"].as_f64(), Some(1.0));
 }
 
 #[tokio::test]

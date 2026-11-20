@@ -28,7 +28,7 @@ impl QueryPlaneReadBudget {
         }
     }
 
-    pub(in crate::odata::query_plane_read) fn scan_candidate_budget(self) -> usize {
+    pub(in crate::odata) fn scan_candidate_budget(self) -> usize {
         self.max_entities
             .saturating_mul(10)
             .max(self.default_page_size)
