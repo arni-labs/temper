@@ -212,15 +212,18 @@ fn postgres_query_field_order_sql(page: &QueryFieldIndexPageQuery) -> String {
             CatalogOrderKey::EventTime(column) => {
                 clauses.push(format!("{} {direction}", event_time_key_sql(column)));
             }
+            // As the in-memory sort compares (ADR-0188): a number as an IEEE
+            // double, a string byte by byte. A row without a value sorts
+            // last ascending and first descending.
             CatalogOrderKey::Field(field_name) => {
                 let field = postgres_string_literal(field_name);
                 clauses.push(format!(
                     "CASE WHEN jsonb_typeof(fields -> {field}) = 'number' \
-                     THEN (fields ->> {field})::numeric END {direction} {nulls}"
+                     THEN CAST(fields ->> {field} AS double precision) END {direction} {nulls}"
                 ));
                 clauses.push(format!(
                     "CASE WHEN jsonb_typeof(fields -> {field}) <> 'number' \
-                     THEN fields ->> {field} END {direction} {nulls}"
+                     THEN (fields ->> {field}) COLLATE \"C\" END {direction} {nulls}"
                 ));
             }
         }

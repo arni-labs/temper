@@ -14,7 +14,9 @@
 //! ascending, first descending, where the in-memory sort puts it.
 
 use super::PersistenceError;
-use super::catalog_field::{CatalogSql, FieldComparison, field_comparison_sql};
+use super::catalog_field::{
+    CatalogSql, FieldClass, FieldComparison, FieldLiteral, field_comparison_sql,
+};
 
 /// The length of an event-time sort key, `YYYY-MM-DDTHH:MM:SS.nnnnnnnnn`.
 pub const EVENT_TIME_KEY_WIDTH: usize = 29;
@@ -91,11 +93,30 @@ impl<'a> CatalogOrderKey<'a> {
             _ => EventTimeColumn::of(field_name).map_or(Self::Field(field_name), Self::EventTime),
         }
     }
+}
 
-    /// Whether every row has a value for this key, so a keyset over it is a
-    /// plain comparison. An app field can be missing or of mixed types.
-    pub fn is_total(self) -> bool {
-        !matches!(self, Self::Field(_))
+/// One key of a keyset cursor: the boundary row's value for one clause of
+/// the page's order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KeysetValue {
+    /// An id, a status, or an event time's key ([`event_time_key`]).
+    Key(String),
+    /// An app field's value, or `None` when the row holds none. A page
+    /// resumed by one only holds rows whose value for that field is absent
+    /// or of the cursor value's JSON type; the reader checks that first
+    /// (ADR-0188).
+    Field(Option<FieldLiteral>),
+}
+
+impl From<&str> for KeysetValue {
+    fn from(key: &str) -> Self {
+        Self::Key(key.to_string())
+    }
+}
+
+impl From<String> for KeysetValue {
+    fn from(key: String) -> Self {
+        Self::Key(key)
     }
 }
 
@@ -178,9 +199,14 @@ pub struct QueryFieldIndexPageQuery {
     pub field_comparisons: Vec<FieldComparison>,
     /// The order; `entity_id` ascending follows unless it ends with `entity_id`.
     pub order_by: Vec<QueryFieldIndexOrder>,
+    /// Rows that also hold, for one of these fields, a value that is not of
+    /// its class (a JSON null included): what a reader asks for to learn
+    /// whether an order by those fields compares one JSON type only.
+    pub mistyped: Vec<(String, FieldClass)>,
     /// Start after the row with these keys, one for each clause of
-    /// [`Self::total_order`]. Every clause must be [`CatalogOrderKey::is_total`].
-    pub after: Option<Vec<String>>,
+    /// [`Self::total_order`]: a [`KeysetValue::Field`] for an app field and
+    /// a [`KeysetValue::Key`] for every other clause.
+    pub after: Option<Vec<KeysetValue>>,
     /// Rows to pass over, after `after` when both are set.
     pub skip: usize,
     /// Most ids to return. With `top == 0` and `include_count`, only the count.
@@ -233,8 +259,7 @@ impl QueryFieldIndexPageQuery {
     /// # Errors
     ///
     /// Returns [`PersistenceError::Storage`] when `after` does not hold one
-    /// key for each clause of the order, or the order has a clause a keyset
-    /// cannot compare ([`CatalogOrderKey::is_total`]).
+    /// key of the right kind for each clause of the order.
     pub fn catalog_conditions(
         &self,
         first_param: usize,
@@ -261,6 +286,20 @@ impl QueryFieldIndexPageQuery {
             let placeholder = next(comparison.literal.param(), &mut params);
             conditions.push(field_comparison_sql(sql, comparison, &placeholder));
         }
+        if !self.mistyped.is_empty() {
+            let mistyped: Vec<String> = self
+                .mistyped
+                .iter()
+                .map(|(field, class)| {
+                    format!(
+                        "({} AND NOT {})",
+                        sql.field_has_key(field),
+                        sql.field_is(field, *class)
+                    )
+                })
+                .collect();
+            conditions.push(format!("({})", mistyped.join(" OR ")));
+        }
         if let Some(after) = &self.after {
             let order = self.total_order();
             if after.len() != order.len() {
@@ -272,17 +311,39 @@ impl QueryFieldIndexPageQuery {
             }
             let mut clauses = Vec::with_capacity(order.len());
             for ((key, descending), value) in order.iter().zip(after) {
-                let sql = match key {
-                    CatalogOrderKey::EntityId => "entity_id".to_string(),
-                    CatalogOrderKey::Status => "status".to_string(),
-                    CatalogOrderKey::EventTime(column) => event_time_sql(*column),
-                    CatalogOrderKey::Field(name) => {
+                let clause = match (key, value) {
+                    (CatalogOrderKey::Field(name), KeysetValue::Field(literal)) => {
+                        KeysetClause::Field {
+                            present: sql.field_present(name),
+                            value: literal.as_ref().map(|literal| {
+                                let placeholder = next(literal.param(), &mut params);
+                                (
+                                    sql.field_value(name, literal.class()),
+                                    sql.literal(&placeholder, literal.class()),
+                                )
+                            }),
+                        }
+                    }
+                    (CatalogOrderKey::Field(name), KeysetValue::Key(_)) => {
                         return Err(PersistenceError::Storage(format!(
-                            "a keyset cannot resume an order by field {name}"
+                            "a keyset resumes field {name} by a field value"
                         )));
                     }
+                    (_, KeysetValue::Field(_)) => {
+                        return Err(PersistenceError::Storage(
+                            "a keyset resumes a catalog key by its text".to_string(),
+                        ));
+                    }
+                    (key, KeysetValue::Key(text)) => KeysetClause::Total {
+                        sql: match key {
+                            CatalogOrderKey::Status => "status".to_string(),
+                            CatalogOrderKey::EventTime(column) => event_time_sql(*column),
+                            _ => "entity_id".to_string(),
+                        },
+                        value: next(text.clone(), &mut params),
+                    },
                 };
-                clauses.push((sql, *descending, next(value.clone(), &mut params)));
+                clauses.push((clause, *descending));
             }
             conditions.push(keyset_sql(&clauses));
         }
@@ -293,28 +354,61 @@ impl QueryFieldIndexPageQuery {
     }
 }
 
-/// Rows strictly after the cursor under `clauses` (`(sql, descending,
-/// placeholder)`): the first key at or past its value, which an index on
-/// the order seeks to, and then strictly after in the order.
-fn keyset_sql(clauses: &[(String, bool, String)]) -> String {
-    debug_assert!(!clauses.is_empty());
-    let (first, first_descending, first_value) = &clauses[0];
-    let at_or_past = if *first_descending { "<=" } else { ">=" };
-    format!(
-        "{first} {at_or_past} {first_value} AND {}",
-        strictly_after(clauses)
-    )
+/// One clause of a keyset as SQL.
+enum KeysetClause {
+    /// A key every row holds: `sql` against the cursor's `value`.
+    Total { sql: String, value: String },
+    /// An app field: `present` is true when the row holds a value, and
+    /// `value` is the row's value and the cursor's, when the cursor holds
+    /// one. A row without a value sorts last ascending and first descending,
+    /// where the in-memory sort puts it.
+    Field {
+        present: String,
+        value: Option<(String, String)>,
+    },
 }
 
-fn strictly_after(clauses: &[(String, bool, String)]) -> String {
-    let (sql, descending, value) = &clauses[0];
+/// Rows strictly after the cursor under `clauses`. When the first key is
+/// one every row holds, the rows at or past its value come first, which an
+/// index on the order seeks to.
+fn keyset_sql(clauses: &[(KeysetClause, bool)]) -> String {
+    debug_assert!(!clauses.is_empty());
+    match &clauses[0] {
+        (KeysetClause::Total { sql, value }, descending) => {
+            let at_or_past = if *descending { "<=" } else { ">=" };
+            format!("{sql} {at_or_past} {value} AND {}", strictly_after(clauses))
+        }
+        (KeysetClause::Field { .. }, _) => strictly_after(clauses),
+    }
+}
+
+fn strictly_after(clauses: &[(KeysetClause, bool)]) -> String {
+    let (clause, descending) = &clauses[0];
     let past = if *descending { "<" } else { ">" };
-    match &clauses[1..] {
-        [] => format!("{sql} {past} {value}"),
-        rest => format!(
-            "({sql} {past} {value} OR ({sql} = {value} AND {}))",
-            strictly_after(rest)
-        ),
+    let rest = match &clauses[1..] {
+        [] => None,
+        rest => Some(strictly_after(rest)),
+    };
+    match clause {
+        KeysetClause::Total { sql, value } => match rest {
+            None => format!("{sql} {past} {value}"),
+            Some(rest) => format!("({sql} {past} {value} OR ({sql} = {value} AND {rest}))"),
+        },
+        KeysetClause::Field { present, value } => {
+            // The order always ends with the id, so a field is never last.
+            let rest = rest.unwrap_or_else(|| "FALSE".to_string());
+            match (value, descending) {
+                (Some((row, cursor)), false) => format!(
+                    "(({present} AND ({row} > {cursor} OR ({row} = {cursor} AND {rest}))) \
+                     OR NOT {present})"
+                ),
+                (None, false) => format!("(NOT {present} AND {rest})"),
+                (Some((row, cursor)), true) => {
+                    format!("({present} AND ({row} < {cursor} OR ({row} = {cursor} AND {rest})))")
+                }
+                (None, true) => format!("({present} OR (NOT {present} AND {rest}))"),
+            }
+        }
     }
 }
 

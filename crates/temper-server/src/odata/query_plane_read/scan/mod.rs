@@ -25,7 +25,7 @@ use super::types::{
 };
 use crate::query_eval::apply_query_options;
 use crate::storage::QueryFieldIndexOrder;
-use temper_runtime::persistence::{EventTimeBound, FieldComparison};
+use temper_runtime::persistence::{EventTimeBound, FieldClass, FieldComparison, KeysetValue};
 
 #[derive(Clone, Debug)]
 pub(super) struct NativeCandidatePagePlan {
@@ -37,10 +37,14 @@ pub(super) struct NativeCandidatePagePlan {
     /// (ADR-0188).
     pub(super) field_comparisons: Vec<FieldComparison>,
     pub(super) order_by: Vec<QueryFieldIndexOrder>,
+    /// The app fields `order_by` sorts by, each with the JSON type its order
+    /// compares. SQL's order is the in-memory sort's only when no candidate
+    /// holds a value of another type there (ADR-0188).
+    pub(super) field_orders: Vec<(String, FieldClass)>,
     /// Start after a continuation's cursor in SQL: one key per clause of the
     /// page's total order (ADR-0187). `None` on page one, and when the
     /// continuation's keyset is folded into the filter instead.
-    pub(super) after: Option<Vec<String>>,
+    pub(super) after: Option<Vec<KeysetValue>>,
     pub(super) filter_pushdown: bool,
     /// The read has no filter at all (a continuation's keyset is not one).
     pub(super) unfiltered: bool,

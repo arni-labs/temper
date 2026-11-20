@@ -17,6 +17,7 @@ use crate::storage::{
     QueryFieldIndexOrderDirection, QueryFieldIndexPage, QueryFieldIndexPageQuery,
 };
 use temper_odata::query::types::{OrderByClause, OrderDirection};
+use temper_runtime::persistence::KeysetValue;
 
 /// The keyset of a page's last row, `last_id`, under `plan`'s order: where
 /// the next page starts. `None` when the row is not in `page` (it left
@@ -26,9 +27,9 @@ fn resume_after(
     plan: &NativeCandidatePagePlan,
     last_id: &str,
     page: &[serde_json::Value],
-) -> Option<Vec<String>> {
+) -> Option<Vec<KeysetValue>> {
     if plan.order_by.is_empty() {
-        return Some(vec![last_id.to_string()]);
+        return Some(vec![KeysetValue::Key(last_id.to_string())]);
     }
     let row = page
         .iter()
@@ -56,22 +57,58 @@ pub(super) async fn try_query_native_page(
     top: usize,
     include_count: bool,
 ) -> Result<Option<QueryFieldIndexPage>, ()> {
-    let Some(query_plane) = request.state.query_plane_store() else {
-        return Ok(None);
-    };
-    let page = QueryFieldIndexPageQuery {
+    run_page(request, &page_query(plan, skip, top, include_count)).await
+}
+
+fn page_query(
+    plan: &NativeCandidatePagePlan,
+    skip: usize,
+    top: usize,
+    include_count: bool,
+) -> QueryFieldIndexPageQuery {
+    QueryFieldIndexPageQuery {
         where_clause: plan.where_clause.clone(),
         params: plan.params.clone(),
         event_time_bounds: plan.event_time_bounds.clone(),
         field_comparisons: plan.field_comparisons.clone(),
+        mistyped: Vec::new(),
         order_by: plan.order_by.clone(),
         after: plan.after.clone(),
         skip,
         top,
         include_count,
+    }
+}
+
+/// Whether no candidate holds, for an app field the order sorts by, a value
+/// of another JSON type than the order compares (a JSON null included).
+/// The in-memory sort finds such values equal to everything, so only then is
+/// SQL's order its order (ADR-0188). One probe of the filter's rows, which
+/// stops at the first such row.
+async fn field_orders_typed(
+    request: &QueryPlaneReadRequest<'_>,
+    plan: &NativeCandidatePagePlan,
+) -> Option<bool> {
+    if plan.field_orders.is_empty() {
+        return Some(true);
+    }
+    let mut probe = page_query(plan, 0, 1, false);
+    probe.order_by.clear();
+    probe.after = None;
+    probe.mistyped = plan.field_orders.clone();
+    let page = run_page(request, &probe).await.ok()??;
+    Some(page.entity_ids.is_empty())
+}
+
+async fn run_page(
+    request: &QueryPlaneReadRequest<'_>,
+    page: &QueryFieldIndexPageQuery,
+) -> Result<Option<QueryFieldIndexPage>, ()> {
+    let Some(query_plane) = request.state.query_plane_store() else {
+        return Ok(None);
     };
     query_plane
-        .query_field_index_page(request.tenant.as_str(), request.entity_type, &page)
+        .query_field_index_page(request.tenant.as_str(), request.entity_type, page)
         .await
         .map_err(|error| {
             tracing::warn!(
@@ -154,7 +191,9 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
             .filter(|clause| defaults.get(&clause.field_name).is_some())
             .map(|clause| clause.field_name.clone())
             .collect::<Vec<_>>();
-        if !native_values_present(request, &plan, &sort_fields).await? {
+        if !native_values_present(request, &plan, &sort_fields).await?
+            || (requested_top > 0 && !field_orders_typed(request, &plan).await?)
+        {
             return None;
         }
     }

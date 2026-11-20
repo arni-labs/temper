@@ -50,6 +50,12 @@ pub(in crate::odata) const RECORD_PROPERTIES: [&str; 18] = [
     "@odata.id",
 ];
 
+/// Whether a read of `name` finds something other than the app field in
+/// `fields`: a [`RECORD_PROPERTIES`] name, or kernel event metadata.
+pub(in crate::odata) fn is_record_property(name: &str) -> bool {
+    RECORD_PROPERTIES.contains(&name) || temper_spec::automaton::is_event_metadata_field(name)
+}
+
 /// The app fields a read may compare on typed values: each declared,
 /// non-nullable scalar property with its JSON type, and which of them have
 /// a declared default.
@@ -62,9 +68,7 @@ pub(in crate::odata) struct DeclaredFields {
 impl DeclaredFields {
     /// A field that compares as `class`.
     pub(in crate::odata) fn declare(&mut self, name: &str, class: FieldClass) {
-        let reserved = RECORD_PROPERTIES.contains(&name)
-            || temper_spec::automaton::is_event_metadata_field(name);
-        if !reserved {
+        if !is_record_property(name) {
             self.classes.insert(name.to_string(), class);
         }
     }

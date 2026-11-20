@@ -22,7 +22,9 @@ mod field_compare;
 
 pub(super) use equality::equality_field_predicates;
 pub(super) use event_time::split_event_time_bounds;
-pub(super) use field_compare::{DeclaredFields, edm_class, split_field_comparisons};
+pub(super) use field_compare::{
+    DeclaredFields, edm_class, is_record_property, split_field_comparisons,
+};
 
 const MAX_INDEXABLE_FIELD_VALUE_BYTES: usize = 2000;
 

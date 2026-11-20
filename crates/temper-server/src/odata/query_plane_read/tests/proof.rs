@@ -805,13 +805,9 @@ async fn file_point_lookup_with_status_ne_uses_lossless_equality_candidates() {
         )
         .await
         .expect("native candidate query should execute");
-    assert_eq!(
-        candidate_ids,
-        vec![
-            "zz-target-archived".to_string(),
-            "zz-target-ready".to_string()
-        ]
-    );
+    // `Status ne 'Archived'` is part of the SQL predicate (ADR-0188), so the
+    // archived file is never a candidate.
+    assert_eq!(candidate_ids, vec!["zz-target-ready".to_string()]);
 
     let result = match read_entity_set_page(request).await {
         Ok(result) => result,

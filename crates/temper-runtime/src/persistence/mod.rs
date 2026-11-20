@@ -16,7 +16,7 @@ pub use catalog_field::{
 pub use catalog_group::CatalogGroupRow;
 pub use catalog_page::{
     CatalogOrderKey, EVENT_TIME_KEY_WIDTH, EventTimeBound, EventTimeColumn, KeyComparison,
-    MISSING_EVENT_TIME_KEY, QueryFieldIndexOrder, QueryFieldIndexOrderDirection,
+    KeysetValue, MISSING_EVENT_TIME_KEY, QueryFieldIndexOrder, QueryFieldIndexOrderDirection,
     QueryFieldIndexPageQuery, event_time_key,
 };
 pub use catalog_state::{catalog_state_for_storage, catalog_state_from_storage};

@@ -32,7 +32,9 @@ use temper_odata::query::types::{
     BinaryOperator, FilterExpr, ODataValue, OrderByClause, OrderDirection, QueryOptions,
 };
 
-use temper_runtime::persistence::{CatalogOrderKey, MISSING_EVENT_TIME_KEY, event_time_key};
+mod sql_keyset;
+use sql_keyset::sql_keyset;
+pub(super) use sql_keyset::sql_keyset_for_row;
 
 use super::scan::{self, SqlKeyset};
 use super::{
@@ -284,49 +286,6 @@ fn literal_false() -> FilterExpr {
         op: temper_odata::query::types::UnaryOperator::Not,
         operand: Box::new(FilterExpr::Literal(ODataValue::Boolean(true))),
     }
-}
-
-/// The cursor as the keys the stores compare, one per clause of `order`, or
-/// `None` when a clause is not a catalog key the store can seek by. An event
-/// time is its instant's key and an absent one sorts as
-/// `MISSING_EVENT_TIME_KEY`; an id or a status is its text. `Id` and `id` are
-/// read from the record's body, which need not hold its id, so they fold.
-fn sql_keyset(cursor: &Cursor, order: &[OrderByClause]) -> Option<Vec<String>> {
-    if cursor.keys.len() != order.len() {
-        return None;
-    }
-    order
-        .iter()
-        .zip(&cursor.keys)
-        .map(
-            |(clause, key)| match CatalogOrderKey::of(&clause.property) {
-                CatalogOrderKey::EntityId if clause.property == ID_PROPERTY => key
-                    .value
-                    .as_str()
-                    .filter(|_| key.present)
-                    .map(str::to_string),
-                CatalogOrderKey::Status => key
-                    .value
-                    .as_str()
-                    .filter(|_| key.present)
-                    .map(str::to_string),
-                CatalogOrderKey::EventTime(_) if key.present => {
-                    key.value.as_str().and_then(event_time_key)
-                }
-                CatalogOrderKey::EventTime(_) => Some(MISSING_EVENT_TIME_KEY.to_string()),
-                CatalogOrderKey::EntityId | CatalogOrderKey::Field(_) => None,
-            },
-        )
-        .collect()
-}
-
-/// The keys the stores compare for `row` under `order` ([`sql_keyset`]): where
-/// a walk's next store page starts after it.
-pub(super) fn sql_keyset_for_row(
-    row: &serde_json::Value,
-    order: &[OrderByClause],
-) -> Option<Vec<String>> {
-    sql_keyset(&cursor_for_row(row, order), order)
 }
 
 /// Combine a caller's optional `$filter` with the keyset predicate.

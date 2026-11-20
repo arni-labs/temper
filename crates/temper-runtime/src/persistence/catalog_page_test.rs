@@ -95,10 +95,73 @@ fn a_keyset_that_does_not_fit_the_order_is_refused() {
         ..QueryFieldIndexPageQuery::default()
     };
     assert!(short.catalog_conditions(3, &SketchSql("")).is_err());
-    let by_field = QueryFieldIndexPageQuery {
+    let field_by_text = QueryFieldIndexPageQuery {
         order_by: vec![order("Total", QueryFieldIndexOrderDirection::Asc)],
         after: Some(vec!["1".into(), "r-1".into()]),
         ..QueryFieldIndexPageQuery::default()
     };
-    assert!(by_field.catalog_conditions(3, &SketchSql("")).is_err());
+    assert!(field_by_text.catalog_conditions(3, &SketchSql("")).is_err());
+    let status_by_field = QueryFieldIndexPageQuery {
+        order_by: vec![order("status", QueryFieldIndexOrderDirection::Asc)],
+        after: Some(vec![KeysetValue::Field(None), "r-1".into()]),
+        ..QueryFieldIndexPageQuery::default()
+    };
+    assert!(
+        status_by_field
+            .catalog_conditions(3, &SketchSql(""))
+            .is_err()
+    );
+}
+
+#[test]
+fn a_field_keyset_puts_rows_without_a_value_last_ascending() {
+    let page = |direction, cursor: Option<FieldLiteral>| QueryFieldIndexPageQuery {
+        order_by: vec![order("rank", direction)],
+        after: Some(vec![KeysetValue::Field(cursor), "r-1".into()]),
+        ..QueryFieldIndexPageQuery::default()
+    };
+    let number = Some(FieldLiteral::Number("3".into()));
+    let sql = |query: QueryFieldIndexPageQuery| {
+        query.catalog_conditions(3, &SketchSql("")).expect("keyset")
+    };
+    let (asc, params) = sql(page(QueryFieldIndexOrderDirection::Asc, number.clone()));
+    assert_eq!(
+        asc,
+        "((present(rank) AND (Number(rank) > Number(?3) OR (Number(rank) = Number(?3) \
+         AND entity_id > ?4))) OR NOT present(rank))"
+    );
+    assert_eq!(params, vec!["3", "r-1"]);
+    let (desc, _) = sql(page(QueryFieldIndexOrderDirection::Desc, number));
+    assert_eq!(
+        desc,
+        "(present(rank) AND (Number(rank) < Number(?3) OR (Number(rank) = Number(?3) \
+         AND entity_id > ?4)))"
+    );
+    let (asc_absent, params) = sql(page(QueryFieldIndexOrderDirection::Asc, None));
+    assert_eq!(asc_absent, "(NOT present(rank) AND entity_id > ?3)");
+    assert_eq!(params, vec!["r-1"]);
+    let (desc_absent, _) = sql(page(QueryFieldIndexOrderDirection::Desc, None));
+    assert_eq!(
+        desc_absent,
+        "(present(rank) OR (NOT present(rank) AND entity_id > ?3))"
+    );
+}
+
+#[test]
+fn mistyped_selects_rows_holding_a_value_of_another_class() {
+    let page = QueryFieldIndexPageQuery {
+        mistyped: vec![
+            ("title".into(), FieldClass::Text),
+            ("rank".into(), FieldClass::Number),
+        ],
+        ..QueryFieldIndexPageQuery::default()
+    };
+    let (sql, params) = page
+        .catalog_conditions(3, &SketchSql(""))
+        .expect("mistyped");
+    assert_eq!(
+        sql,
+        "((has(title) AND NOT is_Text(title)) OR (has(rank) AND NOT is_Number(rank)))"
+    );
+    assert!(params.is_empty());
 }
