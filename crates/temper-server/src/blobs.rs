@@ -15,6 +15,7 @@ use crate::state::ServerState;
 
 mod descriptor;
 mod hydration;
+pub(crate) use hydration::WASM_DEFERRED_BLOB_BUDGET_BYTES;
 mod read_source;
 mod stored_fields;
 pub use descriptor::{

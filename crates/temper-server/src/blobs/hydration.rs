@@ -16,7 +16,8 @@ use crate::state::ServerState;
 
 const GENERIC_INLINE_HYDRATION_BUDGET_BYTES: usize = 1024 * 1024;
 const GENERIC_MAX_INLINE_FIELD_BYTES: usize = 128 * 1024;
-const WASM_DEFERRED_BLOB_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+/// What one WASM call may read of an entity's overflowed fields in all; the largest `/tdata` body follows it (router.rs).
+pub(crate) const WASM_DEFERRED_BLOB_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 const WASM_MAX_DEFERRED_BLOB_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BLOB_REFS_PER_VALUE: usize = 1024;
 const MAX_BLOB_READ_ATTEMPTS_PER_RESPONSE: usize = 64;

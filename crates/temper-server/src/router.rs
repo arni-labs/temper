@@ -23,6 +23,11 @@ use temper_authz::AuthenticatedRequestContext;
 
 const TEMPER_CLIENT_JS: &str = include_str!("../static/temper-client.js");
 const INTERNAL_BLOB_BODY_LIMIT_BYTES: usize = 128 * 1024 * 1024;
+/// The largest body an entity write or action takes (`/tdata/{*path}`): 16 MiB, what one WASM call may read of an
+/// entity's overflowed fields in all (`blobs::hydration`, `WASM_DEFERRED_BLOB_BUDGET_BYTES`). A write whose values
+/// together pass it would store what no integration reacting to it can read back whole. Before 20 Nov 2026 this
+/// route had axum's default of 2 MB, a limit with no reason of Temper's, which callers kept their own caps under.
+const TDATA_BODY_LIMIT_BYTES: usize = crate::blobs::WASM_DEFERRED_BLOB_BUDGET_BYTES;
 
 async fn serve_temper_client() -> (
     StatusCode,
@@ -82,7 +87,8 @@ pub fn build_routes(state: ServerState) -> Router {
                 .post(odata::handle_odata_post)
                 .patch(odata::handle_odata_patch)
                 .put(odata::handle_odata_put)
-                .delete(odata::handle_odata_delete),
+                .delete(odata::handle_odata_delete)
+                .layer(DefaultBodyLimit::max(TDATA_BODY_LIMIT_BYTES)),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
