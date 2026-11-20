@@ -17,7 +17,7 @@ use crate::storage::{
     QueryFieldIndexOrderDirection, QueryFieldIndexPage, QueryFieldIndexPageQuery,
 };
 use temper_odata::query::types::{OrderByClause, OrderDirection};
-use temper_runtime::persistence::KeysetValue;
+use temper_runtime::persistence::{FieldClass, KeysetValue};
 
 /// The keyset of a page's last row, `last_id`, under `plan`'s order: where
 /// the next page starts. `None` when the row is not in `page` (it left
@@ -89,13 +89,24 @@ async fn field_orders_typed(
     request: &QueryPlaneReadRequest<'_>,
     plan: &NativeCandidatePagePlan,
 ) -> Option<bool> {
-    if plan.field_orders.is_empty() {
+    fields_typed(request, plan, &plan.field_orders).await
+}
+
+/// Whether no row `plan`'s filter selects holds, for one of `fields`, a
+/// value of another JSON type than its class (a JSON null included). `None`
+/// when the store cannot say.
+pub(in crate::odata::query_plane_read) async fn fields_typed(
+    request: &QueryPlaneReadRequest<'_>,
+    plan: &NativeCandidatePagePlan,
+    fields: &[(String, FieldClass)],
+) -> Option<bool> {
+    if fields.is_empty() {
         return Some(true);
     }
     let mut probe = page_query(plan, 0, 1, false);
     probe.order_by.clear();
     probe.after = None;
-    probe.mistyped = plan.field_orders.clone();
+    probe.mistyped = fields.to_vec();
     let page = run_page(request, &probe).await.ok()??;
     Some(page.entity_ids.is_empty())
 }

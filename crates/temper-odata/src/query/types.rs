@@ -3,13 +3,12 @@
 //! Parses `$filter`, `$select`, `$expand`, `$orderby`, `$top`, `$skip`, and `$count`
 //! from a URL query string, or from decoded pairs, into [`QueryOptions`].
 
+use super::apply::{GroupCount, parse_apply};
 use super::filter::parse_filter;
 use super::query_string::{split_key_value, split_query_string};
 use crate::error::ODataError;
 
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
+// --- Public types
 
 /// All parsed OData system query options.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -36,6 +35,9 @@ pub struct QueryOptions {
     pub skiptoken: Option<String>,
     /// The `$search` words, if present: word matches first, then by meaning (ADR-0186).
     pub search: Option<String>,
+    /// The `$apply` grouping, if present: one property's groups, each
+    /// counted (ADR-0188).
+    pub apply: Option<GroupCount>,
 }
 
 /// An item in a `$expand` clause, optionally with nested query options.
@@ -153,9 +155,7 @@ pub enum ODataValue {
     DateTimeOffset(chrono::DateTime<chrono::Utc>),
 }
 
-// ---------------------------------------------------------------------------
-// Top-level query string parser
-// ---------------------------------------------------------------------------
+// --- Top-level query string parser
 
 /// Parse a raw URL query string (without leading `?`) into [`QueryOptions`].
 ///
@@ -211,6 +211,7 @@ pub fn parse_query_options_from_pairs<'a>(
             }
             "$skiptoken" => opts.skiptoken = non_empty(value),
             "$search" => opts.search = non_empty(value),
+            "$apply" => opts.apply = Some(parse_apply(value)?),
             // Custom options, $format and system options not handled yet are ignored.
             _ => {}
         }
@@ -219,9 +220,7 @@ pub fn parse_query_options_from_pairs<'a>(
     Ok(opts)
 }
 
-// ---------------------------------------------------------------------------
-// $select parser
-// ---------------------------------------------------------------------------
+// --- $select parser
 
 fn parse_select(value: &str) -> Vec<String> {
     value
@@ -231,9 +230,7 @@ fn parse_select(value: &str) -> Vec<String> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// $orderby parser
-// ---------------------------------------------------------------------------
+// --- $orderby parser
 
 fn parse_orderby(value: &str) -> Result<Vec<OrderByClause>, ODataError> {
     let mut clauses = Vec::new();
@@ -279,9 +276,7 @@ fn parse_orderby(value: &str) -> Result<Vec<OrderByClause>, ODataError> {
     Ok(clauses)
 }
 
-// ---------------------------------------------------------------------------
-// $expand parser
-// ---------------------------------------------------------------------------
+// --- $expand parser
 
 /// The most levels one `$expand` may nest (`A($expand=B($expand=C))` is three).
 ///
@@ -462,9 +457,7 @@ fn split_by_semicolon(s: &str) -> Vec<String> {
     parts
 }
 
-// ---------------------------------------------------------------------------
-// Simple helpers
-// ---------------------------------------------------------------------------
+// --- Simple helpers
 
 fn parse_usize(option: &str, value: &str) -> Result<usize, ODataError> {
     value

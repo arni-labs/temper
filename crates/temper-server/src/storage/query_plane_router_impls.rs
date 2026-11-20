@@ -1,6 +1,6 @@
 //! Query plane storage routed to each tenant's own store.
 
-use temper_runtime::persistence::PersistenceError;
+use temper_runtime::persistence::{CatalogFacetQuery, PersistenceError};
 use temper_store_turso::{TenantStoreRouter, TursoEventStore};
 
 use super::query_plane_impls::catalog_freshness;
@@ -118,6 +118,19 @@ impl QueryPlaneStore for TenantStoreRouter {
             entity_ids,
             total_count,
         }))
+    }
+
+    async fn query_catalog_facets(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        facets: &CatalogFacetQuery,
+    ) -> Result<Option<Vec<(serde_json::Value, usize)>>, PersistenceError> {
+        let store = self.store_for_tenant(tenant).await?;
+        store
+            .query_catalog_facets(tenant, entity_type, facets)
+            .await
+            .map(Some)
     }
 
     async fn load_projection_fields_many(

@@ -1,6 +1,7 @@
 //! OData entity-set reads through the query-plane contract.
 
 mod equality;
+mod facets;
 mod pagination;
 mod scan;
 mod search;
@@ -8,6 +9,7 @@ mod search;
 mod tests;
 mod types;
 
+pub(in crate::odata) use facets::read_facets;
 pub(in crate::odata) use pagination::read_entity_set_from_query_plane;
 pub(in crate::odata) use search::walk_ranked;
 pub(in crate::odata) use types::{

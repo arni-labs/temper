@@ -666,6 +666,7 @@ async fn expand_entity_recursive(
                 count: None,
                 skiptoken: None,
                 search: None,
+                apply: None,
             };
             let (filtered, _) = apply_query_options(related_entities, &nested_query);
             related_entities = filtered;

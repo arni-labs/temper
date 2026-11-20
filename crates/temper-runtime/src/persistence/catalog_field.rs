@@ -123,6 +123,8 @@ pub trait CatalogSql {
     /// The parameter `placeholder` as `class` compares it, from
     /// [`FieldLiteral::param`].
     fn literal(&self, placeholder: &str, class: FieldClass) -> String;
+    /// The row's status as a string compares it, under byte order.
+    fn status(&self) -> String;
 }
 
 /// The SQL condition of `comparison`, with its literal at `placeholder`.
@@ -176,6 +178,9 @@ impl CatalogSql for SketchSql {
     }
     fn literal(&self, placeholder: &str, class: FieldClass) -> String {
         format!("{class:?}({placeholder})")
+    }
+    fn status(&self) -> String {
+        "status".to_string()
     }
 }
 

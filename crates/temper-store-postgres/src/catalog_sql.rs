@@ -72,4 +72,8 @@ impl CatalogSql for PostgresCatalogSql {
             FieldClass::Boolean => format!("CAST({placeholder} AS text)"),
         }
     }
+
+    fn status(&self) -> String {
+        "(status COLLATE \"C\")".to_string()
+    }
 }

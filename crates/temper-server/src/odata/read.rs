@@ -26,7 +26,7 @@ use super::common::{
 use super::filter_sql;
 use super::property_read::{handle_property_read, is_navigation_property};
 use super::query_plane_read::{
-    QueryPlaneReadBudget, QueryPlaneReadRequest, read_entity_set_from_query_plane,
+    QueryPlaneReadBudget, QueryPlaneReadRequest, read_entity_set_from_query_plane, read_facets,
 };
 use super::read_support::{
     record_entity_set_not_found, resolve_entity_set_name, try_load_entity_body_from_catalog,
@@ -913,6 +913,18 @@ async fn handle_entity_set(
     let with_moves = query_params
         .get(ROW_ACTIONS_OPTION)
         .is_some_and(|v| v == "true");
+    if let Some(group) = &query_options.apply {
+        let request = QueryPlaneReadRequest {
+            state,
+            tenant,
+            security_ctx,
+            entity_type: &entity_type,
+            entity_set_name: name,
+            query_options,
+            budget: QueryPlaneReadBudget::from_config(),
+        };
+        return facet_response(request, group, query_params, with_moves).await;
+    }
     let whole_rows = with_moves.then(|| QueryOptions {
         select: None,
         ..query_options.clone()
@@ -984,6 +996,43 @@ async fn handle_entity_set(
         body["@odata.count"] = serde_json::json!(c);
     }
     if let Some(token) = read_result.next_skiptoken {
+        body["@odata.nextLink"] = serde_json::json!(next_link(name, query_params, &token));
+    }
+    ODataResponse {
+        status: StatusCode::OK,
+        body,
+    }
+    .into_response()
+}
+
+/// A facet read (`$apply`, ADR-0188): one page of groups and the link to the
+/// next. A row's moves are not a group's, so `actions=true` is refused.
+async fn facet_response(
+    request: QueryPlaneReadRequest<'_>,
+    group: &temper_odata::query::GroupCount,
+    query_params: &std::collections::BTreeMap<String, String>,
+    with_moves: bool,
+) -> axum::response::Response {
+    if with_moves {
+        let message = "$apply is not read with actions=true";
+        return odata_error(StatusCode::BAD_REQUEST, "UnsupportedQuery", message).into_response();
+    }
+    let name = request.entity_set_name;
+    let page = match read_facets(request, group).await {
+        Ok(page) => page,
+        Err(error) => return error.into_response(),
+    };
+    let id_source = if page.grouped_in_sql {
+        "facet_sql_groups"
+    } else {
+        "facet_walk"
+    };
+    tracing::Span::current().record("id_source", id_source);
+    let mut body = serde_json::json!({
+        "@odata.context": format!("$metadata#{name}"),
+        "value": page.groups,
+    });
+    if let Some(token) = page.next_skiptoken {
         body["@odata.nextLink"] = serde_json::json!(next_link(name, query_params, &token));
     }
     ODataResponse {

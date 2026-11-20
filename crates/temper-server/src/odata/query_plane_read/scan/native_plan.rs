@@ -58,7 +58,10 @@ fn native_order_property_is_lossless(request: &QueryPlaneReadRequest<'_>, proper
 /// string, for a declared, non-nullable scalar the query projection holds
 /// and the record does not also hold at its top. A boolean is never
 /// ordered: the in-memory sort does not compare booleans.
-fn field_order_class(request: &QueryPlaneReadRequest<'_>, property: &str) -> Option<FieldClass> {
+pub(in crate::odata::query_plane_read) fn field_order_class(
+    request: &QueryPlaneReadRequest<'_>,
+    property: &str,
+) -> Option<FieldClass> {
     if filter_sql::is_record_property(property)
         || !request.state.query_projection_indexes_field(
             request.tenant,
@@ -68,6 +71,16 @@ fn field_order_class(request: &QueryPlaneReadRequest<'_>, property: &str) -> Opt
     {
         return None;
     }
+    let (class, nullable) = declared_scalar(request, property)?;
+    (!nullable && class != FieldClass::Boolean).then_some(class)
+}
+
+/// The JSON type of `property` and whether it is nullable, when the entity
+/// type declares it as a scalar a comparison reads.
+pub(in crate::odata::query_plane_read) fn declared_scalar(
+    request: &QueryPlaneReadRequest<'_>,
+    property: &str,
+) -> Option<(FieldClass, bool)> {
     let registry = request
         .state
         .registry
@@ -83,10 +96,7 @@ fn field_order_class(request: &QueryPlaneReadRequest<'_>, property: &str) -> Opt
         .properties
         .iter()
         .find(|candidate| candidate.name == property)?;
-    if declared.nullable {
-        return None;
-    }
-    filter_sql::edm_class(&declared.type_name).filter(|class| *class != FieldClass::Boolean)
+    filter_sql::edm_class(&declared.type_name).map(|class| (class, declared.nullable))
 }
 
 #[cfg(test)]

@@ -3,10 +3,12 @@ mod native_plan;
 mod read_source;
 mod uniform;
 
-pub(super) use native::try_native_page_read;
+pub(super) use native::{fields_typed, try_native_page_read};
 #[cfg(test)]
 pub(super) use native_plan::native_candidate_page_plan;
-pub(super) use native_plan::{SqlKeyset, native_candidate_page_plan_after};
+pub(super) use native_plan::{
+    SqlKeyset, declared_scalar, field_order_class, native_candidate_page_plan_after,
+};
 pub(super) use read_source::read_from_source_cursor;
 
 use std::collections::{BTreeSet, HashMap};

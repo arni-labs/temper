@@ -59,6 +59,7 @@ mod projection_freshness;
 mod projection_repair;
 mod projection_rows;
 mod published_artifacts;
+mod query_facets;
 mod query_page;
 mod scheduled_actions;
 mod secrets;

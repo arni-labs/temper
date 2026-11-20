@@ -1,4 +1,4 @@
-use temper_runtime::persistence::PersistenceError;
+use temper_runtime::persistence::{CatalogFacetQuery, PersistenceError};
 use temper_store_postgres::PostgresEventStore;
 use temper_store_turso::TursoEventStore;
 
@@ -135,6 +135,17 @@ impl QueryPlaneStore for PostgresEventStore {
             entity_ids,
             total_count,
         }))
+    }
+
+    async fn query_catalog_facets(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        facets: &CatalogFacetQuery,
+    ) -> Result<Option<Vec<(serde_json::Value, usize)>>, PersistenceError> {
+        PostgresEventStore::query_catalog_facets(self, tenant, entity_type, facets)
+            .await
+            .map(Some)
     }
 
     async fn load_projection_fields_many(
@@ -331,6 +342,17 @@ impl QueryPlaneStore for TursoEventStore {
             entity_ids,
             total_count,
         }))
+    }
+
+    async fn query_catalog_facets(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        facets: &CatalogFacetQuery,
+    ) -> Result<Option<Vec<(serde_json::Value, usize)>>, PersistenceError> {
+        TursoEventStore::query_catalog_facets(self, tenant, entity_type, facets)
+            .await
+            .map(Some)
     }
 
     async fn load_projection_fields_many(

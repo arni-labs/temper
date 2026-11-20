@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 mod projection;
 pub use projection::{JournalHead, ProjectionCheckpoint, ProjectionRepairCandidate};
 
+mod catalog_facet;
 mod catalog_field;
 mod catalog_group;
 mod catalog_page;
@@ -10,6 +11,7 @@ mod catalog_state;
 mod meaning;
 mod secret;
 mod tombstone;
+pub use catalog_facet::{CatalogFacetQuery, FacetAfter, FacetKey};
 pub use catalog_field::{
     CatalogSql, FieldClass, FieldComparison, FieldComparisonOp, FieldLiteral, field_comparison_sql,
 };

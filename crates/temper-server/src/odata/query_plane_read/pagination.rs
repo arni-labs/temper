@@ -408,6 +408,7 @@ pub(in crate::odata) async fn read_entity_set_from_query_plane(
         },
         skiptoken: None,
         search: None,
+        apply: None,
     };
     let page_request = QueryPlaneReadRequest {
         query_options: &page_options,

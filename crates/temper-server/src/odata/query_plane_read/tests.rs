@@ -27,6 +27,7 @@ mod equality_delta_postgres;
 mod equality_probe;
 mod event_metadata;
 mod event_time_pages;
+mod facets;
 mod field_orders;
 mod keyed_existence;
 mod large_set;

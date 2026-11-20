@@ -64,4 +64,9 @@ impl CatalogSql for TursoCatalogSql {
             FieldClass::Text | FieldClass::Boolean => placeholder.to_string(),
         }
     }
+
+    /// The column, under its default `BINARY` collation: byte order.
+    fn status(&self) -> String {
+        "status".to_string()
+    }
 }

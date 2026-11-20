@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use temper_runtime::persistence::{CatalogGroupRow, PersistenceError};
+use temper_runtime::persistence::{CatalogFacetQuery, CatalogGroupRow, PersistenceError};
 pub use temper_runtime::persistence::{
     QueryFieldIndexOrder, QueryFieldIndexOrderDirection, QueryFieldIndexPageQuery,
 };
@@ -187,6 +187,18 @@ pub trait QueryPlaneStore: Send + Sync {
         _entity_type: &str,
         _page: &QueryFieldIndexPageQuery,
     ) -> Result<Option<QueryFieldIndexPage>, PersistenceError> {
+        Ok(None)
+    }
+
+    /// One page of the groups `facets` asks for, each group's value and its
+    /// count, counted by the database (ADR-0188). `None` when the backend
+    /// cannot group.
+    async fn query_catalog_facets(
+        &self,
+        _tenant: &str,
+        _entity_type: &str,
+        _facets: &CatalogFacetQuery,
+    ) -> Result<Option<Vec<(serde_json::Value, usize)>>, PersistenceError> {
         Ok(None)
     }
 
