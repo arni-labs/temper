@@ -59,7 +59,7 @@ pub(super) async fn commit_field_update(
             "Strict entities require a declared action for field changes".to_owned(),
         ));
     }
-    if state.status == "Deleted" {
+    if state.is_tombstoned() {
         return Err(NotUpdated::Failed(
             "cannot update fields after entity deletion".to_string(),
         ));
@@ -332,7 +332,7 @@ pub(super) async fn catch_up(
 /// have deleted the entity or spent the budget, and both were only ever checked
 /// against the actor's pre-conflict memory.
 fn post_replay_refusal(actor: &EntityActor, state: &EntityState, replace: bool) -> Option<String> {
-    if state.status == "Deleted" {
+    if state.is_tombstoned() {
         return Some("cannot update fields after entity deletion".to_string());
     }
     budget_refusal(actor, state, replace)

@@ -791,15 +791,18 @@ async fn key_index_backfill_skips_already_keyed_entities_and_still_watermarks() 
 /// Soundness (ADR-0153): a DELETED entity is correctly skipped (not keyed) and does
 /// NOT block the watermark — only entities that exist-but-cannot-load do. A deleted
 /// entity alongside a live one: the type still watermarks, the live one is keyed, the
-/// deleted one is not.
+/// deleted one is not. Deleted means the kernel's delete (the record says its last
+/// event was the tombstone, `last_event_tombstone`): a record a spec moved into a state
+/// it names `Deleted` is a record like any other, reads serve it, and it is keyed.
 #[tokio::test]
 async fn key_index_backfill_skips_deleted_entities_without_blocking_watermark() {
     let (state, store) = build_order_state_with_sim("key-backfill-deleted");
     let tenant = TenantId::default();
     let agent_ctx = AgentContext::for_service("deleted-test");
-    for (eid, status, path) in [
-        ("ord-live", "Draft", "/live"),
-        ("ord-del", "Deleted", "/del"),
+    for (eid, status, path, kernel_deleted) in [
+        ("ord-live", "Draft", "/live", false),
+        ("ord-del", "Deleted", "/del", true),
+        ("ord-spec-del", "Deleted", "/spec-del", false),
     ] {
         state
             .dispatch_tenant_action(
@@ -815,6 +818,7 @@ async fn key_index_backfill_skips_deleted_entities_without_blocking_watermark() 
         let snap = serde_json::json!({
             "entity_type": "Order", "entity_id": eid, "status": status, "item_count": 0,
             "fields": { "Id": eid, "WorkspaceId": "ws1", "Path": path },
+            "last_event_tombstone": kernel_deleted,
         });
         store
             .save_snapshot(
@@ -833,6 +837,19 @@ async fn key_index_backfill_skips_deleted_entities_without_blocking_watermark() 
             .key_index_backfill_complete(&tenant, "Order", "ws_path")
             .await,
         "a deleted entity must not block the watermark"
+    );
+    assert!(
+        store
+            .lookup_by_key(
+                tenant.as_str(),
+                "Order",
+                "ws_path",
+                &ws_path_hash("ws1", "/spec-del")
+            )
+            .await
+            .unwrap()
+            .is_some(),
+        "a record in a state a spec names Deleted is keyed"
     );
     assert!(
         store

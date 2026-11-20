@@ -131,7 +131,7 @@ pub(super) async fn commit(
         !refusal.child_id.is_empty(),
         "PRECONDITION: a refused spawn names the child id it reserved"
     );
-    if state.status == "Deleted" {
+    if state.is_tombstoned() {
         return Err("the parent was deleted before its spawn was refused".to_owned());
     }
     // The budget that keeps the replay tail bounded holds for kernel events too.
@@ -178,7 +178,7 @@ pub(super) async fn commit(
                 state.spawn_reservations = previous_reservations.clone();
                 super::field_updates::catch_up(actor, state, attempt, actual, SPAWN_REFUSED_EVENT)
                     .await?;
-                if state.status == "Deleted" {
+                if state.is_tombstoned() {
                     return Err("the parent was deleted before its spawn was refused".to_owned());
                 }
                 // Another writer may have spent the replay budget while this

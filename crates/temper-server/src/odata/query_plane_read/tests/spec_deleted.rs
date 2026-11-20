@@ -307,6 +307,50 @@ async fn a_move_a_spec_declares_from_deleted_runs_and_a_kernel_deleted_record_re
     let _ = std::fs::remove_file(db_path);
 }
 
+/// A field write follows the same rule as a move: a record in a state a spec
+/// names `Deleted` takes it, and a record the kernel deleted refuses it. The
+/// field write used to refuse both, by the status name alone.
+#[tokio::test]
+async fn a_field_write_reaches_a_spec_deleted_record_and_not_a_kernel_deleted_one() {
+    let (store, db_path) = new_store("spec-deleted-fields").await;
+    let state = state_on(&store, "query-plane-spec-deleted-fields");
+    six_orders_one_discarded(&state).await;
+    let tenant = TenantId::default();
+
+    let written = state
+        .update_tenant_entity_fields(
+            &tenant,
+            "Order",
+            "ord-05",
+            serde_json::json!({"Currency": "EUR"}),
+            false,
+        )
+        .await
+        .expect("a record in a spec's Deleted state takes a field write");
+    assert_eq!(written.state.status, "Deleted");
+    assert_eq!(written.state.fields["Currency"], "EUR");
+
+    state
+        .delete_tenant_entity(&tenant, "Order", "ord-04")
+        .await
+        .expect("delete ord-04");
+    let refused = state
+        .update_tenant_entity_fields(
+            &tenant,
+            "Order",
+            "ord-04",
+            serde_json::json!({"Currency": "EUR"}),
+            false,
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a record the kernel deleted takes no field write: {refused:?}"
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
 /// A Temper written before this fix removed ord-05's catalog row when it was
 /// discarded. On restart boot repair replays that record from its journal
 /// before the server serves and puts the row back, writing nothing to the
