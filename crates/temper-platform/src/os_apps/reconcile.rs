@@ -175,8 +175,7 @@ fn digest_entry_bundle(
         wasm_parts.push((format!("wasm:{module_name}"), wasm_bytes.clone()));
     }
     for (module_name, config) in &bundle.wasm_module_configs {
-        let config_bytes = serde_json::to_vec(config).unwrap_or_default();
-        wasm_parts.push((format!("wasm-config:{module_name}"), config_bytes));
+        wasm_parts.push((format!("wasm-config:{module_name}"), config.digest_bytes()));
     }
     wasm_parts.sort_by(|a, b| a.0.cmp(&b.0));
 

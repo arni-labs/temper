@@ -307,6 +307,34 @@ impl WasmModuleManifest {
     pub fn is_required(&self) -> bool {
         self.criticality.is_required()
     }
+
+    /// The bytes of this module's contract that the app bundle digest reads: the fields that decide how the module
+    /// is installed and run, in the shape the digest has always hashed. A field added to the manifest is not here
+    /// unless it changes what is installed, because every installed app's stored digest is this hash: a new field in
+    /// it moves the digest of unchanged files, and boot then refuses to restore a recorded install as another version.
+    /// Review text such as `does` is read by Jev's review, which keys its own cache on it, and is left out.
+    pub fn digest_bytes(&self) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct Installed<'a> {
+            name: &'a str,
+            target: &'a Option<String>,
+            criticality: WasmModuleCriticality,
+            startup_loading: WasmStartupLoading,
+            provenance: &'a Option<String>,
+            import_class: &'a Option<String>,
+            source: &'a Option<String>,
+        }
+        serde_json::to_vec(&Installed {
+            name: &self.name,
+            target: &self.target,
+            criticality: self.criticality,
+            startup_loading: self.startup_loading,
+            provenance: &self.provenance,
+            import_class: &self.import_class,
+            source: &self.source,
+        })
+        .unwrap_or_default()
+    }
 }
 
 /// Metadata for an app in the catalog.

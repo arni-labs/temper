@@ -2488,6 +2488,61 @@ fn test_required_wasm_config_without_artifact_is_not_registered_ready() {
     );
 }
 
+/// An app's stored bundle digest is what boot checks a recorded install against, so a field
+/// added to the manifest that installs nothing different must leave the digest of unchanged files
+/// as it was. The `does` sentence (a2e714903) moved it, and production refused to restore every
+/// pushed app with a module.
+#[test]
+fn test_bundle_digest_ignores_module_review_sentence() {
+    let bundle_with = |does: Option<&str>| {
+        let mut configs = BTreeMap::new();
+        configs.insert(
+            "echo".to_string(),
+            WasmModuleManifest {
+                name: "echo".to_string(),
+                target: None,
+                criticality: WasmModuleCriticality::AppRequired,
+                startup_loading: WasmStartupLoading::Lazy,
+                provenance: None,
+                import_class: None,
+                source: None,
+                does: does.map(str::to_string),
+            },
+        );
+        AppBundle {
+            deployment_mode: AppDeploymentMode::Operator,
+            specs: Vec::new(),
+            csdl: None,
+            cross_invariants_toml: None,
+            cedar_policies: Vec::new(),
+            cedar_policy_sources: Vec::new(),
+            wasm_modules: BTreeMap::new(),
+            wasm_module_configs: configs,
+            agents: Vec::new(),
+            skills: Vec::new(),
+            adrs: Vec::new(),
+            system_files: Vec::new(),
+            seed_instances: Vec::new(),
+        }
+    };
+    let digest = |bundle: &AppBundle| {
+        reconcile::digest_app_bundle(None, "digest-review-sentence-app", bundle).bundle_digest
+    };
+
+    let without = digest(&bundle_with(None));
+    assert_eq!(
+        without,
+        digest(&bundle_with(Some("Echoes its input."))),
+        "a module's review sentence must not change the bundle digest"
+    );
+    // The module contract the digest has hashed since the module `source` field (#181): an
+    // install recorded before a2e714903 restores only if these bytes stay the same.
+    assert_eq!(
+        String::from_utf8(bundle_with(None).wasm_module_configs["echo"].digest_bytes()).unwrap(),
+        r#"{"name":"echo","target":null,"criticality":"app-required","startup_loading":"lazy","provenance":null,"import_class":null,"source":null}"#
+    );
+}
+
 #[test]
 fn test_load_app_bundle_rejects_legacy_reactions_file() {
     let temp_dir = std::env::temp_dir().join(format!(
