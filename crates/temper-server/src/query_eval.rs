@@ -348,48 +348,71 @@ fn normalize_event_time(value: serde_json::Value) -> serde_json::Value {
         .unwrap_or(value)
 }
 
-/// Sort entities in place by the given orderby clauses.
+/// Sort entities in place by the given orderby clauses ([`compare_sort_keys`]).
 fn sort_entities(entities: &mut [serde_json::Value], orderby: &[OrderByClause]) {
-    entities.sort_by(|a, b| {
-        for clause in orderby {
-            let a_val = resolve_property(a, &clause.property);
-            let b_val = resolve_property(b, &clause.property);
-            let (a_val, b_val) =
-                if matches!(clause.property.as_str(), "first_event_at" | "last_event_at") {
-                    (
-                        a_val.map(normalize_event_time),
-                        b_val.map(normalize_event_time),
-                    )
-                } else {
-                    (a_val, b_val)
-                };
-            let kernel_metadata =
-                temper_spec::automaton::is_event_metadata_field(clause.property.as_str());
-            let ordering = match (&a_val, &b_val) {
-                (Some(serde_json::Value::Null), Some(serde_json::Value::Null))
-                    if kernel_metadata =>
-                {
-                    std::cmp::Ordering::Equal
-                }
-                (Some(serde_json::Value::Null), _) if kernel_metadata => {
-                    std::cmp::Ordering::Greater
-                }
-                (_, Some(serde_json::Value::Null)) if kernel_metadata => std::cmp::Ordering::Less,
-                (Some(av), Some(bv)) => json_cmp(av, bv).unwrap_or(std::cmp::Ordering::Equal),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            };
-            let ordering = match clause.direction {
-                OrderDirection::Asc => ordering,
-                OrderDirection::Desc => ordering.reverse(),
-            };
-            if ordering != std::cmp::Ordering::Equal {
-                return ordering;
+    entities
+        .sort_by(|a, b| compare_sort_keys(&sort_key(a, orderby), &sort_key(b, orderby), orderby));
+}
+
+/// What `entity` sorts by under `orderby`, one value for each clause: a
+/// missing value and a JSON null are both `None`, and an event time is its
+/// fixed-width key.
+pub(crate) fn sort_key(
+    entity: &serde_json::Value,
+    orderby: &[OrderByClause],
+) -> Vec<Option<serde_json::Value>> {
+    orderby
+        .iter()
+        .map(|clause| {
+            let value = resolve_property(entity, &clause.property).filter(|v| !v.is_null());
+            if matches!(clause.property.as_str(), "first_event_at" | "last_event_at") {
+                value.map(normalize_event_time)
+            } else {
+                value
             }
+        })
+        .collect()
+}
+
+/// The order of two sort keys (ADR-0188). It is total, so a list sorted a
+/// batch at a time and one sorted whole agree: a row without a value (missing
+/// or JSON null) sorts last ascending and first descending; numbers compare
+/// as doubles and strings by bytes; values of different JSON types order by
+/// type, boolean, number, string, then array and object; two booleans, or
+/// two arrays or objects, are equal here and fall to the next clause.
+pub(crate) fn compare_sort_keys(
+    a: &[Option<serde_json::Value>],
+    b: &[Option<serde_json::Value>],
+    orderby: &[OrderByClause],
+) -> std::cmp::Ordering {
+    for ((a, b), clause) in a.iter().zip(b).zip(orderby) {
+        let ordering = match (a, b) {
+            (Some(a), Some(b)) => {
+                json_cmp(a, b).unwrap_or_else(|| sort_type_rank(a).cmp(&sort_type_rank(b)))
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        };
+        let ordering = match clause.direction {
+            OrderDirection::Asc => ordering,
+            OrderDirection::Desc => ordering.reverse(),
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
         }
-        std::cmp::Ordering::Equal
-    });
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn sort_type_rank(value: &serde_json::Value) -> u8 {
+    match value {
+        serde_json::Value::Null => 0,
+        serde_json::Value::Bool(_) => 1,
+        serde_json::Value::Number(_) => 2,
+        serde_json::Value::String(_) => 3,
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => 4,
+    }
 }
 
 /// Prune each entity to only include the selected properties.
