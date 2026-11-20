@@ -175,3 +175,51 @@ assert = "status == 'Submitted' => Parent[parent_ids].status == 'Open'"
         assert!(across.already_broken.is_empty());
     }
 }
+
+/// A Tally whose rule reads `limit`, declared with `initial`.
+fn tally(initial: usize) -> TransitionTable {
+    TransitionTable::from_ioa_source(&format!(
+        r#"
+[automaton]
+name = "Tally"
+states = ["Open"]
+initial = "Open"
+
+[[state]]
+name = "count"
+type = "counter"
+initial = 0
+
+[[state]]
+name = "limit"
+type = "counter"
+initial = {initial}
+
+[[action]]
+name = "Note"
+kind = "input"
+from = ["Open"]
+to = "Open"
+
+[[invariant]]
+name = "UnderLimit"
+assert = "count <= limit"
+"#
+    ))
+}
+
+#[test]
+fn a_rule_whose_read_default_changes_is_a_changed_rule() {
+    let (installed, new) = (tally(100), tally(5));
+    // A record that never stored `limit` reads each version's default.
+    let stored = EvalContext {
+        counters: BTreeMap::from([("count".to_string(), 50)]),
+        ..EvalContext::default()
+    };
+    assert!(new.adds_record_invariant(&installed));
+    let (broken, _) = new
+        .newly_broken_invariant(&installed, "Open", (&stored, &stored))
+        .expect("the record held the rule at 100 and breaks it at 5");
+    assert_eq!(broken.name, "UnderLimit");
+    assert!(!tally(5).adds_record_invariant(&new));
+}

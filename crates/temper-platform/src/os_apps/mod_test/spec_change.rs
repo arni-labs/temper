@@ -13,6 +13,7 @@ use temper_store_turso::TursoEventStore;
 mod acts_for;
 mod carrying;
 mod replays;
+mod rule_reads;
 mod then;
 
 /// A place an app's Temper is brought to, modelled on a downstream app-place entity.

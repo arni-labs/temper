@@ -57,7 +57,7 @@ pub struct MoveConditions {
 
 /// How a version declares a name a move reads, with its initial value.
 #[derive(Debug, Clone, PartialEq)]
-enum Declared {
+pub(super) enum Declared {
     Counter(usize),
     Bool(bool),
     List(Vec<String>),
@@ -171,7 +171,6 @@ impl TransitionTable {
 
     /// What decides whether a record can make `action` under this version.
     pub fn move_conditions(&self, action: &str) -> MoveConditions {
-        let declared = &self.initial_values;
         MoveConditions {
             rules: self
                 .rules
@@ -193,20 +192,27 @@ impl TransitionTable {
                 .move_reads(action)
                 .into_iter()
                 .map(|name| {
-                    let how = if let Some(value) = declared.counters.get(&name) {
-                        Declared::Counter(*value)
-                    } else if let Some(value) = declared.booleans.get(&name) {
-                        Declared::Bool(*value)
-                    } else if let Some(value) = declared.lists.get(&name) {
-                        Declared::List(value.clone())
-                    } else if let Some(value) = declared.fields.get(&name) {
-                        Declared::Field(value.clone())
-                    } else {
-                        Declared::Undeclared
-                    };
+                    let how = self.declared(&name);
                     (name, how)
                 })
                 .collect(),
+        }
+    }
+
+    /// How this version declares `name`, with its initial value: what a
+    /// record that never stored it reads.
+    pub(super) fn declared(&self, name: &str) -> Declared {
+        let declared = &self.initial_values;
+        if let Some(value) = declared.counters.get(name) {
+            Declared::Counter(*value)
+        } else if let Some(value) = declared.booleans.get(name) {
+            Declared::Bool(*value)
+        } else if let Some(value) = declared.lists.get(name) {
+            Declared::List(value.clone())
+        } else if let Some(value) = declared.fields.get(name) {
+            Declared::Field(value.clone())
+        } else {
+            Declared::Undeclared
         }
     }
 

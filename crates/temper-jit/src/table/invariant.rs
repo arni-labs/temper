@@ -19,7 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 use temper_spec::automaton::{FieldInvariant, Invariant};
-use temper_spec::predicate::Expr;
+use temper_spec::predicate::{Expr, Name};
 
 use super::guard::{self, EvalContext, GuardFailure};
 use super::types::TransitionTable;
@@ -166,13 +166,13 @@ impl TransitionTable {
             .iter()
             .filter(|invariant| invariant.assert.cross_refs().is_empty())
             .find_map(|invariant| {
+                if !self.changes_invariant(installed, invariant) {
+                    return None;
+                }
                 let was = installed
                     .invariants
                     .iter()
                     .find(|old| old.name == invariant.name);
-                if was.is_some_and(|old| old.assert == invariant.assert) {
-                    return None;
-                }
                 let failure =
                     guard::check_detailed(&invariant.assert, status, now, &self.initial_values)?;
                 let held = was.is_none_or(|old| {
@@ -187,12 +187,33 @@ impl TransitionTable {
     /// that a stored record alone can answer.
     pub fn adds_record_invariant(&self, installed: &TransitionTable) -> bool {
         self.invariants.iter().any(|invariant| {
-            invariant.assert.cross_refs().is_empty()
-                && !installed
-                    .invariants
-                    .iter()
-                    .any(|old| old.name == invariant.name && old.assert == invariant.assert)
+            invariant.assert.cross_refs().is_empty() && self.changes_invariant(installed, invariant)
         })
+    }
+
+    /// Whether this version's `invariant` is new or changed from
+    /// `installed`: its name is new, its assertion differs, or a name it
+    /// reads is declared another way (its kind or initial value), which
+    /// changes what a record that never stored that name reads.
+    pub fn changes_invariant(
+        &self,
+        installed: &TransitionTable,
+        invariant: &MoveInvariant,
+    ) -> bool {
+        let Some(old) = installed
+            .invariants
+            .iter()
+            .find(|old| old.name == invariant.name)
+        else {
+            return true;
+        };
+        let mut changed = old.assert != invariant.assert;
+        invariant.assert.for_each_name(&mut |name| {
+            if let Name::Var(name) = name {
+                changed |= self.declared(name) != installed.declared(name);
+            }
+        });
+        changed
     }
 }
 

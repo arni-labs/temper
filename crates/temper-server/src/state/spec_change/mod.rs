@@ -201,11 +201,7 @@ impl ServerState {
         // is made. One the record alone answers is checked against the
         // records stored in every state below.
         for invariant in &new.invariants {
-            if invariant.assert.cross_refs().is_empty()
-                || old.invariants.iter().any(|before| {
-                    before.name == invariant.name && before.assert == invariant.assert
-                })
-            {
+            if invariant.assert.cross_refs().is_empty() || !new.changes_invariant(old, invariant) {
                 continue;
             }
             plan.warnings.push(format!(

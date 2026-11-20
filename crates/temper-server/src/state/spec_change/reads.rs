@@ -94,7 +94,9 @@ pub(super) fn read_names(
             read(Name::Var(field));
         }
     }
-    for invariant in &new.invariants {
+    // The old rules' names too: a record is refused only for a rule it held
+    // under the installed version, and that is read from its own values.
+    for invariant in old.invariants.iter().chain(&new.invariants) {
         invariant.assert.for_each_name(&mut read);
     }
     let made = carries
