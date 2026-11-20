@@ -92,6 +92,41 @@ async fn apply_checked(
     Err(refused)
 }
 
+/// Why `fields` may not be written, if one of them sets a state variable's
+/// field to a value the variable does not hold. A state variable (a counter,
+/// boolean or list) changes only by a move, and its field shows it: the type's
+/// rules and guards read the variable, so a field update that set its field
+/// would store a value no rule checked. Its field sent back unchanged, or set
+/// to the value it holds, is no change.
+fn state_variable_refusal(
+    actor: &EntityActor,
+    state: &EntityState,
+    fields: &Value,
+) -> Option<String> {
+    let table = actor.table.read().expect("table lock poisoned");
+    let declared = &table.initial_values;
+    fields.as_object()?.iter().find_map(|(name, value)| {
+        if state.fields.get(name) == Some(value) {
+            return None;
+        }
+        let holds = if let Some(count) = state.counters.get(name).or(declared.counters.get(name)) {
+            value.as_u64() == u64::try_from(*count).ok()
+        } else if let Some(flag) = state.booleans.get(name).or(declared.booleans.get(name)) {
+            value.as_bool() == Some(*flag)
+        } else if let Some(items) = state.lists.get(name).or(declared.lists.get(name)) {
+            *value == serde_json::json!(items)
+        } else {
+            return None;
+        };
+        (!holds).then(|| {
+            format!(
+                "'{name}' is a state variable of {}: a move changes it, not a field update",
+                state.entity_type
+            )
+        })
+    })
+}
+
 /// Apply a field update and make it durable, or refuse it.
 ///
 /// `Ok(())` means the update is in the journal. An error means it is not, and
@@ -146,6 +181,9 @@ pub(super) async fn commit_field_update(
     // but the event written now must not carry a caller's forged `has_spec` or
     // `ctx_owner_status` into the journal in the first place.
     let fields = effects::sanitize_action_params(&fields).into_owned();
+    if let Some(reason) = state_variable_refusal(actor, state, &fields) {
+        return Err(NotUpdated::Failed(reason));
+    }
 
     let action = if replace {
         effects::FIELDS_REPLACED_EVENT

@@ -329,3 +329,76 @@ fn random_counts_never_store_a_record_the_field_invariant_forbids() {
     }
     assert!(refused > 0, "no seed tried a count the rule forbids");
 }
+
+/// A counter its moves change, kept at two at most.
+const COUNTED: &str = r#"
+[automaton]
+name = "Order"
+states = ["Watching"]
+initial = "Watching"
+
+[[state]]
+name = "n"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Bump"
+kind = "input"
+from = ["Watching"]
+effect = ["n += 1"]
+
+[[invariant]]
+name = "AtMostTwo"
+assert = "n <= 2"
+"#;
+
+/// A counter's field shows the counter, which the rules read: a field update
+/// cannot set it to another value, or the record would show nine where its
+/// rules saw two. Sent back as it is, it is no change.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_field_update_cannot_set_a_counter_its_rules_read() {
+    let state = state_with(COUNTED, "field-invariant-counter");
+    for _ in 0..2 {
+        let response = dispatch(&state, "aapl", "Bump", json!({})).await;
+        assert!(response.success, "{:?}", response.error);
+    }
+    let n = |state: &ServerState| {
+        let state = state.clone();
+        async move {
+            state
+                .get_tenant_entity_state(&TenantId::default(), "Order", "aapl")
+                .await
+                .expect("the record reads")
+                .state
+                .fields["n"]
+                .clone()
+        }
+    };
+    assert_eq!(n(&state).await, json!(2));
+
+    let refused = state
+        .update_tenant_entity_fields(
+            &TenantId::default(),
+            "Order",
+            "aapl",
+            json!({"n": 9}),
+            false,
+        )
+        .await
+        .expect_err("the update stored n = 9 beside a counter of 2");
+    assert!(refused.contains("'n' is a state variable"), "{refused}");
+    assert_eq!(n(&state).await, json!(2));
+
+    let response = state
+        .update_tenant_entity_fields(
+            &TenantId::default(),
+            "Order",
+            "aapl",
+            json!({"n": 2}),
+            false,
+        )
+        .await
+        .expect("the counter's own value is no change");
+    assert!(response.success, "{:?}", response.error);
+}
