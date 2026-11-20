@@ -11,6 +11,16 @@ use super::{
 
 #[async_trait::async_trait]
 impl QueryPlaneStore for TenantStoreRouter {
+    async fn event_time_gaps(
+        &self,
+        tenant: &str,
+    ) -> Result<Option<Vec<temper_runtime::persistence::EventTimeGaps>>, PersistenceError> {
+        self.store_for_tenant(tenant)
+            .await?
+            .event_time_gaps(Some(tenant))
+            .await
+            .map(Some)
+    }
     async fn lagging_projections(
         &self,
         tenant: &str,

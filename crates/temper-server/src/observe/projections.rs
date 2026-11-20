@@ -82,3 +82,49 @@ pub(crate) async fn handle_replay_parity(
         "report": report,
     })))
 }
+
+/// GET /observe/projections/event-times -- the caller's tenant's catalog rows
+/// missing an event time, by entity type, and what their journals could fill
+/// (ADR-0187, "Backfill"). Reads only; it counts as the start-time pass does,
+/// whichever mode that pass runs in.
+#[instrument(
+    skip_all,
+    fields(
+        otel.name = "GET /observe/projections/event-times",
+        tenant = tracing::field::Empty,
+        missing_first = tracing::field::Empty,
+        missing_last = tracing::field::Empty
+    )
+)]
+pub(crate) async fn handle_event_time_gaps(
+    State(state): State<ServerState>,
+    authenticated: Option<Extension<AuthenticatedRequestContext>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let authenticated = require_authenticated_context(authenticated.as_deref())?;
+    require_observe_auth(&state, authenticated, "read_entities", "Projection")?;
+    let tenant = authenticated.tenant();
+    tracing::Span::current().record("tenant", tenant.as_str());
+    let plane = state
+        .query_plane_store()
+        .ok_or(StatusCode::NOT_IMPLEMENTED)?;
+    let gaps = plane
+        .event_time_gaps(tenant.as_str())
+        .await
+        .map_err(|error| {
+            tracing::warn!(tenant = %tenant, error = %error, "event time count failed");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?
+        .ok_or(StatusCode::NOT_IMPLEMENTED)?;
+    let missing_first: u64 = gaps.iter().map(|gap| gap.missing_first).sum();
+    let missing_last: u64 = gaps.iter().map(|gap| gap.missing_last).sum();
+    tracing::Span::current().record("missing_first", missing_first);
+    tracing::Span::current().record("missing_last", missing_last);
+    Ok(Json(serde_json::json!({
+        "kind": "event_time_gaps",
+        "tenant": tenant.as_str(),
+        "mode": temper_runtime::persistence::EventTimeBackfillMode::from_env().label(),
+        "missing_first": missing_first,
+        "missing_last": missing_last,
+        "types": gaps,
+    })))
+}

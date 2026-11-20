@@ -6,6 +6,7 @@ pub use projection::{JournalHead, ProjectionCheckpoint, ProjectionRepairCandidat
 mod catalog_group;
 mod catalog_page;
 mod catalog_state;
+mod event_time_backfill;
 mod meaning;
 mod secret;
 mod tombstone;
@@ -16,6 +17,11 @@ pub use catalog_page::{
     QueryFieldIndexPageQuery, event_time_key,
 };
 pub use catalog_state::{catalog_state_for_storage, catalog_state_from_storage};
+pub use event_time_backfill::{
+    EVENT_TIME_BACKFILL_ENV, EventTimeBackfillMode, EventTimeFill, EventTimeGaps, EventTimeTally,
+    FirstFill, JournalTimes, LastFill, first_event_at_text, journal_time, last_event_at_value,
+    log_event_time_gaps,
+};
 pub use meaning::{
     MeaningPending, MeaningRow, TEXT_RULE, fold, meaning_input, record_text, text_hash,
 };

@@ -38,6 +38,7 @@ mod append_commit;
 #[cfg(test)]
 mod append_commit_test;
 pub mod dbm;
+mod event_time_backfill;
 mod first_event;
 mod metrics;
 mod namespace;

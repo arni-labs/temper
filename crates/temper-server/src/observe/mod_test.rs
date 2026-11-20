@@ -43,6 +43,11 @@ fn test_state_with_registry() -> ServerState {
 /// Build a test state with a local Turso (SQLite) backend for
 /// tests that need persisted data (trajectories, decisions, records).
 async fn test_state_with_turso() -> ServerState {
+    test_state_and_turso().await.0
+}
+
+/// A server on a fresh local Turso store, and that store.
+async fn test_state_and_turso() -> (ServerState, TursoEventStore) {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let db_url = format!(
@@ -63,8 +68,8 @@ async fn test_state_with_turso() -> ServerState {
         .expect("create local turso db");
     let mut state = test_state_with_registry();
     state.data_dir = data_dir;
-    state.set_storage_stack(StorageStack::from_turso(turso));
-    state
+    state.set_storage_stack(StorageStack::from_turso(turso.clone()));
+    (state, turso)
 }
 
 fn build_test_app() -> Router {
@@ -288,6 +293,73 @@ async fn projection_replay_parity_endpoint_reports_projection_drift() {
     assert_eq!(json["report"]["drifted"], 1);
     assert_eq!(json["report"]["drift_examples"][0]["entity_id"], entity_id);
     assert_eq!(json["report"]["drift_examples"][0]["drift_kind"], "fields");
+}
+
+/// ADR-0187 "Backfill": the route counts a row whose state was written
+/// before the kernel kept `last_event_at`, and after the fill the row holds
+/// the time of the record's newest event, the one the actor recovers.
+#[tokio::test]
+async fn event_time_route_counts_a_row_without_its_last_time_until_the_fill() {
+    let (state, turso) = test_state_and_turso().await;
+    let tenant = TenantId::default();
+    let entity_id = "event-time-october";
+    state
+        .get_or_create_tenant_entity(
+            &tenant,
+            "Order",
+            entity_id,
+            serde_json::json!({"Title": "Made in October"}),
+        )
+        .await
+        .expect("create projected entity");
+    let actor_state = state
+        .get_tenant_entity_state(&tenant, "Order", entity_id)
+        .await
+        .expect("load authoritative entity");
+    let recovered = actor_state.state.last_event.last_event_at.expect("a time");
+    let mut october = state.query_projection_state(&actor_state.state);
+    october
+        .as_object_mut()
+        .expect("state object")
+        .remove("last_event_at");
+    let plane = state.query_plane_store().expect("query-plane store");
+    plane
+        .upsert_projection(
+            tenant.as_str(),
+            "Order",
+            entity_id,
+            &actor_state.state.status,
+            &state.query_projection_fields(&tenant, "Order", &actor_state.state.fields),
+            &october,
+            actor_state.state.sequence_nr,
+        )
+        .await
+        .expect("write the row as October left it");
+
+    let app = build_app_with_state(state.clone());
+    let json = observe_json(app.clone(), "/observe/projections/event-times").await;
+    assert_eq!(json["kind"], "event_time_gaps");
+    assert_eq!(json["tenant"], "default");
+    assert_eq!(json["mode"], "count");
+    assert_eq!(json["missing_last"], 1, "{json}");
+    assert_eq!(json["types"][0]["entity_type"], "Order");
+    assert_eq!(json["types"][0]["last_fillable"], 1);
+
+    assert_eq!(turso.fill_event_times().await.unwrap().last_filled, 1);
+    let json = observe_json(app, "/observe/projections/event-times").await;
+    assert_eq!(json["missing_last"], 0, "{json}");
+    let rows = turso
+        .load_entity_catalog_rows(tenant.as_str(), "Order", &[entity_id.to_string()])
+        .await
+        .expect("catalog row");
+    let filled = rows[0].state.as_ref().expect("state")["last_event_at"]
+        .as_str()
+        .expect("a time")
+        .to_string();
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(&filled).unwrap(),
+        recovered
+    );
 }
 
 /// Build a POST request with kernel System authority for functional tests.

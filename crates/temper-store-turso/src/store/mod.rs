@@ -41,6 +41,7 @@ mod commit_probe;
 mod constraints;
 mod entity_listing;
 mod event_store;
+mod event_time_backfill;
 mod evolution;
 pub mod field_index;
 mod field_index_rows;
@@ -171,6 +172,7 @@ impl TursoEventStore {
         store.migrate().await?;
         store.start_first_event_backfill().await?;
         store.start_first_origin_backfill().await?;
+        store.start_event_time_backfill().await?;
         Ok(store)
     }
 
@@ -580,6 +582,9 @@ impl TursoEventStore {
             .await
             .map_err(storage_error)?;
         conn.execute(first_origin::CREATE_BACKFILL_TABLE, ())
+            .await
+            .map_err(storage_error)?;
+        conn.execute(event_time_backfill::CREATE_BACKFILL_TABLE, ())
             .await
             .map_err(storage_error)?;
         conn.execute(schema::CREATE_ENTITY_CATALOG_CHECKPOINT_INDEX, ())

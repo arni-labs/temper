@@ -155,6 +155,7 @@ pub(super) async fn connect_postgres_store(
     eprintln!("  Postgres connected, migrations applied.");
     let store = PostgresEventStore::new(pool.clone());
     store.start_first_event_backfill();
+    store.start_event_time_backfill();
     Ok((StorageStack::from_postgres(store), pool))
 }
 

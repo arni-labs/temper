@@ -14,6 +14,7 @@ mod catalog_row_writes;
 mod commit_outcome;
 mod commit_transport;
 mod event_pages;
+mod event_time_backfill;
 mod event_time_pages;
 mod evolution_tenant;
 mod field_index_writes;

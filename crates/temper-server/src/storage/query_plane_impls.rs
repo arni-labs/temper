@@ -44,6 +44,15 @@ impl QueryPlaneStore for PostgresEventStore {
             .map(Some)
     }
 
+    async fn event_time_gaps(
+        &self,
+        tenant: &str,
+    ) -> Result<Option<Vec<temper_runtime::persistence::EventTimeGaps>>, PersistenceError> {
+        PostgresEventStore::event_time_gaps(self, Some(tenant))
+            .await
+            .map(Some)
+    }
+
     async fn lagging_projections(
         &self,
         tenant: &str,
@@ -240,6 +249,14 @@ impl QueryPlaneStore for PostgresEventStore {
 
 #[async_trait::async_trait]
 impl QueryPlaneStore for TursoEventStore {
+    async fn event_time_gaps(
+        &self,
+        tenant: &str,
+    ) -> Result<Option<Vec<temper_runtime::persistence::EventTimeGaps>>, PersistenceError> {
+        TursoEventStore::event_time_gaps(self, Some(tenant))
+            .await
+            .map(Some)
+    }
     async fn lagging_projections(
         &self,
         tenant: &str,

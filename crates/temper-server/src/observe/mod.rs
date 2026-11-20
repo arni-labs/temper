@@ -233,6 +233,10 @@ pub fn build_observe_router() -> Router<ServerState> {
             "/projections/replay-parity",
             get(projections::handle_replay_parity),
         )
+        .route(
+            "/projections/event-times",
+            get(projections::handle_event_time_gaps),
+        )
         .route("/trajectories", get(evolution::handle_trajectories))
         .route(
             "/evolution/records",

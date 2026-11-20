@@ -113,6 +113,16 @@ pub trait QueryPlaneStore: Send + Sync {
         Ok(None)
     }
 
+    /// The tenant's catalog rows missing an event time, by entity type, and
+    /// what their journals could fill (ADR-0187, "Backfill"). Reads only.
+    /// `None` when the store keeps no such rows (the in-memory store).
+    async fn event_time_gaps(
+        &self,
+        _tenant: &str,
+    ) -> Result<Option<Vec<temper_runtime::persistence::EventTimeGaps>>, PersistenceError> {
+        Ok(None)
+    }
+
     /// Compare catalog checkpoints with the co-located journal in one query.
     /// Called only when the stack verifies this is the journal itself.
     async fn lagging_projections(

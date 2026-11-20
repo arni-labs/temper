@@ -12,6 +12,9 @@
   - `crates/temper-server/src/odata/query_plane_read/` (`pagination.rs`, `scan/`)
   - `crates/temper-store-turso/src/store/query_page.rs`, `src/schema/event_time_order.rs`
   - `crates/temper-store-postgres/src/query_page.rs`, `migrations/0029_event_time_order_indexes.sql`
+  - Backfill: `crates/temper-runtime/src/persistence/event_time_backfill.rs`,
+    `crates/temper-store-turso/src/store/event_time_backfill.rs`,
+    `crates/temper-store-postgres/src/event_time_backfill.rs`, `migrations/0030_event_time_backfill.sql`
 
 ## Context
 
@@ -167,6 +170,113 @@ now names the primary-key index, as the store's other keyed catalog writes
 already do. The other catalog statements were compared on the same database
 before and after: none searches by fewer columns than before.
 
+### Sub-Decision 9: Backfill: rows from before event times take their journal's
+
+A record made before the kernel kept event times (31 Oct 2026, #274) and not
+moved since has no `last_event_at` in its catalog state, and no
+`first_event_at` column when the creation-time migration found none. Its key
+is the sentinel, so it comes first in a newest-first page and last in an
+oldest-first one. On 19 Nov a "newest 1" list of an app's asks answered an
+October record with no time instead of the day before's ask.
+
+**What already covered part of it.** The creation-time migration
+(`first_event.rs` in both stores) filled the `first_event_at` column from
+journal sequence one wherever that event was held, once per store. Nothing
+filled `last_event_at`. The boot field-index refresh
+(`populate_field_index_from_snapshots`) rewrites every row from the recovered
+actor state on each start where it runs, so a record that replays its journal
+got its `last_event_at` that way. The rows left are those it does not reach,
+and those it recovers from a snapshot taken before #274 with no event after
+it: that snapshot has no time, so the recovered state has none.
+
+**The pass.** Each store walks its catalog in key order
+(`event_time_backfill.rs` in each store; what each row gets is
+`temper_runtime::persistence::JournalTimes::plan`). For a row missing a time
+it reads the record's own journal by its key:
+
+- `first_event_at` is the time of the creation event, sequence one. A
+  creation no longer held stays unknown (`first_creation_not_held`): a later
+  event's time is not when the record was made, the rule the creation-time
+  migration and the actor keep.
+- `last_event_at` is the time of the newest event. A record whose snapshot is
+  at or past its newest event is left (`last_held_by_snapshot`): the actor
+  recovers it from that snapshot with no time, and the boot refresh would
+  write the gap back over a filled row.
+- An event's time is the one the actor stamped, its payload's `timestamp`,
+  which its metadata repeats; the journal row's `created_at` only when
+  neither has one. A row with no usable time, or a state that is not an
+  object, is `*_unfillable`.
+
+**The switch.** `TEMPER_EVENT_TIME_BACKFILL`, read once at start, as
+`TEMPER_UNDECLARED_PARAMS` is: any value but `fill`, or none, counts; `fill`
+fills and then counts what is left. The fill keeps its durable cursor in
+`event_time_backfill` (one row: key, counts, `complete`), as the creation-time
+migration keeps `first_event_backfill`; once complete, a start does nothing in
+either mode.
+
+**The count** reads only: no write gate, no cursor row. Each start runs it in
+the background. Each tenant with a gap logs one WARN line, `event time
+backfill: tenant records missing an event time`, with the counts and a
+`by_type` list of each type's; each store logs `event time backfill: store
+counted` (WARN when it has gaps or after a fill, INFO otherwise). WARN,
+because deployed kernels send only WARN and above to Datadog.
+`GET /observe/projections/event-times` answers the same counts for the
+credential's tenant on demand, with the observe authorization
+`/observe/projections/replay-parity` uses.
+
+**The fill** writes a row in one statement that sets only times still missing
+(`IS NULL`, and for the state the sequence it was read at), so it never
+replaces a time, a second run writes nothing, and a stop leaves each record
+whole or untouched; the cursor commits with its batch, so a restart carries
+on after it. Turso batches hold the write gate at most 50 ms or 128 rows, as
+the creation-time migration's do; Postgres takes 128 rows per transaction.
+`first_event_at` goes to the column, as the creation-time migration wrote it;
+`last_event_at` goes into the state, serialized as the actor's `LastEvent`
+serializes it. On Turso the row's `projection_hash` becomes the hash of the
+new state (`unchanged_projections::projection_hash`), so the next projection
+write compares against what the row holds; the Postgres hash covers fields
+only. `updated_at` and `sequence_nr` stay: this is not a move. The four
+expression indexes are on the state and the column, so they follow.
+
+**The next move.** Every catalog upsert keeps an existing `first_event_at`
+column (`COALESCE`), and recovery reads the creation time from that column
+first (`EventStore::first_event_at`), so a recovered actor agrees with it. The
+move's state carries the move's own `last_event_at`.
+
+**Cost.** One catalog row written per record that changes, both times in one
+statement, plus the cursor row once per batch. A synced Turso database's
+change log carries each updated row whole, before and after, so a record
+costs about twice its row in sync traffic. On a local Turso file store
+(release build, a laptop), 1,000 records missing both times, each with two
+journal events, were counted in 52 ms and filled in 344 ms with 2 KB of
+fields, and counted in 83 ms and filled in 874 ms with 100 KB, each 1,000
+rows written; the fill's time includes the 10 ms pause between batches
+(at least eight of 128 rows). A finished fill reran in under 5 ms.
+
+**What an operator does, in order.**
+
+1. Ship. Each start counts and writes nothing.
+2. On staging, read the counts: Datadog logs, `env:staging`, message
+   `event time backfill`, or the route per tenant. `last_fillable` is what the
+   fill will set; `last_held_by_snapshot` and `first_creation_not_held` it
+   will not.
+3. Read a list that showed the problem, such as
+   `$orderby=last_event_at desc&$top=5` on the affected set.
+4. Set `TEMPER_EVENT_TIME_BACKFILL=fill` on staging's Temper and restart it.
+   Wait for `event time backfill: fill complete` and the store line after it.
+5. Read the same list again: the October record sorts by its time.
+6. Do 2 to 5 on production.
+7. Leave the variable or remove it: a finished store does neither.
+
+**Undo.** The fill only adds times that were missing, each one the record's
+own journal holds and the one a replay of that journal recovers; it changes no
+field, status, sequence or existing time. It keeps no list of what it filled,
+so the kernel cannot take the times out again; only restoring the database
+from before the fill would. That is acceptable because a filled time is
+correct data, not a guess: reverting the code leaves the rows as they are,
+and an older release reads `last_event_at` the same way and ignores the
+cursor table.
+
 ## Consequences
 
 ### Positive
@@ -243,3 +353,7 @@ Turso schema can `DROP INDEX IF EXISTS
 idx_entity_catalog_{last,first}_event_{asc,desc}`, marked `additive-ok` (no
 release relies on the indexes for correctness). `0029` itself is never edited
 once released.
+
+The backfill's cursor table (Postgres migration `0030`, Turso
+`event_time_backfill`) is additive, and an older release ignores it. Times the
+fill wrote stay after a revert (Sub-Decision 9, "Undo").
