@@ -659,7 +659,7 @@ pub async fn handle_odata_post(
                 &initial_fields,
             ) {
                 Ok(record) => record,
-                Err(response) => return response,
+                Err(response) => return *response,
             };
             let _commons_guardrail_lock = state.acquire_commons_write_guardrail_lock(&tenant).await;
 

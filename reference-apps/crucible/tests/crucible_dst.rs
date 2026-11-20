@@ -33,6 +33,12 @@ const SESSION_EVENT_IOA: &str = include_str!("../specs/session_event.ioa.toml");
 const CALLABLE_AGENT_IOA: &str = include_str!("../specs/callable_agent.ioa.toml");
 const SESSION_THREAD_IOA: &str = include_str!("../specs/session_thread.ioa.toml");
 
+/// The time a terminate or archive records: the specs' field invariants hold a
+/// Terminated session to its `TerminatedAt` and an Archived one to its
+/// `ArchivedAt`, and every write is checked against them.
+const TERMINATED_AT: &str = r#"{"TerminatedAt":"2026-01-01T00:00:00Z"}"#;
+const ARCHIVED_AT: &str = r#"{"ArchivedAt":"2026-01-01T00:00:00Z"}"#;
+
 fn environment_table() -> Arc<TransitionTable> {
     Arc::new(TransitionTable::from_ioa_source(ENVIRONMENT_IOA))
 }
@@ -216,7 +222,8 @@ fn scripted_managed_agent_archive_transitions_to_archived() {
         .with_ioa_invariants(MANAGED_AGENT_IOA);
     sim.register_actor("agent-1", Box::new(handler));
 
-    sim.step("agent-1", "ArchiveManagedAgent", "{}").unwrap();
+    sim.step("agent-1", "ArchiveManagedAgent", ARCHIVED_AT)
+        .unwrap();
     sim.assert_status("agent-1", "Archived");
 
     assert!(!sim.has_violations());
@@ -234,7 +241,8 @@ fn scripted_managed_agent_archive_is_final() {
         .with_ioa_invariants(MANAGED_AGENT_IOA);
     sim.register_actor("agent-1", Box::new(handler));
 
-    sim.step("agent-1", "ArchiveManagedAgent", "{}").unwrap();
+    sim.step("agent-1", "ArchiveManagedAgent", ARCHIVED_AT)
+        .unwrap();
     sim.assert_status("agent-1", "Archived");
 
     // Second archive must be rejected — Archived is terminal.
@@ -329,10 +337,11 @@ fn scripted_session_full_lifecycle() {
     sim.step("sess-1", "ResumeSession", "{}").unwrap();
     sim.assert_status("sess-1", "Running");
 
-    sim.step("sess-1", "TerminateSession", "{}").unwrap();
+    sim.step("sess-1", "TerminateSession", TERMINATED_AT)
+        .unwrap();
     sim.assert_status("sess-1", "Terminated");
 
-    sim.step("sess-1", "ArchiveSession", "{}").unwrap();
+    sim.step("sess-1", "ArchiveSession", ARCHIVED_AT).unwrap();
     sim.assert_status("sess-1", "Archived");
 
     assert!(!sim.has_violations());
@@ -378,7 +387,8 @@ fn scripted_session_terminate_from_idle() {
 
     sim.step("sess-1", "StartSession", "{}").unwrap();
     sim.step("sess-1", "IdleSession", "{}").unwrap();
-    sim.step("sess-1", "TerminateSession", "{}").unwrap();
+    sim.step("sess-1", "TerminateSession", TERMINATED_AT)
+        .unwrap();
     sim.assert_status("sess-1", "Terminated");
 
     assert!(!sim.has_violations());
@@ -422,8 +432,9 @@ fn scripted_session_archive_is_final() {
     sim.register_actor("sess-1", Box::new(handler));
 
     sim.step("sess-1", "StartSession", "{}").unwrap();
-    sim.step("sess-1", "TerminateSession", "{}").unwrap();
-    sim.step("sess-1", "ArchiveSession", "{}").unwrap();
+    sim.step("sess-1", "TerminateSession", TERMINATED_AT)
+        .unwrap();
+    sim.step("sess-1", "ArchiveSession", ARCHIVED_AT).unwrap();
     sim.assert_status("sess-1", "Archived");
 
     // No further transitions allowed from Archived.

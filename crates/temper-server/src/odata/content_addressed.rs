@@ -351,7 +351,7 @@ async fn ingest_raw_inner(
         &expected_object_id,
         &initial_fields,
     ) {
-        return response;
+        return *response;
     }
     let final_guard = state.acquire_commons_write_guardrail_lock(&tenant).await;
     // Convert the pending reservation back into a final cap check while the

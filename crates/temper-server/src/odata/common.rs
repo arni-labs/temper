@@ -205,26 +205,30 @@ pub(super) fn created_record_or_refusal(
     entity_type: &str,
     entity_id: &str,
     initial_fields: &serde_json::Value,
-) -> Result<serde_json::Value, axum::response::Response> {
+) -> Result<serde_json::Value, Box<axum::response::Response>> {
     let table = state
         .transition_table_for_dispatch(tenant, entity_type)
         .map_err(|error| {
-            odata_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "RegistryError",
-                &error.to_string(),
+            Box::new(
+                odata_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "RegistryError",
+                    &error.to_string(),
+                )
+                .into_response(),
             )
-            .into_response()
         })?;
     crate::state::write_record::created_record(entity_type, entity_id, &table, initial_fields)
         .map_err(|(message, refusal)| {
-            odata_refusal(
-                refusal_status(Some(&refusal)),
-                refusal.code(),
-                &message,
-                Some(&refusal),
+            Box::new(
+                odata_refusal(
+                    refusal_status(Some(&refusal)),
+                    refusal.code(),
+                    &message,
+                    Some(&refusal),
+                )
+                .into_response(),
             )
-            .into_response()
         })
 }
 
