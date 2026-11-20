@@ -382,31 +382,66 @@ fn keyset_sql(clauses: &[(KeysetClause, bool)]) -> String {
     }
 }
 
+/// Rows strictly after the cursor, written flat: one term for each clause
+/// a row can be past the cursor on, holding the cursor's value on every
+/// clause before it. A nested form (`a > x OR (a = x AND (…))`) is the same
+/// condition, but turso_core plans each level of nesting deeper on the
+/// stack: on 2026-11-19 a debug build needed 2,048 KiB of thread stack to
+/// plan a two-field keyset nested and 1,280 KiB flat, and a test thread has
+/// 2 MiB.
 fn strictly_after(clauses: &[(KeysetClause, bool)]) -> String {
-    let (clause, descending) = &clauses[0];
-    let past = if *descending { "<" } else { ">" };
-    let rest = match &clauses[1..] {
-        [] => None,
-        rest => Some(strictly_after(rest)),
-    };
-    match clause {
-        KeysetClause::Total { sql, value } => match rest {
-            None => format!("{sql} {past} {value}"),
-            Some(rest) => format!("({sql} {past} {value} OR ({sql} = {value} AND {rest}))"),
-        },
-        KeysetClause::Field { present, value } => {
-            // The order always ends with the id, so a field is never last.
-            let rest = rest.unwrap_or_else(|| "FALSE".to_string());
-            match (value, descending) {
-                (Some((row, cursor)), false) => format!(
-                    "(({present} AND ({row} > {cursor} OR ({row} = {cursor} AND {rest}))) \
-                     OR NOT {present})"
-                ),
-                (None, false) => format!("(NOT {present} AND {rest})"),
-                (Some((row, cursor)), true) => {
-                    format!("({present} AND ({row} < {cursor} OR ({row} = {cursor} AND {rest})))")
-                }
-                (None, true) => format!("({present} OR (NOT {present} AND {rest}))"),
+    let mut equal: Vec<String> = Vec::with_capacity(clauses.len());
+    let mut terms = Vec::with_capacity(clauses.len());
+    for (clause, descending) in clauses {
+        let (past, same) = clause.past_and_equal(*descending);
+        if let Some(past) = past {
+            terms.push(if equal.is_empty() {
+                past
+            } else {
+                format!("({} AND {past})", equal.join(" AND "))
+            });
+        }
+        equal.push(same);
+    }
+    match terms.as_slice() {
+        [only] => only.clone(),
+        _ => format!("({})", terms.join(" OR ")),
+    }
+}
+
+impl KeysetClause {
+    /// When a row is past the cursor on this clause, if it can be, and when
+    /// it holds the cursor's value. A field value is typed and NULL when the
+    /// row holds none or one of another type, so it compares false.
+    fn past_and_equal(&self, descending: bool) -> (Option<String>, String) {
+        match self {
+            Self::Total { sql, value } => {
+                let past = if descending { "<" } else { ">" };
+                (
+                    Some(format!("{sql} {past} {value}")),
+                    format!("{sql} = {value}"),
+                )
+            }
+            Self::Field {
+                present,
+                value: Some((row, cursor)),
+            } => {
+                let past = if descending {
+                    format!("{row} < {cursor}")
+                } else {
+                    // A row without a value sorts last ascending.
+                    format!("({row} > {cursor} OR NOT {present})")
+                };
+                (Some(past), format!("{row} = {cursor}"))
+            }
+            Self::Field {
+                present,
+                value: None,
+            } => {
+                // The cursor holds no value: last ascending, so nothing is
+                // past it there; first descending, so every value is.
+                let past = descending.then(|| present.clone());
+                (past, format!("NOT {present}"))
             }
         }
     }

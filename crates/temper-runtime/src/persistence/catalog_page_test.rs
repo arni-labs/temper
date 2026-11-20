@@ -127,15 +127,14 @@ fn a_field_keyset_puts_rows_without_a_value_last_ascending() {
     let (asc, params) = sql(page(QueryFieldIndexOrderDirection::Asc, number.clone()));
     assert_eq!(
         asc,
-        "((present(rank) AND (Number(rank) > Number(?3) OR (Number(rank) = Number(?3) \
-         AND entity_id > ?4))) OR NOT present(rank))"
+        "((Number(rank) > Number(?3) OR NOT present(rank)) \
+         OR (Number(rank) = Number(?3) AND entity_id > ?4))"
     );
     assert_eq!(params, vec!["3", "r-1"]);
     let (desc, _) = sql(page(QueryFieldIndexOrderDirection::Desc, number));
     assert_eq!(
         desc,
-        "(present(rank) AND (Number(rank) < Number(?3) OR (Number(rank) = Number(?3) \
-         AND entity_id > ?4)))"
+        "(Number(rank) < Number(?3) OR (Number(rank) = Number(?3) AND entity_id > ?4))"
     );
     let (asc_absent, params) = sql(page(QueryFieldIndexOrderDirection::Asc, None));
     assert_eq!(asc_absent, "(NOT present(rank) AND entity_id > ?3)");
@@ -145,6 +144,32 @@ fn a_field_keyset_puts_rows_without_a_value_last_ascending() {
         desc_absent,
         "(present(rank) OR (NOT present(rank) AND entity_id > ?3))"
     );
+}
+
+/// Two field keys resume flat: one term for each key, never a term inside
+/// another, so the store plans it no deeper than one key.
+#[test]
+fn a_keyset_of_two_fields_is_one_term_for_each_key() {
+    let page = QueryFieldIndexPageQuery {
+        order_by: vec![
+            order("title", QueryFieldIndexOrderDirection::Asc),
+            order("rank", QueryFieldIndexOrderDirection::Desc),
+        ],
+        after: Some(vec![
+            KeysetValue::Field(Some(FieldLiteral::Text("apple".into()))),
+            KeysetValue::Field(Some(FieldLiteral::Number("3".into()))),
+            "r-1".into(),
+        ]),
+        ..QueryFieldIndexPageQuery::default()
+    };
+    let (sql, params) = page.catalog_conditions(3, &SketchSql("")).expect("keyset");
+    assert_eq!(
+        sql,
+        "((Text(title) > Text(?3) OR NOT present(title)) \
+         OR (Text(title) = Text(?3) AND Number(rank) < Number(?4)) \
+         OR (Text(title) = Text(?3) AND Number(rank) = Number(?4) AND entity_id > ?5))"
+    );
+    assert_eq!(params, vec!["apple", "3", "r-1"]);
 }
 
 #[test]

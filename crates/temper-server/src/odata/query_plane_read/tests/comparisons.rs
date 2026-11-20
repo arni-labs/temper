@@ -25,13 +25,16 @@ const COMPARISONS: [&str; 10] = [
 ];
 
 /// Each page is the store's, judging no more rows than it returns and its
-/// probe row, and a count is one SQL count.
+/// probe row, and a count is one SQL count: it judges only the page's probe
+/// row (`$top=0` fetches one row to learn whether there are more), where a
+/// count rechecked in memory judges every row the filter selects.
 async fn assert_exact_in_sql(state: &ServerState, query: &str) {
     let system = SecurityContext::system();
     let counted = read(state, &system, &format!("{query}&$top=0&$count=true")).await;
-    assert_eq!(
-        counted.telemetry.candidate_count, 0,
-        "{query}: counted in SQL"
+    assert!(
+        counted.telemetry.candidate_count <= 1,
+        "{query}: counted in SQL, judged {} rows",
+        counted.telemetry.candidate_count
     );
     let mut token: Option<String> = None;
     loop {
