@@ -255,6 +255,34 @@ impl IdempotencyCache {
         (!is_expired(entry, now)).then(|| read(entry))
     }
 
+    /// Add to the reply kept for `idem_key` the triggers that failed after
+    /// it was kept: an entity trigger runs once the action's own effects are
+    /// done and its reply is kept, and a retry answers with what the first
+    /// answer said. Nothing happens when no reply is kept for the key.
+    pub fn add_trigger_failures(&self, actor_key: &str, idem_key: &str, failures: &[String]) {
+        let added: usize = failures
+            .iter()
+            .map(|failure| reply::VALUE_OVERHEAD_BYTES + failure.len())
+            .sum();
+        let mut entries = match self.entries.write() {
+            Ok(entries) => entries,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(entry) = entries
+            .by_actor
+            .get_mut(actor_key)
+            .and_then(|actor_entries| actor_entries.get_mut(idem_key))
+        else {
+            return;
+        };
+        entry
+            .response
+            .trigger_failures
+            .extend(failures.iter().cloned());
+        entry.bytes += added;
+        entries.bytes += added;
+    }
+
     /// Cache a response for a given actor and idempotency key.
     ///
     /// Keeps a copy without event parameters or the durable key set. When

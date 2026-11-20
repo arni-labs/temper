@@ -55,7 +55,10 @@ impl ServerState {
             .await
             .result
             .map_err(|e| format!("Actor query failed: {e}"))?;
-        if response.state.status == "Deleted"
+        // Only the kernel's delete removes a record. One a spec moved into a
+        // state it names `Deleted` is an ordinary record: its catalog row
+        // answers a read, so this step answers it the same way.
+        if response.state.is_tombstoned()
             || (from_index && !self.entity_exists(tenant, entity_type, entity_id))
         {
             let _ = actor_ref.stop();

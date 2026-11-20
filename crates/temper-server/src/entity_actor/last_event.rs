@@ -183,6 +183,11 @@ pub struct LastEvent {
     /// timer is armed as them. Left out while there is none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timer_needs_person: Option<String>,
+    /// Whether the newest event is the kernel's tombstone: the record was
+    /// deleted. Kept with the record, not read from its events, because a
+    /// snapshot holds no events. Left out while false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub last_event_tombstone: bool,
 }
 
 impl LastEvent {
@@ -208,6 +213,7 @@ impl LastEvent {
         self.last_event_for = event.origin.acting_for.clone();
         self.last_event_agent_type = event.origin.agent_type.clone();
         self.last_event_label = event.origin.label.clone();
+        self.last_event_tombstone = event.kind == temper_runtime::persistence::EventKind::Tombstone;
         if event.action == super::timer_needs_person::TIMER_NEEDS_PERSON_EVENT {
             self.timer_needs_person = super::timer_needs_person::refused_action(event);
         } else if event.origin.by.is_some() {

@@ -182,14 +182,29 @@ impl ReactionDispatcher {
                     None => {
                         target_resolve_error_count += 1;
                         tracing::warn!(
+                            tenant = %tenant,
                             rule = rule.name,
+                            source_entity_type = entity_type,
+                            source_entity_id = entity_id,
+                            target_entity_type = rule.then.entity_type,
+                            target_action = rule.then.action,
                             "Could not resolve target entity ID for reaction"
+                        );
+                        crate::runtime_metrics::record_reaction_refused(
+                            tenant.as_str(),
+                            &rule.then.entity_type,
+                            &rule.then.action,
+                            "unresolved",
                         );
                         results.push(ReactionResult {
                             rule_name: rule.name.clone(),
                             success: false,
                             target_status: None,
                             error: Some("Could not resolve target entity ID".to_string()),
+                            said: Some(super::said::unresolved(
+                                &rule.then.entity_type,
+                                &rule.then.action,
+                            )),
                             depth,
                         });
                         continue;
@@ -279,7 +294,16 @@ impl ReactionDispatcher {
                 authorized_as: security_ctx.clone(),
             };
             let tried = state.dispatch_reaction(reaction, depth).await;
-            let dispatch_result = match tried {
+            // What the sender is told when the target does not take the move.
+            let said = |why| {
+                Some(super::said::not_made(
+                    &rule.then.entity_type,
+                    &target_entity_id,
+                    &rule.then.action,
+                    why,
+                ))
+            };
+            let (dispatch_result, target_existed) = match tried {
                 ReactionTry::Unread(e) => {
                     tracing::warn!(
                         rule = rule.name,
@@ -293,6 +317,7 @@ impl ReactionDispatcher {
                         success: false,
                         target_status: None,
                         error: Some(e.to_string()),
+                        said: said(super::said::Why::Other),
                         depth,
                     });
                     continue;
@@ -307,11 +332,12 @@ impl ReactionDispatcher {
                         success: false,
                         target_status: Some(target_status),
                         error: Some(reason),
+                        said: said(super::said::Why::Withheld),
                         depth,
                     });
                     continue;
                 }
-                ReactionTry::Sent(reply) => *reply,
+                ReactionTry::Sent(reply, target_existed) => (*reply, target_existed),
             };
             fired_count += 1;
 
@@ -329,6 +355,11 @@ impl ReactionDispatcher {
                             None
                         } else {
                             response.error.clone()
+                        },
+                        said: if response.success {
+                            None
+                        } else {
+                            said(super::said::Why::of(&response, target_existed))
                         },
                         depth,
                     });
@@ -374,6 +405,7 @@ impl ReactionDispatcher {
                         success: false,
                         target_status: None,
                         error: Some(e.to_string()),
+                        said: said(super::said::Why::Other),
                         depth,
                     });
                 }

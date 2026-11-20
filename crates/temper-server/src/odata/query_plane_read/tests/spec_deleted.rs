@@ -31,13 +31,17 @@ fn order_spec_with_discard() -> String {
 }
 
 fn state_on(store: &TursoEventStore, system_name: &str) -> ServerState {
-    let spec = order_spec_with_discard();
+    state_with(store, system_name, &order_spec_with_discard())
+}
+
+/// A server on `store` whose Order follows `spec`.
+fn state_with(store: &TursoEventStore, system_name: &str, spec: &str) -> ServerState {
     let mut registry = SpecRegistry::new();
     registry.register_tenant(
         TenantId::default().as_str(),
         parse_csdl(CSDL_XML).expect("CSDL should parse"),
         CSDL_XML.to_string(),
-        &[("Order", spec.as_str())],
+        &[("Order", spec)],
     );
     let mut state = ServerState::from_registry(ActorSystem::new(system_name), registry);
     state.set_storage_stack(StorageStack::from_turso(store.clone()));
@@ -195,6 +199,114 @@ async fn a_spec_deleted_record_keeps_its_catalog_row() {
     let _ = std::fs::remove_file(db_path);
 }
 
+/// A read by key answers a spec-Deleted record the same way whichever step
+/// serves it: from its catalog row, and from its actor when the row gives
+/// nothing (no row, a read that failed, a row one commit behind). The actor
+/// step used to answer not found and forget the record, so the same record
+/// read as `Deleted` or as gone by chance. Only a record the kernel deleted
+/// is not found.
+#[tokio::test]
+async fn a_spec_deleted_record_reads_the_same_with_or_without_its_catalog_row() {
+    let (store, db_path) = new_store("spec-deleted-read").await;
+    let state = state_on(&store, "query-plane-spec-deleted-read");
+    six_orders_one_discarded(&state).await;
+    let tenant = TenantId::default();
+
+    assert_eq!(status_by_key(&state, "ord-05").await, "Deleted");
+    store
+        .remove_query_projection(tenant.as_str(), "Order", "ord-05")
+        .await
+        .expect("take ord-05's catalog row away");
+    assert!(!has_catalog_row(&state, "ord-05").await);
+    assert_eq!(
+        status_by_key(&state, "ord-05").await,
+        "Deleted",
+        "its actor answers as its row did"
+    );
+    assert!(
+        state.entity_exists(&tenant, "Order", "ord-05"),
+        "and the read did not forget a record that exists"
+    );
+
+    // The kernel's own delete is the one thing a read does not find.
+    state
+        .delete_tenant_entity(&tenant, "Order", "ord-04")
+        .await
+        .expect("delete ord-04");
+    let gone = crate::odata::read::load_existing_entity_descriptor_body(
+        &state, &tenant, "Order", "Orders", "ord-04",
+    )
+    .await;
+    assert_eq!(
+        gone.err().map(|response| response.status()),
+        Some(axum::http::StatusCode::NOT_FOUND)
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+/// A move a spec declares from a state it names `Deleted` runs: such a state
+/// is a working step like any other (an app's Deletion record is proved or
+/// abandoned from it). The actor used to refuse every move there, as if the
+/// kernel had deleted the record. A record the kernel did delete still
+/// refuses every move.
+#[tokio::test]
+async fn a_move_a_spec_declares_from_deleted_runs_and_a_kernel_deleted_record_refuses() {
+    let (store, db_path) = new_store("spec-deleted-move").await;
+    let spec = format!(
+        "{}\n[[action]]\nname = \"Restore\"\nkind = \"input\"\nfrom = [\"Deleted\"]\nto = \"Draft\"\n",
+        order_spec_with_discard()
+    );
+    let state = state_with(&store, "query-plane-spec-deleted-move", &spec);
+    six_orders_one_discarded(&state).await;
+    let tenant = TenantId::default();
+    let ctx = AgentContext::for_service("query-plane-spec-deleted-move");
+
+    let restored = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Order",
+            "ord-05",
+            "Restore",
+            serde_json::json!({}),
+            &ctx,
+        )
+        .await
+        .expect("Restore answers");
+    assert!(
+        restored.success,
+        "a move from Deleted runs: {:?}",
+        restored.error
+    );
+    assert_eq!(restored.state.status, "Draft");
+
+    state
+        .delete_tenant_entity(&tenant, "Order", "ord-04")
+        .await
+        .expect("delete ord-04");
+    let refused = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Order",
+            "ord-04",
+            "AddItem",
+            serde_json::json!({"ProductId": "p1", "Quantity": 1}),
+            &ctx,
+        )
+        .await
+        .expect("AddItem answers");
+    assert!(
+        !refused.success,
+        "a record the kernel deleted takes no move"
+    );
+    assert_eq!(
+        refused.error.as_deref(),
+        Some("cannot execute actions after entity deletion")
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
 /// A Temper written before this fix removed ord-05's catalog row when it was
 /// discarded. On restart boot repair replays that record from its journal
 /// before the server serves and puts the row back, writing nothing to the
@@ -238,6 +350,92 @@ async fn a_restart_puts_back_a_spec_deleted_records_catalog_row() {
         (shown, events_after),
         (expected(), events_before),
         "boot repair puts ord-05's catalog row back and leaves its journal as it was"
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+/// What passivation writes for `id`: the record at its last sequence, without
+/// its events. `before_flag` writes it as a kernel from before records said
+/// they were deleted did.
+async fn snapshot_at_last_event(
+    state: &ServerState,
+    store: &TursoEventStore,
+    id: &str,
+    before_flag: bool,
+) {
+    let tenant = TenantId::default();
+    let key = format!("{tenant}:Order:{id}");
+    let last = store
+        .read_events(&key, 0)
+        .await
+        .expect("read journal")
+        .last()
+        .expect("the record has events")
+        .sequence_nr;
+    let record = state
+        .get_tenant_entity_state(&tenant, "Order", id)
+        .await
+        .expect("read the record")
+        .state;
+    assert_eq!(record.sequence_nr, last, "{id} is read at its last event");
+    let mut snapshot = serde_json::to_value(&record).expect("encode the record");
+    let fields = snapshot.as_object_mut().expect("a record is an object");
+    fields.remove("events");
+    if before_flag {
+        fields.remove("last_event_tombstone");
+    }
+    store
+        .save_snapshot(&key, last, &serde_json::to_vec(&snapshot).expect("bytes"))
+        .await
+        .expect("save the snapshot");
+}
+
+/// A snapshot holds no events, and an actor loaded on a deleted id and
+/// passivated later leaves a snapshot at the tombstone. A record loaded from
+/// it is still deleted, not a record in a state a spec names `Deleted`:
+/// whether the snapshot says so itself (ord-04) or was written before records
+/// did (ord-03, known by its snapshot's own event). A record a spec moved to
+/// `Deleted` loads from the same kind of snapshot as the record it is.
+#[tokio::test]
+async fn a_snapshot_taken_at_the_tombstone_still_loads_a_deleted_record() {
+    let (store, db_path) = new_store("tombstone-snapshot").await;
+    let state = state_on(&store, "query-plane-tombstone-snapshot");
+    six_orders_one_discarded(&state).await;
+    let tenant = TenantId::default();
+    for id in ["ord-03", "ord-04"] {
+        state
+            .delete_tenant_entity(&tenant, "Order", id)
+            .await
+            .unwrap_or_else(|error| panic!("delete {id}: {error}"));
+    }
+    snapshot_at_last_event(&state, &store, "ord-03", true).await;
+    snapshot_at_last_event(&state, &store, "ord-04", false).await;
+    snapshot_at_last_event(&state, &store, "ord-05", true).await;
+
+    // A server that never held these records loads them from their snapshots.
+    let reloaded = state_on(&store, "query-plane-tombstone-snapshot-reloaded");
+    for id in ["ord-03", "ord-04"] {
+        let deleted = reloaded
+            .get_tenant_entity_state(&tenant, "Order", id)
+            .await
+            .unwrap_or_else(|error| panic!("load {id}: {error}"))
+            .state;
+        assert_eq!(deleted.status, "Deleted");
+        assert!(
+            deleted.is_tombstoned(),
+            "{id}: a record the kernel deleted is still deleted when loaded from a snapshot at its tombstone"
+        );
+    }
+    let discarded = reloaded
+        .get_tenant_entity_state(&tenant, "Order", "ord-05")
+        .await
+        .expect("load ord-05")
+        .state;
+    assert_eq!(discarded.status, "Deleted");
+    assert!(
+        !discarded.is_tombstoned(),
+        "a record a spec moved to Deleted is not a deleted record"
     );
 
     let _ = std::fs::remove_file(db_path);

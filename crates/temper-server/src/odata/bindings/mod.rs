@@ -143,11 +143,9 @@ pub(super) async fn dispatch_bound_action(
                 &crate::idempotency::RequestFingerprint::new(action, &resolved_body),
             )
         {
-            let body = annotate_entity(
-                action_answer(&cached.state),
-                format!("$metadata#{set_name}/$entity"),
-                None,
-            );
+            let mut state_json = action_answer(&cached.state);
+            say_trigger_failures(&mut state_json, &cached.trigger_failures);
+            let body = annotate_entity(state_json, format!("$metadata#{set_name}/$entity"), None);
             action_span.set_attribute(OtelKeyValue::new("idempotency.hit", true));
             action_span.set_status(Status::Ok);
             return ODataResponse {
@@ -192,15 +190,7 @@ pub(super) async fn dispatch_bound_action(
                     action_span.set_status(Status::Ok);
 
                     let mut state_json = action_answer(&response.state);
-                    // The action committed; triggers that failed are said beside it.
-                    if !response.trigger_failures.is_empty()
-                        && let Some(object) = state_json.as_object_mut()
-                    {
-                        object.insert(
-                            "@temper.triggerFailures".to_string(),
-                            serde_json::json!(response.trigger_failures),
-                        );
-                    }
+                    say_trigger_failures(&mut state_json, &response.trigger_failures);
                     if let Some(hook) = state.bound_action_hook.as_ref() {
                         match hook
                             .after_bound_action(BoundActionHookContext {
@@ -403,6 +393,19 @@ fn action_answer(state: &crate::entity_actor::EntityState) -> serde_json::Value 
         record.insert("events".to_string(), serde_json::json!([]));
     }
     record
+}
+
+/// The action committed; triggers of it that failed are said beside it, on the
+/// first reply and on the reply a retry of the same key gets.
+fn say_trigger_failures(answer: &mut serde_json::Value, failures: &[String]) {
+    if !failures.is_empty()
+        && let Some(object) = answer.as_object_mut()
+    {
+        object.insert(
+            "@temper.triggerFailures".to_string(),
+            serde_json::json!(failures),
+        );
+    }
 }
 
 #[cfg(test)]
