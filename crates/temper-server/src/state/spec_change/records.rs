@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use futures_util::FutureExt;
 use temper_runtime::tenant::TenantId;
 
 use crate::entity_actor::EntityState;
@@ -53,10 +54,11 @@ impl ServerState {
         }
         groups.retain(|group| !group.ids.is_empty());
         let mut unreadable = 0;
+        let mut stored = Vec::new();
         for id in ids.iter().filter(|id| !covered.contains(*id)) {
             match self.current_record_state(tenant, entity_type, id).await {
                 Some(state) if state.total_event_count > 0 && statuses.contains(&state.status) => {
-                    groups.push(CatalogGroup {
+                    stored.push(CatalogGroup {
                         status: state.status.clone(),
                         values: stored_values(&state, names),
                         ids: vec![id.clone()],
@@ -66,7 +68,46 @@ impl ServerState {
                 None => unreadable += 1,
             }
         }
-        Ok((groups, unreadable))
+        // The values as the record holds them: one stored out of line is read
+        // back, never compared as its reference. Groups split on references,
+        // which name their content, so a group still shares its values.
+        let wanted: BTreeSet<String> = names.iter().cloned().collect();
+        let mut readable = Vec::with_capacity(groups.len() + stored.len());
+        for mut group in groups.into_iter().chain(stored) {
+            let values = serde_json::Value::Object(group.values.clone().into_iter().collect());
+            match self.stored_values_read(tenant, &values, &wanted).await {
+                Ok(values) => {
+                    group.values = values;
+                    readable.push(group);
+                }
+                Err(_) => unreadable += group.ids.len(),
+            }
+        }
+        Ok((readable, unreadable))
+    }
+
+    /// `fields` with each of `names` that an earlier write stored out of
+    /// line read back and verified.
+    pub(super) async fn stored_values_read(
+        &self,
+        tenant: &TenantId,
+        fields: &serde_json::Value,
+        names: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, serde_json::Value>, String> {
+        let source = crate::blobs::BlobReadSource::Tenant {
+            state: self,
+            tenant,
+        };
+        // Boxed: the blob read's future is too deep for the install's `Send`
+        // checks.
+        let resolved = crate::blobs::resolve_stored_fields(&source, fields, names)
+            .boxed()
+            .await?;
+        let fields = resolved.as_ref().unwrap_or(fields);
+        Ok(fields
+            .as_object()
+            .map(|map| map.clone().into_iter().collect())
+            .unwrap_or_default())
     }
 }
 

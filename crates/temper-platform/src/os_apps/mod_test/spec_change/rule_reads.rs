@@ -78,3 +78,67 @@ async fn a_rule_whose_initial_value_changes_is_checked_again() {
         "{refused}"
     );
 }
+
+/// A commit too long to keep inline: it is stored out of line, and the
+/// record holds a reference to it.
+const LONG: &str = "c1-0123456789abcdef0123456789abcdef0123";
+
+/// The place, keeping only 16 bytes of a commit inline, with `rule`.
+fn long_commits(rule: &str) -> String {
+    let spilling = PLACE.replacen(
+        "name = \"commit\"\ntype = \"string\"\ninitial = \"\"\n",
+        "name = \"commit\"\ntype = \"string\"\ninitial = \"\"\noverflow_inline_max_bytes = 16\n",
+        1,
+    );
+    assert_ne!(spilling, PLACE, "the commit's declaration moved");
+    if rule.is_empty() {
+        return spilling;
+    }
+    format!("{spilling}\n[[field_invariant]]\nname = \"Commit\"\nassert = \"{rule}\"\n")
+}
+
+/// A rule is checked against the commit p1 holds, not the reference to it:
+/// one that forbids that commit is refused, and one that asks for it is
+/// installed.
+#[tokio::test]
+async fn a_rule_reads_a_value_stored_out_of_line_as_the_value() {
+    let places = Fixture::new("spilled").await;
+    places
+        .install(&long_commits(""))
+        .await
+        .expect("first version");
+    places.create("p1").await;
+    let brought = places
+        .act("p1", "Bring", serde_json::json!({ "commit": LONG }))
+        .await;
+    assert_eq!(brought, (true, "Bringing".to_string()));
+    let journaled = places
+        .state
+        .server
+        .get_tenant_entity_state(&places.tenant, "Place", "p1")
+        .await
+        .expect("read p1")
+        .state;
+    assert!(
+        journaled.fields["commit"]
+            .get("__temper_blob_ref")
+            .is_some(),
+        "the commit must be stored out of line: {:?}",
+        journaled.fields
+    );
+
+    let refused = places
+        .install(&long_commits(&format!("commit != '{LONG}'")))
+        .await
+        .expect_err("p1 holds the commit the new rule forbids");
+    assert!(
+        refused.contains("Commit") && refused.contains("p1"),
+        "{refused}"
+    );
+    places
+        .install(&long_commits(&format!(
+            "commit == '' || commit == '{LONG}'"
+        )))
+        .await
+        .expect("p1 holds the commit the new rule asks for");
+}
