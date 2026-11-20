@@ -80,7 +80,7 @@ impl crate::state::ServerState {
     ///
     /// `<why>` is the reaction's sentence for the sender
     /// ([`ReactionResult::said`]): the sender may not be allowed to read the
-    /// target, so it never carries the target's state or values.
+    /// target, so it never carries the target's id, state or values.
     pub(super) fn say_failed_reactions(
         &self,
         actor_key: &str,

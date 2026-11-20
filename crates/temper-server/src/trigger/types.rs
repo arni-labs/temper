@@ -121,8 +121,8 @@ pub struct ReactionResult {
     /// callers: it may name the target's state and values.
     pub error: Option<String>,
     /// What the move's sender is told when the reaction was not made
-    /// (`trigger::said`): never the target's state, values or a policy's words,
-    /// which the sender may not be allowed to read.
+    /// (`trigger::said`): never the target's id, state, values or a policy's
+    /// words, which the sender may not be allowed to read.
     #[serde(default)]
     pub said: Option<String>,
     /// How many reactions deep in its chain this one fired; the first

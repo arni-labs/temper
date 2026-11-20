@@ -24,9 +24,8 @@ pub(crate) enum ReactionTry {
         reason: String,
         target_status: String,
     },
-    /// The move was sent: the dispatch's reply, and whether the target
-    /// existed when the reaction read it.
-    Sent(Box<Result<EntityResponse, DispatchError>>, bool),
+    /// The move was sent: the dispatch's reply.
+    Sent(Box<Result<EntityResponse, DispatchError>>),
 }
 
 impl ReactionTry {
@@ -34,7 +33,7 @@ impl ReactionTry {
         match self {
             Self::Unread(error) => Attempt::of_error(error),
             Self::Denied { reason, .. } => Attempt::Failed(reason.clone()),
-            Self::Sent(reply, _) => Attempt::of(reply),
+            Self::Sent(reply) => Attempt::of(reply),
         }
     }
 }
@@ -110,9 +109,9 @@ async fn try_reaction(state: &ServerState, reaction: &Reaction) -> ReactionTry {
     if let Ok(response) = &reply
         && response.refused
     {
-        reaction.record_refused(state, response, snapshot.exists);
+        reaction.record_refused(state, response);
     }
-    ReactionTry::Sent(Box::new(reply), snapshot.exists)
+    ReactionTry::Sent(Box::new(reply))
 }
 
 /// Try an owed reaction again; once it lands, run its cascade at the next
@@ -128,7 +127,7 @@ fn react_again(state: ServerState, reaction: Arc<Reaction>, depth: u32) -> OwedT
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let sent = &reaction.sent;
-        if let (ReactionTry::Sent(reply, _), Some(dispatcher)) = (tried, dispatcher)
+        if let (ReactionTry::Sent(reply), Some(dispatcher)) = (tried, dispatcher)
             && let Ok(response) = *reply
             && response.success
         {
