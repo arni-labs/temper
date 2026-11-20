@@ -270,14 +270,7 @@ pub(super) async fn dispatch_matched_route(
 
     if let Some(action_bridge) = route.route.action_bridge.clone() {
         let invoked = engine
-            .invoke_with_blobs(
-                &invoke_hash,
-                &ctx,
-                host,
-                &limits,
-                invoke_streams,
-                std::collections::BTreeMap::new(),
-            )
+            .invoke_with_blobs(&invoke_hash, &ctx, host, &limits, invoke_streams, None)
             .await;
         // As below: the module reads no more of the request.
         let _ = streams.close(guest_request_body).await;
@@ -312,14 +305,7 @@ pub(super) async fn dispatch_matched_route(
     let head_streams = streams.clone();
     let invoke_future = async move {
         match engine
-            .invoke_with_blobs(
-                &invoke_hash,
-                &ctx,
-                host,
-                &limits,
-                invoke_streams,
-                std::collections::BTreeMap::new(),
-            )
+            .invoke_with_blobs(&invoke_hash, &ctx, host, &limits, invoke_streams, None)
             .await
         {
             Ok(result) => {

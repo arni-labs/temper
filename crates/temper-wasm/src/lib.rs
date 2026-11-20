@@ -8,6 +8,7 @@
 pub mod authorized_host;
 pub mod code_map;
 pub mod engine;
+pub mod field_blobs;
 pub mod host_trait;
 pub mod http_stream;
 pub(crate) mod metrics;
@@ -17,6 +18,7 @@ mod workflow_headers;
 
 pub use authorized_host::{AuthorizedWasmHost, WasmAuthzDecision, WasmAuthzGate, extract_domain};
 pub use engine::{WasmEngine, WasmError};
+pub use field_blobs::FieldBlobReader;
 pub use host_trait::{
     BinaryHttpInterceptorFn, HttpClientCache, InternalHttpCapability,
     InternalHttpCapabilityIssuerFn, LocalSandboxAccess, ProductionWasmHost, ProgressEmitterFn,

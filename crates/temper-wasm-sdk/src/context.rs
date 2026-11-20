@@ -671,7 +671,7 @@ impl Context {
 
     /// Read an entity-state field as raw bytes, transparently resolving
     /// blob-ref envelopes via the host. Works for both inline values and
-    /// oversize blob-ref fields (populated by the dispatcher's blob prefetch).
+    /// oversize blob-ref fields (fetched on request and charged to the call's read budget).
     ///
     /// For plain string fields the return bytes are the UTF-8 text (unquoted);
     /// for blob-ref fields the return bytes are the original decoded payload;

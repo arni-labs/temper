@@ -708,11 +708,11 @@ impl crate::state::ServerState {
                 .integration_config
                 .insert("temper_api_url".to_string(), api_url);
         }
-        // ADR-0046: inline-hydrate blob refs below the 128KB ceiling; defer
-        // oversize refs into a blob_cache the WASM guest can read via
-        // host_read_field_stream. No-op on tenants without a Turso store.
+        // ADR-0046: inline-hydrate blob refs below the 128KB ceiling. Larger
+        // fields stay references; the module reads each one on request through
+        // `field_blobs`, charged to the same budget.
         let blob_hydration_budget = crate::blobs::BlobHydrationBudget::wasm_dispatch();
-        let blob_cache = instrument_wasm_dispatch_phase(
+        instrument_wasm_dispatch_phase(
             active_parent_span.clone(),
             ctx,
             &module_name,
@@ -725,6 +725,12 @@ impl crate::state::ServerState {
             ),
         )
         .await;
+        let field_blobs: Arc<dyn temper_wasm::FieldBlobReader> =
+            Arc::new(crate::blobs::WasmFieldBlobReader::for_tenant(
+                self.clone(),
+                ctx.entity_ref.tenant.clone(),
+                blob_hydration_budget,
+            ));
         let denial_tracker = HttpCallAuthzDenialTracker::default();
         let gate: Arc<dyn WasmAuthzGate> = Arc::new(TrackingWasmAuthzGate::new(
             base_gate.clone(),
@@ -929,7 +935,7 @@ impl crate::state::ServerState {
                 host,
                 &limits,
                 &denial_tracker,
-                blob_cache,
+                field_blobs,
                 llm_parent_span_id.as_deref(),
             ),
         );
@@ -1125,7 +1131,7 @@ impl crate::state::ServerState {
         host: Arc<dyn WasmHost>,
         limits: &WasmResourceLimits,
         denial_tracker: &HttpCallAuthzDenialTracker,
-        blob_cache: std::collections::BTreeMap<String, Vec<u8>>,
+        field_blobs: Arc<dyn temper_wasm::FieldBlobReader>,
         llm_parent_span_id: Option<&str>,
     ) -> Result<Option<EntityResponse>, String> {
         // Existing action-triggered invocations don't use streams — pass empty registry.
@@ -1143,8 +1149,14 @@ impl crate::state::ServerState {
             ctx,
             module_name,
             WASM_DISPATCH_PHASE_ENGINE_INVOKE,
-            self.wasm_engine
-                .invoke_with_blobs(&hash, &inv_ctx, host, limits, streams, blob_cache),
+            self.wasm_engine.invoke_with_blobs(
+                &hash,
+                &inv_ctx,
+                host,
+                limits,
+                streams,
+                Some(field_blobs),
+            ),
         )
         .await;
         match invoke_result {

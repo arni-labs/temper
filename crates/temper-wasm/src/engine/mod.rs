@@ -28,6 +28,7 @@ use wasmtime::{Config, Engine, Linker, Module, ProfilingStrategy, ResourceLimite
 use wasmtime_wasi::preview1::WasiP1Ctx;
 use wasmtime_wasi::{WasiCtxBuilder, preview1};
 
+use crate::field_blobs::FieldBlobReader;
 use crate::host_trait::{HttpClientCache, WasmHost};
 use crate::stream::StreamRegistry;
 use crate::types::{
@@ -230,11 +231,11 @@ pub(crate) struct HostState {
     /// None for wasm32-unknown-unknown modules. When present, WASI
     /// syscalls (clock_time_get, random_get, etc.) are available.
     pub(crate) wasi_ctx: Option<WasiP1Ctx>,
-    /// Pre-fetched bytes for oversize blob-ref fields referenced by
-    /// `context_json`. Populated by the dispatcher before the invocation
-    /// enters the blocking WASM thread, so `host_read_field_stream` can resolve
-    /// blob refs synchronously. Keyed by blob key (e.g.
-    /// `field-overflow/sha256/<hex>.json`). See ADR-0046.
+    /// Fetches an overflowed field's bytes the first time the module reads it. `None` where the caller has no
+    /// record store behind the call (an HTTP endpoint). See ADR-0046.
+    pub(crate) field_blobs: Option<Arc<dyn FieldBlobReader>>,
+    /// The overflowed fields this call has read so far, keyed by blob key (e.g.
+    /// `field-overflow/sha256/<hex>.json`), so the module's size probe and its read fetch a field once.
     pub(crate) blob_cache: BTreeMap<String, Vec<u8>>,
     /// Guest-created observability spans scoped to this invocation.
     pub(crate) guest_spans: GuestSpanRegistry,
@@ -392,20 +393,18 @@ impl WasmEngine {
         limits: &WasmResourceLimits,
         streams: Arc<RwLock<StreamRegistry>>,
     ) -> Result<WasmInvocationResult, WasmError> {
-        self.invoke_with_blobs(module_hash, context, host, limits, streams, BTreeMap::new())
+        self.invoke_with_blobs(module_hash, context, host, limits, streams, None)
             .await
     }
 
-    /// Invoke a cached WASM module with pre-fetched blob-ref bytes available to
-    /// the guest via `host_read_field_stream`. See ADR-0046.
+    /// Invoke a cached WASM module whose `host_read_field` can read the record's
+    /// overflowed fields through `field_blobs`. See ADR-0046.
     ///
-    /// `blob_cache` maps blob keys (e.g. `field-overflow/sha256/<hex>.json`) to
-    /// their decoded bytes. Keys correspond to oversize blob refs present in
-    /// `context.entity_state` that exceed the caller's declared inline ceiling.
-    /// Keys the guest does not read are discarded with the invocation.
+    /// `field_blobs` fetches a field the first time the module reads it, so a
+    /// field the module does not read is never fetched.
     #[tracing::instrument(
         name = "wasm.invoke",
-        skip(self, context, host, limits, streams, blob_cache),
+        skip(self, context, host, limits, streams, field_blobs),
         fields(
             otel.name = "wasm.invoke",
             tenant = %context.tenant,
@@ -440,7 +439,7 @@ impl WasmEngine {
         host: Arc<dyn WasmHost>,
         limits: &WasmResourceLimits,
         streams: Arc<RwLock<StreamRegistry>>,
-        blob_cache: BTreeMap<String, Vec<u8>>,
+        field_blobs: Option<Arc<dyn FieldBlobReader>>,
     ) -> Result<WasmInvocationResult, WasmError> {
         let cached = {
             let cache = self.cache.read().expect("cache lock poisoned");
@@ -453,13 +452,6 @@ impl WasmEngine {
         let engine = self.engine.clone();
         let context_owned = context.clone();
         let limits_owned = limits.clone();
-        let blob_cache_entries = blob_cache.len() as u64;
-        let blob_cache_bytes = blob_cache
-            .values()
-            .map(|bytes| bytes.len() as u64)
-            .sum::<u64>();
-        tracing::Span::current().record("blob_cache_entries", blob_cache_entries);
-        tracing::Span::current().record("blob_cache_bytes", blob_cache_bytes);
         let span = tracing::Span::current();
         // The guest thread logs where its caller logs. A new thread starts on
         // the global subscriber, so without this a scoped one (a test's, or a
@@ -489,7 +481,7 @@ impl WasmEngine {
                         host,
                         limits_owned,
                         streams,
-                        blob_cache,
+                        field_blobs,
                     )
                 });
                 let _ = tx.send(result);
@@ -522,7 +514,7 @@ impl WasmEngine {
         host: Arc<dyn WasmHost>,
         limits: WasmResourceLimits,
         streams: Arc<RwLock<StreamRegistry>>,
-        blob_cache: BTreeMap<String, Vec<u8>>,
+        field_blobs: Option<Arc<dyn FieldBlobReader>>,
     ) -> Result<WasmInvocationResult, WasmError> {
         let module_hash = cached.hash.as_str();
         let invocation_span = tracing::Span::current();
@@ -555,7 +547,6 @@ impl WasmEngine {
                 otel.name = "wasm.invoke.prepare_host_state",
                 module_hash = %module_hash,
                 needs_wasi,
-                blob_cache_entries = blob_cache.len() as u64,
             );
             let _entered = phase.enter();
             let wasi_stderr_pipe = if needs_wasi {
@@ -587,7 +578,8 @@ impl WasmEngine {
                 },
                 streams,
                 wasi_ctx,
-                blob_cache,
+                field_blobs,
+                blob_cache: BTreeMap::new(),
                 guest_spans: GuestSpanRegistry::for_invocation(
                     context.clone(),
                     needs_wasi,
@@ -730,6 +722,15 @@ impl WasmEngine {
 
         let duration_ms = start.elapsed().as_millis() as u64;
         tracing::Span::current().record("duration_ms", duration_ms);
+        let read_fields = &store.data().blob_cache;
+        invocation_span.record("blob_cache_entries", read_fields.len() as u64);
+        invocation_span.record(
+            "blob_cache_bytes",
+            read_fields
+                .values()
+                .map(|bytes| bytes.len() as u64)
+                .sum::<u64>(),
+        );
 
         let result_json = {
             let phase = tracing::info_span!(

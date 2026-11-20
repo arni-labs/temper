@@ -23,8 +23,8 @@ pub use descriptor::{
     is_valid_field_overflow_key,
 };
 pub(crate) use hydration::{
-    BlobHydrationBudget, hydrate_blob_refs_for_tenant, hydrate_blob_refs_for_tenant_with_budget,
-    hydrate_comparison_fields,
+    BlobHydrationBudget, WasmFieldBlobReader, hydrate_blob_refs_for_tenant,
+    hydrate_blob_refs_for_tenant_with_budget, hydrate_comparison_fields,
 };
 #[cfg(test)]
 pub(crate) use hydration::{hydrate_blob_refs_in_value, hydrate_blob_refs_in_value_with_ceiling};
@@ -254,8 +254,7 @@ mod tests {
 
         let mut hydrated_fields = state.fields.clone();
         // Read-side ceiling of 200KB: 150KB field inlines, 300KB stays deferred.
-        let deferred =
-            hydrate_blob_refs_in_value_with_ceiling(&store, &mut hydrated_fields, 200 * 1024).await;
+        hydrate_blob_refs_in_value_with_ceiling(&store, &mut hydrated_fields, 200 * 1024).await;
 
         // medium_field was inlined.
         assert_eq!(
@@ -275,13 +274,19 @@ mod tests {
                 .unwrap_or(false),
             "huge field still a blob ref in the hydrated fields object"
         );
-        // Deferred map contains exactly the huge blob.
-        assert_eq!(deferred.len(), 1, "one deferred blob");
-        let deferred_bytes = deferred.values().next().unwrap();
+        // A module reads the huge field on request.
+        let reader = super::WasmFieldBlobReader::for_store(
+            store.clone(),
+            super::BlobHydrationBudget::wasm_dispatch(),
+        );
+        let read =
+            temper_wasm::FieldBlobReader::read_field_blob(&reader, &hydrated_fields["huge_field"])
+                .await
+                .expect("the huge field reads on request");
         // The blob body is the JSON serialization of the original String value,
         // so it includes the surrounding quotes.
         let decoded: serde_json::Value =
-            serde_json::from_slice(deferred_bytes).expect("deferred bytes decode as JSON");
+            serde_json::from_slice(&read).expect("read bytes decode as JSON");
         assert_eq!(decoded.as_str().unwrap(), huge);
     }
 
@@ -476,7 +481,7 @@ mod tests {
 
     /// End-to-end: when the default ceiling is used on read (the dispatcher's
     /// path), every field whose stored size exceeds `DEFAULT_FIELD_INLINE_MAX`
-    /// lands in the deferred map and the fields object keeps ref envelopes.
+    /// keeps its ref envelope for the module to read on request.
     #[tokio::test]
     async fn hydrate_at_default_ceiling_defers_oversize_for_wasm() {
         let (store, _dir) = open_store().await;
@@ -489,14 +494,13 @@ mod tests {
             .expect("put_overflow_blobs");
 
         let mut hydrated_fields = state.fields.clone();
-        let deferred = hydrate_blob_refs_in_value_with_ceiling(
+        hydrate_blob_refs_in_value_with_ceiling(
             &store,
             &mut hydrated_fields,
             DEFAULT_FIELD_INLINE_MAX,
         )
         .await;
 
-        assert_eq!(deferred.len(), 1, "oversize field goes to deferred map");
         assert!(
             hydrated_fields
                 .get("huge")

@@ -130,8 +130,11 @@ pub(crate) enum FieldResolution {
     Bytes(Vec<u8>),
     /// Field not present in `entity_state.fields`.
     NotFound,
-    /// Field is a blob ref but the pre-fetch `blob_cache` is missing the key.
-    BlobRefMissing { key: String },
+    /// Field is a blob ref this call has not read yet; `reference` is its descriptor.
+    BlobRefMissing {
+        key: String,
+        reference: serde_json::Value,
+    },
     /// JSON parse or unexpected shape; caller should treat as host error.
     HostError,
 }
@@ -329,6 +332,7 @@ pub(crate) fn resolve_field_bytes(
             Some(bytes) => FieldResolution::Bytes(bytes.clone()),
             None => FieldResolution::BlobRefMissing {
                 key: blob_key.to_string(),
+                reference: field_value.clone(),
             },
         };
     }
@@ -342,6 +346,30 @@ pub(crate) fn resolve_field_bytes(
         },
     };
     FieldResolution::Bytes(bytes)
+}
+
+/// Fetch an overflowed field the guest asked for through the call's field reader, and keep it for the rest of the
+/// call. The reader charges the fetch to the call's read budget, so only fields the guest reads take from it.
+fn read_field_blob(
+    caller: &mut Caller<'_, HostState>,
+    key: &str,
+    reference: &serde_json::Value,
+) -> Option<Vec<u8>> {
+    let reader = caller.data().field_blobs.clone()?;
+    let timeout = caller.data().remaining_host_call_timeout();
+    let bytes = run_host_call_with_timeout(
+        "host_read_field",
+        caller.data().call_site(key),
+        timeout,
+        reader.read_field_blob(reference),
+    )
+    .ok()
+    .flatten()?;
+    caller
+        .data_mut()
+        .blob_cache
+        .insert(key.to_string(), bytes.clone());
+    Some(bytes)
 }
 
 fn record_context_json_on_span(span: &tracing::Span, context_json: &str, workflow_step: &str) {
@@ -1384,13 +1412,14 @@ pub(super) fn link_host_functions(linker: &mut Linker<HostState>) -> Result<(), 
     //   so guests see identical bytes regardless of inline vs blob-ref storage.
     // - Non-string JSON values are written as their UTF-8 JSON serialization.
     // - Blob-ref values ({"__temper_blob_ref": "..."}) are resolved from the
-    //   per-invocation blob_cache pre-populated by the dispatcher.
+    //   call's field reader the first time the guest reads them, and kept in
+    //   the call's blob_cache so the size probe and the read fetch them once.
     //
     // Return contract (matches `host_get_context`):
     //   >= 0 with value <= buf_len — bytes written; read `value` bytes from buf_ptr.
     //   >  buf_len                 — needed buffer size; caller should resize + retry.
     //     -1                       — field not in entity_state.fields.
-    //     -2                       — field is a blob ref; pre-fetch did not populate blob_cache.
+    //     -2                       — field is a blob ref that could not be read (budget, missing, unverified).
     //     -3                       — generic host error (memory access, JSON parse).
     //
     // See ADR-0046.
@@ -1445,11 +1474,20 @@ pub(super) fn link_host_functions(linker: &mut Linker<HostState>) -> Result<(), 
                 record_context_json_on_span(&span, &caller.data().context_json, "read_field");
                 let _guard = span.enter();
 
-                let bytes = match resolve_field_bytes(
+                let resolution = match resolve_field_bytes(
                     &caller.data().context_json,
                     &caller.data().blob_cache,
                     &field_name,
                 ) {
+                    FieldResolution::BlobRefMissing { key, reference } => {
+                        match read_field_blob(&mut caller, &key, &reference) {
+                            Some(bytes) => FieldResolution::Bytes(bytes),
+                            None => FieldResolution::BlobRefMissing { key, reference },
+                        }
+                    }
+                    resolution => resolution,
+                };
+                let bytes = match resolution {
                     FieldResolution::Bytes(b) => b,
                     FieldResolution::NotFound => {
                         tracing::Span::current().record("result", "not_found");
@@ -1457,11 +1495,11 @@ pub(super) fn link_host_functions(linker: &mut Linker<HostState>) -> Result<(), 
                             .record("duration_ms", started.elapsed().as_millis() as u64);
                         return -1;
                     }
-                    FieldResolution::BlobRefMissing { key } => {
+                    FieldResolution::BlobRefMissing { key, .. } => {
                         tracing::warn!(
                             field = %field_name,
                             blob_key = %key,
-                            "host_read_field: blob ref not in prefetch cache"
+                            "host_read_field: overflowed field could not be read"
                         );
                         tracing::Span::current().record("result", "blob_ref_missing");
                         tracing::Span::current()
@@ -2442,7 +2480,7 @@ mod tests {
         let cache = BTreeMap::new();
 
         match resolve_field_bytes(&ctx, &cache, "big_field") {
-            FieldResolution::BlobRefMissing { key } => {
+            FieldResolution::BlobRefMissing { key, .. } => {
                 assert!(key.ends_with("absent.json"));
             }
             other => panic!("expected BlobRefMissing, got {other:?}"),

@@ -40,7 +40,7 @@ pub(in crate::state::dispatch::wasm) fn invoke_and_handle_result_boxed<'a>(
     host: Arc<dyn WasmHost>,
     limits: &'a WasmResourceLimits,
     denial_tracker: &'a HttpCallAuthzDenialTracker,
-    blob_cache: std::collections::BTreeMap<String, Vec<u8>>,
+    field_blobs: Arc<dyn temper_wasm::FieldBlobReader>,
     llm_parent_span_id: Option<&'a str>,
 ) -> BoxFuture<'a, Result<Option<EntityResponse>, String>> {
     state
@@ -54,7 +54,7 @@ pub(in crate::state::dispatch::wasm) fn invoke_and_handle_result_boxed<'a>(
             host,
             limits,
             denial_tracker,
-            blob_cache,
+            field_blobs,
             llm_parent_span_id,
         )
         .boxed()
