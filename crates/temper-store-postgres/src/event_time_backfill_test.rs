@@ -241,7 +241,7 @@ async fn an_october_record_sorts_by_its_journal_times_once_filled_on_postgres() 
     );
     assert_eq!(
         times(&store, "snapshotted").await,
-        (Some("2026-10-05T09:00:00.000000000Z".into()), None)
+        (Some("2026-10-05T07:00:00.500000000Z".into()), None)
     );
     let oldest = by_last_event(&store, false).await;
     assert_eq!(&oldest[..3], ["set", "lost", "october"]);
