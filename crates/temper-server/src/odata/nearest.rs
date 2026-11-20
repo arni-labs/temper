@@ -9,9 +9,10 @@
 //! ranking under the same `$filter` evaluation and Cedar list and read gates as any
 //! read, until `k` records pass. Each carries `@temper.score`.
 //!
-//! The `decl` and `model` arguments of ADR-0155 named a declared vector; every record
-//! now has its meaning, so they are accepted and ignored, as a spec's retired
-//! `[[vector]]` block is.
+//! Older callers may still use `decl`, `vector` and `model` to search a
+//! declared vector path during the rollout of meaning search.
+
+mod declared;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -24,9 +25,10 @@ use super::authz::{LIST_ACTION, READ_ACTION, authorize_read};
 use super::common::resolve_entity_type;
 use super::query_plane_read::{QueryPlaneReadBudget, QueryPlaneReadRequest, walk_ranked};
 use super::read_support::materialize_entity_set_entities;
-use crate::meaning::rank::rank_nearest;
+use crate::meaning::rank::{Ranked, rank_nearest};
 use crate::response::odata_error;
 use crate::state::ServerState;
+use crate::storage::BoxedEventStore;
 
 /// Look up a named argument in the parsed bound-function parameter list.
 fn arg<'a>(params: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -67,6 +69,11 @@ fn unsupported_query_option(options: &QueryOptions) -> Option<&'static str> {
     .find_map(|(set, name)| set.then_some(name))
 }
 
+enum NearestFrom<'a> {
+    Reference(&'a str),
+    Vector(&'a str),
+}
+
 /// Handle `GET /<Set>/Temper.Nearest(...)`.
 pub(super) async fn handle_nearest(
     state: &ServerState,
@@ -86,13 +93,8 @@ pub(super) async fn handle_nearest(
     };
     if let Some(unsupported) = unsupported_query_option(query_options) {
         return bad_request(&format!(
-            "Temper.Nearest does not accept the OData system query option '{unsupported}'; use the function arguments (to, k, filter)"
+            "Temper.Nearest does not accept the OData system query option '{unsupported}'; use the function arguments (to or decl/vector/model, k, filter)"
         ));
-    }
-    if arg(params, "vector").is_some() {
-        return bad_request(
-            "Temper.Nearest ranks by the kernel's meaning of each record; pass to='<id>', or search by words with $search",
-        );
     }
     let Some(entity_type) = resolve_entity_type(state, tenant, &set_name) else {
         return odata_error(
@@ -102,8 +104,10 @@ pub(super) async fn handle_nearest(
         )
         .into_response();
     };
-    let Some(reference_id) = arg(params, "to") else {
-        return bad_request("Temper.Nearest requires 'to', the id of the record to rank against");
+    let source = match (arg(params, "to"), arg(params, "vector")) {
+        (Some(id), None) => NearestFrom::Reference(id),
+        (None, Some(vector)) => NearestFrom::Vector(vector),
+        _ => return bad_request("Temper.Nearest takes exactly one of 'to' or 'vector'"),
     };
     let budget = QueryPlaneReadBudget::from_config();
     let k = match arg(params, "k") {
@@ -133,78 +137,6 @@ pub(super) async fn handle_nearest(
         return *response;
     }
 
-    // The reference record must exist and be readable before anything about it, its
-    // meaning or the ranking it seeds, is disclosed.
-    let reference = materialize_entity_set_entities(
-        state,
-        tenant,
-        &entity_type,
-        &set_name,
-        std::slice::from_ref(&reference_id.to_string()),
-        true,
-        None,
-    )
-    .await
-    .entities
-    .into_iter()
-    .next();
-    let Some(body) =
-        reference.filter(|body| body.get("status").and_then(|s| s.as_str()) != Some("Deleted"))
-    else {
-        return not_found(reference_id);
-    };
-    if let Err(response) = authorize_read(
-        state,
-        tenant,
-        security_ctx,
-        READ_ACTION,
-        &entity_type,
-        reference_id,
-        &body,
-    ) {
-        return *response;
-    }
-
-    let Some((store, _)) = state.event_journal() else {
-        return odata_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "StorageUnavailable",
-            "Temper.Nearest requires a store",
-        )
-        .into_response();
-    };
-    let meaning = match store
-        .meaning_row(tenant.as_str(), &entity_type, reference_id)
-        .await
-    {
-        Ok(row) => row,
-        Err(error) => return read_failed(&error.to_string()),
-    };
-    let Some((vector, model_tag)) = meaning.and_then(|row| Some((row.vector?, row.model_tag)))
-    else {
-        return odata_error(
-            StatusCode::CONFLICT,
-            "MeaningNotReady",
-            &format!(
-                "reference entity '{reference_id}' has no meaning yet: its text waits for the model, or holds no words"
-            ),
-        )
-        .into_response();
-    };
-    let ranked = match rank_nearest(
-        &store,
-        tenant.as_str(),
-        &entity_type,
-        &vector,
-        &model_tag,
-        reference_id,
-    )
-    .await
-    {
-        Ok(ranked) => ranked,
-        Err(error) => return read_failed(&error.to_string()),
-    };
-
     let walk_options = QueryOptions {
         filter,
         ..QueryOptions::default()
@@ -218,6 +150,14 @@ pub(super) async fn handle_nearest(
         query_options: &walk_options,
         budget,
     };
+    let ranked = match source {
+        NearestFrom::Reference(id) => rank_reference(&request, id).await,
+        NearestFrom::Vector(vector) => declared::rank(&request, params, vector).await,
+    };
+    let ranked = match ranked {
+        Ok(ranked) => ranked,
+        Err(response) => return response,
+    };
     let page = walk_ranked(&request, &ranked, 0, k, false, false).await;
     crate::response::ODataResponse {
         status: StatusCode::OK,
@@ -226,6 +166,86 @@ pub(super) async fn handle_nearest(
             "value": page.entities,
         }),
     }
+    .into_response()
+}
+
+async fn rank_reference(
+    request: &QueryPlaneReadRequest<'_>,
+    reference_id: &str,
+) -> Result<Vec<Ranked>, Response> {
+    // The reference record must exist and be readable before anything about it, its
+    // meaning or the ranking it seeds, is disclosed.
+    let reference = materialize_entity_set_entities(
+        request.state,
+        request.tenant,
+        request.entity_type,
+        request.entity_set_name,
+        std::slice::from_ref(&reference_id.to_string()),
+        true,
+        None,
+    )
+    .await
+    .entities
+    .into_iter()
+    .next();
+    let Some(body) =
+        reference.filter(|body| body.get("status").and_then(|s| s.as_str()) != Some("Deleted"))
+    else {
+        return Err(not_found(reference_id));
+    };
+    if let Err(response) = authorize_read(
+        request.state,
+        request.tenant,
+        request.security_ctx,
+        READ_ACTION,
+        request.entity_type,
+        reference_id,
+        &body,
+    ) {
+        return Err(*response);
+    }
+
+    let store = nearest_store(request.state).ok_or_else(no_store)?;
+    let meaning = match store
+        .meaning_row(request.tenant.as_str(), request.entity_type, reference_id)
+        .await
+    {
+        Ok(row) => row,
+        Err(error) => return Err(read_failed(&error.to_string())),
+    };
+    let Some((vector, model_tag)) = meaning.and_then(|row| Some((row.vector?, row.model_tag)))
+    else {
+        return Err(odata_error(
+            StatusCode::CONFLICT,
+            "MeaningNotReady",
+            &format!(
+                "reference entity '{reference_id}' has no meaning yet: its text waits for the model, or holds no words"
+            ),
+        )
+        .into_response());
+    };
+    rank_nearest(
+        &store,
+        request.tenant.as_str(),
+        request.entity_type,
+        &vector,
+        &model_tag,
+        reference_id,
+    )
+    .await
+    .map_err(|error| read_failed(&error.to_string()))
+}
+
+fn nearest_store(state: &ServerState) -> Option<BoxedEventStore> {
+    state.event_journal().map(|(store, _)| store)
+}
+
+fn no_store() -> Response {
+    odata_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "StorageUnavailable",
+        "Temper.Nearest requires a store",
+    )
     .into_response()
 }
 

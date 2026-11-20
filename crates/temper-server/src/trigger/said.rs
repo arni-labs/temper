@@ -31,8 +31,13 @@ impl Why {
     /// own answer: a record that was never written (no event) or that the
     /// kernel deleted is missing. Whether the record existed is not taken from
     /// an earlier read of it, which a record made in between would contradict.
+    ///
+    /// No event means both counts are zero. The journal's sequence alone is
+    /// not enough: a server with no journal never advances it, and there a
+    /// record that exists has only the count of events applied to it.
     pub(super) fn of(response: &EntityResponse) -> Self {
-        let never_written = response.state.sequence_nr == 0;
+        let never_written =
+            response.state.sequence_nr == 0 && response.state.total_event_count == 0;
         match &response.refusal {
             _ if response.state.is_tombstoned() => Self::Missing,
             Some(Refusal::InvalidState { .. }) if never_written => Self::Missing,

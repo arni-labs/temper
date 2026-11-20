@@ -7,6 +7,7 @@ pub use crate::schema_event_history::{
     ALTER_EVENTS_ADD_SEGMENT_INDEX, CREATE_EVENT_SEGMENTS_OPEN_INDEX, CREATE_EVENT_SEGMENTS_TABLE,
     CREATE_SNAPSHOT_HISTORY_ENTITY_INDEX, CREATE_SNAPSHOT_HISTORY_TABLE,
 };
+pub(crate) use event_time_order::create_event_time_index;
 pub use event_time_order::{create_event_time_indexes, event_time_index_name, event_time_key_sql};
 pub use query_plane::{
     CREATE_ENTITY_CATALOG_CHECKPOINT_INDEX, CREATE_ENTITY_CATALOG_COUNTERS_TABLE,

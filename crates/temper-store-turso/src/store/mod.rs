@@ -95,6 +95,8 @@ pub struct TursoEventStore {
     is_remote: bool,
     /// Set when the local file's commits are copied to Turso Cloud.
     sync_copy: Option<SyncCopy>,
+    /// Successful event-time index initializations, shared by store clones.
+    event_time_indexes: Arc<[tokio::sync::OnceCell<()>; 4]>,
     /// Pauses appends at a fault point (tests only).
     #[cfg(test)]
     commit_probe: Option<commit_probe::CommitProbe>,
@@ -164,6 +166,7 @@ impl TursoEventStore {
             trajectory_batch: Arc::default(),
             is_remote,
             sync_copy,
+            event_time_indexes: Arc::default(),
             #[cfg(test)]
             commit_probe: None,
         };
@@ -584,7 +587,6 @@ impl TursoEventStore {
         conn.execute(schema::CREATE_ENTITY_CATALOG_CHECKPOINT_INDEX, ())
             .await
             .map_err(storage_error)?;
-        query_page::create_event_time_indexes(&conn).await;
 
         // Entity field index — EAV table for OData filter push-down.
         conn.execute(schema::CREATE_ENTITY_FIELD_INDEX_TABLE, ())

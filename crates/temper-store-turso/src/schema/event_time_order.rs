@@ -41,18 +41,22 @@ pub fn event_time_index_name(column: EventTimeColumn, descending: bool) -> &'sta
     }
 }
 
+pub(crate) fn create_event_time_index(column: EventTimeColumn, descending: bool) -> String {
+    let name = event_time_index_name(column, descending);
+    let key = event_time_key_sql(column);
+    let direction = if descending { " DESC" } else { "" };
+    format!(
+        "CREATE INDEX IF NOT EXISTS {name} \
+         ON entity_catalog(tenant, entity_type, {key}{direction}, entity_id, status)"
+    )
+}
+
 /// Every event-time index, as `CREATE INDEX IF NOT EXISTS` statements.
 pub fn create_event_time_indexes() -> Vec<String> {
     let mut statements = Vec::with_capacity(4);
     for column in [EventTimeColumn::Last, EventTimeColumn::First] {
         for descending in [true, false] {
-            let name = event_time_index_name(column, descending);
-            let key = event_time_key_sql(column);
-            let direction = if descending { " DESC" } else { "" };
-            statements.push(format!(
-                "CREATE INDEX IF NOT EXISTS {name} \
-                 ON entity_catalog(tenant, entity_type, {key}{direction}, entity_id, status)"
-            ));
+            statements.push(create_event_time_index(column, descending));
         }
     }
     statements
