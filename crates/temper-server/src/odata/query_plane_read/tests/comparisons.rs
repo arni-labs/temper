@@ -9,6 +9,7 @@ use super::large_set::{
     BUDGET, PostgresCards, assert_matches_memory, read, sim_cards, turso_cards,
 };
 use super::*;
+use temper_odata::query::types::parse_query_options;
 
 const COMPARISONS: [&str; 10] = [
     "$filter=rank gt 5",
@@ -51,11 +52,22 @@ async fn assert_exact_in_sql(state: &ServerState, query: &str) {
     }
 }
 
+/// A filter of equalities alone is answered first by the reconciled
+/// equality read (`equality.rs`), which rechecks its candidates in memory;
+/// every other comparison is the native page's.
+fn equalities_only(query: &str) -> bool {
+    let filter = parse_query_options(query)
+        .expect("query parses")
+        .filter
+        .expect("a filter");
+    crate::odata::filter_sql::equality_field_predicates(&filter).is_some()
+}
+
 async fn assert_comparisons(state: &ServerState, bodies: &[serde_json::Value], in_sql: bool) {
     let system = SecurityContext::system();
     for query in COMPARISONS {
         assert_matches_memory(state, &system, bodies, query).await;
-        if in_sql {
+        if in_sql && !equalities_only(query) {
             assert_exact_in_sql(state, query).await;
         }
     }

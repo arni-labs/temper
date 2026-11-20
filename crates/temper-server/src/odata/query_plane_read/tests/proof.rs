@@ -837,9 +837,10 @@ async fn file_point_lookup_with_status_ne_uses_lossless_equality_candidates() {
         QueryPlaneReadStrategy::NativePagePushdown
     );
     assert!(result.telemetry.filter_pushdown);
-    assert_eq!(result.telemetry.candidate_count, 2);
-    assert_eq!(result.telemetry.materialized_count, 2);
-    assert_eq!(result.telemetry.pushdown_page_count, 2);
+    // Only the matching file is read: the archived one is not a candidate.
+    assert_eq!(result.telemetry.candidate_count, 1);
+    assert_eq!(result.telemetry.materialized_count, 1);
+    assert_eq!(result.telemetry.pushdown_page_count, 1);
     assert_eq!(result.telemetry.returned_count, 1);
 
     let _ = std::fs::remove_file(db_path);
