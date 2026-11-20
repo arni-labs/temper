@@ -17,6 +17,7 @@ use temper_runtime::tenant::TenantId;
 use temper_spec::csdl::parse_csdl;
 use temper_store_turso::TursoEventStore;
 
+mod comparisons;
 mod count_telemetry;
 mod declared_default_count;
 mod declared_defaults;

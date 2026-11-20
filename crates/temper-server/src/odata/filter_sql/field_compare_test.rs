@@ -58,15 +58,55 @@ fn unequal_on_a_declared_string_or_boolean_is_read_as_a_typed_comparison() {
 fn a_literal_of_another_type_an_undeclared_field_or_an_or_stays_in_the_filter() {
     for text in [
         "kind ne 5",
+        "rank gt '5'",
         "other ne 'x'",
         "kind ne 'a' or kind ne 'b'",
-        "kind eq 'steer'",
+        "pinned gt false",
         "kind ne null",
     ] {
         let split = split_field_comparisons(&filter(text), &declared());
         assert!(split.comparisons.is_empty(), "{text}");
         assert_eq!(split.rest, Some(filter(text)), "{text}");
     }
+}
+
+#[test]
+fn every_comparison_of_a_number_or_a_string_is_typed() {
+    let split = split_field_comparisons(
+        &filter("rank gt 5 and 2.5 ge rank and kind lt 'm' and rank ne 0"),
+        &declared(),
+    );
+    let ops: Vec<(&str, FieldComparisonOp)> = split
+        .comparisons
+        .iter()
+        .map(|comparison| (comparison.field.as_str(), comparison.op))
+        .collect();
+    assert_eq!(
+        ops,
+        vec![
+            ("rank", FieldComparisonOp::Gt),
+            ("rank", FieldComparisonOp::Le),
+            ("kind", FieldComparisonOp::Lt),
+            ("rank", FieldComparisonOp::Ne),
+        ]
+    );
+    assert_eq!(split.rest, None);
+}
+
+/// Equality of a string or a boolean is typed and also left to the field
+/// index, which narrows the rows by an index lookup; a number's is typed
+/// only, since its index text (`3.0`) need not be the literal's (`3`).
+#[test]
+fn equality_of_a_string_or_a_boolean_also_narrows_by_the_index() {
+    let split = split_field_comparisons(
+        &filter("kind eq 'steer' and pinned eq true and rank eq 3"),
+        &declared(),
+    );
+    assert_eq!(split.comparisons.len(), 3);
+    assert_eq!(
+        split.rest,
+        Some(filter("kind eq 'steer' and pinned eq true"))
+    );
 }
 
 #[test]

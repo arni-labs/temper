@@ -134,8 +134,15 @@ pub(in crate::odata) fn split_field_comparisons(
                     .missing_default_fields
                     .insert(comparison.field.clone());
             }
+            // Equality of a string or a boolean stays in the filter too: the
+            // field index's text holds every value it can equal, so an index
+            // lookup narrows the rows the typed comparison then decides.
+            let narrows_by_index = comparison.op == FieldComparisonOp::Eq
+                && comparison.literal.class() != FieldClass::Number;
             split.comparisons.push(comparison);
-            continue;
+            if !narrows_by_index {
+                continue;
+            }
         }
         split.rest = Some(match split.rest.take() {
             Some(left) => FilterExpr::BinaryOp {
@@ -173,13 +180,13 @@ fn typed_comparison(conjunct: &FilterExpr, declared: &DeclaredFields) -> Option<
     })
 }
 
-/// Which comparisons of a type are read here. Equality of a string or a
-/// boolean is left to the field index's text (`filter_sql`), which an index
-/// lookup answers. A boolean meets no ordering in the evaluator.
+/// Which comparisons of a type SQL makes as the evaluator does: every one
+/// for a number (both sides parse to the nearest double) and a string (byte
+/// order); equality only for a boolean, which meets no ordering there.
 fn typed_in_sql(class: FieldClass, op: FieldComparisonOp) -> bool {
     match class {
-        FieldClass::Text | FieldClass::Boolean => op == FieldComparisonOp::Ne,
-        FieldClass::Number => false,
+        FieldClass::Text | FieldClass::Number => true,
+        FieldClass::Boolean => matches!(op, FieldComparisonOp::Eq | FieldComparisonOp::Ne),
     }
 }
 
