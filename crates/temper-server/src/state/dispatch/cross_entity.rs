@@ -170,6 +170,8 @@ impl crate::state::ServerState {
                 child_id = %child_id,
             );
 
+            // Each child holds its parent move's follow-on row until it is made.
+            let hold = self.hold_follow_on(&agent);
             tokio::spawn(
                 async move {
                     // determinism-ok: spawn dispatch is a background side-effect
@@ -266,6 +268,7 @@ impl crate::state::ServerState {
                     if let Attempt::StoreFailed(error) = state.spawn_children(&children).await {
                         state.keep_child_spawns(children, &error);
                     }
+                    state.settle_follow_on(hold);
                 }
                 .instrument(span),
             );
@@ -477,6 +480,7 @@ impl crate::state::ServerState {
             entity_id: child.child_id.clone(),
             kind: OwedKind::Child,
             key: child.agent.idempotency_key.clone(),
+            follow_ons: child.agent.follow_ons.clone(),
         };
         self.keep_owed_write(owed, error, move |state| {
             spawn_children_again(state, Arc::clone(&children))

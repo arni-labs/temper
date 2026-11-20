@@ -36,6 +36,8 @@
 //! A background module call's deadline is a row of the same kind
 //! (`request_context::calls`), armed only at boot: it answers the lost call
 //! with its `on_failure`, and lapses like any fire on a record moved on.
+//! So is a move's follow-on row (`request_context::follow_ons`), which a
+//! boot does not arm: it sends the follow-ons it names (`follow_ons`).
 
 mod recovery;
 
@@ -56,6 +58,7 @@ use super::state_timer_follow::BootTimers;
 use super::timer_standing::{Standing, TimerFire};
 use super::{DispatchError, DispatchExtOptions};
 use crate::entity_actor::EntityResponse;
+use crate::request_context::follow_ons::is_follow_row;
 use crate::request_context::{AgentContext, ScheduledFire};
 use crate::state::ServerState;
 use crate::wake::{Armed, TimerRef};
@@ -189,6 +192,10 @@ impl ServerState {
             .map_err(|error| error.to_string())?;
         for row in rows {
             if self.skip_call_recovery(tenant, &row) {
+                continue;
+            }
+            if is_follow_row(&row.arm_id) {
+                self.resume_follow_ons(tenant, &row, gate);
                 continue;
             }
             let timer = match scheduled_timer(tenant, &row) {

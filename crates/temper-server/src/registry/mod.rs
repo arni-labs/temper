@@ -385,6 +385,20 @@ impl SpecRegistry {
         action: &str,
         to_state: &str,
     ) -> Vec<ReactionRule> {
+        let mut rules = self.action_reactions(tenant, entity_type, action);
+        rules.retain(|rule| crate::trigger::registry::matches_state_filter(rule, to_state));
+        rules
+    }
+
+    /// The reactions a move `action` on an `entity_type` record may trigger
+    /// in `tenant`, whatever state it sets: [`Self::reaction_rules`] before
+    /// their guards' statuses are read.
+    pub fn action_reactions(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        action: &str,
+    ) -> Vec<ReactionRule> {
         let Some(spec) = self.get_spec(tenant, entity_type) else {
             return Vec::new();
         };
@@ -394,7 +408,6 @@ impl SpecRegistry {
             .filter(|declared| declared.name == action)
             .flat_map(|declared| &declared.triggers)
             .filter_map(|trigger| synthesize_action_trigger_reaction(entity_type, action, trigger))
-            .filter(|rule| crate::trigger::registry::matches_state_filter(rule, to_state))
             .collect()
     }
 

@@ -27,16 +27,25 @@
 //! A call's deadline is its own: it never makes a schedule identical to it,
 //! and is never dropped as identical to one. A schedule kept only because a
 //! deadline looked the same would vanish when the call answered.
+//!
+//! A move that owes follow-ons (reactions, children, integrations) writes
+//! their row in the same commit too (`request_context::follow_ons`), with the
+//! id `follow:<key>`: the follow-ons remove it once they have settled, and a
+//! boot sends them again if they had not. It is no schedule, and never makes
+//! one identical to it.
 
 use chrono::{DateTime, Utc};
 use temper_runtime::persistence::ScheduledActionRecord;
 
 use super::actor::EntityActor;
-use super::effects::ScheduledAction;
+use super::effects::{ScheduledAction, SpawnRequest};
 use super::types::{EntityEvent, EntityState};
 use crate::request_context::AgentContext;
 use crate::request_context::armed_by::{encode_call_armed_by, encode_scheduled_armed_by};
 use crate::request_context::calls::{call_arm_id, called_integration};
+use crate::request_context::follow_ons::{
+    OwedFollowOns, follow_arm_id, is_follow_row, owes_follow_ons,
+};
 
 /// The scheduled-action rows an event changes in its commit.
 #[derive(Debug, Default)]
@@ -49,9 +58,11 @@ pub(super) struct ScheduledRows {
 
 impl EntityActor {
     /// Name each scheduled action `event` arms, and return the rows to write
-    /// with it: those actions' and the deadlines of the background calls its
-    /// `custom_effects` start, and the row it removes, if `caller` fires one
-    /// of this record's or answers one of its calls. An action identical to
+    /// with it: those actions', the deadlines of the background calls its
+    /// `custom_effects` start and the row of the follow-ons it owes (its
+    /// reactions, its `spawn_requests` and its integrations), and the row it
+    /// removes, if `caller` fires one of this record's or answers one of its
+    /// calls. An action identical to
     /// a schedule already waiting (same action, same due time) is dropped
     /// from `scheduled`, so it is neither written nor armed again. `state` is
     /// the entity before the event is written. Without a journal nothing is
@@ -60,6 +71,7 @@ impl EntityActor {
         &self,
         scheduled: &mut Vec<ScheduledAction>,
         custom_effects: &[String],
+        spawn_requests: &[SpawnRequest],
         state: &EntityState,
         event: &EntityEvent,
         caller: Option<&AgentContext>,
@@ -143,8 +155,68 @@ impl EntityActor {
             .collect();
         if let Some(caller) = caller {
             armed.extend(self.call_deadlines(sequence, state, event, custom_effects, caller));
+            armed.extend(self.follow_row(
+                sequence,
+                state,
+                event,
+                custom_effects,
+                spawn_requests,
+                caller,
+            ));
         }
         ScheduledRows { armed, fired }
+    }
+
+    /// The row of the follow-ons the move `event` owes, if it owes any
+    /// (`owes_follow_ons`): who made it, its key, and what sending them again
+    /// needs. `state` is the record after the move. A move without a key
+    /// writes none: its follow-ons could not be told from a second copy.
+    fn follow_row(
+        &self,
+        sequence: u64,
+        state: &EntityState,
+        event: &EntityEvent,
+        custom_effects: &[String],
+        spawn_requests: &[SpawnRequest],
+        caller: &AgentContext,
+    ) -> Option<ScheduledActionRecord> {
+        let key = caller.idempotency_key.as_ref()?;
+        if !owes_follow_ons(
+            spawn_requests,
+            custom_effects,
+            !caller.owed_reactions.is_empty(),
+        ) {
+            return None;
+        }
+        let owed = encode_scheduled_armed_by(caller).and_then(|made_by| {
+            serde_json::to_string(&OwedFollowOns {
+                caller: made_by,
+                sequence,
+                status: state.status.clone(),
+                fields: state.fields.clone(),
+                params: event.params.clone(),
+                reactions: caller.owed_reactions.clone(),
+                spawn_requests: spawn_requests.to_vec(),
+                custom_effects: custom_effects.to_vec(),
+            })
+        });
+        let armed_by = match owed {
+            Ok(armed_by) => armed_by,
+            Err(error) => {
+                tracing::error!(entity_type = %state.entity_type, entity_id = %state.entity_id,
+                    %error, "follow-ons not encodable; a restart before they settle loses them");
+                return None;
+            }
+        };
+        Some(ScheduledActionRecord {
+            tenant: self.tenant.clone(),
+            entity_type: state.entity_type.clone(),
+            entity_id: state.entity_id.clone(),
+            arm_id: follow_arm_id(key.as_str()),
+            action: event.action.clone(),
+            due_at: event.timestamp.to_rfc3339(),
+            armed_by,
+        })
     }
 
     /// The deadline rows of the background calls `custom_effects` start that
@@ -224,7 +296,9 @@ impl EntityActor {
             Ok(rows) => rows
                 .into_iter()
                 .filter(|row| {
-                    Some(row.arm_id.as_str()) != fired && called_integration(&row.arm_id).is_none()
+                    Some(row.arm_id.as_str()) != fired
+                        && called_integration(&row.arm_id).is_none()
+                        && !is_follow_row(&row.arm_id)
                 })
                 .filter_map(|row| {
                     let due = DateTime::parse_from_rfc3339(&row.due_at).ok()?;

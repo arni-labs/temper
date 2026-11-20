@@ -68,11 +68,16 @@ pub(super) fn leaves_record_unchanged(
         && before.spawn_reservations == after.spawn_reservations;
     // What the move writes beside the record, in its event's commit or after
     // it: children, scheduled actions and their rows (a scheduled action's
-    // fire removes its row with its event), and field-overflow blobs.
+    // fire removes its row with its event), and field-overflow blobs. The row
+    // of its follow-ons is not one: it keeps them only for a move that writes
+    // an event, and a move that writes none sends them as it always did.
     let writes_beside = !result.spawn_requests.is_empty()
         || !result.scheduled_actions.is_empty()
         || !result.overflow_blobs.is_empty()
-        || !scheduled.armed.is_empty()
+        || scheduled
+            .armed
+            .iter()
+            .any(|row| !crate::request_context::follow_ons::is_follow_row(&row.arm_id))
         || scheduled.fired.is_some();
     // What only its event would say: that a timer which fires once has fired
     // (the status clock's entry for its action), that a move naming someone

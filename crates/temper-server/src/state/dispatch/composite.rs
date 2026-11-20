@@ -201,6 +201,7 @@ impl crate::state::ServerState {
                     false,
                     crate::state::write_record::WriteCaller::Kernel,
                     None,
+                    &[],
                 )
                 .await?;
 

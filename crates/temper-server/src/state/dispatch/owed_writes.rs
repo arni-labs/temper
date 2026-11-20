@@ -27,10 +27,12 @@
 //! not answer, because the ask timed out or the actor stopped first, is
 //! treated the same: the write may yet land, or was never handled.
 //!
-//! Kept writes live only in this process, so a restart loses them, except a
-//! state timer's fire, whose row arms it again at boot, and the answer of a
-//! background module call that names an `on_failure`, whose deadline row
-//! answers the call with it after the restart (`request_context::calls`). The gauge
+//! Kept writes live only in this process. A restart sends each again from its
+//! row: a state timer's fire from the timer's row, and a reaction, a child or
+//! a module's answer from the follow-on row of the move that owes it
+//! (`follow_ons`), which it holds while it is tried again; a background call
+//! that names an `on_failure` also has its deadline row
+//! (`request_context::calls`). The gauge
 //! `temper_owed_writes_held` says how many are held now, and
 //! [`ServerState::report_owed_writes_at_shutdown`] logs and counts each one
 //! still held when the process stops.
@@ -86,10 +88,9 @@ impl OwedKind {
     fn at_restart(self) -> &'static str {
         match self {
             Self::Timer => "its row fires it again at boot",
-            Self::Answer => {
-                "a restart loses it; a module call that names an on_failure is answered by it after the restart"
+            Self::Answer | Self::Reaction | Self::Child => {
+                "its move's follow-on row sends it again at boot"
             }
-            Self::Reaction | Self::Child => "a restart loses it",
         }
     }
 }
@@ -104,6 +105,9 @@ pub(crate) struct OwedWrite {
     /// The key every try carries. A write without one is not kept: a try
     /// whose write landed unseen would apply again.
     pub(crate) key: Option<IdempotencyKey>,
+    /// The follow-on row of the move that owes it, held while it is tried
+    /// again (`follow_ons`), so a restart sends it again from there.
+    pub(crate) follow_ons: Option<crate::request_context::ScheduledFire>,
 }
 
 /// What one try of an owed write did.
@@ -209,6 +213,7 @@ impl OwedMove {
             entity_id: self.entity_id.clone(),
             kind,
             key: self.agent_ctx.idempotency_key.clone(),
+            follow_ons: self.agent_ctx.follow_ons.clone(),
         }
     }
 
@@ -238,6 +243,9 @@ impl ServerState {
         };
         if !self.track_owed_write(&key, owed.clone()) {
             return;
+        }
+        if let Some(row) = &owed.follow_ons {
+            self.hold_follow_row(row);
         }
         tracing::warn!(tenant = %owed.tenant, entity_type = %owed.entity_type,
             entity_id = %owed.entity_id, owed_write = owed.kind.as_str(), idempotency_key = %key,
@@ -275,6 +283,9 @@ impl ServerState {
                 }
             }
             state.untrack_owed_write(&key);
+            if let Some(row) = &owed.follow_ons {
+                state.settle_follow_row(row);
+            }
         };
         tokio::spawn(retries.instrument(span)); // determinism-ok: an owed write's retries are a background side-effect
     }

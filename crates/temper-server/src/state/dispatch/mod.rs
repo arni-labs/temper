@@ -13,6 +13,7 @@ mod actions;
 mod adapter;
 mod answers;
 mod authenticated_params;
+mod background_reactions;
 pub(crate) use authenticated_params::bind_authenticated_params;
 mod call_deadlines;
 mod compensation;
@@ -21,6 +22,7 @@ mod cross_entity;
 mod detached;
 mod effects;
 mod error;
+mod follow_ons;
 pub use error::DispatchError;
 pub(crate) mod entity_rows;
 mod generated_callbacks;
@@ -284,6 +286,8 @@ impl crate::state::ServerState {
         let action = _action.to_string();
         let custom_effects = custom_effects.to_vec();
         let entity_state = _entity_state.clone();
+        // The calls hold their move's follow-on row until they are answered.
+        let hold = self.hold_follow_on(agent_ctx);
         let agent_ctx = agent_ctx.for_background_task();
         let action_params = action_params.clone();
         let workflow_root_entity_type = workflow_root_type(&agent_ctx, &entity_type);
@@ -332,6 +336,7 @@ impl crate::state::ServerState {
                         &agent_ctx,
                     );
                 }
+                state.settle_follow_on(hold);
             }
             .instrument(span),
         );

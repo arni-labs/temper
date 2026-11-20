@@ -23,8 +23,21 @@ use super::repeat_stop::RepeatStop;
 use super::types::ReactionResult;
 use crate::state::owed_writes::OwedMove;
 
+/// A committed move whose reactions are owed: its record, its action, and
+/// the status and fields it left the record in.
+pub(crate) struct CommittedMove<'a> {
+    pub(crate) entity_type: &'a str,
+    pub(crate) entity_id: &'a str,
+    pub(crate) action: &'a str,
+    pub(crate) to_state: &'a str,
+    pub(crate) fields: &'a serde_json::Value,
+}
+
 /// The action whose reactions one level of a chain runs, `depth` levels in.
 struct Level<'a> {
+    /// The reactions its action declared when it was sent, before their
+    /// statuses are read; None: those its tenant's spec declares now.
+    declared: Option<&'a [crate::trigger::ReactionRule]>,
     entity_type: &'a str,
     entity_id: &'a str,
     action: &'a str,
@@ -69,12 +82,38 @@ impl crate::ServerState {
     ) -> BoxFuture<'a, Vec<ReactionResult>> {
         crate::growable_stack::on_growable_stack(move || {
             let level = Level {
+                declared: None,
                 entity_type,
                 entity_id,
                 action,
                 to_state,
                 fields,
                 depth,
+            };
+            self.dispatch_level(tenant, level, invoking_ctx).boxed()
+        })
+    }
+
+    /// Dispatch the reactions of the committed move `moved` from `declared`,
+    /// the reactions its action declared when the move was sent, so an
+    /// install before they run changes none of them; None: those its spec
+    /// declares now, as every later level of the chain reads them.
+    pub(crate) fn dispatch_declared_reactions<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        moved: &'a CommittedMove<'a>,
+        declared: Option<&'a [crate::trigger::ReactionRule]>,
+        invoking_ctx: &'a AgentContext,
+    ) -> BoxFuture<'a, Vec<ReactionResult>> {
+        crate::growable_stack::on_growable_stack(move || {
+            let level = Level {
+                declared,
+                entity_type: moved.entity_type,
+                entity_id: moved.entity_id,
+                action: moved.action,
+                to_state: moved.to_state,
+                fields: moved.fields,
+                depth: 0,
             };
             self.dispatch_level(tenant, level, invoking_ctx).boxed()
         })
@@ -105,6 +144,7 @@ impl crate::ServerState {
         invoking_ctx: &AgentContext,
     ) -> Vec<ReactionResult> {
         let Level {
+            declared,
             entity_type,
             entity_id,
             action,
@@ -116,11 +156,18 @@ impl crate::ServerState {
         let source_ctx = invoking_ctx.entering(entity_type, entity_id, action);
         let invoking_ctx = &source_ctx;
         let state = self;
-        let rules = self
-            .registry
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .reaction_rules(tenant, entity_type, action, to_state);
+        let rules = match declared {
+            Some(declared) => declared
+                .iter()
+                .filter(|rule| crate::trigger::registry::matches_state_filter(rule, to_state))
+                .cloned()
+                .collect(),
+            None => self
+                .registry
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .reaction_rules(tenant, entity_type, action, to_state),
+        };
 
         if rules.is_empty() {
             record_reaction_fanout_span(ReactionFanoutCounts::default());

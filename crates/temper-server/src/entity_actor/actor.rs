@@ -1845,6 +1845,7 @@ impl EntityActor {
                         .arm_scheduled_actions(
                             &mut result.scheduled_actions,
                             &result.custom_effects,
+                            &result.spawn_requests,
                             state,
                             &event,
                             caller.as_deref(),
@@ -2154,6 +2155,7 @@ impl EntityActor {
                                         .arm_scheduled_actions(
                                             &mut retry_result.scheduled_actions,
                                             &retry_result.custom_effects,
+                                            &retry_result.spawn_requests,
                                             state,
                                             &retry_event,
                                             caller.as_deref(),

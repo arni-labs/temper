@@ -176,6 +176,8 @@ impl crate::state::ServerState {
         let action = input.action.to_string();
         let custom_effects = input.custom_effects.to_vec();
         let entity_state = input.entity_state.clone();
+        // The calls hold their move's follow-on row until they are answered.
+        let hold = self.hold_follow_on(input.agent_ctx);
         let agent_ctx = input.agent_ctx.for_background_task();
         let action_params = input.action_params.clone();
         let workflow_root_entity_type = agent_ctx
@@ -231,6 +233,7 @@ impl crate::state::ServerState {
                         &agent_ctx,
                     );
                 }
+                state.settle_follow_on(hold);
             }
             .instrument(span),
         );

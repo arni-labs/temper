@@ -550,6 +550,12 @@ pub struct ServerState {
     pub(crate) due_times: Arc<crate::wake::DueTimes>,
     /// This process's background calls are live, even during boot retries.
     pub(crate) call_process_id: uuid::Uuid,
+    /// The follow-on rows of committed moves whose follow-ons are in flight
+    /// in this process: how many each row has. The last to settle removes
+    /// the row, and a boot leaves a row held here to this process
+    /// (`dispatch::follow_ons`).
+    pub(crate) follow_ons_held:
+        Arc<std::sync::Mutex<BTreeMap<crate::request_context::ScheduledFire, usize>>>,
     /// The writes committed moves owe that the store has not taken yet, by
     /// idempotency key, each tried again until it lands or fails otherwise
     /// (`dispatch::owed_writes`). In memory only: a restart loses them.
@@ -880,6 +886,7 @@ impl ServerState {
             scheduled_armed: Arc::default(),
             due_times: Arc::default(),
             call_process_id: temper_runtime::scheduler::sim_uuid(),
+            follow_ons_held: Arc::default(),
             owed_writes: Arc::default(),
             timer_recovery_complete: Arc::default(),
             tenant_restore: Arc::default(),
@@ -1167,6 +1174,7 @@ impl ServerState {
             scheduled_armed: Arc::default(),
             due_times: Arc::default(),
             call_process_id: temper_runtime::scheduler::sim_uuid(),
+            follow_ons_held: Arc::default(),
             owed_writes: Arc::default(),
             timer_recovery_complete: Arc::default(),
             tenant_restore: Arc::default(),

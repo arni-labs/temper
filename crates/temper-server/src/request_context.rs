@@ -19,6 +19,7 @@ pub(crate) mod armed_by;
 pub(crate) mod calls;
 mod execution;
 mod fires;
+pub(crate) mod follow_ons;
 mod inline_chain;
 mod observation_metadata;
 
@@ -119,6 +120,17 @@ pub struct AgentContext {
     /// of the background call this context answers: the answer's commit
     /// removes it, on that record only.
     pub ends_call: Option<ScheduledFire>,
+    /// Runtime-owned; never populated from request headers. The reactions
+    /// this move's action declared when it was sent, which the caller that
+    /// sent it runs after the commit; its follow-on row keeps them
+    /// (`follow_ons`). Set only on the caller a move is sent to its actor
+    /// with; empty everywhere else.
+    pub owed_reactions: Vec<crate::trigger::ReactionRule>,
+    /// Runtime-owned; never populated from request headers. The follow-on
+    /// row of the committed move whose follow-ons this context sends: each
+    /// one holds the row while it is in flight in this process, and the last
+    /// to settle removes it (`state::dispatch::follow_ons`).
+    pub follow_ons: Option<ScheduledFire>,
     /// Runtime-owned; never populated from request headers. The state timer
     /// this dispatch fires: the actor applies its action only while the
     /// record's journal is at the sequence the timer was armed at.
@@ -259,6 +271,8 @@ impl AgentContext {
             fires_scheduled_action: None,
             background_calls: Vec::new(),
             ends_call: None,
+            owed_reactions: Vec::new(),
+            follow_ons: None,
             fires_state_timer: None,
             read_when_set: None,
             read_when_set_for: None,
@@ -303,6 +317,8 @@ impl AgentContext {
             fires_scheduled_action: None,
             background_calls: Vec::new(),
             ends_call: None,
+            owed_reactions: Vec::new(),
+            follow_ons: None,
             fires_state_timer: None,
             read_when_set: None,
             read_when_set_for: None,
@@ -327,10 +343,12 @@ impl AgentContext {
         Self::for_service(service_name).inherit_observability_from(parent)
     }
 
-    /// Copy the execution budget and non-authority observability fields from a parent.
+    /// Copy the execution budget, the follow-on row it is sent under and the
+    /// non-authority observability fields from a parent.
     pub fn inherit_observability_from(mut self, parent: &AgentContext) -> Self {
         self.inline_chain = parent.inline_chain.clone();
         self.callback_hops = parent.callback_hops;
+        self.follow_ons = parent.follow_ons.clone();
         self.session_id = parent.session_id.clone();
         self.intent = parent.intent.clone();
         self.trace_id = parent.trace_id.clone();
@@ -446,6 +464,8 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
         fires_scheduled_action: None,
         background_calls: Vec::new(),
         ends_call: None,
+        owed_reactions: Vec::new(),
+        follow_ons: None,
         fires_state_timer: None,
         read_when_set: None,
         read_when_set_for: None,

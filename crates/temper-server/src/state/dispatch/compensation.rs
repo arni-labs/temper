@@ -63,6 +63,8 @@ impl crate::state::ServerState {
         let entity_id = entity_id.to_string();
         let triggering_action = triggering_action.to_string();
         let error = error.to_string();
+        // The compensation is a follow-on of the move like the call it answers.
+        let hold = self.hold_follow_on(parent_ctx);
         let parent_ctx = parent_ctx.for_background_task();
         let span = crate::trace_context::runtime_work_span!(
             crate::trace_context::cause(),
@@ -89,6 +91,7 @@ impl crate::state::ServerState {
                         &parent_ctx,
                     )
                     .await;
+                state.settle_follow_on(hold);
             }
             .instrument(span),
         );

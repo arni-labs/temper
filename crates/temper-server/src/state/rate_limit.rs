@@ -154,6 +154,7 @@ impl ServerState {
                 false,
                 crate::state::write_record::WriteCaller::Kernel,
                 None,
+                &[],
             )
             .await
             .map_err(rate_limit_dispatch_error);

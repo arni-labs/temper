@@ -1,7 +1,6 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
-use tokio::sync::Semaphore;
-use tracing::{Instrument, instrument};
+use tracing::instrument;
 
 use crate::entity_actor::{EntityMsg, EntityResponse};
 use crate::request_context::AgentContext;
@@ -9,31 +8,13 @@ use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 use temper_runtime::tenant::TenantId;
 
+use super::background_reactions::BackgroundReactionDispatch;
 use super::effects::PostDispatchContext;
 use super::retry;
 use super::{DispatchCommand, DispatchError, DispatchExtOptions, record_workflow_span_attrs};
 use crate::state::admission::AdmissionOutcome;
 use crate::state::write_record::WriteCaller;
-
-const DEFAULT_BACKGROUND_REACTION_MAX_CONCURRENCY: usize = 64;
-
-struct BackgroundReactionDispatch {
-    tenant: TenantId,
-    entity_type: String,
-    entity_id: String,
-    action: String,
-    to_state: String,
-    fields: serde_json::Value,
-    agent_ctx: AgentContext,
-}
-
-fn background_reaction_semaphore() -> Arc<Semaphore> {
-    static SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    Arc::clone(
-        SEMAPHORE
-            .get_or_init(|| Arc::new(Semaphore::new(DEFAULT_BACKGROUND_REACTION_MAX_CONCURRENCY))),
-    )
-}
+use crate::trigger::dispatcher::CommittedMove;
 
 /// Maximum request-body length, in bytes, echoed into the dispatch-failure log.
 const LOG_REQUEST_BODY_MAX_BYTES: usize = 4096;
@@ -268,6 +249,14 @@ impl crate::state::ServerState {
             self.reject_action_supplied_sub_writes(entity_type, action, &params)?;
         }
 
+        // This dispatch runs the move's reactions after it commits: those its
+        // action declares now, as the move is sent. Its follow-on row keeps
+        // them, and they are the ones it runs, whatever is installed between.
+        let declared = self
+            .registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .action_reactions(tenant, entity_type, action);
         let mut response = self
             .dispatch_tenant_action_core(
                 tenant,
@@ -279,39 +268,55 @@ impl crate::state::ServerState {
                 await_integration,
                 caller,
                 expected_authorization_precondition,
+                &declared,
             )
             .await?;
 
         // Dispatch cross-entity reactions (fire-and-forget, depth 0 = top-level)
         if response.success {
+            // The core dispatch left this dispatch holding the follow-on row
+            // its commit wrote, until the reactions are sent.
+            let follow = entered_ctx
+                .idempotency_key
+                .as_ref()
+                .filter(|_| {
+                    !declared.is_empty()
+                        && crate::request_context::follow_ons::wrote_follow_row(&response, true)
+                })
+                .map(|key| {
+                    super::follow_ons::follow_row(tenant, entity_type, entity_id, key.as_str())
+                });
             // The children this action spawned are entities its chain made.
-            let reaction_ctx = entered_ctx.having_made(
+            let mut reaction_ctx = entered_ctx.having_made(
                 response
                     .spawn_requests
                     .iter()
                     .map(|spawn| (spawn.entity_type.as_str(), spawn.entity_id.as_str())),
             );
+            reaction_ctx.follow_ons = follow.clone();
             let agent_ctx = &reaction_ctx;
             {
-                let action = response.action(action);
+                let answered = response.action(action);
+                // A follow-up's retry answered by another recorded action has
+                // that action's reactions, read from its spec.
+                let declared = (answered == action).then_some(declared);
+                let action = answered;
                 let to_state = response.state.status.clone();
                 let fields = serde_json::to_value(&response.state.fields).unwrap_or_default();
                 let reacted = if await_reactions {
-                    self.dispatch_reactions(
-                        tenant,
+                    let moved = CommittedMove {
                         entity_type,
                         entity_id,
                         action,
-                        &to_state,
-                        &fields,
-                        0,
-                        // ADR-0046: thread the invoking context through so
-                        // reactions without an explicit principal inherit
-                        // the invoking authority, and declared principals
-                        // can elevate deterministically.
-                        agent_ctx,
-                    )
-                    .await
+                        to_state: &to_state,
+                        fields: &fields,
+                    };
+                    // ADR-0046: thread the invoking context through so
+                    // reactions without an explicit principal inherit the
+                    // invoking authority, and declared principals can
+                    // elevate deterministically.
+                    self.dispatch_declared_reactions(tenant, &moved, declared.as_deref(), agent_ctx)
+                        .await
                 } else if let Some(background) =
                     self.try_spawn_background_reactions(BackgroundReactionDispatch {
                         tenant: tenant.clone(),
@@ -320,6 +325,7 @@ impl crate::state::ServerState {
                         action: action.to_string(),
                         to_state,
                         fields,
+                        declared,
                         agent_ctx: agent_ctx.clone(),
                     })
                 {
@@ -330,14 +336,17 @@ impl crate::state::ServerState {
                         action_name = action,
                         "background reaction budget exhausted; awaiting reactions inline"
                     );
-                    self.dispatch_reactions(
-                        tenant,
+                    let moved = CommittedMove {
                         entity_type,
                         entity_id,
                         action,
-                        &background.to_state,
-                        &background.fields,
-                        0,
+                        to_state: &background.to_state,
+                        fields: &background.fields,
+                    };
+                    self.dispatch_declared_reactions(
+                        tenant,
+                        &moved,
+                        background.declared.as_deref(),
                         agent_ctx,
                     )
                     .await
@@ -347,6 +356,11 @@ impl crate::state::ServerState {
                     // in the log and counted (`Reaction::record_refused`).
                     Vec::new()
                 };
+                // The reactions are sent, or hold the row in the background
+                // themselves: this dispatch's hold ends.
+                if let Some(row) = &follow {
+                    self.settle_follow_row(row);
+                }
                 // The action is committed: a trigger that then failed is said
                 // beside it instead of being thrown away.
                 self.say_failed_reactions(
@@ -364,62 +378,6 @@ impl crate::state::ServerState {
         // Scheduled actions are handled inside run_post_dispatch_effects
         // (called from dispatch_tenant_action_core).
         Ok(response)
-    }
-
-    fn try_spawn_background_reactions(
-        &self,
-        dispatch: BackgroundReactionDispatch,
-    ) -> Option<BackgroundReactionDispatch> {
-        let Ok(permit) = background_reaction_semaphore().try_acquire_owned() else {
-            return Some(dispatch);
-        };
-
-        let state = self.clone();
-        let BackgroundReactionDispatch {
-            tenant,
-            entity_type,
-            entity_id,
-            action,
-            to_state,
-            fields,
-            agent_ctx,
-        } = dispatch;
-        let span = crate::trace_context::runtime_work_span!(
-            crate::trace_context::cause(),
-            kind = "reaction",
-            "reaction.dispatch.background",
-            tenant = %tenant,
-            entity_type = %entity_type,
-            entity_id = %entity_id,
-            action_name = %action,
-        );
-
-        let reaction_task = async move {
-            let _permit = permit;
-            let results = state
-                .dispatch_reactions(
-                    &tenant,
-                    &entity_type,
-                    &entity_id,
-                    &action,
-                    &to_state,
-                    &fields,
-                    0,
-                    &agent_ctx,
-                )
-                .await;
-            tracing::info!(
-                tenant = %tenant,
-                entity_type = %entity_type,
-                entity_id = %entity_id,
-                action_name = %action,
-                reaction.result_count = results.len(),
-                "background reactions completed"
-            );
-        }
-        .instrument(span);
-        tokio::spawn(reaction_task); // determinism-ok: production-only post-commit reaction side effects
-        None
     }
 
     /// Core dispatch without reaction cascade (used by ReactionDispatcher to
@@ -453,6 +411,7 @@ impl crate::state::ServerState {
         await_integration: bool,
         caller: WriteCaller,
         mut expected_authorization_precondition: Option<String>,
+        owed_reactions: &[crate::trigger::ReactionRule],
     ) -> Result<EntityResponse, DispatchError> {
         let params =
             match self.resolve_authenticated_params(tenant, entity_type, action, params, agent_ctx)
@@ -692,6 +651,9 @@ impl crate::state::ServerState {
         } else {
             self.background_calls(tenant, entity_type)
         };
+        // Its follow-on row keeps the reactions its caller runs after it.
+        actor_caller.owed_reactions = owed_reactions.to_vec();
+        let runs_reactions = !owed_reactions.is_empty();
         let actor_caller = Arc::new(actor_caller);
         let idempotency_key = agent_ctx.idempotency_key.clone();
         // W2 phase: ask_reply — round-trip through the retry layer to the
@@ -883,6 +845,29 @@ impl crate::state::ServerState {
             entity_id,
             &response,
         );
+        // The move's follow-ons hold the row its commit wrote for them while
+        // they run (`follow_ons`); this dispatch holds it until they are
+        // sent, and a caller that runs the move's reactions after it, until
+        // those are.
+        let follow = idempotency_key
+            .as_ref()
+            .filter(|_| {
+                crate::request_context::follow_ons::wrote_follow_row(&response, runs_reactions)
+            })
+            .map(|key| super::follow_ons::follow_row(tenant, entity_type, entity_id, key.as_str()));
+        if let Some(row) = &follow {
+            self.hold_follow_row(row);
+        }
+        let effects_ctx;
+        let agent_ctx = if agent_ctx.follow_ons == follow {
+            agent_ctx
+        } else {
+            effects_ctx = AgentContext {
+                follow_ons: follow.clone(),
+                ..agent_ctx.clone()
+            };
+            &effects_ctx
+        };
         // Run all post-dispatch effects through the dedicated pipeline.
         let ctx = PostDispatchContext {
             tenant,
@@ -925,6 +910,11 @@ impl crate::state::ServerState {
         };
         // The reply the effects claim hands back may be another dispatcher's.
         response.answered_action = answered_action;
+        if let Some(row) = &follow
+            && (!runs_reactions || stale.is_some())
+        {
+            self.settle_follow_row(row);
+        }
         if let Some(stale) = stale {
             tracing::Span::current().record("success", false);
             return Err(stale);

@@ -121,6 +121,8 @@ impl ServerState {
                             entity_id: timer.entity_id.clone(),
                             kind: OwedKind::Timer,
                             key: Some(fire_key.clone()),
+                            // A state timer's fire is owed by its own row.
+                            follow_ons: None,
                         },
                     );
                 }

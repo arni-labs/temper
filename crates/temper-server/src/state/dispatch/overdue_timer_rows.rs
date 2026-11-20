@@ -1,5 +1,6 @@
-//! A gauge of timer rows past their due time, per tenant: state timers and
-//! scheduled actions. It reads the rows, not the timers armed in this process,
+//! A gauge of timer rows past their due time, per tenant: state timers,
+//! scheduled actions, and the follow-on rows of moves whose follow-ons have
+//! not settled (`follow_on`), due from their move's commit. It reads the rows, not the timers armed in this process,
 //! so a row that no process armed, or whose fire never landed, still counts.
 //! Without it the kernel saw an overdue timer only when something touched its
 //! record: 20 release records sat in Queued for two days unseen.
@@ -63,20 +64,34 @@ impl ServerState {
                         })
                     };
                     let (state_rows, state_late) =
-                        self.past_due(&rows.state_timers, state_timer, now);
+                        self.past_due(&rows.state_timers, &state_timer, now);
                     crate::runtime_metrics::record_overdue_timer_rows(
                         &tenant,
                         "state_timeout",
                         state_rows,
                         state_late,
                     );
+                    // A move's follow-on row is due when the move commits and
+                    // waits only for its follow-ons to settle: it is told
+                    // apart, so a schedule's lateness stays its own.
+                    let (follow_ons, schedules): (Vec<_>, Vec<_>) =
+                        rows.scheduled_actions.iter().cloned().partition(|row| {
+                            crate::request_context::follow_ons::is_follow_row(&row.arm_id)
+                        });
                     let (scheduled_rows, scheduled_late) =
-                        self.past_due(&rows.scheduled_actions, scheduled, now);
+                        self.past_due(&schedules, &scheduled, now);
                     crate::runtime_metrics::record_overdue_timer_rows(
                         &tenant,
                         "scheduled_action",
                         scheduled_rows,
                         scheduled_late,
+                    );
+                    let (follow_rows, follow_late) = self.past_due(&follow_ons, &scheduled, now);
+                    crate::runtime_metrics::record_overdue_timer_rows(
+                        &tenant,
+                        "follow_on",
+                        follow_rows,
+                        follow_late,
                     );
                 }
                 Ok(Err(error)) => {
@@ -98,7 +113,7 @@ impl ServerState {
     fn past_due(
         &self,
         rows: &[OverdueTimerRow],
-        timer: impl Fn(&OverdueTimerRow) -> TimerRef,
+        timer: &impl Fn(&OverdueTimerRow) -> TimerRef,
         now: DateTime<Utc>,
     ) -> (u64, u64) {
         let mut count = 0;
