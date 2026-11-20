@@ -16,6 +16,7 @@ mod principal;
 pub mod registry;
 mod repeat_stop;
 pub(crate) mod resolver;
+mod said;
 pub mod sim_dispatcher;
 pub mod types;
 mod withheld;

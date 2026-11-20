@@ -117,8 +117,14 @@ pub struct ReactionResult {
     pub success: bool,
     /// The target entity's status after the action (if available).
     pub target_status: Option<String>,
-    /// Error message if the action failed.
+    /// Error message if the action failed. For the kernel's log and its own
+    /// callers: it may name the target's state and values.
     pub error: Option<String>,
+    /// What the move's sender is told when the reaction was not made
+    /// (`trigger::said`): never the target's state, values or a policy's words,
+    /// which the sender may not be allowed to read.
+    #[serde(default)]
+    pub said: Option<String>,
     /// How many reactions deep in its chain this one fired; the first
     /// reaction of an action is at 0.
     pub depth: u32,
@@ -140,6 +146,7 @@ impl ReactionResult {
                 "reaction not run: it would repeat a step its chain is already in ({repeat}), \
                  so the chain is a loop"
             )),
+            said: Some(super::said::LOOP.to_string()),
             depth,
         }
     }

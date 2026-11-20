@@ -200,6 +200,7 @@ impl SimReactionSystem {
                             success: false,
                             target_status: None,
                             error: Some("Could not resolve target entity ID".to_string()),
+                            said: None,
                             depth,
                         });
                         continue;
@@ -223,6 +224,7 @@ impl SimReactionSystem {
                         success: false,
                         target_status: None,
                         error: Some(format!("No actor found for {target_key}")),
+                        said: None,
                         depth,
                     });
                     continue;
@@ -245,6 +247,7 @@ impl SimReactionSystem {
                         success: false,
                         target_status: None,
                         error: Some(format!("param serialization failed: {e}")),
+                        said: None,
                         depth,
                     });
                     continue;
@@ -262,6 +265,7 @@ impl SimReactionSystem {
                         success: true,
                         target_status: Some(target_status.clone()),
                         error: None,
+                        said: None,
                         depth,
                     });
 
@@ -291,6 +295,7 @@ impl SimReactionSystem {
                         success: false,
                         target_status: None,
                         error: Some(e),
+                        said: None,
                         depth,
                     });
                 }

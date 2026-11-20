@@ -144,18 +144,11 @@ impl Reaction {
             reason,
             "reaction refused"
         );
-        let why = match &response.refusal {
-            _ if response.state.is_tombstoned() => "missing",
-            Some(temper_jit::table::Refusal::InvalidState { .. }) if !target_existed => "missing",
-            Some(temper_jit::table::Refusal::InvalidState { .. }) => "state",
-            Some(temper_jit::table::Refusal::GuardFailed { .. }) => "guard",
-            _ => "other",
-        };
         crate::runtime_metrics::record_reaction_refused(
             tenant,
             &sent.entity_type,
             &sent.action,
-            why,
+            super::said::Why::of(response, target_existed).label(),
         );
     }
 }

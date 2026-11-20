@@ -134,6 +134,23 @@ async fn act(
     send(app, request(Method::POST, &uri, body)).await
 }
 
+/// [`act`], sent under an idempotency key.
+async fn act_keyed(
+    app: &axum::Router,
+    set: &str,
+    id: &str,
+    action: &str,
+    body: Value,
+    key: &str,
+) -> (StatusCode, Value) {
+    let uri = format!("/tdata/{set}('{id}')/Temper.{action}");
+    let mut request = request(Method::POST, &uri, body);
+    request
+        .headers_mut()
+        .insert("idempotency-key", key.parse().unwrap());
+    send(app, request).await
+}
+
 async fn read(app: &axum::Router, set: &str, id: &str) -> (StatusCode, Value) {
     send(
         app,
@@ -220,7 +237,7 @@ async fn a_trigger_aimed_at_a_record_that_does_not_exist_fails_where_its_sender_
         .reload_tenant_policies(TENANT, "permit(principal, action, resource);")
         .unwrap();
     state.rebuild_reaction_dispatcher();
-    for id in ["line-1", "line-2", "line-3"] {
+    for id in ["line-1", "line-2", "line-3", "line-4"] {
         state
             .get_or_create_tenant_entity(&TenantId::new(TENANT), "Line", id, json!({}))
             .await
@@ -310,12 +327,33 @@ async fn a_trigger_aimed_at_a_record_that_does_not_exist_fails_where_its_sender_
     let failure = again["@temper.triggerFailures"][0]
         .as_str()
         .unwrap_or_else(|| panic!("the sender is told: {again}"));
-    assert!(
-        failure.contains("not valid from state 'Fixing'") && !failure.contains("does not exist"),
-        "{failure}"
+    assert_eq!(
+        failure,
+        "Line:Fail:fix: Shipment 'made' did not take Fix: not possible from the state it is in",
+        "the sender may not be allowed to read the shipment, so its state is not named"
     );
     assert_eq!(
         refused(&provider, &exporter),
         counted(&[("missing", 1), ("state", 1)])
+    );
+
+    // A retry under the same key gets the reply the first try got, with what
+    // it said about the trigger.
+    let body = json!({"shipment": "nowhere"});
+    let (status, first) = act_keyed(&app, "Lines", "line-4", "Fail", body.clone(), "k1").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let said = first["@temper.triggerFailures"].clone();
+    assert_eq!(
+        said,
+        json!(["Line:Fail:fix: Shipment 'nowhere' does not exist, and Fix does not make one"]),
+        "{first}"
+    );
+    let (status, retried) = act_keyed(&app, "Lines", "line-4", "Fail", body, "k1").await;
+    assert_eq!(status, StatusCode::OK, "{retried}");
+    assert_eq!(retried["@temper.triggerFailures"], said, "{retried}");
+    assert_eq!(
+        refused(&provider, &exporter),
+        counted(&[("missing", 2), ("state", 1)]),
+        "the retry sent no second reaction"
     );
 }

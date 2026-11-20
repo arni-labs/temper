@@ -77,6 +77,10 @@ impl crate::state::ServerState {
     /// Cedar, or its id unresolved. They go in the list a failed integration
     /// uses (`@temper.triggerFailures`), as `"<rule>: <why>"`, and in the
     /// reply kept for `idempotency_key`, so a retry answers the same.
+    ///
+    /// `<why>` is the reaction's sentence for the sender
+    /// ([`ReactionResult::said`]): the sender may not be allowed to read the
+    /// target, so it never carries the target's state or values.
     pub(super) fn say_failed_reactions(
         &self,
         actor_key: &str,
@@ -91,7 +95,7 @@ impl crate::state::ServerState {
                 format!(
                     "{}: {}",
                     reaction.rule_name,
-                    reaction.error.as_deref().unwrap_or("failed")
+                    reaction.said.as_deref().unwrap_or("not made")
                 )
             })
             .filter(|failure| !response.trigger_failures.contains(failure))
