@@ -23,6 +23,7 @@ mod restore;
 mod secret_tally;
 #[cfg(test)]
 mod serve_first_tests;
+mod stop_signal;
 mod storage;
 mod sync_copy;
 #[cfg(test)]
@@ -366,7 +367,7 @@ pub async fn run(
     // so those reports leave the process before it exits.
     tokio::select! {
         served = axum::serve(listener, router).into_future() => served.context("Server error")?,
-        () = stop_signal() => {}
+        () = stop_signal::stop_signal() => {}
     }
     state.server.report_owed_writes_at_shutdown();
     if let Some(guard) = otel_guard {
@@ -374,31 +375,6 @@ pub async fn run(
     }
 
     Ok(())
-}
-
-/// Resolves when the process is asked to stop: Ctrl-C, or SIGTERM from the
-/// platform it runs on. A signal that cannot be watched never resolves.
-async fn stop_signal() {
-    let interrupt = async {
-        if tokio::signal::ctrl_c().await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut terminate) => {
-                terminate.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        () = interrupt => {}
-        () = terminate => {}
-    }
 }
 
 /// Read a base64-encoded 32-byte vault key from `name`, if set.
