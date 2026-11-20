@@ -205,7 +205,7 @@ async fn rank_reference(
         return Err(*response);
     }
 
-    let store = nearest_store(request.state)?;
+    let store = nearest_store(request.state).ok_or_else(no_store)?;
     let meaning = match store
         .meaning_row(request.tenant.as_str(), request.entity_type, reference_id)
         .await
@@ -236,18 +236,17 @@ async fn rank_reference(
     .map_err(|error| read_failed(&error.to_string()))
 }
 
-fn nearest_store(state: &ServerState) -> Result<BoxedEventStore, Response> {
-    state
-        .event_journal()
-        .map(|(store, _)| store)
-        .ok_or_else(|| {
-            odata_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "StorageUnavailable",
-                "Temper.Nearest requires a store",
-            )
-            .into_response()
-        })
+fn nearest_store(state: &ServerState) -> Option<BoxedEventStore> {
+    state.event_journal().map(|(store, _)| store)
+}
+
+fn no_store() -> Response {
+    odata_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "StorageUnavailable",
+        "Temper.Nearest requires a store",
+    )
+    .into_response()
 }
 
 fn read_failed(error: &str) -> Response {

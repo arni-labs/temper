@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use super::super::authz::entity_id_from_body;
 use super::super::read_support::materialize_entity_set_entities;
-use super::{QueryPlaneReadRequest, arg, bad_request, nearest_store};
+use super::{QueryPlaneReadRequest, arg, bad_request, nearest_store, no_store};
 use crate::meaning::rank::{Ranked, closeness};
 use crate::response::odata_error;
 
@@ -66,7 +66,8 @@ pub(super) async fn rank(
     // The retired index is no longer updated. Read the current record fields
     // within the normal query-plane scan budget.
     let budget = request.budget.scan_candidate_budget();
-    let ids: Vec<String> = nearest_store(request.state)?
+    let ids: Vec<String> = nearest_store(request.state)
+        .ok_or_else(no_store)?
         .list_entity_ids_limited(
             request.tenant.as_str(),
             Some(request.entity_type),
