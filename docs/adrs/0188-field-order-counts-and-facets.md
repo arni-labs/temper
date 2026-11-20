@@ -113,6 +113,13 @@ it trusts SQL's order the read asks the store for one row of the filter holding
 a value of another type (`mistyped`, `LIMIT 1`); if there is one, the read
 walks in memory on the folded keyset, as before.
 
+The keyset is written flat: one term for each key the row can be past the
+cursor on, holding the cursor's value on every key before it. The nested form
+(`a > x OR (a = x AND (…))`) is the same condition, but `turso_core` plans each
+level deeper on the stack: on 2026-11-19 a debug build needed 2,048 KiB of
+thread stack for a two-field page nested and 1,280 KiB flat (a test thread has
+2 MiB; the server's threads have 16 MiB).
+
 Kept on the folded keyset: booleans (the in-memory sort does not compare them),
 nullable, undeclared or unprojected fields, record properties, and any order
 whose rows hold a mixed type at read time.
