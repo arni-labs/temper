@@ -354,3 +354,89 @@ async fn a_restart_puts_back_a_spec_deleted_records_catalog_row() {
 
     let _ = std::fs::remove_file(db_path);
 }
+
+/// What passivation writes for `id`: the record at its last sequence, without
+/// its events. `before_flag` writes it as a kernel from before records said
+/// they were deleted did.
+async fn snapshot_at_last_event(
+    state: &ServerState,
+    store: &TursoEventStore,
+    id: &str,
+    before_flag: bool,
+) {
+    let tenant = TenantId::default();
+    let key = format!("{tenant}:Order:{id}");
+    let last = store
+        .read_events(&key, 0)
+        .await
+        .expect("read journal")
+        .last()
+        .expect("the record has events")
+        .sequence_nr;
+    let record = state
+        .get_tenant_entity_state(&tenant, "Order", id)
+        .await
+        .expect("read the record")
+        .state;
+    assert_eq!(record.sequence_nr, last, "{id} is read at its last event");
+    let mut snapshot = serde_json::to_value(&record).expect("encode the record");
+    let fields = snapshot.as_object_mut().expect("a record is an object");
+    fields.remove("events");
+    if before_flag {
+        fields.remove("last_event_tombstone");
+    }
+    store
+        .save_snapshot(&key, last, &serde_json::to_vec(&snapshot).expect("bytes"))
+        .await
+        .expect("save the snapshot");
+}
+
+/// A snapshot holds no events, and an actor loaded on a deleted id and
+/// passivated later leaves a snapshot at the tombstone. A record loaded from
+/// it is still deleted, not a record in a state a spec names `Deleted`:
+/// whether the snapshot says so itself (ord-04) or was written before records
+/// did (ord-03, known by its snapshot's own event). A record a spec moved to
+/// `Deleted` loads from the same kind of snapshot as the record it is.
+#[tokio::test]
+async fn a_snapshot_taken_at_the_tombstone_still_loads_a_deleted_record() {
+    let (store, db_path) = new_store("tombstone-snapshot").await;
+    let state = state_on(&store, "query-plane-tombstone-snapshot");
+    six_orders_one_discarded(&state).await;
+    let tenant = TenantId::default();
+    for id in ["ord-03", "ord-04"] {
+        state
+            .delete_tenant_entity(&tenant, "Order", id)
+            .await
+            .unwrap_or_else(|error| panic!("delete {id}: {error}"));
+    }
+    snapshot_at_last_event(&state, &store, "ord-03", true).await;
+    snapshot_at_last_event(&state, &store, "ord-04", false).await;
+    snapshot_at_last_event(&state, &store, "ord-05", true).await;
+
+    // A server that never held these records loads them from their snapshots.
+    let reloaded = state_on(&store, "query-plane-tombstone-snapshot-reloaded");
+    for id in ["ord-03", "ord-04"] {
+        let deleted = reloaded
+            .get_tenant_entity_state(&tenant, "Order", id)
+            .await
+            .unwrap_or_else(|error| panic!("load {id}: {error}"))
+            .state;
+        assert_eq!(deleted.status, "Deleted");
+        assert!(
+            deleted.is_tombstoned(),
+            "{id}: a record the kernel deleted is still deleted when loaded from a snapshot at its tombstone"
+        );
+    }
+    let discarded = reloaded
+        .get_tenant_entity_state(&tenant, "Order", "ord-05")
+        .await
+        .expect("load ord-05")
+        .state;
+    assert_eq!(discarded.status, "Deleted");
+    assert!(
+        !discarded.is_tombstoned(),
+        "a record a spec moved to Deleted is not a deleted record"
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}

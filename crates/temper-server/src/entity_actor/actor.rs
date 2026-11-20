@@ -891,8 +891,20 @@ impl EntityActor {
             }
         }
 
-        match store.read_events(persistence_id, from_sequence).await {
-            Ok(envelopes) => {
+        let read_from = if loaded_snapshot {
+            super::tombstone::read_from_after_snapshot(state, from_sequence)
+        } else {
+            from_sequence
+        };
+        match store.read_events(persistence_id, read_from).await {
+            Ok(mut envelopes) => {
+                if read_from != from_sequence {
+                    super::tombstone::mark_deleted_by_snapshot_event(
+                        state,
+                        &mut envelopes,
+                        from_sequence,
+                    );
+                }
                 if envelopes.len() > MAX_EVENTS_SINCE_SNAPSHOT {
                     return Err(ActorError::custom(format!(
                         "snapshot tail replay budget exceeded for {}:{} ({} > {} events since snapshot)",
@@ -2559,9 +2571,7 @@ impl EntityActor {
                 // would record nothing. A tombstone is terminal, so it is the
                 // record's newest event; a spec's own `Deleted` state is not
                 // one, and still takes a tombstone.
-                if state.events.back().is_some_and(|event| {
-                    event.kind == temper_runtime::persistence::EventKind::Tombstone
-                }) {
+                if state.is_tombstoned() {
                     ctx.reply(EntityResponse {
                         success: true,
                         state: state.clone(),
