@@ -3,7 +3,7 @@
 //! Before, `ne` was never exact: the read fell to the bounded scan and every
 //! one of these answered 413.
 
-use super::large_set::{PostgresCards, assert_matches_memory, turso_cards};
+use super::large_set::{PostgresCards, assert_matches_memory, sim_cards, turso_cards};
 use super::*;
 
 const NE_READS: [&str; 6] = [
@@ -18,6 +18,15 @@ const NE_READS: [&str; 6] = [
 #[tokio::test]
 async fn ne_reads_walk_and_count_past_the_budget_on_turso() {
     let (state, bodies, _dir) = turso_cards("ne-turso").await;
+    let system = SecurityContext::system();
+    for query in NE_READS {
+        assert_matches_memory(&state, &system, &bodies, query).await;
+    }
+}
+
+#[tokio::test]
+async fn ne_reads_give_the_same_pages_in_memory() {
+    let (state, bodies) = sim_cards("ne-sim").await;
     let system = SecurityContext::system();
     for query in NE_READS {
         assert_matches_memory(&state, &system, &bodies, query).await;
