@@ -221,6 +221,7 @@ pub(super) async fn dispatch_matched_route(
             response_body_handle: guest_response_body.0,
         }),
         trigger_principal: None,
+        attempt: 1,
     };
 
     // Build the canonical Cedar-gated host chain while retaining the inbound

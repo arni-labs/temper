@@ -1666,6 +1666,7 @@ async fn handle_stream_get(
         workflow_run_id: None,
         http_request: None,
         trigger_principal: None,
+        attempt: 1,
     };
 
     let wasm_result = match state

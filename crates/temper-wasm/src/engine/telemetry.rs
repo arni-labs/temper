@@ -73,6 +73,7 @@ pub(super) fn empty_result(
         error: Some("module returned empty result".to_string()),
         duration_ms,
         empty_answer: false,
+        retry: false,
     }
 }
 
@@ -109,6 +110,7 @@ pub(super) fn finalize_result(
         .get("error")
         .and_then(|v| v.as_str())
         .map(String::from);
+    let retry = parsed.get("retry").and_then(|v| v.as_bool()) == Some(true);
     let stream_count_after = store
         .data()
         .streams
@@ -121,7 +123,8 @@ pub(super) fn finalize_result(
     if let Some(ref error_message) = error {
         tracing::Span::current().record("error", error_message.as_str());
     }
-    if !success {
+    // A retry is not a failure yet: the call is made again.
+    if !success && !retry {
         let error_message = error
             .as_deref()
             .unwrap_or("module returned unsuccessful result");
@@ -149,6 +152,7 @@ pub(super) fn finalize_result(
         error,
         duration_ms,
         empty_answer: parsed.get("empty").and_then(|v| v.as_bool()) == Some(true),
+        retry,
     }
 }
 

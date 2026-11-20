@@ -179,6 +179,22 @@ pub fn set_empty_result() {
     }
 }
 
+/// Answer `retry`: the module cannot answer yet (a service it calls is down,
+/// something it waits for is not ready). Nothing moves, and the kernel calls
+/// the module again later with the same trigger and params
+/// ([`Context::attempt`] says which try), first a second later and then
+/// twice as long after each try, until it answers or the trigger's
+/// `timeout_secs`, counted from the first try, passes: then its
+/// `on_failure` is sent. A call whose record has moved on since is dropped.
+/// A call that waits for an answer (`await_integration`) is not retried: a
+/// retry is its failure.
+pub fn set_retry_result(reason: &str) {
+    let json = serde_json::json!({ "retry": true, "success": false, "error": reason }).to_string();
+    unsafe {
+        host::host_set_result(json.as_ptr() as i32, json.len() as i32);
+    }
+}
+
 /// Set the invocation result as an error.
 pub fn set_error_result(error: &str) {
     let result = serde_json::json!({

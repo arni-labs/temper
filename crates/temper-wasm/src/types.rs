@@ -54,6 +54,16 @@ pub struct WasmInvocationContext {
     /// made by the kernel itself (a system or service move) or anonymously.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_principal: Option<TriggerPrincipal>,
+    /// Which try of this call this is, from 1. A module that answers
+    /// `retry` is called again with the same trigger and params, and the
+    /// next number here.
+    #[serde(default = "first_attempt")]
+    pub attempt: u32,
+}
+
+/// A call's first try.
+fn first_attempt() -> u32 {
+    1
 }
 
 /// The principal a triggering move was made as.
@@ -131,6 +141,11 @@ pub struct WasmInvocationResult {
     /// written it to mean "send `on_success`".
     #[serde(default)]
     pub empty_answer: bool,
+    /// The module answered `retry` (`"retry": true`): it cannot answer
+    /// yet. Nothing moves, and a background call is made again later, until
+    /// it answers or its trigger's deadline passes. `error` says why.
+    #[serde(default)]
+    pub retry: bool,
 }
 
 /// Resource limits for WASM module execution (TigerStyle budgets).

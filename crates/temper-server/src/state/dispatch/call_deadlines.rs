@@ -31,7 +31,7 @@ pub(super) fn configured_timeout(integration: &Integration) -> Option<Duration> 
 /// `engine/mod.rs` sets the store's epoch deadline and the deadline of every
 /// host call it makes from it), so no call's module runs longer. No margin is added:
 /// the row is armed again only after a restart, when the call is gone.
-fn call_deadline(integration: &Integration) -> Duration {
+pub(super) fn call_deadline(integration: &Integration) -> Duration {
     configured_timeout(integration).unwrap_or_else(|| WasmResourceLimits::default().max_duration)
 }
 

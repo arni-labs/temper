@@ -133,6 +133,10 @@ pub struct Context {
     /// made the move itself (a system or service move), when it was made
     /// anonymously, and on a host that predates the field.
     pub trigger_principal: Option<TriggerPrincipal>,
+    /// Which try of this call this is, from 1: a module that answered
+    /// retry (`set_retry_result`) is called again with the next number. 1 on
+    /// a host that predates the field.
+    pub attempt: u32,
 }
 
 /// The principal a triggering move was made as.
@@ -307,6 +311,11 @@ impl Context {
         let trigger_principal = parsed
             .get("trigger_principal")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let attempt = parsed
+            .get("attempt")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(1);
 
         Ok(Self {
             config,
@@ -319,6 +328,7 @@ impl Context {
             wasm_module,
             http_request,
             trigger_principal,
+            attempt,
         })
     }
 

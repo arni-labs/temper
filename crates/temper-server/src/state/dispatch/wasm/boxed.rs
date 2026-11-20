@@ -42,7 +42,7 @@ pub(in crate::state::dispatch::wasm) fn invoke_and_handle_result_boxed<'a>(
     denial_tracker: &'a HttpCallAuthzDenialTracker,
     field_blobs: Arc<dyn temper_wasm::FieldBlobReader>,
     llm_parent_span_id: Option<&'a str>,
-) -> BoxFuture<'a, Result<Option<EntityResponse>, String>> {
+) -> BoxFuture<'a, Result<super::Called, String>> {
     state
         .invoke_and_handle_result(
             ctx,

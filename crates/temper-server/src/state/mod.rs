@@ -1502,6 +1502,7 @@ impl ServerState {
             workflow_run_id: agent_ctx.workflow_run_id.clone(),
             http_request: None,
             trigger_principal: None,
+            attempt: 1,
         };
 
         let security_ctx = agent_ctx.security_ctx.as_ref().ok_or_else(|| {

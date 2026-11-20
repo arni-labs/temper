@@ -78,6 +78,7 @@ fn guest_log_named_event_carries_datadog_trace_and_span_correlation() {
         workflow_run_id: None,
         http_request: None,
         trigger_principal: None,
+        attempt: 1,
     };
 
     let span = tracing::info_span!("wasm.invoke");
@@ -198,6 +199,7 @@ fn production_guest_log_does_not_emit_duplicate_uncorrelated_wasm_event() {
         workflow_run_id: Some("Channel:en-1".to_string()),
         http_request: None,
         trigger_principal: None,
+        attempt: 1,
     };
     let host = ProductionWasmHost::new(BTreeMap::new()).with_invocation_context(context);
 

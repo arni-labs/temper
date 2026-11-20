@@ -258,6 +258,7 @@ fn llm_root_span_stays_on_active_trace() {
             agent_ctx: &agent_ctx,
             dispatch_idempotency_key: None,
             mode: WasmDispatchMode::Inline,
+            attempt: 1,
         };
         let span = build_llm_root_span(&ctx, &integration, &entity_state, "provider_caller");
         let has_opt_out = span

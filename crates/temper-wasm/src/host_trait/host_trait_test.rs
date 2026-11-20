@@ -396,6 +396,7 @@ fn internal_http_call_replaces_guest_authority_with_fresh_capability() {
             workflow_run_id: Some("CurationQuery:cq-1".to_string()),
             http_request: None,
             trigger_principal: None,
+            attempt: 1,
         });
 
     let headers = vec![
@@ -598,6 +599,7 @@ fn guest_log_span_attrs_include_message_and_invocation_context() {
         workflow_run_id: None,
         http_request: None,
         trigger_principal: None,
+        attempt: 1,
     };
 
     let attrs = guest_log_span_attrs(
@@ -665,6 +667,7 @@ fn guest_log_span_event_is_named_for_trace_export() {
         workflow_run_id: None,
         http_request: None,
         trigger_principal: None,
+        attempt: 1,
     };
 
     {

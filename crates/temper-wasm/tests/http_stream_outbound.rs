@@ -110,6 +110,7 @@ async fn outbound_streaming_injects_internal_auth_headers() {
                 workflow_run_id: Some("CurationQuery:cq-1".to_string()),
                 http_request: None,
                 trigger_principal: None,
+                attempt: 1,
             }),
     );
 

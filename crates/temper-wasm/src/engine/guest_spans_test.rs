@@ -24,6 +24,7 @@ fn context() -> WasmInvocationContext {
         workflow_run_id: Some("Session:s-1".to_string()),
         http_request: None,
         trigger_principal: None,
+        attempt: 1,
     }
 }
 

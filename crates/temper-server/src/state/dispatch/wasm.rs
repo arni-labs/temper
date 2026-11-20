@@ -27,6 +27,7 @@ use super::{
 use replay_inputs::{extract_trajectory_actions_from_ots, has_replay_trajectory_input};
 
 mod boxed;
+mod call_again;
 mod invocation_artifacts;
 mod local_tdata_host;
 mod replay_inputs;
@@ -36,6 +37,7 @@ pub(super) use boxed::{
     dispatch_callback_action_boxed, dispatch_wasm_callback_boxed, dispatch_wasm_integrations_boxed,
 };
 use boxed::{handle_wasm_failure_boxed, invoke_and_handle_result_boxed};
+use call_again::Called;
 use local_tdata_host::LocalTDataWasmHost;
 
 /// Build a request-bound internal HTTP capability issuer for a non-System caller.
@@ -240,6 +242,8 @@ struct WasmDispatchCtx<'a> {
     agent_ctx: &'a AgentContext,
     dispatch_idempotency_key: Option<&'a str>,
     mode: WasmDispatchMode,
+    /// Which try of the call this is, from 1 (`call_again`).
+    attempt: u32,
 }
 
 fn agent_ctx_for_composite_wasm_result(
@@ -506,6 +510,7 @@ impl crate::state::ServerState {
             agent_ctx: req.agent_ctx,
             dispatch_idempotency_key: req.dispatch_idempotency_key,
             mode: req.mode,
+            attempt: 1,
         };
         let mut last_response: Option<EntityResponse> = None;
         // Triggers on one action are independent: one that fails is kept, and
@@ -533,7 +538,7 @@ impl crate::state::ServerState {
             };
 
             match self
-                .dispatch_single_integration(
+                .call_until_answered(
                     &call_ctx,
                     &integration,
                     req.entity_state,
@@ -579,6 +584,7 @@ impl crate::state::ServerState {
         error.type = tracing::field::Empty,
         error.message = tracing::field::Empty,
         exception.message = tracing::field::Empty,
+        wasm.attempt = ctx.attempt,
     ))]
     async fn dispatch_single_integration(
         &self,
@@ -587,7 +593,7 @@ impl crate::state::ServerState {
         entity_state: &EntityState,
         action_params: &serde_json::Value,
         base_gate: &Arc<dyn WasmAuthzGate>,
-    ) -> Result<Option<EntityResponse>, String> {
+    ) -> Result<Called, String> {
         // --- Resolve module ---
         let Some(module_name) = integration.module.clone() else {
             tracing::warn!(
@@ -596,7 +602,7 @@ impl crate::state::ServerState {
                 integration = %integration.name,
                 "WASM integration missing module name"
             );
-            return Ok(None);
+            return Ok(Called::answered(None));
         };
 
         let current_span = Span::current();
@@ -637,7 +643,8 @@ impl crate::state::ServerState {
             record_wasm_error_on_span(active_span, &error_str);
             return self
                 .handle_module_not_found(ctx, integration, &module_name)
-                .await;
+                .await
+                .map(Called::answered);
         };
         instrument_wasm_dispatch_phase_result(
             active_parent_span.clone(),
@@ -697,6 +704,7 @@ impl crate::state::ServerState {
                     workflow_run_id: ctx.agent_ctx.workflow_run_id.clone(),
                     http_request: None,
                     trigger_principal: trigger_principal::trigger_principal(ctx.agent_ctx),
+                    attempt: ctx.attempt,
                 };
                 (authz_ctx, inv_ctx)
             },
@@ -1133,7 +1141,7 @@ impl crate::state::ServerState {
         denial_tracker: &HttpCallAuthzDenialTracker,
         field_blobs: Arc<dyn temper_wasm::FieldBlobReader>,
         llm_parent_span_id: Option<&str>,
-    ) -> Result<Option<EntityResponse>, String> {
+    ) -> Result<Called, String> {
         // Existing action-triggered invocations don't use streams — pass empty registry.
         let streams = Arc::new(std::sync::RwLock::new(StreamRegistry::default()));
         let hash = self
@@ -1160,6 +1168,12 @@ impl crate::state::ServerState {
         )
         .await;
         match invoke_result {
+            // A background call that answers retry is made again
+            // (`call_again`); nothing moves now. A call the asker waits on
+            // takes it as a failure.
+            Ok(result) if result.retry && matches!(ctx.mode, WasmDispatchMode::Background) => Ok(
+                Called::Again(self.note_retry(ctx, module_name, &result).await),
+            ),
             Ok(mut result) if result.success => {
                 if integration.llm {
                     let session_id = ctx
@@ -1279,7 +1293,8 @@ impl crate::state::ServerState {
                         error_str,
                         result.duration_ms,
                     )
-                    .await;
+                    .await
+                    .map(Called::answered);
                 }
 
                 if integration.llm {
@@ -1366,7 +1381,8 @@ impl crate::state::ServerState {
                             error.to_string(),
                             result.duration_ms,
                         )
-                        .await;
+                        .await
+                        .map(Called::answered);
                     }
                 };
 
@@ -1452,10 +1468,10 @@ impl crate::state::ServerState {
                     )
                     .await?;
                     if let Some(resp) = callback_response {
-                        return Ok(Some(resp));
+                        return Ok(Called::answered(Some(resp)));
                     }
                 }
-                Ok(None)
+                Ok(Called::answered(None))
             }
             Ok(result) => {
                 with_wasm_dispatch_phase(
@@ -1513,6 +1529,7 @@ impl crate::state::ServerState {
                     result.duration_ms,
                 )
                 .await
+                .map(Called::answered)
             }
             Err(e) => {
                 with_wasm_dispatch_phase(
@@ -1565,6 +1582,7 @@ impl crate::state::ServerState {
                     0,
                 )
                 .await
+                .map(Called::answered)
             }
         }
     }

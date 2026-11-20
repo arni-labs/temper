@@ -34,6 +34,7 @@ fn build_context() -> WasmInvocationContext {
         workflow_run_id: None,
         http_request: None,
         trigger_principal: None,
+        attempt: 1,
     }
 }
 
@@ -236,6 +237,7 @@ async fn invoke_scm_ingest_pack_from_env() {
         workflow_run_id: None,
         http_request: None,
         trigger_principal: None,
+        attempt: 1,
     };
 
     let blob_url = format!("http://127.0.0.1:3000/_internal/blobs/{pack_blob_key}");

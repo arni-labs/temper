@@ -90,6 +90,7 @@ async fn stream_setup_warning_keeps_host_and_path_without_secrets() {
                     workflow_run_id: None,
                     http_request: None,
                     trigger_principal: None,
+                    attempt: 1,
                 },
                 Arc::new(ProductionWasmHost::new(BTreeMap::new())),
                 &WasmResourceLimits::default(),

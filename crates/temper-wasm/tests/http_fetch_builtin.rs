@@ -87,6 +87,7 @@ fn context(
         workflow_run_id: None,
         http_request: None,
         trigger_principal: None,
+        attempt: 1,
     }
 }
 
