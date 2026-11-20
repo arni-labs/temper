@@ -10,6 +10,9 @@ use temper_store_turso::TursoEventStore;
 mod storage;
 use storage::PauseInstallStorage;
 
+#[path = "install_order/policy_first.rs"]
+mod policy_first;
+
 tokio::task_local! { static INSTALLER: bool; }
 
 const CSDL: &str = r#"<?xml version="1.0"?><edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx"><edmx:DataServices><Schema Namespace="Order" xmlns="http://docs.oasis-open.org/odata/ns/edm"><EntityType Name="Job"><Key><PropertyRef Name="Id"/></Key><Property Name="Id" Type="Edm.String" Nullable="false"/></EntityType><EntityContainer Name="Container"><EntitySet Name="Jobs" EntityType="Order.Job"/></EntityContainer></Schema></edmx:DataServices></edmx:Edmx>"#;

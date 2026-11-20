@@ -1083,7 +1083,48 @@ async fn install_once(
         None
     };
 
-    // ── Step 2: Bootstrap into memory (verification + registry). ────
+    // ── Step 2: Load Cedar policies into memory, before the specs. ──
+    // A version's specs are decided under its own policy: once one is live,
+    // its actions and the reactions it declares are authorized at once, so
+    // under the old policy a reaction the update adds could make a write the
+    // new policy forbids. The policy goes first, as the modules do (see
+    // Swap): an old spec under the new policy can only be refused what the
+    // new version forbids. Cedar is parsed without the schema, so a policy
+    // naming the new version's types loads before them. If the specs then do
+    // not load, the policy that was in force is put back.
+    let previous_policy = state.server.authz.get_tenant_policy_text(tenant);
+    if let Some(ref policy_text) = combined_policy {
+        if let Err(e) = state
+            .server
+            .authz
+            .reload_tenant_policies(tenant, policy_text)
+        {
+            return Err(format!("os-app '{app_name}' Cedar did not load: {e}"));
+        }
+        let mut policies = state.server.tenant_policies.write().unwrap(); // ci-ok: infallible lock
+        policies.insert(tenant.to_string(), policy_text.clone());
+    }
+    let restore_policy = |state: &PlatformState| {
+        if combined_policy.is_none() {
+            return;
+        }
+        let mut policies = state.server.tenant_policies.write().unwrap(); // ci-ok: infallible lock
+        match &previous_policy {
+            Some(text) => {
+                if let Err(e) = state.server.authz.reload_tenant_policies(tenant, text) {
+                    tracing::error!(tenant, app = app_name, error = %e,
+                        "the policy in force before a failed install did not load again");
+                }
+                policies.insert(tenant.to_string(), text.clone());
+            }
+            None => {
+                state.server.authz.remove_tenant(tenant);
+                policies.remove(tenant);
+            }
+        }
+    };
+
+    // ── Step 3: Bootstrap into memory (verification + registry). ────
     // Only process specs whose content has changed (added or updated);
     // skipped specs are already loaded with identical content.
     if plan.specs && !bundle.specs.is_empty() {
@@ -1114,7 +1155,8 @@ async fn install_once(
                     cross_invariants_source: bundle.cross_invariants_toml.as_deref(),
                     verification_mode: bootstrap::BootstrapSpecVerificationMode::TrustBundle,
                 },
-            )?;
+            )
+            .inspect_err(|_| restore_policy(state))?;
 
             if let Some(ps) = state
                 .server
@@ -1132,20 +1174,6 @@ async fn install_once(
                 )
                 .await;
             }
-        }
-    }
-
-    // ── Step 3: Load Cedar policies into memory. ────────────────────
-    if let Some(ref policy_text) = combined_policy {
-        if let Err(e) = state
-            .server
-            .authz
-            .reload_tenant_policies(tenant, policy_text)
-        {
-            return Err(format!("os-app '{app_name}' Cedar did not load: {e}"));
-        } else {
-            let mut policies = state.server.tenant_policies.write().unwrap(); // ci-ok: infallible lock
-            policies.insert(tenant.to_string(), policy_text.clone());
         }
     }
 
