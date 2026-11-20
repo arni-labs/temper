@@ -11,9 +11,9 @@
 use super::large_set::{BUDGET, ROWS, in_memory, install_reader, read, sim_cards, turso_cards};
 use super::*;
 
-/// A batch being judged and the page kept with its probe row, whatever
-/// `$skip` is.
-const MOST_HELD: usize = 2 * BUDGET.max_entities + 1;
+/// A batch being judged and the page kept, whatever `$skip` is. The page
+/// fetches one probe row past `$top`, and a batch is as large as that page.
+const MOST_HELD: usize = 2 * (BUDGET.max_entities + 1);
 
 /// Read every page of `query` by `$skip`, and check each against the
 /// evaluator's rows `skip..skip + 20` and what it held.

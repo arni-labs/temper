@@ -158,9 +158,12 @@ fn keyset_handles_null_orderby_values() {
         row("en-b", serde_json::json!({})), // absent -> null, sorts last
         row("en-c", serde_json::json!({ "Score": 8 })),
         row("en-d", serde_json::json!({})), // absent -> null, sorts last, id tiebreak
+        // An explicit JSON null is no value too (ADR-0188 Sub-Decision 6);
+        // the sort once found it equal to 5 and to 8.
+        row("en-0", serde_json::json!({ "Score": null })),
     ];
     let ordered = sorted(&rows, &order);
-    assert_eq!(ids(&ordered), vec!["en-a", "en-c", "en-b", "en-d"]);
+    assert_eq!(ids(&ordered), vec!["en-a", "en-c", "en-0", "en-b", "en-d"]);
 
     for cut in 0..ordered.len() {
         let cursor = cursor_for_row(&ordered[cut], &order);

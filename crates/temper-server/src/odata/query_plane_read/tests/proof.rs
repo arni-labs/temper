@@ -587,9 +587,13 @@ async fn nullable_scalar_order_uses_read_source_full_proof() {
         Err(_) => panic!("read-source order proof should succeed"),
     };
 
+    // A JSON null is no value and sorts last ascending (ADR-0188
+    // Sub-Decision 6), as the continuation cursor reads it. Before, the sort
+    // found it equal to "packed" and listed it first by its id, and the
+    // cursor after it (no value, ascending) then had nothing after it.
     assert_eq!(result.entities.len(), 1);
-    assert_eq!(result.entities[0]["Id"].as_str(), Some("ord-null-notes"));
-    assert!(result.entities[0]["Notes"].is_null());
+    assert_eq!(result.entities[0]["Id"].as_str(), Some("ord-text-notes"));
+    assert_eq!(result.entities[0]["Notes"].as_str(), Some("packed"));
     assert_eq!(
         result.telemetry.strategy,
         QueryPlaneReadStrategy::ReadSourceCursor
