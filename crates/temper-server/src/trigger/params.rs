@@ -1,6 +1,6 @@
 //! Shared helper for building a reaction's params from its `args`.
 //!
-//! Used by both the async [`super::dispatcher::ReactionDispatcher`] and the
+//! Used by both the async production dispatcher ([`crate::ServerState::dispatch_reactions`]) and the
 //! deterministic [`super::sim_dispatcher::SimReactionSystem`] so production
 //! and simulation apply identical semantics.
 

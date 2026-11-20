@@ -26,7 +26,7 @@ use temper_spec::automaton;
 use temper_spec::cross_invariant::parse_cross_invariants;
 use temper_spec::csdl::{CsdlDocument, emit_csdl_xml, merge_csdl};
 
-use crate::trigger::ReactionRegistry;
+use crate::trigger::ReactionRule;
 pub use types::*;
 
 use relations::{build_relation_graph, build_webhook_routes, synthesize_action_trigger_reaction};
@@ -371,31 +371,31 @@ impl SpecRegistry {
         Ok(())
     }
 
-    /// Build a [`ReactionRegistry`] from every tenant's entity-kind
-    /// `[[action.triggers]]`.
-    pub fn build_reaction_registry(&self) -> ReactionRegistry {
-        let mut registry = ReactionRegistry::new();
-        for (tenant, config) in &self.tenants {
-            let mut rules = Vec::new();
-            // ADR-0046: synthesize reaction rules from [[action.triggers]]
-            // entity-kind blocks on every entity's actions. Wasm/Webhook
-            // kinds are handled by a separate runtime path.
-            for (entity_type, spec) in &config.entities {
-                for action in &spec.automaton.actions {
-                    for trigger in &action.triggers {
-                        if let Some(rule) =
-                            synthesize_action_trigger_reaction(entity_type, &action.name, trigger)
-                        {
-                            rules.push(rule);
-                        }
-                    }
-                }
-            }
-            if !rules.is_empty() {
-                registry.register_tenant_rules(tenant.clone(), rules);
-            }
-        }
-        registry
+    /// The reaction rules a move of `entity_type` by `action` into
+    /// `to_state` sets going in `tenant`: the entity-kind
+    /// `[[action.triggers]]` the installed spec declares on that action
+    /// (ADR-0046), in declaration order, less those whose guard pins
+    /// statuses `to_state` is not among. Read from the spec on each move, so
+    /// a version is followed from the moment it is registered, whichever
+    /// path installed it; there is no copy to rebuild.
+    pub fn reaction_rules(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        action: &str,
+        to_state: &str,
+    ) -> Vec<ReactionRule> {
+        let Some(spec) = self.get_spec(tenant, entity_type) else {
+            return Vec::new();
+        };
+        spec.automaton
+            .actions
+            .iter()
+            .filter(|declared| declared.name == action)
+            .flat_map(|declared| &declared.triggers)
+            .filter_map(|trigger| synthesize_action_trigger_reaction(entity_type, action, trigger))
+            .filter(|rule| crate::trigger::registry::matches_state_filter(rule, to_state))
+            .collect()
     }
 
     /// Make `csdl` the whole schema of the registered `tenant`, and rebuild

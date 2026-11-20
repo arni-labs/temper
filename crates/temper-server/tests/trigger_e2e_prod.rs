@@ -5,7 +5,7 @@
 //! `reactions.toml`. Proves the full ADR-0046 chain works:
 //!
 //! spec → parse → validate → synthesize_action_trigger_reaction →
-//! build_reaction_registry → ReactionDispatcher → target entity commits.
+//! SpecRegistry::reaction_rules → dispatch_reactions → target entity commits.
 
 use temper_runtime::ActorSystem;
 use temper_runtime::tenant::TenantId;
@@ -203,7 +203,6 @@ fn build_state(tenant: &str, tenant_policy: &str) -> ServerState {
         .authz
         .reload_tenant_policies(tenant, tenant_policy)
         .expect("tenant policy should load");
-    state.rebuild_reaction_dispatcher();
     state
 }
 
@@ -227,7 +226,6 @@ fn build_file_workspace_state(tenant: &str, tenant_policy: &str) -> ServerState 
         .authz
         .reload_tenant_policies(tenant, tenant_policy)
         .expect("tenant policy should load");
-    state.rebuild_reaction_dispatcher();
     state
 }
 
@@ -328,15 +326,15 @@ permit(
 /// A tenant carrying more reaction rules than `MAX_REACTIONS_PER_TENANT` boots
 /// and still fires its inline trigger through the production dispatcher.
 ///
-/// This is the regression for the 2026-09-10 outage. `build_reaction_registry`
-/// calls `register_tenant_rules` with the tenant's whole rule set, and that
-/// call asserted on the count. The tenant's fifteenth app took it to 265 rules,
+/// This is the regression for the 2026-09-10 outage. The server then built a
+/// reaction registry with the tenant's whole rule set, and that build
+/// asserted on the count. The tenant's fifteenth app took it to 265 rules,
 /// so the panic happened at startup while replaying specs already committed to
 /// disk, and the platform crash-looped. It also meant a trigger that was never
 /// registered dispatched nothing and logged nothing.
 ///
 /// The path exercised here is the one that failed: registry registration, then
-/// `rebuild_reaction_dispatcher`, then a real dispatch that must move a second
+/// a real dispatch, whose rules are read from the registry, that must move a second
 /// entity. The filler rules are inline triggers on an action the test never
 /// dispatches, the shape of many apps sharing one tenant.
 #[tokio::test]
@@ -368,7 +366,10 @@ async fn a_tenant_past_the_advisory_threshold_boots_and_still_fires_its_trigger(
         )
         .expect("registration should succeed past the advisory threshold");
     assert!(
-        registry.build_reaction_registry().rule_count(&tenant) > MAX_REACTIONS_PER_TENANT,
+        registry
+            .reaction_rules(&tenant, "Order", "Poke", "Draft")
+            .len()
+            > MAX_REACTIONS_PER_TENANT,
         "the fillers must carry the tenant past the advisory threshold"
     );
 
@@ -389,9 +390,6 @@ permit(
 "#,
         )
         .expect("tenant policy should load");
-    // Before the fix this panicked: the rule count crossed the assertion while
-    // the registry was being built from specs already accepted.
-    state.rebuild_reaction_dispatcher();
 
     let pay_id = "pay-crowded";
     let order_id = "order-crowded";

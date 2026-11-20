@@ -147,7 +147,6 @@ async fn each_written_event_is_counted_by_its_action_and_how_it_came_about() {
         .authz
         .reload_tenant_policies(TENANT, "permit(principal, action, resource);")
         .unwrap();
-    state.rebuild_reaction_dispatcher();
     let walk = state.start_runtime().await.expect("the first start");
     walk.await.unwrap();
 

@@ -106,7 +106,6 @@ async fn server(db: &Path, cache: Option<IdempotencyCache>) -> Router {
         state.idempotency_cache = Arc::new(cache);
     }
     state.set_storage_stack(StorageStack::from_turso(store));
-    state.rebuild_reaction_dispatcher();
     state
         .authz
         .reload_tenant_policies("default", "permit(principal, action, resource);")

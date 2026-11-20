@@ -295,7 +295,6 @@ fn install_installs(state: &temper_server::ServerState) {
             &[("Order", v2.as_str())],
         );
     }
-    state.rebuild_reaction_dispatcher();
 }
 
 async fn order_status(state: &temper_server::ServerState, id: &str) -> String {

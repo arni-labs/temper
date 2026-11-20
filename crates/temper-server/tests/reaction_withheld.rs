@@ -188,7 +188,6 @@ async fn refused_reactions_are_visible_and_allowed_reactions_add_no_withheld_sig
                         permit(principal, action, resource);
                         forbid(principal, action == Action::"Count", resource) when { resource.id == "denied" };
                     "#).unwrap();
-                    state.rebuild_reaction_dispatcher();
                     let tenant = TenantId::new(tenant_name);
                     let id = if denied { "denied" } else { "allowed" };
                     let journal = format!("{tenant_name}:Ledger:{id}");

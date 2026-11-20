@@ -3128,7 +3128,7 @@ async fn test_ensure_markdown_file_repairs_existing_canonical_query_aliases() {
 }
 
 #[tokio::test]
-async fn test_install_os_app_rebuilds_reaction_dispatcher_for_inline_entity_triggers() {
+async fn test_install_os_app_reactions_follow_inline_entity_triggers() {
     use serde_json::json;
     use temper_runtime::tenant::TenantId;
     use temper_server::request_context::AgentContext;

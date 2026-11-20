@@ -226,7 +226,6 @@ fn server_with_spec(name: &str, change: &str, events: SimEventStore) -> ServerSt
         .authz
         .reload_tenant_policies("default", POLICY)
         .expect("policy should load");
-    state.rebuild_reaction_dispatcher();
     state
 }
 

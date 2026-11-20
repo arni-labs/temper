@@ -110,7 +110,6 @@ fn state_with(spec: &str, name: &str) -> ServerState {
             ),
         )
         .expect("the policy loads");
-    state.rebuild_reaction_dispatcher();
     state
 }
 

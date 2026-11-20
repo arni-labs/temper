@@ -333,7 +333,6 @@ fn server(
         .authz
         .reload_tenant_policies(TENANT, "permit(principal, action, resource);")
         .expect("the tenant policy parses");
-    state.rebuild_reaction_dispatcher();
     let hash = state
         .wasm_engine
         .compile_and_cache(specs::oracle_module(&outage.answer()).as_bytes())

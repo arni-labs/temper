@@ -165,7 +165,6 @@ fn chain_state() -> crate::ServerState {
         .authz
         .reload_tenant_policies("default", "permit(principal, action, resource);")
         .expect("policy loads");
-    state.rebuild_reaction_dispatcher();
     state
 }
 
@@ -394,15 +393,8 @@ async fn reaction_keys_match_earlier_ones_then_stop_growing() {
 async fn a_stopped_reaction_is_a_failed_result() {
     let state = chain_state();
     let tenant = TenantId::default();
-    let dispatcher = state
-        .reaction_dispatcher
-        .read()
-        .expect("dispatcher lock")
-        .clone()
-        .expect("dispatcher built");
-    let results = dispatcher
+    let results = state
         .dispatch_reactions(
-            &state,
             &tenant,
             "Ticker",
             "t1",

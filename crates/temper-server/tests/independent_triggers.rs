@@ -136,7 +136,6 @@ fn build_state(outside: &MockServer) -> ServerState {
         .authz
         .reload_tenant_policies(TENANT, "permit(principal, action, resource);")
         .expect("policy should load");
-    state.rebuild_reaction_dispatcher();
     state
 }
 

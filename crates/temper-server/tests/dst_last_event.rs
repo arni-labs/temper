@@ -93,7 +93,6 @@ fn server_with_spec(store: &SimEventStore, spec: &str) -> ServerState {
         .authz
         .reload_tenant_policies("default", "permit(principal, action, resource);")
         .unwrap();
-    state.rebuild_reaction_dispatcher();
     state
 }
 fn runtime() -> tokio::runtime::Runtime {

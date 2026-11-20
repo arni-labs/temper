@@ -133,7 +133,6 @@ impl Fixture {
             .load_tenant_wasm_modules(&self.tenant)
             .await
             .expect("load the tenant's modules");
-        state.server.rebuild_reaction_dispatcher();
         add_os_apps_dir(self.apps_root.clone());
         Server { state, store }
     }

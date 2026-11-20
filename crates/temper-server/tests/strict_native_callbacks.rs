@@ -95,7 +95,6 @@ async fn strict_native_callbacks_run_through_the_actual_wasm_engine() {
             .authz
             .reload_tenant_policies("default", "permit(principal, action, resource);")
             .unwrap();
-        state.rebuild_reaction_dispatcher();
         let payload = json!({"action":"Complete","params":{"observed":"real engine","expected_revision":expected_revision,"unrelated":"generated"},"success":success,"error":if success {""} else {"local execution failed"}}).to_string();
         let data = payload
             .bytes()

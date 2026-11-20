@@ -136,7 +136,6 @@ fn temper(spec: &str) -> ServerState {
         .authz
         .reload_tenant_policies("default", ONLY_ANN)
         .expect("the policy loads");
-    state.rebuild_reaction_dispatcher();
     state
 }
 

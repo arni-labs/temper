@@ -343,7 +343,6 @@ pub(super) async fn server_with(
         .authz
         .reload_tenant_policies("default", policy)
         .expect("the app's Cedar parses");
-    state.server.rebuild_reaction_dispatcher();
     state.server.start_runtime().await;
     state
 }

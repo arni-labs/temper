@@ -99,7 +99,6 @@ use crate::storage::{
     BackendLabel, BoxedEventStore, MetadataStore, PolicyStore, QueryPlaneStore, StorageStack,
     TrajectorySink,
 };
-use crate::trigger::ReactionDispatcher;
 use crate::wasm_registry::WasmModuleRegistry;
 use crate::webhooks::WebhookDispatcher;
 use temper_wasm::{StreamRegistry, WasmEngine, WasmInvocationContext};
@@ -509,10 +508,6 @@ pub struct ServerState {
     pub record_store: Arc<RecordStore>,
     /// Optional Postgres evolution record store (source of truth when configured).
     pub pg_record_store: Option<Arc<PostgresRecordStore>>,
-    /// Optional reaction dispatcher for cross-entity coordination.
-    ///
-    /// Wrapped in `RwLock` so hot-loaded specs can refresh reaction rules at runtime.
-    pub reaction_dispatcher: Arc<RwLock<Option<Arc<ReactionDispatcher>>>>,
     /// Optional webhook dispatcher for external system notifications.
     pub webhook_dispatcher: Option<Arc<WebhookDispatcher>>,
     /// Native adapter integration registry (`type = "adapter"` dispatch path).
@@ -868,7 +863,6 @@ impl ServerState {
             metrics: Arc::new(MetricsCollector::new()),
             record_store: Arc::new(RecordStore::new()),
             pg_record_store: None,
-            reaction_dispatcher: Arc::new(RwLock::new(None)),
             webhook_dispatcher: None,
             adapter_registry: Arc::new(AdapterRegistry::with_builtins()),
             wasm_module_registry: Arc::new(RwLock::new(WasmModuleRegistry::new())),
@@ -1156,7 +1150,6 @@ impl ServerState {
             metrics: Arc::new(MetricsCollector::new()),
             record_store: Arc::new(RecordStore::new()),
             pg_record_store: None,
-            reaction_dispatcher: Arc::new(RwLock::new(None)),
             webhook_dispatcher: None,
             adapter_registry: Arc::new(AdapterRegistry::with_builtins()),
             wasm_module_registry: Arc::new(RwLock::new(WasmModuleRegistry::new())),
@@ -1217,26 +1210,6 @@ impl ServerState {
         };
         state.register_builtin_wasm_modules();
         state
-    }
-
-    /// Attach a reaction dispatcher for cross-entity coordination.
-    pub fn with_reaction_dispatcher(self, dispatcher: Arc<ReactionDispatcher>) -> Self {
-        if let Ok(mut slot) = self.reaction_dispatcher.write() {
-            *slot = Some(dispatcher);
-        }
-        self
-    }
-
-    /// Rebuild and install reaction dispatcher from the current spec registry.
-    pub fn rebuild_reaction_dispatcher(&self) {
-        let reaction_registry = {
-            let registry = self.registry.read().unwrap();
-            registry.build_reaction_registry()
-        };
-        let dispatcher = Arc::new(ReactionDispatcher::new(Arc::new(reaction_registry)));
-        if let Ok(mut slot) = self.reaction_dispatcher.write() {
-            *slot = Some(dispatcher);
-        }
     }
 
     pub(crate) fn query_projection_fields(

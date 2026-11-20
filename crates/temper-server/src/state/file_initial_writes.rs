@@ -345,12 +345,7 @@ impl ServerState {
         );
         let _ = self.event_tx.send(change);
 
-        let dispatcher = self
-            .reaction_dispatcher
-            .read()
-            .ok()
-            .and_then(|slot| slot.clone());
-        if let Some(dispatcher) = dispatcher {
+        {
             let state = self.clone();
             let tenant = tenant.clone();
             let file_id = file_id.to_string();
@@ -371,9 +366,8 @@ impl ServerState {
                     // determinism-ok: post-commit external reaction side effects
                     // determinism-ok: post-commit reaction side effects mirror the
                     // existing non-awaited File `$value` update behavior.
-                    dispatcher
+                    state
                         .dispatch_reactions(
-                            &state,
                             &tenant,
                             "File",
                             &file_id,

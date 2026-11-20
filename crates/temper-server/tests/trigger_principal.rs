@@ -140,7 +140,6 @@ fn server(name: &str) -> ServerState {
         .authz
         .reload_tenant_policies("default", "permit(principal, action, resource);")
         .expect("policy should load");
-    state.rebuild_reaction_dispatcher();
     let hash = state
         .wasm_engine
         .compile_and_cache(ECHO_WASM)

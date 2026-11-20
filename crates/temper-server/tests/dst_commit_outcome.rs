@@ -159,7 +159,6 @@ fn server_with_tally(store: &SimEventStore, seed: u64, tally: &str) -> ServerSta
         .authz
         .reload_tenant_policies(TENANT, "permit(principal, action, resource);")
         .expect("the tenant policy parses");
-    state.rebuild_reaction_dispatcher();
     state
 }
 

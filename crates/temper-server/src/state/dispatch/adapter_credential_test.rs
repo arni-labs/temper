@@ -781,7 +781,6 @@ id_field="observed"
 name = "Rollover""#,
     );
     let state = strict_test_support::state_with_spec(&spec);
-    state.rebuild_reaction_dispatcher();
     let tenant = TenantId::default();
     let response = state
         .dispatch_adapter_callback(

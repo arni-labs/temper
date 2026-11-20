@@ -127,7 +127,6 @@ async fn restore(
     if state.tenant_unavailable_reason(name).is_some() {
         return Ok(());
     }
-    state.server.rebuild_reaction_dispatcher();
 
     if let Some(text) = left.legacy_policies.take() {
         match state.server.authz.reload_tenant_policies(name, &text) {

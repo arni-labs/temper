@@ -467,7 +467,6 @@ pub(super) async fn load_specs_from_directory(
                 )
             })?;
     }
-    state.rebuild_reaction_dispatcher();
     state.spawn_follow_spec_changes();
     // The records the check carries wait in their old states until this pass
     // has made their carries, after the answer.

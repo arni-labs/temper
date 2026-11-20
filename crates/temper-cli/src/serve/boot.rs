@@ -65,7 +65,6 @@ pub(super) async fn restore_own(
     later: &mut Later,
 ) -> Result<()> {
     bootstrap::seed_cedar_policies(state, policy_seed);
-    state.server.rebuild_reaction_dispatcher();
     bootstrap::hydrate_entities(state, apps, later).await;
     bootstrap::recover_cedar_policies(state, later).await;
     bootstrap::recover_wasm_modules(state, later).await;

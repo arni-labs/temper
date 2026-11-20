@@ -124,7 +124,6 @@ fn install(state: &ServerState, order: &str) {
             &[("Order", order), ("Payment", PAYMENT)],
         )
         .expect("tenant registration");
-    state.rebuild_reaction_dispatcher();
 }
 
 fn build_state() -> ServerState {

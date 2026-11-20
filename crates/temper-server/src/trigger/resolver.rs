@@ -1,6 +1,6 @@
 //! Target entity ID resolution for reaction rules.
 //!
-//! Shared logic used by both the async [`ReactionDispatcher`] and the
+//! Shared logic used by both the async [`ServerState::dispatch_reactions`](crate::ServerState::dispatch_reactions) and the
 //! simulation [`SimReactionSystem`] to determine which entity instance
 //! a reaction rule targets.
 

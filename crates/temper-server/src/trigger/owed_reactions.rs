@@ -2,12 +2,12 @@
 //!
 //! Each try reads the target, authorizes the move on it as it is now, and
 //! sends the move through the core dispatch, without its own reaction
-//! cascade: [`super::ReactionDispatcher`] runs the cascade of a move that
+//! cascade: [`ServerState::dispatch_reactions`](crate::ServerState::dispatch_reactions) runs the cascade of a move that
 //! lands at once. A try the store failed, in the read or the send, is kept
 //! (`state::dispatch::owed_writes`) and tried again under the reaction's key
 //! until it lands or fails otherwise, and its cascade runs when it lands.
 
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 
 use temper_authz::SecurityContext;
 
@@ -121,13 +121,8 @@ fn react_again(state: ServerState, reaction: Arc<Reaction>, depth: u32) -> OwedT
     Box::pin(async move {
         let tried = try_reaction(&state, &reaction).await;
         let attempt = tried.attempt();
-        let dispatcher = state
-            .reaction_dispatcher
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
         let sent = &reaction.sent;
-        if let (ReactionTry::Sent(reply), Some(dispatcher)) = (tried, dispatcher)
+        if let ReactionTry::Sent(reply) = tried
             && let Ok(response) = *reply
             && response.success
         {
@@ -138,8 +133,7 @@ fn react_again(state: ServerState, reaction: Arc<Reaction>, depth: u32) -> OwedT
                     .iter()
                     .map(|spawn| (spawn.entity_type.as_str(), spawn.entity_id.as_str())),
             );
-            Box::pin(dispatcher.dispatch_reactions(
-                &state,
+            Box::pin(state.dispatch_reactions(
                 &sent.tenant,
                 &sent.entity_type,
                 &sent.entity_id,

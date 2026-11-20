@@ -18,7 +18,6 @@ use crate::state::write_record::WriteCaller;
 const DEFAULT_BACKGROUND_REACTION_MAX_CONCURRENCY: usize = 64;
 
 struct BackgroundReactionDispatch {
-    dispatcher: Arc<crate::trigger::ReactionDispatcher>,
     tenant: TenantId,
     entity_type: String,
     entity_id: String,
@@ -293,38 +292,28 @@ impl crate::state::ServerState {
                     .map(|spawn| (spawn.entity_type.as_str(), spawn.entity_id.as_str())),
             );
             let agent_ctx = &reaction_ctx;
-            // A poisoned lock must not silently disable reactions: the slot
-            // only holds an Arc, so the data can't be torn — recover it.
-            let dispatcher = self
-                .reaction_dispatcher
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            if let Some(dispatcher) = dispatcher {
+            {
                 let action = response.action(action);
                 let to_state = response.state.status.clone();
                 let fields = serde_json::to_value(&response.state.fields).unwrap_or_default();
                 let reacted = if await_reactions {
-                    dispatcher
-                        .dispatch_reactions(
-                            self,
-                            tenant,
-                            entity_type,
-                            entity_id,
-                            action,
-                            &to_state,
-                            &fields,
-                            0,
-                            // ADR-0046: thread the invoking context through so
-                            // reactions without an explicit principal inherit
-                            // the invoking authority, and declared principals
-                            // can elevate deterministically.
-                            agent_ctx,
-                        )
-                        .await
+                    self.dispatch_reactions(
+                        tenant,
+                        entity_type,
+                        entity_id,
+                        action,
+                        &to_state,
+                        &fields,
+                        0,
+                        // ADR-0046: thread the invoking context through so
+                        // reactions without an explicit principal inherit
+                        // the invoking authority, and declared principals
+                        // can elevate deterministically.
+                        agent_ctx,
+                    )
+                    .await
                 } else if let Some(background) =
                     self.try_spawn_background_reactions(BackgroundReactionDispatch {
-                        dispatcher: Arc::clone(&dispatcher),
                         tenant: tenant.clone(),
                         entity_type: entity_type.to_string(),
                         entity_id: entity_id.to_string(),
@@ -341,19 +330,17 @@ impl crate::state::ServerState {
                         action_name = action,
                         "background reaction budget exhausted; awaiting reactions inline"
                     );
-                    dispatcher
-                        .dispatch_reactions(
-                            self,
-                            tenant,
-                            entity_type,
-                            entity_id,
-                            action,
-                            &background.to_state,
-                            &background.fields,
-                            0,
-                            agent_ctx,
-                        )
-                        .await
+                    self.dispatch_reactions(
+                        tenant,
+                        entity_type,
+                        entity_id,
+                        action,
+                        &background.to_state,
+                        &background.fields,
+                        0,
+                        agent_ctx,
+                    )
+                    .await
                 } else {
                     // They run in the background and cannot reach this answer:
                     // each failure is on the source record's observe stream,
@@ -389,7 +376,6 @@ impl crate::state::ServerState {
 
         let state = self.clone();
         let BackgroundReactionDispatch {
-            dispatcher,
             tenant,
             entity_type,
             entity_id,
@@ -410,9 +396,8 @@ impl crate::state::ServerState {
 
         let reaction_task = async move {
             let _permit = permit;
-            let results = dispatcher
+            let results = state
                 .dispatch_reactions(
-                    &state,
                     &tenant,
                     &entity_type,
                     &entity_id,

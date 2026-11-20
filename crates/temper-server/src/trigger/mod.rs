@@ -21,7 +21,6 @@ pub mod sim_dispatcher;
 pub mod types;
 mod withheld;
 
-pub use dispatcher::ReactionDispatcher;
 pub use registry::ReactionRegistry;
 pub use sim_dispatcher::SimReactionSystem;
 pub use types::{

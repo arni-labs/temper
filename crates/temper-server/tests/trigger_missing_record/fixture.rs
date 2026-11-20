@@ -204,7 +204,6 @@ pub async fn server(temp: &tempfile::TempDir, store: Option<TursoEventStore>) ->
         .authz
         .reload_tenant_policies(TENANT, "permit(principal, action, resource);")
         .unwrap();
-    state.rebuild_reaction_dispatcher();
     for id in ["line-1", "line-2", "line-3", "line-4"] {
         state
             .get_or_create_tenant_entity(&TenantId::new(TENANT), "Line", id, json!({}))

@@ -171,7 +171,6 @@ async fn server_looking_every(
         .authz
         .reload_tenant_policies(TENANT, "permit(principal, action, resource);")
         .expect("policy should load");
-    state.rebuild_reaction_dispatcher();
     state
         .start_runtime()
         .await
@@ -390,7 +389,6 @@ fn check_recovery(by: &AgentContext, spoil: Spoil, install: bool, expected: Opti
                         CSDL.to_string(),
                         &[("Watch", ioa.as_str())],
                     );
-                second.state.rebuild_reaction_dispatcher();
                 second.state.follow_spec_changes().await;
             }
             let result = reaches(&second.state, &id, "Merged", Duration::from_secs(20)).await;

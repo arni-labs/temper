@@ -103,7 +103,6 @@ fn build_state(tenant: &str, survey_ioa: &str) -> ServerState {
             r#"permit(principal == Agent::"service:sibling-callback-test", action, resource);"#,
         )
         .expect("policy should load");
-    state.rebuild_reaction_dispatcher();
     state
 }
 

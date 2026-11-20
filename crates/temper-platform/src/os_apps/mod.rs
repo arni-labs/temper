@@ -1135,11 +1135,6 @@ async fn install_once(
         }
     }
 
-    // Installed specs can change triggers and cross-entity reactions: refresh the dispatcher.
-    if plan.specs {
-        state.server.rebuild_reaction_dispatcher();
-    }
-
     // ── Step 3: Load Cedar policies into memory. ────────────────────
     if let Some(ref policy_text) = combined_policy {
         if let Err(e) = state

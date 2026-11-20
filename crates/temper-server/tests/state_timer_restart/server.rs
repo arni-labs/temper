@@ -205,7 +205,6 @@ impl Server {
                 .authz
                 .reload_tenant_policies("default", PERMIT_ALL)
                 .unwrap();
-            state.rebuild_reaction_dispatcher();
             let boot = state.start_runtime().await;
             (state, journal, boot)
         });

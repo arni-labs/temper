@@ -143,7 +143,6 @@ fn build_state() -> ServerState {
         .authz
         .reload_tenant_policies("default", "permit(principal, action, resource);")
         .expect("policy loads");
-    state.rebuild_reaction_dispatcher();
     state
 }
 

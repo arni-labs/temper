@@ -193,7 +193,6 @@ fn build_state(tenant: &str, job_ioa: &str, cache: Option<IdempotencyCache>) -> 
             r#"permit(principal == Agent::"service:key-scope-test", action, resource);"#,
         )
         .expect("policy should load");
-    state.rebuild_reaction_dispatcher();
     state
 }
 

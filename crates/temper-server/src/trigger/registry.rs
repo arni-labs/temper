@@ -1,5 +1,7 @@
-//! Reaction rule registry with tenant isolation. Rules are synthesized from
-//! entity-kind `[[action.triggers]]` (see `SpecRegistry::build_reaction_registry`).
+//! Reaction rule registry with tenant isolation, for the deterministic
+//! [`SimReactionSystem`](super::SimReactionSystem). The server reads a move's
+//! rules from its installed spec instead
+//! ([`SpecRegistry::reaction_rules`](crate::registry::SpecRegistry::reaction_rules)).
 //!
 //! Uses `BTreeMap` throughout for deterministic iteration order (DST compliance).
 
@@ -127,7 +129,7 @@ impl ReactionRegistry {
 /// Whether the statuses a rule's guard pins (its `status == 'S'` /
 /// `status in [...]` conjuncts) allow `to_state`. The guard still runs in
 /// full at dispatch; this only skips rules that cannot fire.
-fn matches_state_filter(rule: &ReactionRule, to_state: &str) -> bool {
+pub(crate) fn matches_state_filter(rule: &ReactionRule, to_state: &str) -> bool {
     rule.when
         .guard
         .as_ref()

@@ -148,7 +148,6 @@ fn build_state(tenant: &str, triggers: &str) -> ServerState {
                 "#,
         )
         .expect("reaction E2E policy should load");
-    state.rebuild_reaction_dispatcher();
     state
 }
 
@@ -191,7 +190,7 @@ async fn status(
 // E2E-1: Basic reaction fires through production dispatcher.
 //
 // Proves the whole stack wires up: [[action.triggers]] → try_register_tenant
-// → build_reaction_registry → ReactionDispatcher → dispatch_tenant_action
+// → SpecRegistry::reaction_rules → dispatch_reactions → dispatch_tenant_action
 // → reaction target action completes.
 // =========================================================================
 

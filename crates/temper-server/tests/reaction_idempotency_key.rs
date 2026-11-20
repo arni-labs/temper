@@ -125,7 +125,6 @@ fn build_state(tenant: &str, cache: Option<IdempotencyCache>) -> ServerState {
             r#"permit(principal == Agent::"service:reaction-key-test", action, resource);"#,
         )
         .expect("policy should load");
-    state.rebuild_reaction_dispatcher();
     state
 }
 
@@ -238,15 +237,8 @@ async fn a_retry_matches_the_reaction_key_its_target_already_recorded() {
 
     // The reactions that retry starts, run again to read their results: the
     // door's reaction is answered by its recorded key, not refused.
-    let dispatcher = state
-        .reaction_dispatcher
-        .read()
-        .expect("dispatcher lock")
-        .clone()
-        .expect("reaction dispatcher");
-    let results = dispatcher
+    let results = state
         .dispatch_reactions(
-            &state,
             &tenant,
             "Room",
             "r1",

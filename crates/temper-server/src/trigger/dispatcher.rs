@@ -1,11 +1,12 @@
 //! Production (async) dispatcher for cross-entity reactions.
 //!
-//! [`ReactionDispatcher`] evaluates reaction rules after a successful entity
-//! action and asynchronously dispatches target actions via [`ServerState`].
+//! [`ServerState::dispatch_reactions`](crate::ServerState::dispatch_reactions)
+//! evaluates reaction rules after a successful entity action and dispatches
+//! their target actions.
 //! Fire-and-forget: the source transition is already committed regardless of
 //! reaction outcome.
 
-use std::sync::Arc;
+use std::sync::PoisonError;
 
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
@@ -18,20 +19,9 @@ use tracing::instrument;
 
 use super::owed_reactions::{Reaction, ReactionTry};
 use super::principal::{effective_trigger_security_context, resolve_trigger_principal};
-use super::registry::ReactionRegistry;
 use super::repeat_stop::RepeatStop;
 use super::types::ReactionResult;
 use crate::state::owed_writes::OwedMove;
-
-/// Async reaction dispatcher for production use.
-///
-/// Holds a shared [`ReactionRegistry`] and dispatches target actions through
-/// the server state. A chain stops the first time a reaction would repeat a
-/// step it is already inside of ([`InlineChain`](crate::request_context::InlineChain)
-/// says why); the reaction it stops is reported, not dropped.
-pub struct ReactionDispatcher {
-    registry: Arc<ReactionRegistry>,
-}
 
 /// The action whose reactions one level of a chain runs, `depth` levels in.
 struct Level<'a> {
@@ -43,12 +33,17 @@ struct Level<'a> {
     depth: u32,
 }
 
-impl ReactionDispatcher {
-    /// Create a new dispatcher with the given registry.
-    pub fn new(registry: Arc<ReactionRegistry>) -> Self {
-        Self { registry }
-    }
-
+/// Reactions, dispatched by the server state.
+///
+/// A move's reactions are the entity-kind `[[action.triggers]]` its tenant's
+/// installed specs declare when the move is dispatched, read from the spec
+/// registry ([`SpecRegistry::reaction_rules`](crate::registry::SpecRegistry::reaction_rules)).
+/// There is no copy of them to rebuild after an install: every way of
+/// installing a version changes the registry, so the next move follows it.
+/// A chain stops the first time a reaction would repeat a step it is already
+/// inside of ([`InlineChain`](crate::request_context::InlineChain) says why);
+/// the reaction it stops is reported, not dropped.
+impl crate::ServerState {
     /// Dispatch reactions triggered by a successful entity action.
     ///
     /// This is called after the source action has been committed and the SSE
@@ -63,7 +58,6 @@ impl ReactionDispatcher {
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_reactions<'a>(
         &'a self,
-        state: &'a crate::ServerState,
         tenant: &'a TenantId,
         entity_type: &'a str,
         entity_id: &'a str,
@@ -82,8 +76,7 @@ impl ReactionDispatcher {
                 fields,
                 depth,
             };
-            self.dispatch_level(state, tenant, level, invoking_ctx)
-                .boxed()
+            self.dispatch_level(tenant, level, invoking_ctx).boxed()
         })
     }
 
@@ -107,7 +100,6 @@ impl ReactionDispatcher {
     ))]
     async fn dispatch_level(
         &self,
-        state: &crate::ServerState,
         tenant: &TenantId,
         level: Level<'_>,
         invoking_ctx: &AgentContext,
@@ -123,12 +115,12 @@ impl ReactionDispatcher {
         // The source action is the step these reactions continue from.
         let source_ctx = invoking_ctx.entering(entity_type, entity_id, action);
         let invoking_ctx = &source_ctx;
-        let rules: Vec<_> = self
+        let state = self;
+        let rules = self
             .registry
-            .lookup(tenant, entity_type, action, to_state)
-            .into_iter()
-            .cloned()
-            .collect();
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reaction_rules(tenant, entity_type, action, to_state);
 
         if rules.is_empty() {
             record_reaction_fanout_span(ReactionFanoutCounts::default());
@@ -378,7 +370,6 @@ impl ReactionDispatcher {
                             serde_json::to_value(&response.state.fields).unwrap_or_default();
                         let cascade_results = self
                             .dispatch_reactions(
-                                state,
                                 tenant,
                                 &rule.then.entity_type,
                                 &target_entity_id,

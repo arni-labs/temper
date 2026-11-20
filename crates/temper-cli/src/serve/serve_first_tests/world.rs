@@ -261,7 +261,6 @@ async fn arm_probes(store: TursoEventStore, tenants: &[String]) {
             .reload_tenant_policies(tenant, PERMIT_ALL)
             .expect("probe policy parses");
     }
-    state.rebuild_reaction_dispatcher();
     let _boot = state.start_runtime().await;
     let who = AgentContext {
         security_ctx: Some(SecurityContext::from_verified_jwt(

@@ -115,7 +115,6 @@ fn repair_app_runtime_metadata_from_bundle(
                 format!("Failed to restore runtime metadata for os-app '{app_name}': {error}")
             })?;
     }
-    state.server.rebuild_reaction_dispatcher();
     state.server.spawn_follow_spec_changes();
     tracing::info!(
         tenant,
