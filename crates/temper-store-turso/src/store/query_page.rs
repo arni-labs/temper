@@ -6,26 +6,46 @@
 //! instead of passing over the earlier rows (ADR-0187).
 
 use temper_runtime::persistence::{
-    CatalogOrderKey, PersistenceError, QueryFieldIndexPageQuery, storage_error,
+    CatalogOrderKey, EventTimeColumn, PersistenceError, QueryFieldIndexPageQuery, storage_error,
 };
 use tracing::instrument;
 
-use super::TursoEventStore;
-use super::instrumentation::WriteConnection;
-use crate::schema::{create_event_time_indexes as event_time_indexes, event_time_key_sql};
-
-/// Create the catalog's event-time indexes. Building one evaluates its key
-/// for every existing row; a failure leaves reads of that order to sort in
-/// SQL, so it is reported and startup goes on.
-pub(super) async fn create_event_time_indexes(conn: &WriteConnection) {
-    for statement in event_time_indexes() {
-        if let Err(error) = conn.execute(&statement, ()).await {
-            tracing::error!(%error, statement, "event-time catalog index was not created");
-        }
-    }
-}
+use super::{TursoEventStore, WritePriority};
+use crate::schema::{create_event_time_index, event_time_index_name, event_time_key_sql};
 
 impl TursoEventStore {
+    /// Build only the index this order needs. Building one scans every catalog
+    /// row, so leave it off the startup path.
+    pub(super) async fn event_time_page_index(
+        &self,
+        page: &QueryFieldIndexPageQuery,
+    ) -> Option<&'static str> {
+        let (column, descending) = page.leading_event_time()?;
+        let slot = match column {
+            EventTimeColumn::First => 0,
+            EventTimeColumn::Last => 2,
+        } + usize::from(descending);
+        let name = event_time_index_name(column, descending);
+        let initialized = self.event_time_indexes[slot]
+            .get_or_try_init(|| async {
+                let conn = self
+                    .write_connection("event_time_catalog_index", WritePriority::Low)
+                    .await?;
+                conn.execute(&create_event_time_index(column, descending), ())
+                    .await
+                    .map_err(storage_error)?;
+                Ok::<(), PersistenceError>(())
+            })
+            .await;
+        match initialized {
+            Ok(_) => Some(name),
+            Err(error) => {
+                tracing::warn!(%error, index = name, "event-time catalog index unavailable; sorting in SQL");
+                None
+            }
+        }
+    }
+
     /// Return a bounded page of entity IDs matching a translated query-plane filter.
     ///
     /// The returned count is the storage candidate count, before Cedar row
@@ -62,7 +82,14 @@ impl TursoEventStore {
         // A window count over a page in an index's order would sort every
         // match by its key; a separate count reads only the filter.
         let window_count = page.include_count && !page.uses_event_time();
-        let sql = turso_query_field_page_sql(page, &where_clause, params.len(), window_count);
+        let event_time_index = self.event_time_page_index(page).await;
+        let sql = turso_query_field_page_sql(
+            page,
+            &where_clause,
+            params.len(),
+            window_count,
+            event_time_index,
+        );
         let mut all_params: Vec<crate::driver::Value> = vec![
             crate::driver::Value::from(tenant.to_string()),
             crate::driver::Value::from(entity_type.to_string()),
@@ -156,17 +183,15 @@ pub(super) fn turso_query_field_page_sql(
     where_clause: &str,
     params: usize,
     window_count: bool,
+    event_time_index: Option<&str>,
 ) -> String {
     let select = if window_count {
         "entity_id, COUNT(*) OVER() AS total_count"
     } else {
         "entity_id"
     };
-    let index = match page.leading_event_time() {
-        Some((column, descending)) => format!(
-            "INDEXED BY {} ",
-            crate::schema::event_time_index_name(column, descending)
-        ),
+    let index = match event_time_index {
+        Some(name) => format!("INDEXED BY {name} "),
         None => super::field_index::catalog_filter_index(where_clause).to_string(),
     };
     let order_sql = turso_query_field_order_sql(page);

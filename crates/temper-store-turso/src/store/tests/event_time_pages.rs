@@ -293,6 +293,40 @@ async fn an_event_time_bound_selects_by_time_and_never_a_row_without_one() {
     assert!(ids.iter().all(|id| !missing.contains(&id)));
 }
 
+#[tokio::test]
+async fn a_populated_catalog_opens_without_building_event_time_indexes() {
+    let url = super::sqlite_test_url("event-time-reopen");
+    let store = crate::TursoEventStore::new(&url, None).await.unwrap();
+    let seeded = seed(&store).await;
+    drop(store);
+
+    let store = crate::TursoEventStore::new(&url, None).await.unwrap();
+    {
+        let conn = store.connection().await.unwrap();
+        let mut indexes = conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type = 'index' \
+                 AND name GLOB 'idx_entity_catalog_*_event_*'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(indexes.next().await.unwrap().is_none());
+    }
+
+    let page = ordered_page(EventTimeColumn::Last, true);
+    let (ids, _) = store
+        .query_field_index_page(&seeded.tenant, ENTITY_TYPE, &page)
+        .await
+        .unwrap();
+    let want: Vec<_> = expected(&seeded, EventTimeColumn::Last, true, |_| true)
+        .into_iter()
+        .take(page.top)
+        .map(|(_, id)| id)
+        .collect();
+    assert_eq!(ids, want);
+}
+
 /// The plan lines of the statement a page runs.
 async fn plan(
     store: &crate::TursoEventStore,
@@ -305,6 +339,7 @@ async fn plan(
         &where_clause,
         params.len(),
         false,
+        store.event_time_page_index(page).await,
     );
     let mut values = vec![Value::from(tenant.to_string()), Value::from(ENTITY_TYPE)];
     values.extend(params.into_iter().map(Value::from));
