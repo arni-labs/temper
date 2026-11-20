@@ -815,13 +815,6 @@ async fn file_point_lookup_with_status_ne_uses_lossless_equality_candidates() {
 
     let result = match read_entity_set_page(request).await {
         Ok(result) => result,
-        Err(QueryPlaneReadError::QueryTooLarge { telemetry }) => panic!(
-            "file point lookup should push down equality candidates: QueryTooLarge filter_pushdown={} fallback={:?} candidates={} pushed={}",
-            telemetry.filter_pushdown,
-            telemetry.fallback_reason,
-            telemetry.candidate_count,
-            telemetry.pushdown_page_count
-        ),
         Err(QueryPlaneReadError::AuthorizationDenied(_)) => {
             panic!("file point lookup should not be denied by read authorization")
         }

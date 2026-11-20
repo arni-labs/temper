@@ -205,7 +205,9 @@ async fn directory_root_lookup_souls_scenario_with_real_key_and_duplicates() {
         ..QueryOptions::default()
     };
 
-    // (1) Before the watermark: a NEW workspace's root lookup misses → scans 15 > budget → 413.
+    // (1) Before the watermark: a NEW workspace's root lookup misses and walks
+    // all 15 directories, past the old scan budget. It used to answer 413; it
+    // now answers empty (ADR-0188).
     match read_entity_set_page(QueryPlaneReadRequest {
         state: &state,
         tenant: &tenant,
@@ -217,9 +219,8 @@ async fn directory_root_lookup_souls_scenario_with_real_key_and_duplicates() {
     })
     .await
     {
-        Err(QueryPlaneReadError::QueryTooLarge { .. }) => {}
-        Ok(_) => panic!("expected 413 for a missing root before watermark, got Ok"),
-        Err(_) => panic!("expected QueryTooLarge before watermark, got another error"),
+        Ok(result) => assert!(result.entities.is_empty(), "wsB has no root yet"),
+        Err(_) => panic!("a missing root before the watermark is answered, not refused"),
     }
 
     // (2) Backfill: clear the lazy index (fresh-boot), run it, confirm the real root
@@ -965,7 +966,8 @@ async fn keyed_miss_returns_empty_without_scan_413_once_watermarked() {
         max_entities: 1,
     };
 
-    // Before the watermark: keyed miss → scan fallback → 413.
+    // Before the watermark: keyed miss → a walk of every order, past the old
+    // scan budget → empty (ADR-0188; it used to answer 413).
     match read_entity_set_page(QueryPlaneReadRequest {
         state: &state,
         tenant: &tenant,
@@ -977,9 +979,8 @@ async fn keyed_miss_returns_empty_without_scan_413_once_watermarked() {
     })
     .await
     {
-        Err(QueryPlaneReadError::QueryTooLarge { .. }) => {}
-        Ok(_) => panic!("expected 413 before watermark, got Ok"),
-        Err(_) => panic!("expected QueryTooLarge before watermark, got another error"),
+        Ok(result) => assert!(result.entities.is_empty(), "no order matches"),
+        Err(_) => panic!("a keyed miss before the watermark is answered, not refused"),
     }
 
     // Watermark Order → a keyed miss is now authoritative absence.

@@ -20,7 +20,7 @@ use super::super::read_support::{
     catalog_select_projection_fields, materialize_entity_set_entities,
 };
 use super::types::{
-    QueryPlaneCoverageReport, QueryPlaneFallbackReason, QueryPlaneReadBudget, QueryPlaneReadError,
+    QueryPlaneCoverageReport, QueryPlaneFallbackReason, QueryPlaneReadBudget,
     QueryPlaneReadRequest, QueryPlaneReadStrategy, QueryPlaneReadTelemetry,
 };
 use crate::query_eval::apply_query_options;
@@ -210,30 +210,6 @@ pub(super) fn base_telemetry(
     }
 }
 
-pub(super) fn budget_rejection(
-    request: &QueryPlaneReadRequest<'_>,
-    strategy: QueryPlaneReadStrategy,
-    filter_pushdown: bool,
-    catalog_materialization: bool,
-    coverage: QueryPlaneCoverageReport,
-    counters: ScanCounters,
-) -> QueryPlaneReadError {
-    QueryPlaneReadError::QueryTooLarge {
-        telemetry: base_telemetry(
-            request,
-            TelemetryInput {
-                strategy,
-                fallback_reason: QueryPlaneFallbackReason::FallbackCandidateBudget,
-                filter_pushdown,
-                catalog_materialization,
-                coverage,
-                counters,
-                returned_count: 0,
-            },
-        ),
-    }
-}
-
 fn row_attrs(
     request: &QueryPlaneReadRequest<'_>,
     entity_id: &str,
@@ -374,6 +350,19 @@ pub(super) async fn materialize_filter_and_authorize_ids(
     authz: &RowAuthz,
     counters: &mut ScanCounters,
 ) -> Vec<serde_json::Value> {
+    let materialized = materialize_ids(request, entity_ids, prefer_catalog, authz, counters).await;
+    filter_and_authorize(request, materialized, authz)
+}
+
+/// The documents of `entity_ids`, before the filter and row authorization;
+/// none when no row may be read.
+pub(super) async fn materialize_ids(
+    request: &QueryPlaneReadRequest<'_>,
+    entity_ids: &[String],
+    prefer_catalog: bool,
+    authz: &RowAuthz,
+    counters: &mut ScanCounters,
+) -> Vec<serde_json::Value> {
     counters.candidate_count += entity_ids.len();
     if matches!(authz, RowAuthz::DenyAll) || entity_ids.is_empty() {
         return Vec::new();
@@ -393,16 +382,21 @@ pub(super) async fn materialize_filter_and_authorize_ids(
     counters.catalog_shadow_check_budget += materialized.catalog_shadow_check_budget;
     counters.catalog_shadow_check_scheduled += materialized.catalog_shadow_check_scheduled;
     counters.catalog_select_projection |= materialized.catalog_select_projection;
+    materialized.entities
+}
 
+/// The documents the read's filter keeps and this list may show.
+pub(super) fn filter_and_authorize(
+    request: &QueryPlaneReadRequest<'_>,
+    entities: Vec<serde_json::Value>,
+    authz: &RowAuthz,
+) -> Vec<serde_json::Value> {
     let entities = if request.query_options.filter.is_some() {
-        let (entities, _) = apply_query_options(
-            materialized.entities,
-            &filter_only_query_options(request.query_options),
-        );
+        let (entities, _) =
+            apply_query_options(entities, &filter_only_query_options(request.query_options));
         entities
     } else {
-        materialized.entities
+        entities
     };
-
     retain_authorized(request, entities, authz)
 }

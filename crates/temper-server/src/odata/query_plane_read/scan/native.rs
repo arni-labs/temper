@@ -6,13 +6,46 @@ use super::super::types::{QueryPlaneCoverageReport, QueryPlaneReadError};
 use super::uniform::try_uniform_native_page;
 use super::{
     CandidateScanResult, NativeCandidatePagePlan, RowAuthz, ScanCounters, TelemetryInput,
-    apply_select_only, base_telemetry, budget_rejection, decide_row_authz,
-    materialize_filter_and_authorize_ids,
+    apply_select_only, base_telemetry, decide_row_authz, filter_and_authorize, materialize_ids,
 };
+use crate::odata::authz::entity_id_from_body;
+use crate::odata::query_plane_read::pagination::{canonical_pagination_order, sql_keyset_for_row};
 use crate::odata::query_plane_read::types::{
     QueryPlaneFallbackReason, QueryPlaneReadRequest, QueryPlaneReadStrategy,
 };
-use crate::storage::{QueryFieldIndexPage, QueryFieldIndexPageQuery};
+use crate::storage::{
+    QueryFieldIndexOrderDirection, QueryFieldIndexPage, QueryFieldIndexPageQuery,
+};
+use temper_odata::query::types::{OrderByClause, OrderDirection};
+
+/// The keyset of a page's last row, `last_id`, under `plan`'s order: where
+/// the next page starts. `None` when the row is not in `page` (it left
+/// between the page and its documents) or a clause of the order is not a
+/// key the store can seek by.
+fn resume_after(
+    plan: &NativeCandidatePagePlan,
+    last_id: &str,
+    page: &[serde_json::Value],
+) -> Option<Vec<String>> {
+    if plan.order_by.is_empty() {
+        return Some(vec![last_id.to_string()]);
+    }
+    let row = page
+        .iter()
+        .find(|entity| entity_id_from_body(entity) == Some(last_id))?;
+    let order: Vec<OrderByClause> = plan
+        .order_by
+        .iter()
+        .map(|clause| OrderByClause {
+            property: clause.field_name.clone(),
+            direction: match clause.direction {
+                QueryFieldIndexOrderDirection::Asc => OrderDirection::Asc,
+                QueryFieldIndexOrderDirection::Desc => OrderDirection::Desc,
+            },
+        })
+        .collect();
+    sql_keyset_for_row(row, &canonical_pagination_order(Some(&order)))
+}
 
 /// One store page of `plan`: `top` ids from `skip` rows past its start (the
 /// first row, or the row after its continuation's cursor).
@@ -139,52 +172,39 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
         return Some(result);
     }
 
-    let scan_budget = request.budget.scan_candidate_budget();
+    // ADR-0188: no scan budget. The rows are walked a store page at a time,
+    // each page starting after the last row of the one before (a keyset the
+    // store seeks to), keeping only the requested page and a running count,
+    // until the page is full or, for `$count`, the last row is judged. What
+    // bounds the walk is time. Measured 2026-11-19 on an Apple M-series Mac
+    // (release build, Turso file store, 12,000 records, a forbid policy
+    // hiding half): see ADR-0188 for the rows judged per second.
     let page_size = request.budget.scan_page_size(request.query_options);
-    let mut storage_offset = 0;
+    let mut walk = plan.clone();
+    let mut storage_skip = 0;
     let mut authorized_seen = 0usize;
     let mut returned_before_select = Vec::new();
     let mut counters = ScanCounters::empty();
 
     loop {
-        let remaining_budget = scan_budget.saturating_sub(counters.candidate_count);
-        if remaining_budget == 0 {
-            return Some(Err(budget_rejection(
-                request,
-                QueryPlaneReadStrategy::NativePagePushdown,
-                plan.filter_pushdown,
-                true,
-                coverage,
-                counters,
-            )));
-        }
-        let storage_top = page_size.min(remaining_budget);
         // The loop counts the rows it authorizes, so no page asks the store
-        // for a count. `storage_offset` counts from the continuation's
-        // cursor, which the store seeks to, not from the first row.
-        let page =
-            match try_query_native_page(request, &plan, storage_offset, storage_top, false).await {
-                Ok(Some(page)) => page,
-                Ok(None) => return None,
-                Err(()) => return None,
-            };
+        // for a count. A page whose last row has no keyset the store can
+        // seek by moves on by `storage_skip` rows past the last cursor.
+        let page = match try_query_native_page(request, &walk, storage_skip, page_size, false).await
+        {
+            Ok(Some(page)) => page,
+            Ok(None) | Err(()) => return None,
+        };
         counters.pushdown_sparse_probe_count += 1;
         counters.pushdown_page_count += page.entity_ids.len();
-
-        if page.entity_ids.is_empty() {
+        let Some(last_id) = page.entity_ids.last().cloned() else {
             break;
-        }
-
+        };
         let page_len = page.entity_ids.len();
-        let authorized = materialize_filter_and_authorize_ids(
-            request,
-            &page.entity_ids,
-            true,
-            &authz,
-            &mut counters,
-        )
-        .await;
-        for entity in authorized {
+        let materialized =
+            materialize_ids(request, &page.entity_ids, true, &authz, &mut counters).await;
+        let resume = resume_after(&walk, &last_id, &materialized);
+        for entity in filter_and_authorize(request, materialized, &authz) {
             let index = authorized_seen;
             authorized_seen += 1;
             if index >= skip && returned_before_select.len() < requested_top {
@@ -192,12 +212,18 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
             }
         }
 
-        storage_offset += page_len;
         if !include_count && returned_before_select.len() >= requested_top {
             break;
         }
-        if page_len < storage_top {
+        if page_len < page_size {
             break;
+        }
+        match resume {
+            Some(after) => {
+                walk.after = Some(after);
+                storage_skip = 0;
+            }
+            None => storage_skip += page_len,
         }
     }
 

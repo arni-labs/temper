@@ -17,10 +17,8 @@ pub(in crate::odata) use types::{
 use super::authz::{LIST_ACTION, authorize_read};
 #[cfg(test)]
 use scan::native_candidate_page_plan;
-use scan::{
-    ScanCounters, SqlKeyset, budget_rejection, read_from_source_cursor, try_native_page_read,
-};
-use types::{QueryPlaneCoverageReport, QueryPlaneFallbackReason, QueryPlaneReadStrategy};
+use scan::{SqlKeyset, read_from_source_cursor, try_native_page_read};
+use types::{QueryPlaneCoverageReport, QueryPlaneFallbackReason};
 
 /// The store's page answers the read before any id list is read when SQL
 /// narrows it: a filter pushed down, or none at all. Its order, keyset and
@@ -109,15 +107,13 @@ fn should_reconcile_empty_exact_match_against_authoritative(
     // asynchronously-projected row. Reconcile against authoritative state even
     // when the index already holds other entities of this type.
     //
-    // Cost tradeoff: a genuinely-absent target then falls through to a bounded
-    // authoritative scan (capped by `scan_candidate_budget`) instead of a cheap
-    // empty native page. That is the read-path cost of read-after-write
-    // correctness; it never serializes the write hot path. The gate is tight —
-    // only pushdown-able equality conjunctions pay it; ranges/Or/Ne/contains/
-    // functions return `None` from `equality_field_predicates` and are
-    // unaffected. When the type is too large for that scan, the budget gate
-    // bounds the reconcile to the rows the native page cannot answer for (ARN-68) —
-    // see `read_entity_set_from_query_plane`.
+    // Cost tradeoff: a genuinely-absent target then falls through to an
+    // authoritative read of the rows the native page cannot answer for (ARN-68)
+    // instead of a cheap empty native page. That is the read-path cost of
+    // read-after-write correctness; it never serializes the write hot path. The
+    // gate is tight — only pushdown-able equality conjunctions pay it;
+    // ranges/Or/Ne/contains/functions return `None` from
+    // `equality_field_predicates` and are unaffected.
     request
         .query_options
         .filter
@@ -195,13 +191,6 @@ async fn unvouched_ids(
     Some(gap)
 }
 
-fn should_check_source_cursor_catalog_coverage(
-    candidate_count: usize,
-    budget: QueryPlaneReadBudget,
-) -> bool {
-    candidate_count <= budget.scan_candidate_budget()
-}
-
 /// Execute one page of an OData entity-set read through the query-plane
 /// contract. Pagination (server-driven `@odata.nextLink` continuation) is
 /// layered on top by [`read_entity_set_from_query_plane`].
@@ -259,10 +248,9 @@ pub(in crate::odata::query_plane_read) async fn read_entity_set_page_with(
     // Set when an empty native page for an exact-match resolution is treated as
     // a possibly-lagging projection and we fall through to the authoritative
     // path below (ARN-89). It suppresses the native retry on that path and
-    // selects the `ProjectionLagReconcile` telemetry reason. If the type then
-    // turns out to be too large for the reconcile scan, the budget gate bounds
-    // the reconcile to the rows the native page cannot answer for instead of
-    // rejecting (ARN-68).
+    // selects the `ProjectionLagReconcile` telemetry reason. The reconcile then
+    // reads only the rows the native page cannot answer for, when the store can
+    // say which those are (ARN-68).
     let mut reconciling_exact_match_lag = false;
     if !keyed_authoritative_absent
         && let Some(plan) = native_plan.clone()
@@ -301,29 +289,20 @@ pub(in crate::odata::query_plane_read) async fn read_entity_set_page_with(
                 .await
         }
     };
-    let needs_full_proof = request.query_options.filter.is_some()
-        || request.query_options.orderby.is_some()
-        || request.query_options.count == Some(true);
-    let over_scan_budget = needs_full_proof
-        && !should_check_source_cursor_catalog_coverage(all_entity_ids.len(), request.budget);
-    // ARN-462: an empty exact-match page must use the gap ∪ native-page union
-    // even when the type is *under* `scan_candidate_budget`. The over-budget
-    // gate used to be the only caller, so an in-budget type (DesignLanguages
-    // 1275 < 10k) hydrated every id and returned 0.
-    if reconciling_exact_match_lag || over_scan_budget {
-        // ARN-68 (the SessionEntries-list flavor): the full scan is only needed
+    // ARN-462: an empty exact-match page uses the gap ∪ native-page union
+    // whatever the type's size.
+    if reconciling_exact_match_lag {
+        // ARN-68 (the SessionEntries-list flavor): the full walk is only needed
         // for entities the native page cannot answer for. Reconcile that gap,
         // not the type. A committed-but-unprojected match is FOUND; a genuine
-        // miss returns bounded empty. If the union exceeds the scan budget, or
-        // the backend cannot say which catalog rows are current, keep the
-        // honest over-budget rejection. In-budget probe failure still falls
-        // through (no second invented probe).
-        if reconciling_exact_match_lag
-            && let Some(pairs) = request
-                .query_options
-                .filter
-                .as_ref()
-                .and_then(super::filter_sql::equality_field_predicates)
+        // miss returns empty. When the backend cannot say which catalog rows
+        // are current, the walk below reads the whole type (ADR-0188: there is
+        // no scan budget to refuse it).
+        if let Some(pairs) = request
+            .query_options
+            .filter
+            .as_ref()
+            .and_then(super::filter_sql::equality_field_predicates)
         {
             let field_names: std::collections::BTreeSet<String> =
                 pairs.into_iter().map(|(name, _)| name).collect();
@@ -360,41 +339,26 @@ pub(in crate::odata::query_plane_read) async fn read_entity_set_page_with(
                         candidate_ids.insert(id.to_string());
                     }
                 }
-                if candidate_ids.len() <= request.budget.scan_candidate_budget() {
-                    let ids: Vec<String> = candidate_ids.into_iter().collect();
-                    let coverage = QueryPlaneCoverageReport {
-                        missing: gap_len,
-                        matched: 0,
-                    };
-                    let result = read_from_source_cursor(
-                        &request,
-                        &ids,
-                        coverage,
-                        &missing_ids,
-                        QueryPlaneFallbackReason::ProjectionLagReconcile,
-                    )
-                    .await?;
-                    return Ok(QueryPlaneReadResult {
-                        entities: result.entities,
-                        count: result.count,
-                        telemetry: result.telemetry,
-                        next_skiptoken: None,
-                    });
-                }
+                let ids: Vec<String> = candidate_ids.into_iter().collect();
+                let coverage = QueryPlaneCoverageReport {
+                    missing: gap_len,
+                    matched: 0,
+                };
+                let result = read_from_source_cursor(
+                    &request,
+                    &ids,
+                    coverage,
+                    &missing_ids,
+                    QueryPlaneFallbackReason::ProjectionLagReconcile,
+                )
+                .await?;
+                return Ok(QueryPlaneReadResult {
+                    entities: result.entities,
+                    count: result.count,
+                    telemetry: result.telemetry,
+                    next_skiptoken: None,
+                });
             }
-        }
-        if over_scan_budget {
-            return Err(budget_rejection(
-                &request,
-                QueryPlaneReadStrategy::ReadSourceCursor,
-                false,
-                request.state.query_plane_store().is_some(),
-                QueryPlaneCoverageReport::default(),
-                ScanCounters {
-                    candidate_count: all_entity_ids.len(),
-                    ..ScanCounters::empty()
-                },
-            ));
         }
     }
     // Every record's catalog row commits with its event, so the catalog

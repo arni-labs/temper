@@ -929,10 +929,7 @@ async fn handle_entity_set(
     .await
     {
         Ok(result) => result,
-        Err(error) => {
-            error.record_telemetry(&span);
-            return error.into_response();
-        }
+        Err(error) => return error.into_response(),
     };
     read_result.telemetry.record(&span);
 

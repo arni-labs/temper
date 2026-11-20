@@ -185,6 +185,66 @@ pub(super) async fn seed_cards(state: &ServerState) -> Vec<serde_json::Value> {
     bodies
 }
 
+/// The cards on the simulation store, which has no query plane: every read
+/// takes the in-memory path.
+pub(super) async fn sim_cards(system_name: &str) -> (ServerState, Vec<serde_json::Value>) {
+    let mut state = card_state(system_name);
+    state.set_storage_stack(StorageStack::from_sim(
+        temper_store_sim::SimEventStore::no_faults(7),
+        None,
+    ));
+    let bodies = seed_cards(&state).await;
+    (state, bodies)
+}
+
+/// Statuses the reader's policy hides: half of the cards.
+pub(super) const HIDDEN_STATUSES: [&str; 2] = ["Done", "Held"];
+
+/// Install a policy that lets a reader list cards and read every card
+/// except those in [`HIDDEN_STATUSES`], so each row is judged on its own;
+/// the reader's context.
+pub(super) fn install_reader(state: &ServerState) -> SecurityContext {
+    state
+        .authz
+        .reload_tenant_policies(
+            TenantId::default().as_str(),
+            r#"
+            permit(principal, action == Action::"list", resource is Card);
+            permit(principal, action == Action::"read", resource is Card);
+            forbid(principal, action == Action::"read", resource is Card)
+                when { resource.status == "Done" || resource.status == "Held" };
+            "#,
+        )
+        .expect("install the reader's policy");
+    SecurityContext {
+        principal: temper_authz::Principal {
+            id: "reader".to_string(),
+            kind: temper_authz::PrincipalKind::Customer,
+            role: None,
+            acting_for: None,
+            agent_type: None,
+            label: None,
+            attributes: Default::default(),
+        },
+        context_attrs: Default::default(),
+        correlation_id: "large-set-reader".to_string(),
+        cause: None,
+        credential: None,
+    }
+}
+
+/// The cards the reader may see.
+pub(super) fn visible(bodies: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    bodies
+        .iter()
+        .filter(|body| {
+            let status = body["status"].as_str().unwrap_or_default();
+            !HIDDEN_STATUSES.contains(&status)
+        })
+        .cloned()
+        .collect()
+}
+
 /// The cards on a Turso store in a temporary file.
 pub(super) async fn turso_cards(
     system_name: &str,
@@ -263,10 +323,6 @@ pub(super) async fn read(
     .await
     {
         Ok(result) => result,
-        Err(QueryPlaneReadError::QueryTooLarge { telemetry }) => panic!(
-            "{query}: refused as too large after {} candidates",
-            telemetry.candidate_count
-        ),
         Err(_) => panic!("{query}: read failed"),
     }
 }
