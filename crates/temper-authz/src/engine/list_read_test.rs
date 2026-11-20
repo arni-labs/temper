@@ -116,6 +116,24 @@ const POLICIES: &[&str] = &[
     // Policies for other types and actions only.
     r#"permit(principal, action == Action::"read", resource is Invoice);
        permit(principal, action == Action::"Pay", resource is Order);"#,
+    // The broad forbids an app gets for its platform agents: each reads the
+    // row in its unless, and only applies to one kind of caller.
+    r#"permit(principal, action == Action::"read", resource is Order);
+       forbid(principal, action, resource)
+       when { principal has agent_type && principal.agent_type == "katagami-hook" }
+       unless { (action == Action::"Add" && resource is Order) || (context has via && context.via != "request") };
+       forbid(principal, action, resource)
+       when { (principal has role && principal.role == "file-upload") || (principal has agent_type && principal.agent_type == "file-upload") }
+       unless { resource is File && resource has id && principal has id && resource.id == principal.id };"#,
+    // A forbid whose unless lets one kind of caller through whatever the row.
+    r#"permit(principal, action == Action::"read", resource is Order);
+       forbid(principal, action == Action::"read", resource is Order)
+       unless { principal is Customer || resource.status == "Open" };"#,
+    // A caller-only part that errors for callers without a role, which Cedar
+    // skips, beside one that reads the row.
+    r#"permit(principal, action == Action::"read", resource is Order);
+       forbid(principal, action == Action::"read", resource is Order)
+       when { principal.role == "file-upload" && resource.status == "Closed" };"#,
 ];
 
 #[test]
@@ -148,6 +166,26 @@ fn the_cases_reach_every_outcome() {
     assert_eq!(decisions(POLICIES[2], &customer).2, "allow_all");
     assert_eq!(decisions(POLICIES[2], &guest).2, "deny_all");
     assert_eq!(decisions(POLICIES[5], &customer).2, "deny_all");
+}
+
+/// A policy that reads the row but whose caller-only part already rules out
+/// this caller is left out of the read, so the read is decided once; for the
+/// caller it is meant for, it stays on the per-row path.
+#[test]
+fn a_rule_for_another_caller_leaves_the_read_whole() {
+    let customer = reader(PrincipalKind::Customer, None);
+    let agent = reader(PrincipalKind::Agent, None);
+    let uploader = reader(PrincipalKind::Agent, Some("file-upload"));
+    assert_eq!(decisions(POLICIES[3], &customer).2, "allow_all");
+    assert_eq!(decisions(POLICIES[3], &uploader).2, "per_row");
+    assert_eq!(decisions(POLICIES[8], &customer).2, "allow_all");
+    assert_eq!(decisions(POLICIES[8], &uploader).2, "per_row");
+    assert_eq!(decisions(POLICIES[9], &customer).2, "allow_all");
+    assert_eq!(decisions(POLICIES[9], &agent).2, "per_row");
+    assert_eq!(decisions(POLICIES[10], &customer).2, "allow_all");
+    assert_eq!(decisions(POLICIES[10], &uploader).2, "per_row");
+    // A part that reads a context key a row can fill is never decided once.
+    assert_eq!(decisions(POLICIES[0], &customer).2, "per_row");
 }
 
 /// A row is checked only against the policies that can tell rows apart.

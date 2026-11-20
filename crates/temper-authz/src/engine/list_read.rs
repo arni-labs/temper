@@ -61,9 +61,16 @@ impl AuthzEngine {
             // whichever row it is.
             None => return ListRead::DenyAll,
         };
-        let Some(split) =
-            list_uniformity::split(&policies.policy_set, security_ctx, action, resource_type)
-        else {
+        let decide = |guard: &Policy| {
+            self.decide_caller_only(security_ctx, action, resource_type, probe_attrs, guard)
+        };
+        let Some(split) = list_uniformity::split(
+            &policies.policy_set,
+            security_ctx,
+            action,
+            resource_type,
+            &decide,
+        ) else {
             return ListRead::PerRow(Box::new(whole_set_per_row()));
         };
         let attribute_keys = match split.uniformity {
@@ -120,6 +127,32 @@ impl AuthzEngine {
             list_permits,
             row_policies: Some(row_policies),
         }))
+    }
+
+    /// One condition-only permit evaluated for this read's caller, against the
+    /// probe row ([`list_uniformity::CallerOnly`]). The condition reads no
+    /// row, so the probe stands for every one.
+    pub(super) fn decide_caller_only(
+        &self,
+        security_ctx: &SecurityContext,
+        action: &str,
+        resource_type: &str,
+        probe_attrs: &HashMap<String, serde_json::Value>,
+        guard: &Policy,
+    ) -> Option<bool> {
+        let policies = compile(vec![guard.clone()])?;
+        match self.evaluate_request(
+            security_ctx,
+            action,
+            resource_type,
+            probe_attrs,
+            &policies,
+            CedarCheck::RowFilter,
+        ) {
+            AuthzDecision::Allow { .. } => Some(true),
+            AuthzDecision::Deny(AuthzDenial::NoMatchingPermit) => Some(false),
+            AuthzDecision::Deny(_) => None,
+        }
     }
 
     /// Whether one row of a list read may be read, given its

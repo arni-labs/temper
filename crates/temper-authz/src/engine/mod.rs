@@ -794,12 +794,17 @@ impl AuthzEngine {
                 };
             }
         };
+        let probe = HashMap::new();
+        let decide = |guard: &cedar_policy::Policy| {
+            self.decide_caller_only(security_ctx, action, resource_type, &probe, guard)
+        };
         if let Some(tenant_policies) = tenants.get(tenant) {
             return list_uniformity::classify(
                 &tenant_policies.policies.policy_set,
                 security_ctx,
                 action,
                 resource_type,
+                &decide,
             );
         }
         drop(tenants);
@@ -809,6 +814,7 @@ impl AuthzEngine {
                 security_ctx,
                 action,
                 resource_type,
+                &decide,
             );
         }
         // No tenant policy and not a system principal: Cedar default-deny.
