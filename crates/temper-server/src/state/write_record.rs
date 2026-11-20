@@ -1,8 +1,8 @@
 //! The record a write will store, and the one constraint check every write
 //! path runs on it.
 //!
-//! Relation integrity, field invariants and hard cross-invariants describe a
-//! stored record. Each write path builds the record it is about to store with
+//! Relation integrity and hard cross-invariants describe a stored record and
+//! the records it points at. Each write path builds the record it is about to store with
 //! the same function the entity actor applies for that write (create, field
 //! update, action) and checks that record here, so the record that is checked
 //! is the record that is stored. The checks read the record's values, never
@@ -14,6 +14,13 @@
 //! a WASM module's requests back into the API, platform code) must be able to
 //! finish what an earlier move started, such as ending a session whose parent
 //! was archived since.
+//!
+//! The rules over one record's own values, its `[[invariant]]`s and
+//! `[[field_invariant]]`s, are not checked here: no other record's change can
+//! break them, so that reason never holds for them. The entity actor checks
+//! them on every move and field update, whoever makes it
+//! (`entity_actor::move_invariants`), and a create checks its first state
+//! (`entity_actor::create_refusal`).
 
 use std::collections::BTreeSet;
 
@@ -112,8 +119,8 @@ impl From<ConstraintViolation> for ActionRecordError {
 
 impl ServerState {
     /// Check the record a write will store against the tenant's relation
-    /// integrity, field invariants and hard cross-invariants. A kernel
-    /// follow-on is not checked (see the module docs).
+    /// integrity and hard cross-invariants. A kernel follow-on is not checked
+    /// (see the module docs).
     pub(crate) async fn check_record_to_store(
         &self,
         write: RecordWrite<'_>,
@@ -153,15 +160,6 @@ impl ServerState {
             operation,
             record,
             pending,
-        )
-        .await?;
-        constraints::pre_upsert_field_invariant_checks(
-            self,
-            tenant,
-            entity_type,
-            entity_id,
-            operation,
-            record,
         )
         .await?;
         constraints::post_write_invariant_checks(self, write, record, pending).await
@@ -207,8 +205,8 @@ impl ServerState {
     }
 
     /// The fields of an `entity_type` record that the checks on `action`
-    /// read: the names its field invariants read, its relation fields, and
-    /// the source fields of the cross-invariants the action triggers.
+    /// read: its relation fields, and the source fields of the
+    /// cross-invariants the action triggers.
     fn fields_checked(
         &self,
         tenant: &TenantId,
@@ -220,12 +218,6 @@ impl ServerState {
             return names;
         }
         let registry = self.registry.read().expect("registry lock poisoned");
-        for invariant in registry
-            .field_invariants_for(tenant, entity_type)
-            .unwrap_or_default()
-        {
-            names.extend(invariant.referenced_fields());
-        }
         let Some(tenant_config) = registry.get_tenant(tenant) else {
             return names;
         };
@@ -249,8 +241,8 @@ impl ServerState {
     /// Runs before the action is sent to the actor, which the caller then
     /// holds to `current`: the actor applies the action only while the record
     /// is still `current`, so the record checked here is the record stored.
-    /// Kernel follow-ons and entity types with no relation, field invariant
-    /// or matching cross-invariant skip the work.
+    /// Kernel follow-ons and entity types with no relation or matching
+    /// cross-invariant skip the work.
     pub(crate) async fn check_action_record(
         &self,
         caller: WriteCaller,
@@ -284,8 +276,8 @@ impl ServerState {
     }
 
     /// Whether the record a `caller`'s `action` on `entity_type` stores is
-    /// checked: the call comes from outside the kernel and the tenant declares
-    /// a constraint that write must satisfy.
+    /// checked here: the call comes from outside the kernel and the tenant
+    /// declares a relation or cross-invariant that write must satisfy.
     pub(crate) fn action_record_checked(
         &self,
         caller: WriteCaller,
@@ -310,22 +302,25 @@ impl ServerState {
                 .iter()
                 .any(|inv| constraints::trigger_matches(&inv.on, entity_type, action))
         });
-        let has_field_invariants = registry
-            .field_invariants_for(tenant, entity_type)
-            .is_some_and(|invariants| !invariants.is_empty());
-        has_relations || has_cross_invariants || has_field_invariants
+        has_relations || has_cross_invariants
     }
 }
 
 /// The fields a create stores: the initial fields as the actor builds its
-/// first state from them.
+/// first state from them. Refused when that first state would break one of
+/// the type's invariants, whoever creates it
+/// ([`crate::entity_actor::create_refusal`]).
 pub(crate) fn created_record(
     entity_type: &str,
     entity_id: &str,
     table: &TransitionTable,
     initial_fields: &Value,
-) -> Value {
-    EntityActor::build_initial_state(entity_type, entity_id, table, initial_fields).fields
+) -> Result<Value, (String, temper_jit::table::Refusal)> {
+    let state = EntityActor::build_initial_state(entity_type, entity_id, table, initial_fields);
+    match crate::entity_actor::create_refusal(&state, table) {
+        Some(refused) => Err(refused),
+        None => Ok(state.fields),
+    }
 }
 
 /// The fields a field update stores: a PATCH merge (`replace == false`) or a

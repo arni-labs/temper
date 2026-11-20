@@ -57,8 +57,8 @@ pub struct TransitionTable {
     /// Declared defaults used by strict actors and pre-state constraints.
     #[serde(default)]
     pub initial_values: super::action_contract::InitialValues,
-    /// The `[[invariant]]`s every move is checked against
-    /// ([`super::invariant`]).
+    /// The `[[invariant]]`s and `[[field_invariant]]`s every write is
+    /// checked against ([`super::invariant`]).
     #[serde(default)]
     pub invariants: Vec<super::invariant::MoveInvariant>,
     /// Pre-built index: action name → indices into `rules`.

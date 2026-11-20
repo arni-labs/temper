@@ -7,11 +7,13 @@
 //! seeds read the record before either write lands and others run one after
 //! the other.
 //!
-//! Invariant: no write commits against a version it did not read. Exactly one
-//! write commits, the stored record keeps the invariant, and the other write
-//! is refused: as stale with the record's current version when it read the
-//! record before the first one landed, or by the invariant when it read the
-//! record after.
+//! Invariant: exactly one write commits, the stored record keeps the
+//! invariant, and the other write is refused by it. A rule over the record's
+//! own values is checked inside its actor, one write at a time, so however
+//! the two interleave the second one sees the first: neither is ever refused
+//! as stale (that refusal guards what is decided before the write reaches
+//! the actor: Cedar, relations, cross-invariants; `dst_stale_writes` covers
+//! it).
 
 use serde_json::{Value, json};
 use temper_runtime::ActorSystem;
@@ -126,7 +128,7 @@ async fn outside_write(
 }
 
 #[tokio::test]
-async fn racing_outside_writes_commit_only_against_the_version_they_read() {
+async fn racing_outside_writes_are_each_checked_against_the_one_before() {
     let mut stale_seeds = 0u64;
     for seed in 0..SEEDS {
         let (_guard, _clock, _ids) = install_deterministic_context(seed);
@@ -199,9 +201,9 @@ async fn racing_outside_writes_commit_only_against_the_version_they_read() {
             }
         }
     }
-    assert!(
-        stale_seeds > 0,
-        "no seed raced both reads ahead of the first write; the workload does not exercise the race"
+    assert_eq!(
+        stale_seeds, 0,
+        "a write was refused as stale, though the actor checks this rule one write at a time"
     );
 }
 

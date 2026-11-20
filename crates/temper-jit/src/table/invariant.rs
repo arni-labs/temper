@@ -1,31 +1,57 @@
-//! The `[[invariant]]`s the kernel checks on every move.
+//! The rules over one record that the kernel checks on every write: its
+//! `[[invariant]]`s and `[[field_invariant]]`s.
 //!
-//! The verification cascade proves a spec's invariants over its model. A
-//! record can still reach a state the model never reached: it was written
-//! before a rule existed, under a spec that was never verified, or with values
-//! the model does not track. So every move is checked as well. A move that
-//! would make an invariant false, when it held before the move, is refused. An
-//! invariant that did not hold before the move either is not the move's doing,
-//! and does not stop it.
+//! The verification cascade proves a spec's invariants over its model; a
+//! field invariant reads values the model does not track. Either way a record
+//! can reach a state the model never reached: it was written before a rule
+//! existed, under a spec that was never verified, or with values the model
+//! does not track. So every write is checked, whoever makes it: a person, a
+//! reaction, a timer, a module's answer or a carry. Both kinds are the same
+//! rule at run time, one record's own values, so they are one list here and
+//! one check. A write that would make a rule false, when it held before the
+//! write, is refused. A rule that did not hold before the write either is not
+//! the write's doing, and does not stop it: the record is not stranded by
+//! it, and a write that repairs it goes through.
 //!
 //! A move resolves the statuses of the records it points at, never their
 //! fields, so an invariant that reads another record's field is not checked
 //! on moves (see [`MoveInvariant::from_spec`]).
 
 use serde::{Deserialize, Serialize};
-use temper_spec::automaton::Invariant;
+use temper_spec::automaton::{FieldInvariant, Invariant};
 use temper_spec::predicate::Expr;
 
 use super::guard::{self, EvalContext, GuardFailure};
 use super::types::TransitionTable;
 
-/// An `[[invariant]]` the kernel checks on every move.
+/// An `[[invariant]]` or `[[field_invariant]]` the kernel checks on every
+/// write.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoveInvariant {
     /// The invariant's name, as the spec writes it.
     pub name: String,
     /// What must hold.
     pub assert: Expr,
+    /// Which section of the spec declares it.
+    #[serde(default)]
+    pub declared_as: DeclaredAs,
+    /// What the spec says when it does not hold (a field invariant's
+    /// `message`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// The section of a spec a [`MoveInvariant`] comes from. Both are checked
+/// the same way; a write that breaks a field invariant is answered as a
+/// broken data rule (`ConstraintViolation`), as it always was.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclaredAs {
+    /// An `[[invariant]]`, which the verification cascade proves too.
+    #[default]
+    Invariant,
+    /// A `[[field_invariant]]`, over values the cascade does not model.
+    FieldInvariant,
 }
 
 impl MoveInvariant {
@@ -40,6 +66,19 @@ impl MoveInvariant {
         Self::checked(invariant).then(|| Self {
             name: invariant.name.clone(),
             assert: invariant.assert.clone(),
+            declared_as: DeclaredAs::Invariant,
+            message: None,
+        })
+    }
+
+    /// The field invariant as writes check it, or `None` when they cannot
+    /// (it reads another record's field).
+    pub fn from_field_invariant(invariant: &FieldInvariant) -> Option<Self> {
+        (!invariant.assert.reads_related_field()).then(|| Self {
+            name: invariant.name.clone(),
+            assert: invariant.assert.clone(),
+            declared_as: DeclaredAs::FieldInvariant,
+            message: invariant.message.clone(),
         })
     }
 
@@ -110,6 +149,50 @@ impl TransitionTable {
                 guard::check_detailed(&invariant.assert, status, ctx, &self.initial_values)
                     .map(|failure| (invariant, failure))
             })
+    }
+
+    /// The first invariant this version adds or changes from `installed`
+    /// that a stored record in `status` breaks, and did not break under
+    /// `installed`: the record would be one its new spec forbids. `now` and
+    /// `before` are its values as each version reads them. Those that read
+    /// another record are left out: the record alone cannot answer them.
+    pub fn newly_broken_invariant(
+        &self,
+        installed: &TransitionTable,
+        status: &str,
+        (now, before): (&EvalContext, &EvalContext),
+    ) -> Option<(&MoveInvariant, GuardFailure)> {
+        self.invariants
+            .iter()
+            .filter(|invariant| invariant.assert.cross_refs().is_empty())
+            .find_map(|invariant| {
+                let was = installed
+                    .invariants
+                    .iter()
+                    .find(|old| old.name == invariant.name);
+                if was.is_some_and(|old| old.assert == invariant.assert) {
+                    return None;
+                }
+                let failure =
+                    guard::check_detailed(&invariant.assert, status, now, &self.initial_values)?;
+                let held = was.is_none_or(|old| {
+                    guard::check_detailed(&old.assert, status, before, &installed.initial_values)
+                        .is_none()
+                });
+                held.then_some((invariant, failure))
+            })
+    }
+
+    /// Whether this version adds or changes an invariant from `installed`
+    /// that a stored record alone can answer.
+    pub fn adds_record_invariant(&self, installed: &TransitionTable) -> bool {
+        self.invariants.iter().any(|invariant| {
+            invariant.assert.cross_refs().is_empty()
+                && !installed
+                    .invariants
+                    .iter()
+                    .any(|old| old.name == invariant.name && old.assert == invariant.assert)
+        })
     }
 }
 

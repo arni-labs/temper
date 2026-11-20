@@ -32,7 +32,7 @@ use super::authz::{
     CREATE_ACTION, MutationResource, apply_authenticated_context, authorize_mutation,
     require_authenticated_context,
 };
-use super::common::run_write_prechecks;
+use super::common::{created_record_or_refusal, run_write_prechecks};
 use super::response::annotate_entity;
 use super::storage_guardrails::storage_cap_error_response;
 use crate::blob_store::{BlobByteStream, BlobIngestAdmissionError, MAX_RAW_BLOB_BYTES};
@@ -344,6 +344,15 @@ async fn ingest_raw_inner(
         "Status": "Durable",
         "CreatedAt": now,
     });
+    if let Err(response) = created_record_or_refusal(
+        &state,
+        &tenant,
+        entity_type,
+        &expected_object_id,
+        &initial_fields,
+    ) {
+        return response;
+    }
     let final_guard = state.acquire_commons_write_guardrail_lock(&tenant).await;
     // Convert the pending reservation back into a final cap check while the
     // mutation lock prevents another writer from taking the released bytes.

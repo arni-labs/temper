@@ -262,7 +262,7 @@ pub struct EntityActor {
     idempotency_cache: Option<Arc<crate::idempotency::IdempotencyCache>>,
     /// Object store for field-overflow blob bytes. SQL stores only refs.
     pub(super) blob_store: Option<crate::blob_store::BlobStore>,
-    legacy_blob_store: Option<Arc<dyn crate::storage::BlobStore>>,
+    pub(super) legacy_blob_store: Option<Arc<dyn crate::storage::BlobStore>>,
     /// Run once with the state this actor rehydrated from stored events.
     on_rehydrated: Option<RehydrateHook>,
     /// A write's outcome could not be learned, so the state in memory may not
@@ -2493,6 +2493,10 @@ impl EntityActor {
                     Err(NotUpdated::Failed(reason)) => {
                         EntityResponse::write_failed(state.clone(), reason)
                     }
+                    Err(NotUpdated::Refused(reason, refusal)) => EntityResponse {
+                        refusal: Some(refusal),
+                        ..EntityResponse::refused(state.clone(), reason)
+                    },
                     Err(NotUpdated::Store(error)) => {
                         persistence_failure_reply(state.clone(), &error)
                     }

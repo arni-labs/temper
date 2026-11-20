@@ -39,7 +39,7 @@ pub use effects::{
     build_eval_context_with_xref, process_action, process_action_with_xref, sync_fields,
 };
 pub(crate) use effects::{makes_record, move_refusal, no_record_refusal};
-pub(crate) use move_invariants::broken_invariant;
+pub(crate) use move_invariants::{broken_invariant, create_refusal};
 pub use sim_handler::EntityActorHandler;
 pub(crate) use snapshot_queue::SnapshotWriteQueue;
 pub use types::{

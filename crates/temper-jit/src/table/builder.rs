@@ -201,6 +201,12 @@ impl TransitionTable {
                 .invariants
                 .iter()
                 .filter_map(super::invariant::MoveInvariant::from_spec)
+                .chain(
+                    automaton
+                        .field_invariants
+                        .iter()
+                        .filter_map(super::invariant::MoveInvariant::from_field_invariant),
+                )
                 .collect(),
             rule_index,
         }

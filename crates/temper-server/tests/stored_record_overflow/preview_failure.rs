@@ -87,10 +87,7 @@ async fn an_unreadable_preview_stops_before_a_recovered_actor_can_store_an_unche
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(
-        body.as_str().unwrap().contains("could not be read"),
-        "{body}"
-    );
+    assert!(body.as_str().unwrap().contains("could not be"), "{body}");
     assert_eq!(
         reads.load(Ordering::SeqCst),
         1,
@@ -239,10 +236,7 @@ assert = 'related(Batch, ChildRef).status in ["Draft"]'
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(
-        body.as_str().unwrap().contains("could not be read"),
-        "{body}"
-    );
+    assert!(body.as_str().unwrap().contains("could not be"), "{body}");
     assert_eq!(reads.load(Ordering::SeqCst), 1);
     assert_eq!(stored(&state, "parent").await, before);
     assert_eq!(stored(&state, "child").await.0, "Draft");

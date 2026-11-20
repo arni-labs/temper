@@ -49,6 +49,27 @@ pub(crate) async fn try_process_action_with_blob_prestate(
         }
     }
     // Invariants read the same logical prestate as input constraints.
+    add_invariant_reads(state, table, &mut fields);
+    let mut fields = Value::Object(fields);
+    crate::blobs::hydrate_comparison_fields(&blob_source, &mut fields).await?;
+    Ok(process_action_with_xref_and_field_mode(
+        state,
+        table,
+        action,
+        params,
+        related,
+        mode,
+        Some(&fields),
+    ))
+}
+
+/// Add to `fields` each stored field value the type's invariants read that
+/// may hold a reference to a value stored out of line.
+pub(super) fn add_invariant_reads(
+    state: &EntityState,
+    table: &TransitionTable,
+    fields: &mut Map<String, Value>,
+) {
     for invariant in &table.invariants {
         invariant.assert.for_each_name(&mut |name| {
             if let temper_spec::predicate::Name::Var(name) = name
@@ -62,15 +83,4 @@ pub(crate) async fn try_process_action_with_blob_prestate(
             }
         });
     }
-    let mut fields = Value::Object(fields);
-    crate::blobs::hydrate_comparison_fields(&blob_source, &mut fields).await?;
-    Ok(process_action_with_xref_and_field_mode(
-        state,
-        table,
-        action,
-        params,
-        related,
-        mode,
-        Some(&fields),
-    ))
 }

@@ -1,12 +1,16 @@
-//! Check a move against its type's `[[invariant]]`s
-//! ([`temper_jit::table::invariant`]): refuse a move that would break one that
-//! held, and warn about those the record already breaks.
+//! Check a write against its type's `[[invariant]]`s and
+//! `[[field_invariant]]`s ([`temper_jit::table::invariant`]): refuse a move or
+//! field update that would break one that held, whoever makes it, and warn
+//! about those the record already breaks.
 
 use futures_util::FutureExt;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-use temper_jit::table::{EvalContext, Refusal, RelatedMap, TransitionTable};
+use temper_jit::table::{
+    ConstraintDetails, ConstraintKind, DeclaredAs, EvalContext, GuardFailure, MoveInvariant,
+    Refusal, RelatedMap, TransitionTable,
+};
 use temper_spec::predicate::Name;
 
 use super::types::EntityState;
@@ -74,25 +78,13 @@ impl InvariantsBefore {
         let across =
             table.invariants_across_move((&self.status, &self.ctx), (&state.status, &after));
         if let Some((invariant, failure)) = across.broken {
-            let mut message = format!(
-                "Action '{action}' from state '{}' would break invariant '{}': '{}' would be false",
-                self.status, invariant.name, failure.expr
-            );
-            if !failure.found.is_empty() {
-                let found: Vec<String> = failure
-                    .found
-                    .iter()
-                    .map(|(name, value)| format!("{name} = {value}"))
-                    .collect();
-                message.push_str(&format!(" ({})", found.join(", ")));
-            }
-            return Ok(Some((
-                message,
-                Refusal::InvariantViolated {
-                    invariant: invariant.name.clone(),
-                    assert: failure.expr,
-                    conditions: failure.conditions,
-                },
+            let write = format!("Action '{action}' from state '{}'", self.status);
+            return Ok(Some(broken_rule(
+                state,
+                invariant,
+                failure,
+                &write,
+                operation(action),
             )));
         }
         for (invariant, failure) in across.already_broken {
@@ -153,15 +145,94 @@ pub(crate) fn broken_invariant(state: &EntityState, table: &TransitionTable) -> 
         "invariant '{}': '{}' is false",
         invariant.name, failure.expr
     );
-    if !failure.found.is_empty() {
-        let found: Vec<String> = failure
-            .found
-            .iter()
-            .map(|(name, value)| format!("{name} = {value}"))
-            .collect();
-        message.push_str(&format!(" ({})", found.join(", ")));
+    if let Some(says) = &invariant.message {
+        message.push_str(&format!(" ({says})"));
     }
+    push_found(&mut message, &failure);
     Some(message)
+}
+
+/// Why a new record `state` may not be created: it would start out breaking
+/// one of its type's invariants. A create has no state before it, so every
+/// invariant must hold, as the verification cascade asks of a first state.
+pub(crate) fn create_refusal(
+    state: &EntityState,
+    table: &TransitionTable,
+) -> Option<(String, Refusal)> {
+    let ctx = invariant_context(state, table, &RelatedMap::new());
+    let (invariant, failure) = table.broken_invariant(&state.status, &ctx)?;
+    let write = format!("Creating it in state '{}'", state.status);
+    Some(broken_rule(state, invariant, failure, &write, "create"))
+}
+
+/// The label a write carries in a broken data rule: `patch` or `put` for a
+/// field update, `action` for a move.
+fn operation(action: &str) -> &'static str {
+    match action {
+        super::effects::FIELDS_UPDATED_EVENT => "patch",
+        super::effects::FIELDS_REPLACED_EVENT => "put",
+        _ => "action",
+    }
+}
+
+/// The answer to a `write` on `state` that `invariant` refuses. A field
+/// invariant answers as the broken data rule it always answered as, with the
+/// spec's message; an `[[invariant]]` names the failing part and the values
+/// the write would leave.
+fn broken_rule(
+    state: &EntityState,
+    invariant: &MoveInvariant,
+    failure: GuardFailure,
+    write: &str,
+    operation: &str,
+) -> (String, Refusal) {
+    if invariant.declared_as == DeclaredAs::FieldInvariant {
+        let message = invariant.message.clone().unwrap_or_else(|| {
+            format!(
+                "field invariant '{}' violated on {}('{}')",
+                invariant.name, state.entity_type, state.entity_id
+            )
+        });
+        let details = ConstraintDetails {
+            kind: ConstraintKind::FieldInvariant,
+            invariant: Some(invariant.name.clone()),
+            entity_type: state.entity_type.clone(),
+            entity_id: state.entity_id.clone(),
+            operation: operation.to_string(),
+        };
+        return (
+            message,
+            Refusal::ConstraintViolation {
+                details: Box::new(details),
+            },
+        );
+    }
+    let mut message = format!(
+        "{write} would break invariant '{}': '{}' would be false",
+        invariant.name, failure.expr
+    );
+    push_found(&mut message, &failure);
+    (
+        message,
+        Refusal::InvariantViolated {
+            invariant: invariant.name.clone(),
+            assert: failure.expr,
+            conditions: failure.conditions,
+        },
+    )
+}
+
+/// Add the values a failing part read to `message`.
+fn push_found(message: &mut String, failure: &GuardFailure) {
+    if failure.found.is_empty() {
+        return;
+    }
+    let found: Vec<String> = failure
+        .found
+        .iter()
+        .map(|(name, value)| format!("{name} = {value}"))
+        .collect();
+    message.push_str(&format!(" ({})", found.join(", ")));
 }
 
 /// The values the type's invariants read from `state`, and nothing else: a

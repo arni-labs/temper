@@ -12,11 +12,13 @@
 //! outcome into a reply.
 
 use serde_json::Value;
+use temper_jit::table::{Refusal, RelatedMap};
 use temper_runtime::persistence::PersistenceError;
 use temper_runtime::scheduler::sim_now;
 
 use super::actor::{EntityActor, ReplayLogging, ReplayPolicy};
 use super::effects;
+use super::move_invariants::InvariantsBefore;
 use super::types::{EntityEvent, EntityState, MAX_EVENTS_SINCE_SNAPSHOT};
 
 /// Attempts allowed after the first, matching the `Action` arm's ADR-0046 budget.
@@ -34,6 +36,60 @@ pub(super) enum NotUpdated {
     Failed(String),
     /// The store did not take the update's event.
     Store(PersistenceError),
+    /// The update would break one of the type's invariants
+    /// ([`InvariantsBefore`]); the caller replies with the refusal.
+    Refused(String, Refusal),
+}
+
+/// Apply `fields` to `state`, or refuse them and leave `state` as it was:
+/// a field update is held to the type's invariants as every move is, whoever
+/// sends it, so no write stores a record its spec forbids
+/// ([`InvariantsBefore`]). A field update reads no related record.
+async fn apply_checked(
+    actor: &EntityActor,
+    state: &mut EntityState,
+    fields: &Value,
+    replace: bool,
+    action: &str,
+) -> Result<(), NotUpdated> {
+    // The values the invariants read, each one an earlier write stored out
+    // of line read back and verified.
+    let names: std::collections::BTreeSet<String> = {
+        let table = actor.table.read().expect("table lock poisoned");
+        let mut reads = serde_json::Map::new();
+        super::action_input::add_invariant_reads(state, &table, &mut reads);
+        reads.into_iter().map(|(name, _)| name).collect()
+    };
+    let source = crate::blobs::BlobReadSource::Staged {
+        store: actor.blob_store.as_ref(),
+        legacy: actor.legacy_blob_store.as_deref(),
+        blobs: &[],
+    };
+    let logical = crate::blobs::resolve_stored_fields(&source, &state.fields, &names)
+        .await
+        .map_err(NotUpdated::Failed)?;
+    let table = actor.table.read().expect("table lock poisoned");
+    let related = RelatedMap::new();
+    let before = InvariantsBefore::of(state, &table, &related, logical.as_ref())
+        .map_err(NotUpdated::Failed)?;
+    let previous_fields = state.fields.clone();
+    // Bind the result: `debug_assert!` does not evaluate its argument in release
+    // builds, so asserting the call directly would skip the update in production.
+    let applied = effects::apply_field_update(state, fields, replace);
+    debug_assert!(
+        applied,
+        "object-ness was checked above; the apply cannot decline"
+    );
+    let Some(before) = before else {
+        return Ok(());
+    };
+    let refused = match before.refusal(state, &table, &related, action, &[]) {
+        Ok(None) => return Ok(()),
+        Ok(Some((reason, refusal))) => NotUpdated::Refused(reason, refusal),
+        Err(reason) => NotUpdated::Failed(reason),
+    };
+    state.fields = previous_fields;
+    Err(refused)
 }
 
 /// Apply a field update and make it durable, or refuse it.
@@ -101,13 +157,7 @@ pub(super) async fn commit_field_update(
     // from the NEW fields, then journal fail-closed: an update that is not
     // durable must not be acknowledged. Rolled back on failure.
     let mut previous_fields = state.fields.clone();
-    // Bind the result: `debug_assert!` does not evaluate its argument in release
-    // builds, so asserting the call directly would skip the update in production.
-    let applied = effects::apply_field_update(state, &fields, replace);
-    debug_assert!(
-        applied,
-        "object-ness was checked above; the apply cannot decline"
-    );
+    apply_checked(actor, state, &fields, replace, action).await?;
     let mut event = field_event(action, state, &fields);
     event.origin = super::EventOrigin::from_caller(caller);
 
@@ -161,11 +211,7 @@ pub(super) async fn commit_field_update(
                 // Re-apply onto the caught-up state and rebuild the event against
                 // its (possibly new) status.
                 previous_fields = state.fields.clone();
-                let applied = effects::apply_field_update(state, &fields, replace);
-                debug_assert!(
-                    applied,
-                    "object-ness was checked above; the apply cannot decline"
-                );
+                apply_checked(actor, state, &fields, replace, action).await?;
                 event = field_event(action, state, &fields);
                 event.origin = super::EventOrigin::from_caller(caller);
             }

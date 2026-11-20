@@ -144,6 +144,30 @@ pub(super) fn verification_gate_response(err: VerificationGateError) -> axum::re
     (StatusCode::LOCKED, axum::Json(body)).into_response()
 }
 
+/// Whether the record's own rules refused the write: a field invariant
+/// (`ConstraintViolation`) or an `[[invariant]]` (`InvariantViolated`).
+pub(super) fn refused_by_rule(response: &crate::entity_actor::EntityResponse) -> bool {
+    use temper_jit::table::Refusal;
+    matches!(
+        response.refusal,
+        Some(Refusal::ConstraintViolation { .. } | Refusal::InvariantViolated { .. })
+    )
+}
+
+/// The 409 answer to a write [`refused_by_rule`], with the refusal's fields.
+pub(super) fn rule_refusal_response(
+    response: &crate::entity_actor::EntityResponse,
+) -> axum::response::Response {
+    let refusal = response.refusal.as_ref();
+    odata_refusal(
+        refusal_status(refusal),
+        refusal.map_or("ConstraintViolation", |refusal| refusal.code()),
+        response.error.as_deref().unwrap_or_default(),
+        refusal,
+    )
+    .into_response()
+}
+
 pub(super) fn constraint_violation_response(err: ConstraintViolation) -> axum::response::Response {
     let refusal = err.refusal();
     odata_refusal(
@@ -170,6 +194,38 @@ pub(super) async fn run_write_prechecks(
         .check_record_to_store(write, record)
         .await
         .map_err(constraint_violation_response)
+}
+
+/// The fields a create stores, built as the actor builds its first state;
+/// a first state that breaks one of the type's invariants is answered as
+/// the broken rule (409 for a field invariant), whoever creates it.
+pub(super) fn created_record_or_refusal(
+    state: &ServerState,
+    tenant: &TenantId,
+    entity_type: &str,
+    entity_id: &str,
+    initial_fields: &serde_json::Value,
+) -> Result<serde_json::Value, axum::response::Response> {
+    let table = state
+        .transition_table_for_dispatch(tenant, entity_type)
+        .map_err(|error| {
+            odata_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "RegistryError",
+                &error.to_string(),
+            )
+            .into_response()
+        })?;
+    crate::state::write_record::created_record(entity_type, entity_id, &table, initial_fields)
+        .map_err(|(message, refusal)| {
+            odata_refusal(
+                refusal_status(Some(&refusal)),
+                refusal.code(),
+                &message,
+                Some(&refusal),
+            )
+            .into_response()
+        })
 }
 
 /// Resolve the parent of a `$value` path to `(set_name, entity_id)`.

@@ -1,9 +1,9 @@
 //! Integration tests for `[[field_invariant]]` enforcement on the OData write
 //! path.
 //!
-//! Exercises the full pipeline: `build_router` → `POST /tdata/...` →
-//! [`pre_upsert_field_invariant_checks`](temper_server::odata::constraints::pre_upsert_field_invariant_checks)
-//! → 409 `field_invariant` response. Uses a synthetic two-state entity
+//! Exercises the full pipeline: `build_router` → `POST /tdata/...` → the
+//! entity actor's invariant check, which every write runs whoever makes it →
+//! 409 `field_invariant` response. Uses a synthetic two-state entity
 //! (`Container`) built around the existing `Order` CSDL — `Order` has scalar
 //! string properties (`Currency`, `Notes`) that the invariants can key off
 //! without requiring a bespoke CSDL fixture.
@@ -250,10 +250,10 @@ async fn patch_that_satisfies_rule_is_allowed() {
     );
 }
 
+/// A field invariant is a rule over the record's own values, so the operator
+/// switch for checks that read other records does not turn it off.
 #[tokio::test]
-async fn field_invariant_bypass_respects_feature_flag() {
-    // When `cross_invariant_enforce` is false, the check is bypassed.
-    // This verifies the shared feature flag convention.
+async fn a_field_invariant_holds_with_cross_record_checks_off() {
     let mut state = build_state_with_field_invariant();
     state.cross_invariant_enforce = false;
     let (status, body) = post_order(
@@ -263,8 +263,12 @@ async fn field_invariant_bypass_respects_feature_flag() {
     .await;
     assert_eq!(
         status,
-        StatusCode::CREATED,
-        "with enforcement disabled, invariant should be bypassed: {body:?}"
+        StatusCode::CONFLICT,
+        "the field invariant held with cross-record checks off: {body:?}"
+    );
+    assert_eq!(
+        body["error"]["details"]["type"].as_str(),
+        Some("field_invariant")
     );
 }
 

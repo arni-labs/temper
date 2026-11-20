@@ -16,7 +16,6 @@ use tracing::instrument;
 
 use temper_jit::table::{ConstraintDetails, ConstraintKind, Refusal};
 use temper_runtime::tenant::TenantId;
-use temper_spec::FieldInvariant;
 use temper_spec::cross_invariant::{
     CrossInvariant, CrossInvariantOperator, InvariantKind, parse_related_field_assert,
 };
@@ -106,24 +105,6 @@ impl ConstraintViolation {
         operation: &str,
     ) -> Self {
         let kind = ConstraintKind::CrossInvariant;
-        Self::new(
-            kind,
-            Some(invariant),
-            message,
-            entity_type,
-            entity_id,
-            operation,
-        )
-    }
-
-    fn field_invariant(
-        invariant: &str,
-        message: impl Into<String>,
-        entity_type: &str,
-        entity_id: &str,
-        operation: &str,
-    ) -> Self {
-        let kind = ConstraintKind::FieldInvariant;
         Self::new(
             kind,
             Some(invariant),
@@ -597,85 +578,4 @@ fn extract_field_as_string(fields: &serde_json::Value, name: &str) -> Option<Str
         serde_json::Value::Number(n) => Some(n.to_string()),
         _ => None,
     }
-}
-
-/// The object field invariants are evaluated on: the record as it will be
-/// stored, with its properties (including `Status`) at the top level.
-fn field_invariant_view(fields: &serde_json::Value) -> serde_json::Value {
-    if fields.is_object() {
-        fields.clone()
-    } else {
-        serde_json::Value::Object(serde_json::Map::new())
-    }
-}
-
-/// Evaluate cross-field invariants declared on an entity's IOA spec against
-/// the record the write will store.
-///
-/// Runs between [`pre_upsert_relation_checks`] and
-/// [`post_write_invariant_checks`] in the write pipeline. Honours the
-/// `state.cross_invariant_enforce` feature flag so a single operator control
-/// governs all three constraint families. Iteration order follows the order
-/// declared in the spec; violations short-circuit on the first failing rule.
-#[instrument(skip_all, fields(otel.name = "constraint.pre_upsert_field_invariant_checks", tenant = %tenant, entity_type, entity_id, operation))]
-pub async fn pre_upsert_field_invariant_checks(
-    state: &ServerState,
-    tenant: &TenantId,
-    entity_type: &str,
-    entity_id: &str,
-    operation: &str,
-    fields: &serde_json::Value,
-) -> Result<(), ConstraintViolation> {
-    if !state.cross_invariant_enforce {
-        state.metrics.record_cross_bypass();
-        return Ok(());
-    }
-
-    // Snapshot the field invariants for this (tenant, entity_type). Keep the
-    // registry lock scope tight — we don't want to hold it across await points
-    // later in the function.
-    let invariants: Vec<FieldInvariant> = {
-        let registry = state.registry.read().unwrap(); // ci-ok: RwLock read — poisoned lock = prior panic, fail-fast correct
-        registry
-            .field_invariants_for(tenant, entity_type)
-            .unwrap_or_default()
-    };
-    if invariants.is_empty() {
-        return Ok(());
-    }
-
-    // A variable the record stores no value for reads as its declared
-    // initial value, as it does in every guard.
-    let view = ReadDefaults::for_entity(state, tenant, entity_type)
-        .fields_as_read(&field_invariant_view(fields));
-
-    for inv in invariants {
-        if inv.passes(&view) {
-            continue;
-        }
-        let message = inv.message.clone().unwrap_or_else(|| {
-            format!(
-                "field invariant '{}' violated on {}('{}')",
-                inv.name, entity_type, entity_id
-            )
-        });
-        state.metrics.record_cross_invariant_violation(
-            tenant.as_str(),
-            &inv.name,
-            "field_invariant",
-        );
-        tracing::warn!(
-            tenant = %tenant, entity_type, entity_id, invariant = %inv.name, operation,
-            "constraint violation: field invariant"
-        );
-        return Err(ConstraintViolation::field_invariant(
-            &inv.name,
-            message,
-            entity_type,
-            entity_id,
-            operation,
-        ));
-    }
-
-    Ok(())
 }

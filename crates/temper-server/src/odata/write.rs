@@ -23,8 +23,8 @@ use super::authz::{
 };
 use super::bindings::dispatch_bound_action;
 use super::common::{
-    constraint_violation_response, extract_key, resolve_entity_type, run_write_prechecks,
-    verification_gate_response,
+    constraint_violation_response, created_record_or_refusal, extract_key, refused_by_rule,
+    resolve_entity_type, rule_refusal_response, run_write_prechecks, verification_gate_response,
 };
 use super::constraints::{DeletePlan, plan_delete};
 use super::file_content::refuse_content_fields;
@@ -35,11 +35,11 @@ use super::stream_put::{handle_file_value_put, handle_stream_put, streamed_file_
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::entity_actor::EntityState;
 use crate::request_context::{AgentContext, extract_agent_context};
-use crate::response::{ODataResponse, odata_error, odata_refusal};
+use crate::response::{ODataResponse, odata_error, odata_refusal, refusal_status};
 use crate::state::batch_delete::BatchDeleteError;
 use crate::state::redecide::Redecide;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
-use crate::state::write_record::{RecordWrite, WriteCaller, created_record, field_update_record};
+use crate::state::write_record::{RecordWrite, WriteCaller, field_update_record};
 use crate::state::{CreateError, ServerState};
 
 type ODataWriteError = Box<axum::response::Response>;
@@ -382,17 +382,16 @@ async fn authorize_pg_mutation(
     Ok((actor_state, version))
 }
 
-/// The record a Postgres-runtime action stores: its actor's own handler run
-/// on a copy of `current`, with the status beside the fields as field
-/// invariants read it. `None` when the actor refuses the action and stores
-/// nothing.
-async fn pg_action_record(
+/// The state a Postgres-runtime action leaves: its actor's own handler run
+/// on a copy of `current`. `None` when the actor refuses the action and
+/// stores nothing.
+async fn pg_action_next(
     actor_sys: &temper_actor_runtime::ActorSystem,
     handle: &temper_actor_runtime::ActorHandle,
     current: &temper_actor_runtime::spec_actor::SpecActorState,
     action: &str,
     params: &serde_json::Value,
-) -> Result<Option<serde_json::Value>, ODataWriteError> {
+) -> Result<Option<temper_actor_runtime::spec_actor::SpecActorState>, ODataWriteError> {
     let internal = |message: String| {
         Box::new(
             odata_error(
@@ -411,10 +410,16 @@ async fn pg_action_record(
         Err(temper_actor_runtime::ActorError::Rejected(_)) => return Ok(None),
         Err(error) => return Err(internal(error.to_string())),
     };
-    let next: temper_actor_runtime::spec_actor::SpecActorState =
-        serde_json::from_slice(&next).map_err(|error| internal(error.to_string()))?;
-    let mut record = match next.fields {
-        serde_json::Value::Object(fields) => fields,
+    serde_json::from_slice(&next)
+        .map(Some)
+        .map_err(|error| internal(error.to_string()))
+}
+
+/// The record a Postgres-runtime state stores, with the status beside the
+/// fields as the record checks read it.
+fn pg_record(next: &temper_actor_runtime::spec_actor::SpecActorState) -> serde_json::Value {
+    let mut record = match &next.fields {
+        serde_json::Value::Object(fields) => fields.clone(),
         _ => serde_json::Map::new(),
     };
     for key in ["status", "Status"] {
@@ -423,7 +428,34 @@ async fn pg_action_record(
             serde_json::Value::String(next.status.clone()),
         );
     }
-    Ok(Some(serde_json::Value::Object(record)))
+    serde_json::Value::Object(record)
+}
+
+/// The first of the type's invariants a Postgres-runtime write breaks: one
+/// that held on the record its actor stored before the write and does not on
+/// the record it would store, read as the actor stores them (its fields,
+/// with the status beside them, each missing declared value read as its
+/// initial). That actor runs its own move code, which does not hold the
+/// record to them. Invariants that read another record are left out.
+fn pg_broken_rule<'t>(
+    table: &'t temper_jit::table::TransitionTable,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> Option<&'t temper_jit::table::MoveInvariant> {
+    let defaults = crate::odata::read_defaults::ReadDefaults::from_table(table);
+    let (before, after) = (
+        defaults.fields_as_read(before),
+        defaults.fields_as_read(after),
+    );
+    let holds = |record: &serde_json::Value, invariant: &temper_jit::table::MoveInvariant| {
+        let env = temper_spec::predicate::JsonEnv::new(record);
+        temper_spec::predicate::eval(&invariant.assert, &env) == temper_spec::predicate::Truth::True
+    };
+    table
+        .invariants
+        .iter()
+        .filter(|invariant| invariant.assert.cross_refs().is_empty())
+        .find(|invariant| holds(&before, invariant) && !holds(&after, invariant))
 }
 
 async fn authorize_existing_mutation(
@@ -619,16 +651,15 @@ pub async fn handle_odata_post(
                 return odata_error(StatusCode::BAD_REQUEST, "StrictActionContract", &error)
                     .into_response();
             }
-            let created_record = match state.transition_table_for_dispatch(&tenant, &entity_type) {
-                Ok(table) => created_record(&entity_type, &entity_id, &table, &initial_fields),
-                Err(error) => {
-                    return odata_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "RegistryError",
-                        &error.to_string(),
-                    )
-                    .into_response();
-                }
+            let created_record = match created_record_or_refusal(
+                &state,
+                &tenant,
+                &entity_type,
+                &entity_id,
+                &initial_fields,
+            ) {
+                Ok(record) => record,
+                Err(response) => return response,
             };
             let _commons_guardrail_lock = state.acquire_commons_write_guardrail_lock(&tenant).await;
 
@@ -1028,9 +1059,17 @@ pub async fn handle_odata_post(
                     }
                 }
                 let caller = WriteCaller::of_request(&security_ctx);
-                if state.action_record_checked(caller, &tenant, &entity_type, action_name) {
-                    // The record checked is the one this runtime's own actor stores.
-                    let record = match pg_action_record(
+                let checked =
+                    state.action_record_checked(caller, &tenant, &entity_type, action_name);
+                // This runtime's actor runs its own move code, which does not
+                // hold the record to its type's invariants: they are checked
+                // here on the state it would store.
+                let rules = state
+                    .transition_table_for_dispatch(&tenant, &entity_type)
+                    .ok()
+                    .filter(|table| !table.invariants.is_empty());
+                if checked || rules.is_some() {
+                    let next = match pg_action_next(
                         actor_sys,
                         &handle,
                         &actor_state,
@@ -1039,10 +1078,57 @@ pub async fn handle_odata_post(
                     )
                     .await
                     {
-                        Ok(record) => record,
+                        Ok(next) => next,
                         Err(response) => return *response,
                     };
-                    if let Some(record) = record
+                    if let (Some(next), Some(table)) = (&next, &rules)
+                        && let Some(invariant) =
+                            pg_broken_rule(table, &pg_record(&actor_state), &pg_record(next))
+                    {
+                        let (message, refusal) = if invariant.declared_as
+                            == temper_jit::table::DeclaredAs::FieldInvariant
+                        {
+                            let message = invariant.message.clone().unwrap_or_else(|| {
+                                format!(
+                                    "field invariant '{}' violated on {entity_type}('{key_str}')",
+                                    invariant.name
+                                )
+                            });
+                            let details = temper_jit::table::ConstraintDetails {
+                                kind: temper_jit::table::ConstraintKind::FieldInvariant,
+                                invariant: Some(invariant.name.clone()),
+                                entity_type: entity_type.clone(),
+                                entity_id: key_str.clone(),
+                                operation: "action".to_string(),
+                            };
+                            let refusal = temper_jit::table::Refusal::ConstraintViolation {
+                                details: Box::new(details),
+                            };
+                            (message, refusal)
+                        } else {
+                            let assert = invariant.assert.to_string();
+                            let message = format!(
+                                "Action '{action_name}' would break invariant '{}': '{assert}' \
+                                 would be false",
+                                invariant.name
+                            );
+                            let refusal = temper_jit::table::Refusal::InvariantViolated {
+                                invariant: invariant.name.clone(),
+                                assert,
+                                conditions: Vec::new(),
+                            };
+                            (message, refusal)
+                        };
+                        return odata_refusal(
+                            refusal_status(Some(&refusal)),
+                            refusal.code(),
+                            &message,
+                            Some(&refusal),
+                        )
+                        .into_response();
+                    }
+                    if checked
+                        && let Some(next) = &next
                         && let Err(violation) = state
                             .check_record_to_store(
                                 RecordWrite {
@@ -1053,7 +1139,7 @@ pub async fn handle_odata_post(
                                     action: action_name,
                                     operation: "action",
                                 },
-                                &record,
+                                &pg_record(next),
                             )
                             .await
                     {
@@ -1334,6 +1420,7 @@ pub async fn handle_odata_patch(
                         }
                         .into_response()
                     }
+                    Ok(response) if refused_by_rule(&response) => rule_refusal_response(&response),
                     Ok(response) if response.store_unavailable => {
                         crate::write_health::store_unavailable(
                             response
@@ -1595,6 +1682,7 @@ pub async fn handle_odata_put(
                         }
                         .into_response()
                     }
+                    Ok(response) if refused_by_rule(&response) => rule_refusal_response(&response),
                     Ok(response) if response.store_unavailable => {
                         crate::write_health::store_unavailable(
                             response

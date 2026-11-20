@@ -355,6 +355,48 @@ async fn records_that_differ_only_in_what_an_invariant_reads_are_tried_apart() {
     assert!(!refused.contains("p1"), "p1 is small: {refused}");
 }
 
+/// No record may hold values its spec forbids: a version that adds a rule a
+/// stored record breaks where it stands is refused, naming the record, unless
+/// a `[[carry]]` moves it to values the rule allows. A record that keeps the
+/// rule does not stop it.
+#[tokio::test]
+async fn a_new_field_invariant_stored_records_break_is_refused_unless_carried() {
+    let places = Fixture::new("forbids").await;
+    places.install(PLACE).await.expect("first version");
+    places.placed("p1").await;
+    places.create("p2").await;
+    let forbids_c1 = format!(
+        "{PLACE}\n[[field_invariant]]\nname = \"NoFirstCommit\"\n\
+         message = \"c1 is withdrawn\"\nassert = \"commit != 'c1'\"\n"
+    );
+
+    let refused = places
+        .install(&forbids_c1)
+        .await
+        .expect_err("p1 was brought to c1, which the new rule forbids");
+    assert!(
+        refused.contains("NoFirstCommit") && refused.contains("p1"),
+        "{refused}"
+    );
+    assert!(!refused.contains("p2"), "p2 holds no commit: {refused}");
+
+    places
+        .install(&format!(
+            "{forbids_c1}\n[[carry]]\nfrom = \"Placed\"\nset = {{ commit = \"c2\" }}\n"
+        ))
+        .await
+        .expect("the carry moves p1 to a commit the rule allows");
+    places.carry().await;
+    let p1 = places
+        .state
+        .server
+        .get_tenant_entity_state(&places.tenant, "Place", "p1")
+        .await
+        .expect("read p1")
+        .state;
+    assert_eq!(p1.fields["commit"], "c2", "{:?}", p1.fields);
+}
+
 /// The shape under test: a new counter, and a constraint on an existing
 /// action that reads it. A missing declared counter reads as its initial
 /// value (temper #167), so the stored place can still Bring.

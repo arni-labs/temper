@@ -4,7 +4,8 @@
 //! A new version may change anything, so long as no stored record is left
 //! with no way forward: in a state the version drops, or in a state where
 //! moves start and none is possible for the record's values though one was
-//! under the installed version. The version says where such records go with
+//! under the installed version, or holding values an invariant the version
+//! adds or changes forbids. The version says where such records go with
 //! `[[carry]]` sections. Before anything is written, each carry is tried on
 //! each record it applies to with the move code every move runs
 //! ([`process_action`]): the carried record must hold to the new version's
@@ -15,7 +16,9 @@
 //! Records are read once per type, and only in the states a change can
 //! affect: those the version drops, those a move with changed conditions
 //! starts from ([`TransitionTable::move_conditions`]), and those a carry of
-//! either version starts from ([`reads`]). One grouped catalog query covers
+//! either version starts from ([`reads`]), and every state when the version
+//! adds or changes an invariant the record alone can answer
+//! ([`TransitionTable::newly_broken_invariant`]). One grouped catalog query covers
 //! each record whose catalog row is current; each other record is read on
 //! its own. A carry is tried on one record of each group.
 //!
@@ -193,24 +196,30 @@ impl ServerState {
     ) {
         let (old, new) = checked.tables;
         let entity_type = change.entity_type.as_str();
-        // Whether a stored record's moves keep a new invariant depends on
-        // their effects and the caller's parameters, which the check does
-        // not have; each such move is checked when it is made.
+        // An invariant that reads another record cannot be answered from the
+        // stored record alone; a move that would break it is refused when it
+        // is made. One the record alone answers is checked against the
+        // records stored in every state below.
         for invariant in &new.invariants {
-            if !old
-                .invariants
-                .iter()
-                .any(|before| before.name == invariant.name && before.assert == invariant.assert)
+            if invariant.assert.cross_refs().is_empty()
+                || old.invariants.iter().any(|before| {
+                    before.name == invariant.name && before.assert == invariant.assert
+                })
             {
-                plan.warnings.push(format!(
-                    "{entity_type}: invariant '{}' is new or changed. Stored records are not \
-                     checked against it; a move that would break it is refused when it is made",
-                    invariant.name
-                ));
+                continue;
             }
+            plan.warnings.push(format!(
+                "{entity_type}: invariant '{}' is new or changed and reads another record, so \
+                 stored records are not checked against it; a move that would break it is \
+                 refused when it is made",
+                invariant.name
+            ));
         }
         let carries = change.proposed.carry_moves();
-        let statuses = affected_states(old, new, &carries);
+        let mut statuses = affected_states(old, new, &carries);
+        if new.adds_record_invariant(old) {
+            statuses.extend(old.states.iter().chain(&new.states).cloned());
+        }
         if statuses.is_empty() {
             return;
         }
@@ -244,10 +253,56 @@ impl ServerState {
         let mut carried: BTreeMap<String, Carried<'_>> = BTreeMap::new();
         let mut stuck: BTreeMap<String, (Standing, Vec<String>)> = BTreeMap::new();
         let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut forbidden: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let waits_for = carry_moves(old);
         for group in groups {
             let before = old.stored_context(&group.values);
             let after = new.stored_context(&group.values);
+            let carry = carries.iter().find(|(action, carry)| {
+                carry.from == group.status && new.blocked(&group.status, &after, action).is_none()
+            });
+            // No record may hold values its spec forbids. A carry from where
+            // it stands that selects it moves it out (the background pass
+            // plans with the installed version on both sides, so it carries
+            // any record breaking a rule, not only newly); a record the new
+            // version newly forbids with no carry stops the install.
+            let serves_here = new.states.contains(&group.status);
+            if let Some((action, carry)) = carry
+                && serves_here
+                && new.broken_invariant(&group.status, &after).is_some()
+            {
+                carried
+                    .entry(action.clone())
+                    .or_insert_with(|| Carried {
+                        status: group.status.clone(),
+                        action: action.clone(),
+                        carry,
+                        groups: Vec::new(),
+                    })
+                    .groups
+                    .push(group.ids);
+                continue;
+            }
+            let breaks = serves_here
+                .then(|| new.newly_broken_invariant(old, &group.status, (&after, &before)))
+                .flatten();
+            if let Some((invariant, failure)) = breaks {
+                let found: Vec<String> = failure
+                    .found
+                    .iter()
+                    .map(|(name, value)| format!("{name} = {value}"))
+                    .collect();
+                let note = format!(
+                    "{entity_type} in {}: these records break invariant '{}', which the new \
+                     version adds or changes ('{}' is false: {}), and no [[carry]] moves them",
+                    group.status,
+                    invariant.name,
+                    failure.expr,
+                    found.join(", ")
+                );
+                forbidden.entry(note).or_default().extend(group.ids);
+                continue;
+            }
             // A record a carry of the installed version selects waits for
             // it: the carry is its way forward, so a new version must carry
             // it too.
@@ -291,9 +346,6 @@ impl ServerState {
                     was == Standing::Free
                 }
             };
-            let carry = carries.iter().find(|(action, carry)| {
-                carry.from == group.status && new.blocked(&group.status, &after, action).is_none()
-            });
             if let Some((action, carry)) = carry {
                 carried
                     .entry(action.clone())
@@ -322,6 +374,9 @@ impl ServerState {
         }
         for (note, ids) in notes {
             plan.warnings.push(answer::with_records(&note, &ids));
+        }
+        for (note, ids) in forbidden {
+            refused.reasons.push(answer::with_records(&note, &ids));
         }
         for (status, (now, mut ids)) in stuck {
             ids.sort();
