@@ -350,7 +350,9 @@ async fn ingest_raw_inner(
         entity_type,
         &expected_object_id,
         &initial_fields,
-    ) {
+    )
+    .await
+    {
         return *response;
     }
     let final_guard = state.acquire_commons_write_guardrail_lock(&tenant).await;

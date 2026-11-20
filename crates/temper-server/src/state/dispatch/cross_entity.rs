@@ -338,12 +338,13 @@ impl crate::state::ServerState {
             Err(error) => return Attempt::StoreFailed(error),
         };
         let created = match self
-            .get_or_create_tenant_entity_by(
+            .spawn_tenant_entity(
                 tenant,
                 child_type,
                 child_id,
                 child.initial_fields.clone(),
                 &creator,
+                child.initializer.as_ref(),
             )
             .await
         {

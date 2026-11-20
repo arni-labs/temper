@@ -1386,6 +1386,46 @@ impl ServerState {
         )
     }
 
+    /// Why the record `entity_id` may not be created with `initial_fields`:
+    /// its first state would break one of its type's invariants, as every
+    /// write is checked whoever makes it. A spawn's first state is the one
+    /// after `then`, its initializer, when the initializer can be made on it.
+    /// A record that exists is not created again, so it is not refused.
+    pub(crate) async fn first_state_refusal(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        initial_fields: &serde_json::Value,
+        then: Option<(&str, &serde_json::Value)>,
+    ) -> Option<String> {
+        if self.entity_exists(tenant, entity_type, entity_id) {
+            return None;
+        }
+        let table = {
+            let registry = self.registry.read().unwrap();
+            registry.get_table_live(tenant, entity_type)?
+        };
+        let table = table
+            .read()
+            .expect("transition table lock poisoned")
+            .clone();
+        if table.invariants.is_empty() {
+            return None;
+        }
+        super::write_record::created_record(
+            self,
+            tenant,
+            (entity_type, entity_id),
+            &table,
+            initial_fields,
+            then,
+        )
+        .await
+        .err()
+        .map(super::write_record::CreateRefused::reason)
+    }
+
     /// Create a new entity with initial fields and return its state.
     pub async fn get_or_create_tenant_entity(
         &self,
@@ -1394,7 +1434,7 @@ impl ServerState {
         entity_id: &str,
         initial_fields: serde_json::Value,
     ) -> Result<EntityResponse, CreateError> {
-        self.create_tenant_entity(tenant, entity_type, entity_id, initial_fields, None)
+        self.create_tenant_entity(tenant, entity_type, entity_id, initial_fields, None, None)
             .await
     }
 
@@ -1417,6 +1457,29 @@ impl ServerState {
             entity_id,
             initial_fields,
             Some(created_by),
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::get_or_create_tenant_entity_by`] for a child a move spawns,
+    /// whose first state is the one after `initializer`.
+    pub(crate) async fn spawn_tenant_entity(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        initial_fields: serde_json::Value,
+        created_by: &AgentContext,
+        initializer: Option<&(String, serde_json::Value)>,
+    ) -> Result<EntityResponse, CreateError> {
+        self.create_tenant_entity(
+            tenant,
+            entity_type,
+            entity_id,
+            initial_fields,
+            Some(created_by),
+            initializer.map(|(action, params)| (action.as_str(), params)),
         )
         .await
     }
@@ -1429,6 +1492,7 @@ impl ServerState {
         entity_id: &str,
         initial_fields: serde_json::Value,
         created_by: Option<&AgentContext>,
+        then: Option<(&str, &serde_json::Value)>,
     ) -> Result<EntityResponse, CreateError> {
         self.check_created_event(tenant, entity_type, entity_id, &initial_fields)
             .map_err(|e| match e {
@@ -1437,6 +1501,12 @@ impl ServerState {
                 }
                 e => CreateError::Failed(e.to_string()),
             })?;
+        if let Some(reason) = self
+            .first_state_refusal(tenant, entity_type, entity_id, &initial_fields, then)
+            .await
+        {
+            return Err(CreateError::Failed(reason));
+        }
         let actor_ref = self
             .get_or_spawn_tenant_actor_created_by(
                 tenant,
@@ -1544,6 +1614,12 @@ impl ServerState {
         table.validate_initial_fields(&initial_fields)?;
         if !table.rules.is_empty() {
             return Ok(None);
+        }
+        if let Some(reason) = self
+            .first_state_refusal(tenant, entity_type, entity_id, &initial_fields, None)
+            .await
+        {
+            return Err(reason);
         }
 
         let Some((store, backend)) = self.event_journal() else {

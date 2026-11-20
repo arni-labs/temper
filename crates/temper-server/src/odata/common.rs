@@ -199,7 +199,7 @@ pub(super) async fn run_write_prechecks(
 /// The fields a create stores, built as the actor builds its first state;
 /// a first state that breaks one of the type's invariants is answered as
 /// the broken rule (409 for a field invariant), whoever creates it.
-pub(super) fn created_record_or_refusal(
+pub(super) async fn created_record_or_refusal(
     state: &ServerState,
     tenant: &TenantId,
     entity_type: &str,
@@ -218,18 +218,30 @@ pub(super) fn created_record_or_refusal(
                 .into_response(),
             )
         })?;
-    crate::state::write_record::created_record(entity_type, entity_id, &table, initial_fields)
-        .map_err(|(message, refusal)| {
-            Box::new(
-                odata_refusal(
-                    refusal_status(Some(&refusal)),
-                    refusal.code(),
-                    &message,
-                    Some(&refusal),
-                )
-                .into_response(),
+    crate::state::write_record::created_record(
+        state,
+        tenant,
+        (entity_type, entity_id),
+        &table,
+        initial_fields,
+        None,
+    )
+    .await
+    .map_err(|refused| {
+        Box::new(match refused {
+            crate::state::write_record::CreateRefused::Broken(message, refusal) => odata_refusal(
+                refusal_status(Some(&refusal)),
+                refusal.code(),
+                &message,
+                Some(&refusal),
             )
+            .into_response(),
+            crate::state::write_record::CreateRefused::Unreadable(error) => {
+                odata_error(StatusCode::INTERNAL_SERVER_ERROR, "StorageError", &error)
+                    .into_response()
+            }
         })
+    })
 }
 
 /// Resolve the parent of a `$value` path to `(set_name, entity_id)`.

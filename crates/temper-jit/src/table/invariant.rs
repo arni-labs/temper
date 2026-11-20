@@ -183,6 +183,19 @@ impl TransitionTable {
             })
     }
 
+    /// The names this version's invariants read.
+    pub fn invariant_names(&self) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+        for invariant in &self.invariants {
+            invariant.assert.for_each_name(&mut |name| {
+                if let Name::Var(name) = name {
+                    names.insert(name.to_string());
+                }
+            });
+        }
+        names
+    }
+
     /// Whether this version adds or changes an invariant from `installed`
     /// that a stored record alone can answer.
     pub fn adds_record_invariant(&self, installed: &TransitionTable) -> bool {

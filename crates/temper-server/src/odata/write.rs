@@ -679,7 +679,9 @@ pub async fn handle_odata_post(
                 &entity_type,
                 &entity_id,
                 &initial_fields,
-            ) {
+            )
+            .await
+            {
                 Ok(record) => record,
                 Err(response) => return *response,
             };

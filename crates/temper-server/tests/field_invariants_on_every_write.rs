@@ -402,3 +402,39 @@ async fn a_field_update_cannot_set_a_counter_its_rules_read() {
         .expect("the counter's own value is no change");
     assert!(response.success, "{:?}", response.error);
 }
+
+/// A record the kernel creates is held to the type's rules as one a person
+/// creates: its first state may not break them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_the_kernel_creates_cannot_start_out_breaking_a_field_invariant() {
+    let state = state_with(WATCH, "field-invariant-create");
+    let refused = state
+        .get_or_create_tenant_entity(
+            &TenantId::default(),
+            "Order",
+            "msft",
+            json!({"checked_n": 4, "quiet_n": 9}),
+        )
+        .await
+        .expect_err("the create stored quiet 9 of 4 checked");
+    let refused = refused.to_string();
+    assert!(
+        refused.contains(INVARIANT) || refused.contains("quiet readings are among those checked"),
+        "{refused}"
+    );
+    assert!(
+        !state.entity_exists(&TenantId::default(), "Order", "msft"),
+        "a refused create leaves no record"
+    );
+
+    state
+        .get_or_create_tenant_entity(
+            &TenantId::default(),
+            "Order",
+            "msft",
+            json!({"checked_n": 4, "quiet_n": 2}),
+        )
+        .await
+        .expect("a first state that keeps the rule is created");
+    assert_eq!(counts(&state, "msft").await, (4, 2));
+}

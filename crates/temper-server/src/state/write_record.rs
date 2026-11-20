@@ -306,20 +306,67 @@ impl ServerState {
     }
 }
 
+/// Why a create is refused.
+pub(crate) enum CreateRefused {
+    /// Its first state would break one of the type's invariants.
+    Broken(String, temper_jit::table::Refusal),
+    /// A value it holds out of line could not be read back to check it.
+    Unreadable(String),
+}
+
+impl CreateRefused {
+    /// What the refusal says.
+    pub(crate) fn reason(self) -> String {
+        match self {
+            Self::Broken(reason, _) | Self::Unreadable(reason) => reason,
+        }
+    }
+}
+
 /// The fields a create stores: the initial fields as the actor builds its
-/// first state from them. Refused when that first state would break one of
-/// the type's invariants, whoever creates it
-/// ([`crate::entity_actor::create_refusal`]).
-pub(crate) fn created_record(
-    entity_type: &str,
-    entity_id: &str,
+/// first state from them. A spawn's first state is the one after `then`, its
+/// initializer, when the initializer can be made on it. Refused when that
+/// first state would break one of the type's invariants, whoever creates it
+/// ([`crate::entity_actor::create_refusal`]), read with each value held out
+/// of line read back, never compared as its reference.
+pub(crate) async fn created_record(
+    state: &ServerState,
+    tenant: &TenantId,
+    (entity_type, entity_id): (&str, &str),
     table: &TransitionTable,
     initial_fields: &Value,
-) -> Result<Value, (String, temper_jit::table::Refusal)> {
-    let state = EntityActor::build_initial_state(entity_type, entity_id, table, initial_fields);
-    match crate::entity_actor::create_refusal(&state, table) {
-        Some(refused) => Err(refused),
-        None => Ok(state.fields),
+    then: Option<(&str, &Value)>,
+) -> Result<Value, CreateRefused> {
+    let fields = effects::sanitize_action_params(initial_fields);
+    let mut first = EntityActor::build_initial_state(entity_type, entity_id, table, &fields);
+    if let Some((action, params)) = then {
+        let mut after = first.clone();
+        let moved = crate::entity_actor::process_action_with_xref(
+            &mut after,
+            table,
+            action,
+            params,
+            &RelatedMap::new(),
+        );
+        if moved.success {
+            first = after;
+        }
+    }
+    let source = crate::blobs::BlobReadSource::Tenant { state, tenant };
+    // Boxed: the blob read's future is too deep for the write paths' `Send`
+    // checks.
+    let resolved =
+        crate::blobs::resolve_stored_fields(&source, &first.fields, &table.invariant_names())
+            .boxed()
+            .await
+            .map_err(CreateRefused::Unreadable)?;
+    let checked = resolved.map(|fields| EntityState {
+        fields,
+        ..first.clone()
+    });
+    match crate::entity_actor::create_refusal(checked.as_ref().unwrap_or(&first), table) {
+        Some((reason, refusal)) => Err(CreateRefused::Broken(reason, refusal)),
+        None => Ok(first.fields),
     }
 }
 

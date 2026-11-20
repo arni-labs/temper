@@ -1,6 +1,6 @@
 //! The dry run of one carry on the records it applies to, before the swap.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde_json::Value;
 use temper_authz::AuthzEngine;
@@ -72,7 +72,7 @@ impl ServerState {
             // The rules read the record's values, never the references to
             // those an earlier write stored out of line, as a move reads them.
             match self
-                .stored_values_read(tenant, &record.fields, &invariant_names(new))
+                .stored_values_read(tenant, &record.fields, &new.invariant_names())
                 .await
             {
                 Ok(fields) => record.fields = Value::Object(fields.into_iter().collect()),
@@ -228,17 +228,4 @@ fn way_forward(
             record.status
         )),
     }
-}
-
-/// The names the version's invariants read.
-fn invariant_names(table: &TransitionTable) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    for invariant in &table.invariants {
-        invariant.assert.for_each_name(&mut |name| {
-            if let temper_spec::predicate::Name::Var(name) = name {
-                names.insert(name.to_string());
-            }
-        });
-    }
-    names
 }

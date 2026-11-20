@@ -446,3 +446,4 @@ async fn concurrent_declared_bytes_cannot_exceed_budget() {
 }
 
 mod failure_and_streaming;
+mod invariants;
