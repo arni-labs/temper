@@ -263,9 +263,9 @@ async fn a_trigger_aimed_at_a_record_that_does_not_exist_fails_where_its_sender_
     assert_eq!(failures.len(), 1, "{failed}");
     let failure = failures[0].as_str().unwrap();
     assert!(failure.contains("fix"), "it names the trigger: {failure}");
-    assert!(
-        failure.contains("Shipment 'abc123' does not exist"),
-        "it says the record is missing: {failure}"
+    assert_eq!(
+        failure, "Line:Fail:fix: the Shipment it names does not exist, and Fix does not make one",
+        "it says the record is missing, and not which id: the id may come from a record the sender cannot read"
     );
     // No empty record was made for the id.
     assert_eq!(
@@ -329,7 +329,7 @@ async fn a_trigger_aimed_at_a_record_that_does_not_exist_fails_where_its_sender_
         .unwrap_or_else(|| panic!("the sender is told: {again}"));
     assert_eq!(
         failure,
-        "Line:Fail:fix: Shipment 'made' did not take Fix: not possible from the state it is in",
+        "Line:Fail:fix: its Shipment did not take Fix: not possible from the state it is in",
         "the sender may not be allowed to read the shipment, so its state is not named"
     );
     assert_eq!(
@@ -345,7 +345,7 @@ async fn a_trigger_aimed_at_a_record_that_does_not_exist_fails_where_its_sender_
     let said = first["@temper.triggerFailures"].clone();
     assert_eq!(
         said,
-        json!(["Line:Fail:fix: Shipment 'nowhere' does not exist, and Fix does not make one"]),
+        json!(["Line:Fail:fix: the Shipment it names does not exist, and Fix does not make one"]),
         "{first}"
     );
     let (status, retried) = act_keyed(&app, "Lines", "line-4", "Fail", body, "k1").await;

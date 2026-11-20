@@ -1,10 +1,12 @@
 //! What a move's sender is told about a reaction of it that was not made.
 //!
-//! The sender may not be allowed to read the reaction's target, so the
-//! sentence names only what the rule itself names (the target's type, the id
-//! the rule resolved and the move) and the kind of reason. It never carries
-//! the target's state, its values, a guard's words or a policy's: those are in
-//! the kernel's log line and in the source record's observe event.
+//! The sender may not be allowed to read the reaction's target, nor the
+//! record the target's id was read from (a reaction of a reaction reads it
+//! from a record the sender never touched). So the sentence names only what
+//! the spec names (the rule, the target's type and the move) and the kind of
+//! reason. It never carries the target's id, its state, its values, a guard's
+//! words or a policy's: those are in the kernel's log line and in the source
+//! record's observe event.
 
 use crate::entity_actor::EntityResponse;
 use temper_jit::table::Refusal;
@@ -25,12 +27,15 @@ pub(super) enum Why {
 }
 
 impl Why {
-    /// Why the target refused the move it was sent. `target_existed`: whether
-    /// the target was there when the reaction read it.
-    pub(super) fn of(response: &EntityResponse, target_existed: bool) -> Self {
+    /// Why the target refused the move it was sent, read from the dispatch's
+    /// own answer: a record that was never written (no event) or that the
+    /// kernel deleted is missing. Whether the record existed is not taken from
+    /// an earlier read of it, which a record made in between would contradict.
+    pub(super) fn of(response: &EntityResponse) -> Self {
+        let never_written = response.state.sequence_nr == 0;
         match &response.refusal {
             _ if response.state.is_tombstoned() => Self::Missing,
-            Some(Refusal::InvalidState { .. }) if !target_existed => Self::Missing,
+            Some(Refusal::InvalidState { .. }) if never_written => Self::Missing,
             Some(Refusal::InvalidState { .. }) => Self::State,
             Some(Refusal::GuardFailed { .. }) => Self::Guard,
             _ => Self::Other,
@@ -50,18 +55,19 @@ impl Why {
 }
 
 /// The sentence for a move the target did not take.
-pub(super) fn not_made(entity_type: &str, entity_id: &str, action: &str, why: Why) -> String {
-    let target = format!("{entity_type} '{entity_id}'");
+pub(super) fn not_made(entity_type: &str, action: &str, why: Why) -> String {
     match why {
-        Why::Missing => format!("{target} does not exist, and {action} does not make one"),
+        Why::Missing => {
+            format!("the {entity_type} it names does not exist, and {action} does not make one")
+        }
         Why::State => {
-            format!("{target} did not take {action}: not possible from the state it is in")
+            format!("its {entity_type} did not take {action}: not possible from the state it is in")
         }
         Why::Guard => {
-            format!("{target} did not take {action}: a condition of the move did not hold")
+            format!("its {entity_type} did not take {action}: a condition of the move did not hold")
         }
-        Why::Withheld => format!("{target} did not take {action}: not permitted"),
-        Why::Other => format!("{target} did not take {action}"),
+        Why::Withheld => format!("its {entity_type} did not take {action}: not permitted"),
+        Why::Other => format!("its {entity_type} did not take {action}"),
     }
 }
 

@@ -88,15 +88,9 @@ impl Reaction {
     /// agents watch it, as well as in the log. The refused dispatch wrote its
     /// own trajectory entry.
     ///
-    /// `target_existed`: whether the target record existed when the reaction
-    /// was tried. A move that cannot make the record, aimed at one that does
-    /// not exist, is counted as `missing`.
-    pub(super) fn record_refused(
-        &self,
-        state: &ServerState,
-        response: &EntityResponse,
-        target_existed: bool,
-    ) {
+    /// A move that cannot make the record, aimed at one that does not exist,
+    /// is counted as `missing` ([`super::said::Why::of`]).
+    pub(super) fn record_refused(&self, state: &ServerState, response: &EntityResponse) {
         let sent = &self.sent;
         let cause = self
             .authorized_as
@@ -148,7 +142,7 @@ impl Reaction {
             tenant,
             &sent.entity_type,
             &sent.action,
-            super::said::Why::of(response, target_existed).label(),
+            super::said::Why::of(response).label(),
         );
     }
 }

@@ -298,12 +298,11 @@ impl ReactionDispatcher {
             let said = |why| {
                 Some(super::said::not_made(
                     &rule.then.entity_type,
-                    &target_entity_id,
                     &rule.then.action,
                     why,
                 ))
             };
-            let (dispatch_result, target_existed) = match tried {
+            let dispatch_result = match tried {
                 ReactionTry::Unread(e) => {
                     tracing::warn!(
                         rule = rule.name,
@@ -337,7 +336,7 @@ impl ReactionDispatcher {
                     });
                     continue;
                 }
-                ReactionTry::Sent(reply, target_existed) => (*reply, target_existed),
+                ReactionTry::Sent(reply) => *reply,
             };
             fired_count += 1;
 
@@ -359,7 +358,7 @@ impl ReactionDispatcher {
                         said: if response.success {
                             None
                         } else {
-                            said(super::said::Why::of(&response, target_existed))
+                            said(super::said::Why::of(&response))
                         },
                         depth,
                     });
