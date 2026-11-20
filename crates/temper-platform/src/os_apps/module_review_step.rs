@@ -116,16 +116,21 @@ impl ReviewAnswer {
     }
 }
 
-/// A review under way beside the install.
+/// A review under way beside the install, or only the installed version's sources to keep ([`keep_installed`]):
+/// that is no review to ask about, so it names none, and is kept only once the install succeeds, as a review is.
 #[derive(Default)]
 pub(super) struct PendingReview {
-    left: Option<(ReviewAsked, ReviewAnswer)>,
+    asked: Option<ReviewAsked>,
+    answer: Option<ReviewAnswer>,
 }
 
 impl PendingReview {
     /// Pass the review to the caller that decides whether the whole install succeeded.
     pub(super) fn left_running(self) -> (Vec<ReviewAsked>, Vec<ReviewAnswer>) {
-        self.left.into_iter().unzip()
+        (
+            self.asked.into_iter().collect(),
+            self.answer.into_iter().collect(),
+        )
     }
 }
 
@@ -147,8 +152,12 @@ pub(super) async fn start(
     bundle: &AppBundle,
     wasm: bool,
 ) -> PendingReview {
-    if !wasm || bundle.wasm_modules.is_empty() {
+    if bundle.wasm_modules.is_empty() {
         return PendingReview::default();
+    }
+    // An install that puts no module leaves the installed ones as they are: the bundle's own, by their digest.
+    if !wasm {
+        return keep_installed(state, tenant, app_name, app_dir, bundle).await;
     }
     let specs = specs_of(bundle);
     let changed: Vec<String> = changed_modules(state, tenant, app_name, bundle, &specs)
@@ -157,7 +166,7 @@ pub(super) async fn start(
         .map(|(module, _)| module)
         .collect();
     if changed.is_empty() {
-        return PendingReview::default();
+        return keep_installed(state, tenant, app_name, app_dir, bundle).await;
     }
     let reviewer = state.module_reviewer.get().cloned();
     let mut said = Vec::new();
@@ -183,7 +192,7 @@ pub(super) async fn start(
         }
     }
     if modules.is_empty() && said.is_empty() {
-        return PendingReview::default();
+        return keep_installed(state, tenant, app_name, app_dir, bundle).await;
     }
     let asked: Vec<String> = modules.iter().map(|module| module.module.clone()).collect();
     let version = version_of(app_dir, tenant, app_name, bundle);
@@ -249,18 +258,82 @@ pub(super) async fn start(
         abort: task.abort_handle(),
     });
     PendingReview {
-        left: Some((
-            ReviewAsked {
-                app: app_name.to_string(),
-                version,
-                modules: changed,
-            },
-            ReviewAnswer {
-                said: answer,
-                asked,
-                publication,
-            },
-        )),
+        asked: Some(ReviewAsked {
+            app: app_name.to_string(),
+            version,
+            modules: changed,
+        }),
+        answer: Some(ReviewAnswer {
+            said: answer,
+            asked,
+            publication,
+        }),
+    }
+}
+
+/// Keep the installed version's module sources and sentences when the app's kept review holds none, for an install
+/// that reviews nothing. The next version's refusal compares its lines with these ([`SOURCES`]); with none, every
+/// finding refuses, on lines the author never touched. A review keeps them for every version whose module it read, so
+/// only an app whose kept review predates them (or that has none) lacks them, and an install that changes no module
+/// would otherwise never give them. The advice kept stays as it was. Kept, like a review, only once the whole install
+/// succeeds; it stops no review under way, which keeps the same sources, its module's code being as installed.
+async fn keep_installed(
+    state: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+    app_dir: &Path,
+    bundle: &AppBundle,
+) -> PendingReview {
+    let Some(store) = state
+        .server
+        .storage_stack
+        .as_ref()
+        .and_then(|stack| stack.platform.clone())
+    else {
+        return PendingReview::default();
+    };
+    let row = match store.load_module_review(tenant, app_name).await {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::warn!(error = %error, app = %app_name, "module review: the kept review could not be read");
+            return PendingReview::default();
+        }
+    };
+    let mut kept = row
+        .and_then(|row| serde_json::from_str::<serde_json::Value>(&row.result).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| json!({ "warnings": [], "modules_reviewed": [] }));
+    if kept.get(SOURCES).is_some() && kept.get(SENTENCES).is_some() {
+        return PendingReview::default();
+    }
+    kept[SENTENCES] = json!(sentences_of(bundle));
+    kept[SOURCES] = json!(sources_of(app_dir, bundle));
+    let version = version_of(app_dir, tenant, app_name, bundle);
+    // Nothing was reviewed: a caller that waits is told so at once.
+    let (_, said) = watch::channel(Some(ReviewOutcome::default()));
+    let (install_succeeded, installed) = oneshot::channel::<()>();
+    let (tenant, app_name) = (tenant.to_string(), app_name.to_string());
+    let task = tokio::spawn(async move {
+        if installed.await.is_err() {
+            return;
+        }
+        if let Err(error) = store
+            .save_module_review(&tenant, &app_name, &version, &kept.to_string())
+            .await
+        {
+            tracing::warn!(error = %error, app = %app_name, "module review: the installed sources were not kept");
+        }
+    });
+    PendingReview {
+        asked: None,
+        answer: Some(ReviewAnswer {
+            said,
+            asked: Vec::new(),
+            publication: Arc::new(ReviewPublication {
+                installed: Mutex::new(Some(install_succeeded)),
+                abort: task.abort_handle(),
+            }),
+        }),
     }
 }
 

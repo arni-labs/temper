@@ -602,6 +602,66 @@ async fn a_finding_on_a_line_as_installed_is_advice_in_a_changed_module() {
     );
 }
 
+/// An app whose kept review holds no sources (kept before reviews kept them) gets them from its next install, even one
+/// that changes no module, so its module's next change is held only to the lines that change made.
+#[tokio::test]
+async fn an_install_that_changes_no_module_keeps_the_sources_the_next_change_is_held_to() {
+    let tenant = unique_tenant("review-keeps-sources");
+    let server = seeded(&tenant).await;
+    server
+        .ps
+        .save_module_review(
+            &tenant,
+            APP,
+            "seed",
+            r#"{"warnings":[],"modules_reviewed":[]}"#,
+        )
+        .await
+        .expect("a review kept before sources were");
+    server
+        .state
+        .set_module_reviewer(Arc::new(ModuleReviewer::new(HeldJudge::finding_at(
+            0,
+            "pub fn step",
+        ))));
+
+    // The same files under another commit: no module and no spec changed, so nothing is reviewed or asked about.
+    let mut same = app_with_module(Some("seed"), 1);
+    same["COMMIT"] = "same\n".into();
+    let body = install_over_http(&server.state, &tenant, same).await;
+    assert!(
+        body["result"]["reviewing"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "{body}"
+    );
+    let mut kept = serde_json::Value::Null;
+    for _ in 0..400 {
+        kept = review_of(&server.state, &tenant, "same").await;
+        if kept["state"] == "done" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await; // determinism-ok: it is kept on its own task
+    }
+    assert_eq!(
+        kept["state"], "done",
+        "the installed sources are kept: {kept}"
+    );
+    assert_eq!(
+        kept["warnings"],
+        serde_json::json!([]),
+        "the advice as it was: {kept}"
+    );
+
+    // Version 2 changes only the module's second line: a finding on its first is advice, not a refusal.
+    install_over_http(&server.state, &tenant, app_with_module(Some("c2"), 2)).await;
+    let done = finished_review(&server.state, &tenant, "c2").await;
+    assert!(
+        found_first_item(&done["warnings"]),
+        "kept as advice: {done}"
+    );
+}
+
 /// A changed module Jev finds nothing in installs even when it is large: size is advice, not a refusal.
 #[tokio::test]
 async fn a_large_changed_module_with_no_finding_installs() {
