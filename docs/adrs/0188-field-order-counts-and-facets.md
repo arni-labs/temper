@@ -70,7 +70,42 @@ time, each page starting after the last row of the one before (a keyset the
 store seeks to), keeping only the requested page and a running count. A list
 page keeps walking until it is full. The read-source walk (no native page) does
 the same in batches. `QueryTooLarge` and its 413 are gone; nothing replaces
-them with another cap.
+them with another cap, on the walk or on `$skip`.
+
+What a walk holds while it runs (`scan/walk_page.rs`), counted in the read's
+`held_documents` telemetry:
+
+- **In store or id order** (the store's walk, and the read-source walk with no
+  `$orderby`), the first `$skip` rows are counted and dropped as they are
+  judged. It holds one batch of documents and the page: at most a batch plus
+  `$top` plus the probe row, whatever `$skip` is.
+- **In an order the walk sorts itself** (the read-source walk with an
+  `$orderby` the store cannot order), any row can move into the page until the
+  last one is judged. The walk keeps the first `$skip + $top` rows in a bounded
+  heap (`log($skip + $top)` work a row, never a re-sort of what it holds), as
+  their sort keys and ids, not their documents; once the walk ends it reads the
+  page's documents again and judges them again. So its documents are one batch
+  or the page, and its memory grows with `$skip + $top` sort keys and ids, up
+  to the number of rows the filter selects. With `$skip` 0 the heap is the page
+  and holds its documents. A design with no memory for skipped rows would walk
+  the rows again for every heap-full of them, multiplying the walk's time by
+  `$skip / ($skip-sized heap)`; holding keys is the cheaper trade.
+
+A walk stops when its client goes away. axum serves each connection in a task
+of its own (`axum` 0.8.8 `serve/mod.rs` `handle_connection`, `tokio::spawn`)
+and polls the handler's future inside hyper's connection future. When the
+client closes, hyper's HTTP/1 dispatcher reads end of file while the request is
+in flight (`hyper` 1.8.1 `proto/h1/conn.rs` `mid_message_detect_eof`, half
+close off by default), the connection future ends with an error, and the task
+drops it and the handler's future with it. Nothing on the read path is spawned
+or run on a blocking thread, so dropping the future stops the walk at its next
+`.await`. hyper only sees the closed socket when the task is polled again,
+though, and a Turso page whose rows are cached never returns `Pending`: on
+2026-11-19 a release server went on judging rows for 2.3 s after a reader's
+`$count` of 12,000 cards was abandoned at 0.4 s. So each walk yields to the
+runtime between batches (`scan::walk_yield`: the store's walk, the read-source
+walk, the sparse id walk under an unfiltered count, and the facet walk), and the
+same check then stopped within one batch.
 
 Measured on 2026-11-19 on an Apple M3 Max (16 cores, 128 GB, macOS 26.5; the
 machine was not idle), release `temper serve --storage turso` on a file store,
@@ -107,11 +142,11 @@ a keyset clause `KeysetValue::Field` beside the catalog keys. SQL's order is
 - strings compare by bytes: Turso's default `BINARY`, Postgres `COLLATE "C"`;
 - a record without a value sorts last ascending and first descending.
 
-`sort_entities` finds a value of another JSON type (or a JSON null) equal to
-everything, which is not a total order and cannot be matched in SQL. So before
-it trusts SQL's order the read asks the store for one row of the filter holding
-a value of another type (`mistyped`, `LIMIT 1`); if there is one, the read
-walks in memory on the folded keyset, as before.
+The in-memory order puts values of different JSON types in an order of types
+(Sub-Decision 6), which the SQL order does not reproduce. So before it trusts
+SQL's order the read asks the store for one row of the filter holding a value
+of another type or a JSON null (`mistyped`, `LIMIT 1`); if there is one, the
+read walks in memory on the folded keyset, as before.
 
 The keyset is written flat: one term for each key the row can be past the
 cursor on, holding the cursor's value on every key before it. The nested form
@@ -120,7 +155,7 @@ level deeper on the stack: on 2026-11-19 a debug build needed 2,048 KiB of
 thread stack for a two-field page nested and 1,280 KiB flat (a test thread has
 2 MiB; the server's threads have 16 MiB).
 
-Kept on the folded keyset: booleans (the in-memory sort does not compare them),
+Kept on the folded keyset: booleans (the in-memory order finds two equal),
 nullable, undeclared or unprojected fields, record properties, and any order
 whose rows hold a mixed type at read time.
 
@@ -163,15 +198,53 @@ allowed, the filter is exact in SQL and not an equality conjunction (which has
 its own reconciled read, ADR-0153), and the key is `Status` or a field SQL
 orders exactly (Sub-Decision 3) with no declared default and no value of
 another type among the filter's rows. Otherwise the records are walked as a
-list read walks them, each row authorized, and counted in memory: the walk
-keeps one count per distinct value and one page of records (`BTreeMap`), and
-every page of groups walks the records again. A hidden row is never counted.
+list read walks them, each row authorized, and counted in memory. A walked
+facet holds one entry for each distinct value among the rows it may count (a
+`BTreeMap` of value to count) and one page of records, so its memory grows
+with the number of distinct values, not of rows. Every page of groups walks
+all the rows again from the first: a facet of `g` groups read `$top` at a time
+judges the rows `ceil(g / $top)` times. A hidden row is never counted.
+
+### Sub-Decision 6: One total order in memory
+
+`sort_entities` found a JSON null, and a value of another JSON type, equal to
+every value. That is not an order (5 = null = 1 but 5 > 1), so where a null
+fell decided the answer, and a walk that sorts a batch at a time could answer
+differently from one sort of everything: values 5, null, 1 in id order with
+`$top=1` gave 5 sorted whole and 1 sorted a batch at a time. The in-memory
+order (`query_eval::compare_sort_keys`) is now total, and the sort, the walk
+and the continuation cursor (`pagination.rs`, which already read a null as no
+value) agree:
+
+- a missing value and a JSON null are both no value, last ascending and first
+  descending;
+- numbers compare as doubles and strings by bytes, as before;
+- values of different JSON types order by type: boolean, number, string, then
+  array and object;
+- two booleans, or two arrays or objects, are equal and fall to the next key,
+  as before; the id is always the last key.
+
+**Behaviour change.** An `$orderby` over a field holding explicit nulls now
+lists those records with the records that lack the field, where before they
+fell wherever the sort met them; one over a field of mixed JSON types now
+groups the types. A folded continuation still compares only values of the
+cursor's type (`gt` between a number and a string is false), so paging such a
+mixed-type order by `$skiptoken` can still pass over the other types' rows, as
+on main; `$skip` pages it correctly. Boolean orders have the same gap on main:
+two booleans are equal in the sort but not in the continuation's `eq`.
 
 ## Rollout Plan
 
 1. **Phase 0** — this change. No migration, no new index, no setting.
 2. **Phase 1** — the typed sort-key index of Sub-Decision 3, if field-ordered
    pages on large types prove slow in use.
+3. **Follow-up, recorded, not built** — policies the kernel can turn into a
+   SQL filter. What limits counts and facets for anyone but an admin is the
+   per-row Cedar walk: about 4,350 rows judged a second for a reader under a
+   per-row policy, against 10 ms for an admin's single SQL count on the same
+   12,000 records (Sub-Decision 2). Cedar partial evaluation of the common
+   owner and member policy shapes into a SQL condition would let those counts
+   stop walking rows.
 
 ## Consequences
 
@@ -189,8 +262,12 @@ every page of groups walks the records again. A hidden row is never counted.
 
 ### Risks
 - **Long requests.** Proxies and clients with request timeouts may cut a long
-  per-row count off; the server keeps working until the walk ends or the
-  connection drops.
+  per-row count off. The server stops the walk within one batch of the client
+  closing the connection (Sub-Decision 2); a proxy that keeps its upstream
+  connection open after its own client left keeps the walk running.
+- **`$skip` on a sorted walk.** Its memory grows with `$skip + $top` sort keys
+  and ids, up to the rows the filter selects (Sub-Decision 2).
+- **Orders over nulls and mixed types.** Their pages change (Sub-Decision 6).
 - **String equality is stricter.** `field eq '5'` no longer returns records
   whose value is the number 5. That was a wrong answer, but a client may have
   leaned on it.
@@ -223,9 +300,10 @@ every page of groups walks the records again. A hidden row is never counted.
    the code. Rejected.
 2. **Answer a per-row count as an estimate.** A count that is sometimes wrong
    cannot be told from one that is right. Rejected.
-3. **Order mixed-type fields in SQL by type then value.** The in-memory sort
-   has no such order; the two would disagree on the page boundaries. Rejected
-   for the type check.
+3. **Order mixed-type fields in SQL by type then value.** The in-memory order
+   now has one (Sub-Decision 6), but reproducing it in both stores' SQL for a
+   case the type check already sends to memory adds expressions to every
+   field-ordered page. Rejected for the type check.
 4. **Facets by listing every record to the client.** What this replaces.
 
 ## Rollback Policy

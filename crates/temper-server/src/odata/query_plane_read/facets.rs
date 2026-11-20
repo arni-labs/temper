@@ -272,6 +272,8 @@ async fn walked_groups(
             Some(next) => token = Some(next),
             None => break,
         }
+        // Let the connection see a client that left (`scan::walk_yield`).
+        super::scan::walk_yield().await;
     }
     let mut groups: Vec<Group> = counts
         .into_iter()

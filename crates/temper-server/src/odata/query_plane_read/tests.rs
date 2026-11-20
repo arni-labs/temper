@@ -36,6 +36,7 @@ mod paging;
 mod per_row_walk;
 mod proof;
 mod spec_deleted;
+mod walk_skip;
 
 const CSDL_XML: &str = include_str!("../../../../../test-fixtures/specs/model.csdl.xml");
 const ORDER_IOA: &str = include_str!("../../../../../test-fixtures/specs/order.ioa.toml");

@@ -139,6 +139,9 @@ pub(in crate::odata) struct QueryPlaneReadTelemetry {
     pub(in crate::odata::query_plane_read) pushdown_sparse_page: bool,
     pub(in crate::odata::query_plane_read) pushdown_sparse_probe_count: usize,
     pub(in crate::odata::query_plane_read) pushdown_page_count: usize,
+    /// The most documents a walk held at once (ADR-0188); zero when the read
+    /// is not a walk.
+    pub(in crate::odata::query_plane_read) held_documents: usize,
 }
 
 impl QueryPlaneReadTelemetry {
@@ -151,6 +154,9 @@ impl QueryPlaneReadTelemetry {
         self.catalog_shadow_check_scheduled += other.catalog_shadow_check_scheduled;
         self.pushdown_sparse_probe_count += other.pushdown_sparse_probe_count;
         self.pushdown_page_count += other.pushdown_page_count;
+        // Two reads made one after the other never hold their documents at
+        // the same time.
+        self.held_documents = self.held_documents.max(other.held_documents);
     }
 
     /// Record this read contract's telemetry onto the current OData span.
@@ -180,6 +186,7 @@ impl QueryPlaneReadTelemetry {
             self.pushdown_sparse_probe_count as u64,
         );
         span.record("pushdown_page_count", self.pushdown_page_count as u64);
+        span.record("held_documents", self.held_documents as u64);
         span.record("pushdown_sparse_skip_reason", self.fallback_reason.as_str());
     }
 }

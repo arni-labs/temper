@@ -886,6 +886,7 @@ pub(super) async fn handle_odata_get_for_tenant(
     pushdown_sparse_page = tracing::field::Empty,
     pushdown_sparse_probe_count = tracing::field::Empty,
     pushdown_page_count = tracing::field::Empty,
+    held_documents = tracing::field::Empty,
     pushdown_sparse_skip_reason = tracing::field::Empty,
     row_authz = tracing::field::Empty,
     row_policies = tracing::field::Empty,

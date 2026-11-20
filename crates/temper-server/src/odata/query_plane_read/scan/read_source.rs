@@ -5,12 +5,11 @@ use super::super::types::{
     QueryPlaneCoverageReport, QueryPlaneFallbackReason, QueryPlaneReadError, QueryPlaneReadRequest,
     QueryPlaneReadStrategy,
 };
+use super::walk_page::{FinishedPage, WalkPage, sort_page};
 use super::{
     CandidateScanResult, RowAuthz, ScanCounters, TelemetryInput, apply_select_only, base_telemetry,
     decide_row_authz, materialize_and_authorize_ids, materialize_filter_and_authorize_ids,
 };
-use crate::query_eval::apply_query_options;
-use temper_odata::query::types::QueryOptions;
 
 /// Selected documents held at once while a per-entity list is filtered.
 ///
@@ -20,12 +19,11 @@ use temper_odata::query::types::QueryOptions;
 const SPARSE_DECISION_BATCH: usize = 32;
 
 /// Walk `all_entity_ids` a batch at a time: materialize, filter and
-/// authorize each batch, count what it keeps, and hold only the first
-/// `$skip + $top` rows in the read's order (ADR-0188). A sorted read merges
-/// each batch into that prefix and drops the rest, so it holds at most
-/// `$skip + $top` rows plus one batch, however many records the type has;
-/// the id list itself is the one thing held for every record. There is no
-/// scan budget: what bounds the walk is time.
+/// authorize each batch, count what it keeps, and hold only the requested
+/// page ([`WalkPage`], ADR-0188). It holds one batch of documents and the
+/// page's; a sorted walk with a `$skip` also holds the sort keys and ids of
+/// the first `$skip + $top` rows. The id list itself is the one thing held
+/// for every record. There is no scan budget: what bounds the walk is time.
 async fn read_source_walk(
     request: &QueryPlaneReadRequest<'_>,
     all_entity_ids: &[String],
@@ -48,22 +46,18 @@ async fn read_source_walk(
         return result;
     }
 
-    let prefix = skip.saturating_add(requested_top);
-    let walk_all = include_count || query_options.orderby.is_some();
-    let order_only = QueryOptions {
-        orderby: query_options.orderby.clone(),
-        ..QueryOptions::default()
-    };
+    let order = query_options.orderby.as_deref();
+    let walk_all = include_count || order.is_some();
     let missing: BTreeSet<&str> = missing_ids.iter().map(String::as_str).collect();
     let prefer_catalog = request.state.query_plane_store().is_some();
     let page_size = request.budget.scan_page_size(query_options);
     let mut counters = ScanCounters::empty();
-    let mut kept: Vec<serde_json::Value> = Vec::new();
+    let mut held = WalkPage::new(order, skip, requested_top);
     let mut seen = 0usize;
     let nothing_to_read =
         matches!(authz, RowAuthz::DenyAll) || (requested_top == 0 && !include_count);
     for batch in all_entity_ids.chunks(page_size) {
-        if nothing_to_read || (!walk_all && kept.len() >= prefix) {
+        if nothing_to_read || (!walk_all && held.is_full()) {
             break;
         }
         let authorized = materialize_filter_and_authorize_ids(
@@ -74,6 +68,7 @@ async fn read_source_walk(
             &mut counters,
         )
         .await;
+        counters.hold(held.documents_held() + authorized.len());
         seen += authorized.len();
         if query_options.filter.is_some() {
             coverage.matched += authorized
@@ -82,15 +77,29 @@ async fn read_source_walk(
                 .filter(|entity_id| missing.contains(entity_id))
                 .count();
         }
-        kept.extend(authorized);
-        if query_options.orderby.is_some() {
-            kept = apply_query_options(kept, &order_only).0;
-        }
-        kept.truncate(prefix);
+        held.add(authorized);
+        super::walk_yield().await;
     }
 
     let count = include_count.then_some(seen);
-    let page: Vec<serde_json::Value> = kept.into_iter().skip(skip).collect();
+    let page = match held.finish() {
+        FinishedPage::Documents(page) => page,
+        // The walk kept only the page's ids: read its documents again. A row
+        // that changed since it was judged is judged again here.
+        FinishedPage::Ids(ids) => {
+            let mut page = materialize_filter_and_authorize_ids(
+                request,
+                &ids,
+                prefer_catalog,
+                authz,
+                &mut counters,
+            )
+            .await;
+            counters.hold(page.len());
+            sort_page(&mut page, order.unwrap_or_default());
+            page
+        }
+    };
     let entities = apply_select_only(page, query_options);
     let returned_count = entities.len();
     let telemetry = base_telemetry(
@@ -233,6 +242,7 @@ async fn sparse_allowed_ids<'a>(
                 allowed.push(entity_id);
             }
         }
+        super::walk_yield().await;
     }
     Some(allowed)
 }

@@ -2,6 +2,7 @@ mod native;
 mod native_plan;
 mod read_source;
 mod uniform;
+mod walk_page;
 
 pub(super) use native::{fields_typed, try_native_page_read};
 #[cfg(test)]
@@ -72,6 +73,21 @@ pub(super) struct ScanCounters {
     pub(super) pushdown_sparse_probe_count: usize,
     pub(super) pushdown_page_count: usize,
     pub(super) catalog_select_projection: bool,
+    /// The most documents a walk held at once: the batch being judged and
+    /// the page it keeps (ADR-0188). Zero for a read that is not a walk.
+    pub(super) held_documents: usize,
+}
+
+/// Give the task back to the runtime between two batches of a walk, so a
+/// walk stops when its client goes away. hyper notices a closed connection
+/// only when the connection's task is polled again (`proto/h1/conn.rs`
+/// `mid_message_detect_eof` in hyper 1.8) and then drops the handler's
+/// future with the connection; a Turso page whose rows are cached never
+/// returns `Pending`, so without this a walk ran to its end after the client
+/// left. On 2026-11-19 a release server kept judging rows for 2.3 s after a
+/// reader's `$count` of 12,000 cards was abandoned at 0.4 s.
+pub(in crate::odata::query_plane_read) async fn walk_yield() {
+    tokio::task::yield_now().await;
 }
 
 impl ScanCounters {
@@ -84,7 +100,13 @@ impl ScanCounters {
             pushdown_sparse_probe_count: 0,
             pushdown_page_count: 0,
             catalog_select_projection: false,
+            held_documents: 0,
         }
+    }
+
+    /// Note that a walk holds `documents` now.
+    pub(super) fn hold(&mut self, documents: usize) {
+        self.held_documents = self.held_documents.max(documents);
     }
 }
 
@@ -213,6 +235,7 @@ pub(super) fn base_telemetry(
         pushdown_sparse_page: input.strategy == QueryPlaneReadStrategy::NativePagePushdown,
         pushdown_sparse_probe_count: input.counters.pushdown_sparse_probe_count,
         pushdown_page_count: input.counters.pushdown_page_count,
+        held_documents: input.counters.held_documents,
     }
 }
 

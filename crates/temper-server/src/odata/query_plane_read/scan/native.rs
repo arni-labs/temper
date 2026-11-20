@@ -256,6 +256,8 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
         let materialized =
             materialize_ids(request, &page.entity_ids, true, &authz, &mut counters).await;
         let resume = resume_after(&walk, &last_id, &materialized);
+        counters.hold(returned_before_select.len() + materialized.len());
+        // Rows before `$skip` are counted, never kept.
         for entity in filter_and_authorize(request, materialized, &authz) {
             let index = authorized_seen;
             authorized_seen += 1;
@@ -277,6 +279,7 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
             }
             None => storage_skip += page_len,
         }
+        super::walk_yield().await;
     }
 
     let count = include_count.then_some(authorized_seen);

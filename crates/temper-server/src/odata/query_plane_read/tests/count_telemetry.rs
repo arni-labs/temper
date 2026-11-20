@@ -191,6 +191,7 @@ fn adding_count_scan_work_preserves_page_metadata() {
         pushdown_sparse_page: false,
         pushdown_sparse_probe_count: 2,
         pushdown_page_count: 7,
+        held_documents: 25,
     };
     let count = QueryPlaneReadTelemetry {
         strategy: QueryPlaneReadStrategy::NativePagePushdown,
@@ -212,6 +213,7 @@ fn adding_count_scan_work_preserves_page_metadata() {
         pushdown_sparse_page: true,
         pushdown_sparse_probe_count: 4,
         pushdown_page_count: 11,
+        held_documents: 40,
     };
     let expected = QueryPlaneReadTelemetry {
         candidate_count: 18,
@@ -220,6 +222,8 @@ fn adding_count_scan_work_preserves_page_metadata() {
         catalog_shadow_check_scheduled: 3,
         pushdown_sparse_probe_count: 6,
         pushdown_page_count: 18,
+        // The count and the page are read one after the other.
+        held_documents: 40,
         ..page.clone()
     };
     page.add_scan_work(&count);
