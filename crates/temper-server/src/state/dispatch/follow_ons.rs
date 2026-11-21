@@ -178,11 +178,15 @@ impl ServerState {
         let server = self.clone();
         let tenant = tenant.clone();
         let action = row.action.clone();
+        // The row is due at the move's event.
+        let moved_at = chrono::DateTime::parse_from_rfc3339(&row.due_at)
+            .ok()
+            .map(|at| at.with_timezone(&chrono::Utc));
         let gate = gate.clone();
         let resume = async move {
             let _permit = gate.acquire_owned().await.ok();
             if server
-                .send_follow_ons(&tenant, &fire, &action, &owed, &caller)
+                .send_follow_ons(&tenant, &fire, &action, moved_at, &owed, &caller)
                 .await
             {
                 server.settle_follow_row(&fire);
@@ -191,8 +195,8 @@ impl ServerState {
         tokio::spawn(resume); // determinism-ok: boot recovery of owed follow-ons
     }
 
-    /// Send the follow-ons `owed` names for the move `action` on `fire`'s
-    /// record, as `caller`: its reactions, children and integrations, each
+    /// Send the follow-ons `owed` names for the move `action`, made at
+    /// `moved_at`, on `fire`'s record, as `caller`: its reactions, children and integrations, each
     /// holding the row while in flight. False when its integrations could not
     /// be sent because the record could not be read: the row is kept for the
     /// next boot.
@@ -201,6 +205,7 @@ impl ServerState {
         tenant: &TenantId,
         fire: &ScheduledFire,
         action: &str,
+        moved_at: Option<chrono::DateTime<chrono::Utc>>,
         owed: &OwedFollowOns,
         caller: &AgentContext,
     ) -> bool {
@@ -233,7 +238,8 @@ impl ServerState {
             return true;
         }
         // The integrations read the record as the move left it, at the
-        // move's sequence, which names its calls' deadline rows.
+        // move's sequence, which names its calls' deadline rows, and at its
+        // time, from which their tries and deadlines count.
         let mut entity_state = match self
             .get_tenant_entity_state(tenant, &fire.entity_type, &fire.entity_id)
             .await
@@ -249,6 +255,9 @@ impl ServerState {
         entity_state.status = owed.status.clone();
         entity_state.fields = owed.fields.clone();
         entity_state.sequence_nr = owed.sequence;
+        if moved_at.is_some() {
+            entity_state.last_event.last_event_at = moved_at;
+        }
         self.dispatch_wasm_integrations(
             tenant,
             &fire.entity_type,

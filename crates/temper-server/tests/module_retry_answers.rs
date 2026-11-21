@@ -14,7 +14,11 @@
 //!   `on_failure` is sent, once;
 //! - a record that has moved on since the move that started the call is not
 //!   called for again: the call is dropped, and nothing is left behind to
-//!   answer it later.
+//!   answer it later;
+//! - a restart while the call waits resumes it: the next process makes the
+//!   try the schedule is at, with that try's `attempt`, and keeps the first
+//!   try's deadline, so the call is answered once, never both by its module
+//!   and by its deadline.
 //!
 //! The real WASM engine runs the module, in a single-threaded, paused-clock
 //! Tokio runtime whose clock the simulation reads.
@@ -193,7 +197,15 @@ impl Process {
 
     /// Exit, carrying the clock it ran to the next process.
     fn stop(self, clock: &ProcessClock) {
-        self.runtime.block_on(async { clock.end(Duration::ZERO) });
+        self.kill(clock, Duration::ZERO);
+    }
+
+    /// Exit with whatever is in flight lost, and stay down for `downtime`.
+    fn kill(self, clock: &ProcessClock, downtime: Duration) {
+        self.runtime.block_on(async { clock.end(downtime) });
+        let Self { runtime, state } = self;
+        drop(state);
+        drop(runtime);
     }
 }
 
@@ -367,6 +379,99 @@ fn a_retry_is_dropped_once_the_record_moves_on() {
         );
         let rows = store.list_scheduled_actions(TENANT).await.unwrap();
         assert!(rows.is_empty(), "the dropped call leaves nothing: {rows:?}");
+    });
+    process.stop(&clock);
+}
+
+/// Ask with a module that always answers `retry`, and restart at 17 s, after
+/// tries at 0 s, 1 s, 3 s and 7 s, into a process whose module is `wat`. The
+/// schedule's next try was due at 15 s: the fifth.
+fn restarted_mid_retry(store: &SimEventStore, clock: &ProcessClock, wat: &str) -> Process {
+    let first = Process::start(
+        store,
+        clock,
+        &answering_when("never in a context", &json!({}), &retry()),
+    );
+    first.runtime.block_on(async {
+        ask(&first.state).await;
+        settle().await;
+        pass(10).await;
+        assert_eq!(
+            journal(store).await,
+            ["Created", "Ask"],
+            "a retry moves nothing"
+        );
+    });
+    first.kill(clock, Duration::from_secs(7));
+    Process::start(store, clock, wat)
+}
+
+#[test]
+fn a_call_retrying_at_a_restart_resumes_its_count_and_is_answered_once() {
+    let clock = Arc::new(ProcessClock::new());
+    let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(14)));
+    let store = SimEventStore::no_faults(14);
+    // The module answers only on the fifth try, which the restarted process
+    // makes at once: a call made again from its first try would reach it
+    // only after the deadline had given up on it.
+    let wat = answering_when(
+        r#""attempt":5"#,
+        &json!({ "params": { "score": 70 } }),
+        &retry(),
+    );
+    let process = restarted_mid_retry(&store, &clock, &wat);
+    process.runtime.block_on(async {
+        settle().await;
+        pass(2).await;
+        assert_eq!(
+            journal(&store).await,
+            ["Created", "Ask", "Finish"],
+            "the restarted call resumes at its fifth try, which answers"
+        );
+        let rows = store.list_scheduled_actions(TENANT).await.unwrap();
+        assert!(
+            rows.is_empty(),
+            "the answer ends the call and its one deadline: {rows:?}"
+        );
+        pass(2 * DEADLINE_SECS).await;
+        assert_eq!(
+            journal(&store).await,
+            ["Created", "Ask", "Finish"],
+            "answered once, never given up on as well"
+        );
+    });
+    process.stop(&clock);
+}
+
+#[test]
+fn a_call_retrying_across_a_restart_is_given_up_on_once_at_its_first_deadline() {
+    let clock = Arc::new(ProcessClock::new());
+    let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(15)));
+    let store = SimEventStore::no_faults(15);
+    let wat = answering_when("never in a context", &json!({}), &retry());
+    let process = restarted_mid_retry(&store, &clock, &wat);
+    process.runtime.block_on(async {
+        settle().await;
+        // 17 s have passed; the deadline is 30 s after the first try.
+        pass(DEADLINE_SECS - 17 - 2).await;
+        assert_eq!(
+            journal(&store).await,
+            ["Created", "Ask"],
+            "still owed before its deadline"
+        );
+        pass(4).await;
+        assert_eq!(
+            journal(&store).await,
+            ["Created", "Ask", "GiveUp"],
+            "given up on once, at the deadline counted from the first try"
+        );
+        pass(2 * DEADLINE_SECS).await;
+        assert_eq!(journal(&store).await, ["Created", "Ask", "GiveUp"]);
+        let rows = store.list_scheduled_actions(TENANT).await.unwrap();
+        assert!(
+            rows.is_empty(),
+            "nothing is left to answer it again: {rows:?}"
+        );
     });
     process.stop(&clock);
 }

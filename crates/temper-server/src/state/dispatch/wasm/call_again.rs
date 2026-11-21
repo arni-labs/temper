@@ -8,7 +8,8 @@
 //! [`LAST_RETRY_WAIT`]. There is no cap on tries; the deadline bounds them.
 //!
 //! - The deadline is the trigger's, as for any call (`timeout_secs`, else the
-//!   engine's limit), counted from the first try. When it passes, the
+//!   engine's limit), counted from the first try, made at the move's event:
+//!   the same instant its deadline row is due. When it passes, the
 //!   trigger's `on_failure` is sent, once, with the module's last reason; a
 //!   trigger with none fails as a failed call does.
 //! - Before each try after the first, the record is read: if it has moved on
@@ -17,8 +18,12 @@
 //!   as for any call.
 //!
 //! The call stays owed while it waits: the background task that makes it
-//! holds the move's follow-on row (`follow_ons`), so a restart makes the call
-//! again from its first try.
+//! holds the move's follow-on row (`follow_ons`), whose due time is the
+//! move's event. Tries and deadline are both counted from that event, so a
+//! restart resumes the call where its schedule is: the next process makes
+//! the try due last, with that try's `attempt`, and the same deadline, which
+//! its deadline row and its tries share. The call is answered once: by its
+//! module, or by its deadline.
 
 use std::time::Duration;
 
@@ -58,10 +63,14 @@ impl ServerState {
         action_params: &serde_json::Value,
         base_gate: &std::sync::Arc<dyn WasmAuthzGate>,
     ) -> Result<Option<EntityResponse>, String> {
-        let due = sim_now() + call_deadline(integration);
-        let mut wait = FIRST_RETRY_WAIT;
-        let mut attempt: u32 = 1;
+        let first_try = entity_state
+            .last_event
+            .last_event_at
+            .unwrap_or_else(sim_now);
+        let due = first_try + call_deadline(integration);
+        let mut tries = Tries::resumed(first_try);
         loop {
+            let attempt = tries.attempt;
             let try_ctx = WasmDispatchCtx { attempt, ..*ctx };
             let reason = match self
                 .dispatch_single_integration(
@@ -76,10 +85,12 @@ impl ServerState {
                 Called::Answered(response) => return Ok(response.map(|response| *response)),
                 Called::Again(reason) => reason,
             };
-            let left = (due - sim_now()).to_std().unwrap_or(Duration::ZERO);
-            if !left.is_zero() {
-                tokio::time::sleep(wait.min(left)).await; // determinism-ok: retry backoff on the paused clock in simulation
-                wait = (wait * 2).min(LAST_RETRY_WAIT);
+            tries.next();
+            let wait = (tries.at.min(due) - sim_now())
+                .to_std()
+                .unwrap_or(Duration::ZERO);
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await; // determinism-ok: retry backoff on the paused clock in simulation
             }
             if !self.still_at(&try_ctx, entity_state).await {
                 tracing::info!(
@@ -108,7 +119,6 @@ impl ServerState {
                 )
                 .await;
             }
-            attempt = attempt.saturating_add(1);
         }
     }
 
@@ -161,5 +171,49 @@ impl ServerState {
             Ok(now) => now.state.event_sequence() == entity_state.event_sequence(),
             Err(_) => true,
         }
+    }
+}
+
+/// Where a call's tries are: the first at the move's event, the next
+/// [`FIRST_RETRY_WAIT`] later, then twice as long after each, up to
+/// [`LAST_RETRY_WAIT`].
+struct Tries {
+    /// The try due at `at`, from 1.
+    attempt: u32,
+    /// When it is due.
+    at: chrono::DateTime<chrono::Utc>,
+    /// How long after it the next is due.
+    wait: Duration,
+}
+
+impl Tries {
+    /// The try due last for a call whose first try was at `first`: the first
+    /// for a call just made, a later one for a call a restart resumes.
+    fn resumed(first: chrono::DateTime<chrono::Utc>) -> Self {
+        let mut tries = Self {
+            attempt: 1,
+            at: first,
+            wait: FIRST_RETRY_WAIT,
+        };
+        let now = sim_now();
+        while tries.after() <= now {
+            tries.next();
+        }
+        tries
+    }
+
+    /// When the try after this one is due.
+    fn after(&self) -> chrono::DateTime<chrono::Utc> {
+        let wait = chrono::Duration::from_std(self.wait).unwrap_or(chrono::Duration::MAX);
+        self.at
+            .checked_add_signed(wait)
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+    }
+
+    /// Move on to the next try.
+    fn next(&mut self) {
+        self.at = self.after();
+        self.attempt = self.attempt.saturating_add(1);
+        self.wait = (self.wait * 2).min(LAST_RETRY_WAIT);
     }
 }
