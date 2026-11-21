@@ -39,13 +39,21 @@ pub(super) async fn capture_cpu(
         .report()
         .build_unresolved()
         .map_err(|e| fail(profile_type, mode, "report_build", e))?;
-    let mut profile = symbols::resolve(unresolved)
-        .pprof()
-        .map_err(|e| fail(profile_type, mode, "pprof_conversion", e))?;
-    name_sample_types(&mut profile, &CPU_SAMPLE_TYPES);
-    profile.period_type = profile.sample_type.get(1).cloned();
-
-    let body = encode(&profile).map_err(|e| fail(profile_type, mode, "pprof_serialize", e))?;
+    drop(guard);
+    // Naming the frames reads the binary's debug info: seconds of blocking
+    // work, which on an async worker stalls every task queued behind it. It
+    // runs on a blocking thread, as the heap dump does.
+    let (kind, how) = (profile_type.to_string(), mode.to_string());
+    let body = tokio::task::spawn_blocking(move || {
+        let mut profile = symbols::resolve(unresolved)
+            .pprof()
+            .map_err(|e| fail(&kind, &how, "pprof_conversion", e))?;
+        name_sample_types(&mut profile, &CPU_SAMPLE_TYPES);
+        profile.period_type = profile.sample_type.get(1).cloned();
+        encode(&profile).map_err(|e| fail(&kind, &how, "pprof_serialize", e))
+    })
+    .await
+    .map_err(|e| fail(profile_type, mode, "symbolize_task", e))??;
     record_capture_done(profile_type, mode, started);
     Ok(body)
 }
