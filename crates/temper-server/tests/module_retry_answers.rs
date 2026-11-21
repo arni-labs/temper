@@ -346,6 +346,49 @@ fn a_module_that_keeps_answering_retry_is_given_up_on_once_at_its_deadline() {
     process.stop(&clock);
 }
 
+/// A retry reason a module builds from the URL it called (the SDK's own
+/// HTTP errors name it) reaches the logs, invocation history and on_failure
+/// without the URL's signature or credentials: they are cut where the
+/// module's answer enters the kernel (`temper_wasm::url_redaction`).
+#[test]
+fn a_retry_reason_keeps_no_url_credentials() {
+    let clock = Arc::new(ProcessClock::new());
+    let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(13)));
+    let store = SimEventStore::no_faults(13);
+    let leaky = json!({
+        "retry": true,
+        "success": false,
+        "error": "HTTP call failed with code -3: PUT https://key:secret@acct.r2.example/b/k.json?X-Amz-Signature=deadbeef"
+    });
+    let wat = answering_when("never in a context", &json!({}), &leaky);
+    let process = Process::start(&store, &clock, &wat);
+    process.runtime.block_on(async {
+        ask(&process.state).await;
+        settle().await;
+        pass(DEADLINE_SECS + 2).await;
+        let events = store
+            .read_events(JOURNAL, 0)
+            .await
+            .expect("the journal reads");
+        let gave_up = events
+            .iter()
+            .find(|event| event.event_type == "GiveUp")
+            .expect("the call is given up on at its deadline");
+        let said = gave_up.payload.to_string();
+        assert!(
+            said.contains("https://<redacted>@acct.r2.example/b/k.json?<redacted>"),
+            "{said}"
+        );
+        for secret in ["deadbeef", "X-Amz-Signature", "secret"] {
+            assert!(
+                !said.contains(secret),
+                "on_failure carries {secret}: {said}"
+            );
+        }
+    });
+    process.stop(&clock);
+}
+
 #[test]
 fn a_retry_is_dropped_once_the_record_moves_on() {
     let clock = Arc::new(ProcessClock::new());

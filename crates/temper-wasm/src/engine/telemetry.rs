@@ -48,7 +48,7 @@ pub(super) fn map_invoke_error(
             WasmError::Timeout(max_duration)
         }
         _ => {
-            let err = error.to_string();
+            let err = crate::url_redaction::redact_url_credentials(&error.to_string());
             record_failure(context, needs_wasi, duration_ms, err.as_str());
             WasmError::Invocation(err)
         }
@@ -106,10 +106,12 @@ pub(super) fn finalize_result(
         .get("success")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    // The module's own words, logged, kept in history and sent to
+    // on_failure: no URL in them keeps its credentials.
     let error = parsed
         .get("error")
         .and_then(|v| v.as_str())
-        .map(String::from);
+        .map(crate::url_redaction::redact_url_credentials);
     let retry = parsed.get("retry").and_then(|v| v.as_bool()) == Some(true);
     let stream_count_after = store
         .data()
