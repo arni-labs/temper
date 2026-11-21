@@ -2465,6 +2465,173 @@ async fn collect_sse_frames_until(
 }
 
 #[tokio::test]
+async fn record_wait_matches_existing_and_wakes_on_a_readable_commit() {
+    let state = test_state_with_ioa();
+    state
+        .authz
+        .reload_tenant_policies(
+            "default",
+            r#"
+        permit(principal, action in [Action::"list", Action::"create"], resource);
+        permit(principal, action == Action::"read", resource is Order)
+        when { resource has customer && resource.customer == "Alice" };
+    "#,
+        )
+        .unwrap();
+    let app = authenticated_router(state);
+    let wait = || {
+        app.clone().oneshot(
+            Request::get(
+                "/tdata/$wait?sets=Orders&timeout_ms=5000&$filter=customer%20eq%20%27Alice%27",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+    };
+    let mut pending = std::pin::pin!(wait());
+    assert!(futures::poll!(&mut pending).is_pending());
+
+    for (id, customer) in [("other", "Bob"), ("matching", "Alice")] {
+        let body = serde_json::json!({"id": id, "customer": customer});
+        let created = app
+            .clone()
+            .oneshot(
+                Request::post("/tdata/Orders")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        if id == "other" {
+            assert!(futures::poll!(&mut pending).is_pending());
+        }
+    }
+
+    for response in [pending.await.unwrap(), wait().await.unwrap()] {
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["outcome"], "matched");
+        assert_eq!(body["record"]["entity_id"], "matching");
+        assert_eq!(body["record"]["fields"]["customer"], "Alice");
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(
+                "/tdata/$wait?sets=Orders&timeout_ms=20&$filter=customer%20eq%20%27Bob%27",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["outcome"], "timed_out",
+        "an unreadable existing record cannot match"
+    );
+}
+
+#[tokio::test]
+async fn scoped_event_stream_delivers_values_without_observer_access() {
+    let state = test_state_with_ioa();
+    state
+        .authz
+        .reload_tenant_policies(
+            "default",
+            r#"
+        permit(principal, action == Action::"create", resource);
+        permit(principal, action == Action::"read", resource is Order)
+        when { resource has customer && resource.customer == "Alice" };
+    "#,
+        )
+        .unwrap();
+    let app = authenticated_router(state);
+    let stream = app
+        .clone()
+        .oneshot(
+            Request::get("/tdata/$events?sets=Orders&timeout_ms=5000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    let observed = app
+        .clone()
+        .oneshot(
+            Request::get("/tdata/$events?sets=Orders&timeout_ms=5000&observe=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(observed.status(), StatusCode::FORBIDDEN);
+
+    for (id, customer) in [("hidden", "Bob"), ("visible", "Alice")] {
+        let created = app
+            .clone()
+            .oneshot(
+                Request::post("/tdata/Orders")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"id": id, "customer": customer}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+    }
+    let message =
+        collect_sse_frames_until(stream.into_body(), |s| s.contains("visible"), 3000).await;
+    assert!(!message.contains("hidden"), "{message}");
+    assert!(message.contains(r#""customer":"Alice""#), "{message}");
+}
+
+#[tokio::test]
+async fn scoped_event_stream_reports_a_gap_instead_of_skipping_records() {
+    let state = test_state_with_ioa();
+    let app = authenticated_router(state.clone());
+    let stream = app
+        .oneshot(
+            Request::get("/tdata/$events?sets=Orders&timeout_ms=5000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    // Overflow the existing bounded observation queue without polling the body.
+    for _ in 0..257 {
+        state
+            .record_event_tx
+            .send(crate::events::RecordChange {
+                change: EntityStateChange {
+                    tenant: "default".into(),
+                    entity_type: "Order".into(),
+                    ..Default::default()
+                },
+                record: Arc::new(serde_json::json!({})),
+            })
+            .unwrap();
+    }
+    let message =
+        collect_sse_frames_until(stream.into_body(), |s| s.contains("interrupted"), 3000).await;
+    assert!(message.contains("event: interrupted"), "{message}");
+}
+
+#[tokio::test]
 async fn test_sse_events_endpoint_delivers_state_changes() {
     let state = test_state_with_ioa();
     let event_tx = state.event_tx.clone();

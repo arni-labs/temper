@@ -46,3 +46,5 @@ pub use types::{
     EffectOutcome, EntityEvent, EntityMsg, EntityResponse, EntityState, ProcessedIdempotencyKey,
     StatusClock,
 };
+
+pub(crate) use effects::FIELDS_UPDATED_EVENT;

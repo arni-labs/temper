@@ -71,7 +71,7 @@ fn filter_entities(
 }
 
 /// Evaluate a filter expression against a single entity, returning a bool.
-fn evaluate_filter(entity: &serde_json::Value, expr: &FilterExpr) -> Option<bool> {
+pub(crate) fn evaluate_filter(entity: &serde_json::Value, expr: &FilterExpr) -> Option<bool> {
     match expr {
         FilterExpr::BinaryOp { left, op, right } => {
             match op {

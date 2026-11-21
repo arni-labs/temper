@@ -182,15 +182,7 @@ impl crate::state::ServerState {
             observation_metadata: (!ctx.agent_ctx.observation_metadata.is_empty())
                 .then(|| ctx.agent_ctx.observation_metadata.clone()),
         };
-        self.record_entity_observe_event_with_seq(
-            ctx.tenant.as_str(),
-            ctx.entity_type,
-            ctx.entity_id,
-            seq,
-            "state_change",
-            serde_json::to_value(&change).unwrap_or_default(),
-        );
-        let _ = self.event_tx.send(change);
+        self.publish_entity_change(change, &response.state);
         if matches!(
             response.state.status.as_str(),
             "Completed" | "Failed" | "Cancelled"

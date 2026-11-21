@@ -89,7 +89,7 @@ use temper_store_postgres::PostgresEventStore;
 
 use crate::adapters::AdapterRegistry;
 use crate::entity_actor::{EntityMsg, SnapshotWriteQueue};
-use crate::events::EntityStateChange;
+use crate::events::{EntityStateChange, RecordChange};
 use crate::idempotency::IdempotencyCache;
 use crate::internal_invocation::InternalInvocationCredentialStore;
 use crate::ots_trajectory_outbox::OtsTrajectoryOutbox;
@@ -497,6 +497,7 @@ pub struct ServerState {
     pub key_index_watermarks_loaded: Arc<RwLock<BTreeSet<String>>>,
     /// Broadcast channel for entity state change events (SSE subscriptions).
     pub event_tx: Arc<tokio::sync::broadcast::Sender<EntityStateChange>>,
+    pub(crate) record_event_tx: Arc<tokio::sync::broadcast::Sender<RecordChange>>,
     /// Broadcast channel for replayable per-entity lifecycle and progress events.
     pub entity_observe_tx: Arc<tokio::sync::broadcast::Sender<EntityObserveEvent>>,
     /// Server start time (DST-safe: uses sim_now()).
@@ -830,6 +831,7 @@ impl ServerState {
         }
 
         let (event_tx, _) = tokio::sync::broadcast::channel(256); // determinism-ok: broadcast for external observation
+        let (record_event_tx, _) = tokio::sync::broadcast::channel(256); // determinism-ok: bounded per-process observation backlog, reported on overflow
         let (entity_observe_tx, _) = tokio::sync::broadcast::channel(512); // determinism-ok: broadcast for external observation
         let (design_time_tx, _) = tokio::sync::broadcast::channel(256); // determinism-ok: broadcast for external observation
         let (pending_decision_tx, _) = tokio::sync::broadcast::channel(256); // determinism-ok: broadcast for external observation
@@ -864,6 +866,7 @@ impl ServerState {
             key_index_backfilled: Arc::new(RwLock::new(BTreeMap::new())),
             key_index_watermarks_loaded: Arc::new(RwLock::new(BTreeSet::new())),
             event_tx: Arc::new(event_tx),
+            record_event_tx: Arc::new(record_event_tx),
             entity_observe_tx: Arc::new(entity_observe_tx),
             start_time: sim_now(),
             metrics: Arc::new(MetricsCollector::new()),
@@ -1116,6 +1119,7 @@ impl ServerState {
     /// (e.g. `PlatformState`) so that writes are visible to dispatch.
     pub fn from_registry_shared(system: ActorSystem, registry: Arc<RwLock<SpecRegistry>>) -> Self {
         let (event_tx, _) = tokio::sync::broadcast::channel(256); // determinism-ok: broadcast for external observation
+        let (record_event_tx, _) = tokio::sync::broadcast::channel(256); // determinism-ok: bounded per-process observation backlog, reported on overflow
         let (entity_observe_tx, _) = tokio::sync::broadcast::channel(512); // determinism-ok: broadcast for external observation
         let (design_time_tx, _) = tokio::sync::broadcast::channel(256); // determinism-ok: broadcast for external observation
         let (pending_decision_tx, _) = tokio::sync::broadcast::channel(256); // determinism-ok: broadcast for external observation
@@ -1152,6 +1156,7 @@ impl ServerState {
             key_index_backfilled: Arc::new(RwLock::new(BTreeMap::new())),
             key_index_watermarks_loaded: Arc::new(RwLock::new(BTreeSet::new())),
             event_tx: Arc::new(event_tx),
+            record_event_tx: Arc::new(record_event_tx),
             entity_observe_tx: Arc::new(entity_observe_tx),
             start_time: sim_now(),
             metrics: Arc::new(MetricsCollector::new()),

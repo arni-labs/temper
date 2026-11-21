@@ -109,3 +109,25 @@ fn put(
     let previous = records.insert(attribute, value);
     debug_assert!(previous.is_none(), "a principal attribute set twice");
 }
+
+/// Recheck the caller's principal records before a long-lived read emits a row.
+pub(crate) async fn refresh_principal_records(
+    state: &ServerState,
+    tenant: &TenantId,
+    context: &temper_authz::SecurityContext,
+) -> Result<temper_authz::SecurityContext, IdentityError> {
+    use temper_authz::PrincipalKind;
+
+    let principal = &context.principal;
+    let user = (principal.kind == PrincipalKind::Customer).then_some(principal.id.as_str());
+    let records = principal_records(state, tenant, user, principal.acting_for.as_deref()).await?;
+    let mut refreshed = context.clone();
+    // Principal-record names are reserved and begin with an uppercase type
+    // name, either directly or after the acting-for prefix.
+    refreshed.principal.attributes.retain(|key, _| {
+        !key.strip_prefix(ACTING_FOR)
+            .unwrap_or(key)
+            .starts_with(|c: char| c.is_ascii_uppercase())
+    });
+    Ok(refreshed.with_principal_records(&records))
+}

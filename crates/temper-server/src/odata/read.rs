@@ -710,7 +710,7 @@ async fn annotate_moves(
 }
 
 #[instrument(skip_all, fields(tenant = %tenant, otel.name = "GET /odata/{path}"))]
-pub(super) async fn handle_odata_get_for_tenant(
+pub(crate) async fn handle_odata_get_for_tenant(
     state: ServerState,
     tenant: TenantId,
     security_ctx: SecurityContext,

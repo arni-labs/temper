@@ -1543,15 +1543,7 @@ impl ServerState {
             intent: None,
             observation_metadata: None,
         };
-        self.record_entity_observe_event_with_seq(
-            tenant.as_str(),
-            entity_type,
-            entity_id,
-            seq,
-            "state_change",
-            serde_json::to_value(&change).unwrap_or_default(),
-        );
-        let _ = self.event_tx.send(change);
+        self.publish_entity_change(change, &response.state);
 
         Ok(response)
     }
@@ -1726,15 +1718,7 @@ impl ServerState {
             intent: None,
             observation_metadata: None,
         };
-        self.record_entity_observe_event_with_seq(
-            tenant.as_str(),
-            entity_type,
-            entity_id,
-            seq,
-            "state_change",
-            serde_json::to_value(&change).unwrap_or_default(),
-        );
-        let _ = self.event_tx.send(change);
+        self.publish_entity_change(change, &state);
 
         Ok(Some(EntityResponse {
             success: true,
@@ -1859,6 +1843,13 @@ impl ServerState {
         .result
         .map_err(|e| format!("Actor update failed: {e}"))?;
 
+        if response.success {
+            self.publish_crud_change(
+                tenant,
+                &response.state,
+                crate::entity_actor::FIELDS_UPDATED_EVENT,
+            );
+        }
         Ok(response)
     }
 
@@ -1978,6 +1969,12 @@ impl ServerState {
             } else if let Ok(mut cache) = self.entity_state_cache.lock() {
                 cache.pop(&format!("{tenant}:{entity_type}:{entity_id}"));
             }
+
+            self.publish_crud_change(
+                tenant,
+                &response.state,
+                temper_runtime::persistence::TOMBSTONE_EVENT_TYPE,
+            );
 
             // Tombstone persisted successfully; now it is safe to remove actor
             // and in-memory index entries. A deleted record keeps no timer.

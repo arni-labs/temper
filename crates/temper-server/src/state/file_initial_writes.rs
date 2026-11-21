@@ -335,15 +335,7 @@ impl ServerState {
             observation_metadata: (!agent_ctx.observation_metadata.is_empty())
                 .then(|| agent_ctx.observation_metadata.clone()),
         };
-        self.record_entity_observe_event_with_seq(
-            tenant.as_str(),
-            "File",
-            file_id,
-            seq,
-            "state_change",
-            serde_json::to_value(&change).unwrap_or_default(),
-        );
-        let _ = self.event_tx.send(change);
+        self.publish_entity_change(change, &response.state);
 
         {
             let state = self.clone();

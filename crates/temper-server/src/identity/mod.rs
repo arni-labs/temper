@@ -14,6 +14,7 @@ mod resolver_support;
 mod revocation;
 
 pub use error::IdentityError;
+pub(crate) use principal_records::refresh_principal_records;
 pub use resolver::{IdentityResolver, MAX_CREDENTIAL_BYTES, ResolvedIdentity};
 pub use resolver_support::hash_token;
 pub(crate) use revocation::credential_revoked;

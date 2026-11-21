@@ -46,6 +46,7 @@ async fn serve_temper_client() -> (
 /// - GET  /tdata/$metadata            → CSDL XML (tenant-scoped)
 /// - GET  /tdata/$hints               → agent hints JSON
 /// - GET  /tdata/$events              → SSE stream of entity state changes
+/// - GET  /tdata/$wait                → wait for an authorized change or condition
 /// - GET  /tdata/{*path}              → entity set / entity / navigation / function
 /// - POST /tdata/{*path}              → create entity / bound action
 /// - any method on /webhooks/{tenant}/{*path} → inbound webhook receiver
@@ -67,7 +68,8 @@ pub fn build_routes(state: ServerState) -> Router {
         .route("/", get(odata::handle_service_document))
         .route("/$metadata", get(odata::handle_metadata))
         .route("/$hints", get(odata::handle_hints))
-        .route("/$events", get(events::handle_events))
+        .route("/$events", get(events::handle_events_request))
+        .route("/$wait", get(events::handle_wait))
         // Content-addressed binary ingest. Registered as a specific
         // route so axum routes it ahead of the generic `/{*path}`
         // catch-all, and so the body extractor can take a streaming
