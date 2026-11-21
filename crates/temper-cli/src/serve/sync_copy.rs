@@ -38,12 +38,6 @@ const TRIM_BUDGET: Duration = Duration::from_secs(1);
 /// engine's automatic checkpoints off.
 const MAX_WAL_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Push attempts timing out in a row before the server exits. The sync
-/// engine sends its requests one at a time, so one the remote never answers
-/// holds every later push until its connection fails; the supervisor's
-/// restart starts a fresh one, and the start checks the file again.
-const TIMEOUTS_BEFORE_RESTART: u32 = 6;
-
 /// The server's router: `routes` with, when the store's database has a copy,
 /// changes answered only after they reach it, and one span per request
 /// around all of it. The span goes on last, so a request's push, and the
@@ -177,8 +171,10 @@ fn reads_only(method: &Method, path: &str) -> bool {
 }
 
 /// Push changes no request waited for, check a file the start could not
-/// check, trim the change log, checkpoint the local log, and restart when
-/// only a restart helps.
+/// check, trim the change log, checkpoint the local log, and restart when a
+/// file behind its remote copy needs restoring. A remote that stops
+/// answering is no reason to restart: the engine ends a request that gets no
+/// answer, and the next push opens a fresh connection.
 fn spawn_upkeep(store: TursoEventStore, copy: SyncCopy) {
     let interval = std::env::var("TEMPER_TURSO_SYNC_INTERVAL_MS")
         .ok()
@@ -205,13 +201,6 @@ fn spawn_upkeep(store: TursoEventStore, copy: SyncCopy) {
             }
             if let Err(error) = copy.push_committed().await {
                 tracing::warn!(%error, "turso.sync background push failed");
-            }
-            if copy.pushes_timed_out_in_a_row() >= TIMEOUTS_BEFORE_RESTART {
-                tracing::error!(
-                    timeouts = copy.pushes_timed_out_in_a_row(),
-                    "turso.sync pushes keep timing out; exiting so the restart opens a fresh connection"
-                );
-                std::process::exit(75);
             }
             if let Err(error) = store.trim_change_log(TRIM_BUDGET).await {
                 tracing::warn!(%error, "turso.sync could not trim the change log; the next tick will");
