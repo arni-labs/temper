@@ -410,9 +410,10 @@ pub(crate) fn process_action_with_xref_and_field_mode(
         ));
     }
 
-    if let Err(error) = table.validate_action_params(
+    if let Err(error) = table.validate_action_params_on(
         action,
         params,
+        &state.fields,
         comparison_fields.unwrap_or(&state.fields),
         &state.counters,
         &state.booleans,

@@ -82,19 +82,7 @@ impl ServerState {
                 // do not carry; a param wins, so a value the spawning action
                 // just set is never overwritten by the field as it stood
                 // before the action.
-                let copied = crate::blobs::resolve_copied_values(
-                    &crate::blobs::BlobReadSource::Tenant {
-                        state: self,
-                        tenant,
-                    },
-                    Value::Object(req.copied_fields.clone()),
-                )
-                .await
-                .map_err(|error| SpawnRefusal::new(action, error))?;
-                let mut params = match copied {
-                    Value::Object(copied) => copied,
-                    _ => serde_json::Map::new(),
-                };
+                let mut params = req.copied_fields.clone();
                 params.extend(action_params.as_object().cloned().unwrap_or_default());
                 params.extend(parent_fields.clone());
                 let params = self
@@ -119,6 +107,11 @@ impl ServerState {
         if let Some((action, params)) = &initializer
             && !defer_initializer_check
         {
+            // Checked as it will be sent: with copied values read back.
+            let params = &self
+                .copied_values(tenant, params)
+                .await
+                .map_err(|error| SpawnRefusal::new(action, error))?;
             self.load_authz_resource_snapshot(tenant, &req.entity_type, &req.entity_id)
                 .await
                 .map_err(|error| error.to_string())

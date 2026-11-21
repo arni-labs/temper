@@ -6,7 +6,9 @@
 //! fields and a reaction's args read such a field's value before they send
 //! it, and the target stores the value as its own. Before, the copy sent the
 //! source's reference and the target's move was refused, while the same
-//! copy of a small field went through.
+//! copy of a small field went through. The value is read in the try that
+//! sends the move, so a blob store that does not answer keeps the spawn or
+//! the reaction owed, and it lands once the store answers again.
 
 mod common;
 
@@ -16,7 +18,9 @@ use common::CSDL_XML;
 use serde_json::{Value, json};
 use temper_runtime::ActorSystem;
 use temper_runtime::tenant::TenantId;
+use temper_server::idempotency::IdempotencyKey;
 use temper_server::registry::SpecRegistry;
+use temper_server::request_context::AgentContext;
 use temper_server::{ServerState, StorageStack};
 use temper_spec::csdl::parse_csdl;
 use temper_store_turso::TursoEventStore;
@@ -61,6 +65,10 @@ name = "Note"
 kind = "input"
 from = ["Open"]
 params = ["note"]
+[[action]]
+name = "Share"
+kind = "input"
+from = ["Open"]
 [[action.triggers]]
 name = "mirror"
 kind = "entity"
@@ -121,6 +129,42 @@ async fn state_with(dir: &tempfile::TempDir) -> ServerState {
 }
 
 async fn move_on(state: &ServerState, entity_type: &str, id: &str, action: &str, params: Value) {
+    sent_as(
+        state,
+        &AgentContext::default(),
+        entity_type,
+        id,
+        action,
+        params,
+    )
+    .await;
+}
+
+/// A move sent with a caller's idempotency key: what it owes (a child, a
+/// reaction) is kept and tried again when a try does not land, which only a
+/// keyed move's follow-ons can be without applying twice.
+async fn keyed_move(state: &ServerState, entity_type: &str, id: &str, action: &str) {
+    let caller = AgentContext {
+        idempotency_key: Some(IdempotencyKey::Request(format!(
+            "{entity_type}-{id}-{action}"
+        ))),
+        ..AgentContext::default()
+    };
+    let params = match action {
+        "Fire" => json!({ "run": id.replace("job", "session") }),
+        _ => json!({}),
+    };
+    sent_as(state, &caller, entity_type, id, action, params).await;
+}
+
+async fn sent_as(
+    state: &ServerState,
+    caller: &AgentContext,
+    entity_type: &str,
+    id: &str,
+    action: &str,
+    params: Value,
+) {
     let response = state
         .dispatch_tenant_action(
             &TenantId::default(),
@@ -128,7 +172,7 @@ async fn move_on(state: &ServerState, entity_type: &str, id: &str, action: &str,
             id,
             action,
             params,
-            &Default::default(),
+            caller,
         )
         .await
         .expect("the move answers");
@@ -150,7 +194,8 @@ async fn stored_reference(state: &ServerState, entity_type: &str, id: &str, fiel
 }
 
 async fn reaches(state: &ServerState, entity_type: &str, id: &str, status: &str) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // Long enough for an owed write's second try (1 s, then 2 s).
+    tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if let Ok(record) = state
                 .get_tenant_entity_state(&TenantId::default(), entity_type, id)
@@ -204,6 +249,136 @@ async fn a_reaction_copies_a_large_field_by_value() {
     move_on(&state, "Source", "s1", "Note", json!({ "note": large() })).await;
     let source = stored_reference(&state, "Source", "s1", "note").await;
 
+    move_on(&state, "Source", "s1", "Share", json!({})).await;
     reaches(&state, "Sink", "s1", "Copied").await;
     assert_eq!(stored_reference(&state, "Sink", "s1", "note").await, source);
+}
+
+/// The file `reference` names under `dir`, the server's data directory.
+fn blob_file(dir: &tempfile::TempDir, reference: &Value) -> std::path::PathBuf {
+    let key = reference["__temper_blob_ref"]
+        .as_str()
+        .expect("a reference has a key");
+    let name = key.rsplit('/').next().expect("the key names a file");
+    let mut stack = vec![dir.path().to_path_buf()];
+    while let Some(path) = stack.pop() {
+        for entry in std::fs::read_dir(&path).expect("the data directory reads") {
+            let path = entry.expect("the entry reads").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+                return path;
+            }
+        }
+    }
+    panic!("no blob file {name} under the data directory");
+}
+
+/// A blob store that does not answer for `file`: the file becomes a link to
+/// itself, which every open fails (not as missing), until it is restored.
+struct Unreadable {
+    file: std::path::PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl Unreadable {
+    fn make(file: std::path::PathBuf) -> Self {
+        let bytes = std::fs::read(&file).expect("the blob reads");
+        std::fs::remove_file(&file).expect("the blob is removed");
+        std::os::unix::fs::symlink(&file, &file).expect("the blob becomes a loop");
+        Self { file, bytes }
+    }
+
+    fn restore(self) {
+        std::fs::remove_file(&self.file).expect("the loop is removed");
+        std::fs::write(&self.file, &self.bytes).expect("the blob is written back");
+    }
+}
+
+async fn status(state: &ServerState, entity_type: &str, id: &str) -> Option<String> {
+    state
+        .get_tenant_entity_state(&TenantId::default(), entity_type, id)
+        .await
+        .ok()
+        .map(|record| record.state.status)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spawn_whose_copied_field_cannot_be_read_yet_lands_once_it_can() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir).await;
+    state
+        .get_or_create_tenant_entity(&TenantId::default(), "Job", "job-2", json!({}))
+        .await
+        .expect("the job is created");
+    move_on(
+        &state,
+        "Job",
+        "job",
+        "Configure",
+        json!({ "prompt": large() }),
+    )
+    .await;
+    let parent = stored_reference(&state, "Job", "job-2", "prompt").await;
+    let unreadable = Unreadable::make(blob_file(&dir, &parent));
+
+    keyed_move(&state, "Job", "job-2", "Fire").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_ne!(
+        status(&state, "Session", "session-2").await.as_deref(),
+        Some("Ready"),
+        "the child started without its copied field"
+    );
+
+    unreadable.restore();
+    reaches(&state, "Session", "session-2", "Ready").await;
+    assert_eq!(
+        stored_reference(&state, "Session", "session-2", "prompt").await,
+        parent
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reaction_whose_copied_field_cannot_be_read_yet_lands_once_it_can() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir).await;
+    state
+        .get_or_create_tenant_entity(&TenantId::default(), "Sink", "s2", json!({}))
+        .await
+        .expect("the sink is created");
+    move_on(&state, "Source", "s2", "Note", json!({ "note": large() })).await;
+    let source = stored_reference(&state, "Source", "s2", "note").await;
+    let unreadable = Unreadable::make(blob_file(&dir, &source));
+
+    keyed_move(&state, "Source", "s2", "Share").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        status(&state, "Sink", "s2").await.as_deref(),
+        Some("Empty"),
+        "the reaction landed without its copied field"
+    );
+
+    unreadable.restore();
+    reaches(&state, "Sink", "s2", "Copied").await;
+    assert_eq!(stored_reference(&state, "Sink", "s2", "note").await, source);
+}
+
+/// A move that sends back the reference its record holds, as a client that
+/// echoes a record it read does, is no change to that field.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_may_send_back_the_reference_its_record_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir).await;
+    move_on(&state, "Source", "s3", "Note", json!({ "note": large() })).await;
+    let held = stored_reference(&state, "Source", "s3", "note").await;
+
+    move_on(
+        &state,
+        "Source",
+        "s3",
+        "Note",
+        json!({ "note": held.clone() }),
+    )
+    .await;
+    assert_eq!(stored_reference(&state, "Source", "s3", "note").await, held);
 }
