@@ -182,7 +182,10 @@ impl crate::state::ServerState {
             observation_metadata: (!ctx.agent_ctx.observation_metadata.is_empty())
                 .then(|| ctx.agent_ctx.observation_metadata.clone()),
         };
-        self.publish_entity_change(change, &response.state);
+        self.publish_entity_change(
+            change,
+            response.unrecorded_at.is_none().then_some(&response.state),
+        );
         if matches!(
             response.state.status.as_str(),
             "Completed" | "Failed" | "Cancelled"

@@ -335,7 +335,7 @@ impl ServerState {
             observation_metadata: (!agent_ctx.observation_metadata.is_empty())
                 .then(|| agent_ctx.observation_metadata.clone()),
         };
-        self.publish_entity_change(change, &response.state);
+        self.publish_entity_change(change, Some(&response.state));
 
         {
             let state = self.clone();

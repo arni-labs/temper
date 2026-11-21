@@ -126,7 +126,7 @@ impl ServerState {
                 tenant: tenant.to_string(),
                 ..EntityStateChange::default()
             },
-            state,
+            Some(state),
         );
     }
 
@@ -134,7 +134,7 @@ impl ServerState {
     pub(crate) fn publish_entity_change(
         &self,
         change: EntityStateChange,
-        state: &crate::EntityState,
+        committed: Option<&crate::EntityState>,
     ) {
         self.record_entity_observe_event_with_seq(
             &change.tenant,
@@ -144,10 +144,10 @@ impl ServerState {
             "state_change",
             serde_json::to_value(&change).unwrap_or_default(),
         );
-        if self.record_event_tx.receiver_count() == 0 {
+        let Some(state) = committed.filter(|_| self.record_event_tx.receiver_count() != 0) else {
             let _ = self.event_tx.send(change);
             return;
-        }
+        };
         let _ = self.event_tx.send(change.clone());
         // Carry the row, without the replay log or idempotency history. Cedar
         // authorizes this descriptor before any overflow values are hydrated.

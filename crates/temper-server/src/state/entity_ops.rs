@@ -1543,7 +1543,7 @@ impl ServerState {
             intent: None,
             observation_metadata: None,
         };
-        self.publish_entity_change(change, &response.state);
+        self.publish_entity_change(change, Some(&response.state));
 
         Ok(response)
     }
@@ -1718,7 +1718,7 @@ impl ServerState {
             intent: None,
             observation_metadata: None,
         };
-        self.publish_entity_change(change, &state);
+        self.publish_entity_change(change, Some(&state));
 
         Ok(Some(EntityResponse {
             success: true,

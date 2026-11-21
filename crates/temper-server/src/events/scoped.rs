@@ -58,8 +58,8 @@ enum Outcome {
     Interrupted,
 }
 
-fn invalid_query(message: &str) -> Response {
-    odata_error(StatusCode::BAD_REQUEST, "InvalidQuery", message).into_response()
+fn invalid_query(message: &str) -> ODataResponse {
+    odata_error(StatusCode::BAD_REQUEST, "InvalidQuery", message)
 }
 
 impl Subscription {
@@ -67,7 +67,7 @@ impl Subscription {
         state: ServerState,
         authenticated: AuthenticatedRequestContext,
         query: &SubscriptionQuery,
-    ) -> Result<Self, Response> {
+    ) -> Result<Self, ODataResponse> {
         let Some(sets) = query.sets.as_ref().filter(|sets| !sets.is_empty()) else {
             return Err(invalid_query("Send sets with one or more entity set names"));
         };
@@ -85,8 +85,7 @@ impl Subscription {
                     StatusCode::NOT_FOUND,
                     "EntitySetNotFound",
                     "The subscription names an unknown entity set",
-                )
-                .into_response());
+                ));
             };
             types.insert(entity_type, set.to_string());
         }
@@ -249,7 +248,7 @@ pub(super) fn stream(
     }
     let mut subscription = match Subscription::open(state, authenticated, &query) {
         Ok(subscription) => subscription,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     subscription.observe_metadata = query.observe;
     let stream = async_stream::stream! {
@@ -287,7 +286,7 @@ pub(crate) async fn handle_wait(
     };
     let mut subscription = match Subscription::open(state, authenticated, &query) {
         Ok(subscription) => subscription,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     if !query.only_changes
         && let Some(filter) = query.filter.take()
