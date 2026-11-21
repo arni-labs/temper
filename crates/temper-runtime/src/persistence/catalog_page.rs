@@ -289,19 +289,43 @@ impl QueryFieldIndexPageQuery {
             conditions.push(field_comparison_sql(sql, comparison, &placeholder));
         }
         for group in &self.text_matches {
+            let mut literals = std::collections::BTreeMap::new();
             let alternatives = group
                 .iter()
                 .map(|text| {
-                    let literal = next(text.needle.clone(), &mut params);
-                    let matched = sql.record_contains(&text.field, &literal);
+                    let literal = literals
+                        .entry(text.needle.as_str())
+                        .or_insert_with(|| next(text.needle.clone(), &mut params));
+                    let matched = sql.record_contains(&text.field, literal);
                     if text.or_missing {
                         format!("({matched} OR NOT {})", sql.field_has_key(&text.field))
                     } else {
                         matched
                     }
                 })
-                .collect::<Vec<_>>();
-            conditions.push(format!("({})", alternatives.join(" OR ")));
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            // One test per distinct literal can skip JSON extraction for all
+            // fields when storing that literal never needs JSON escaping.
+            let can_skip_extraction = literals.len() < group.len()
+                && group.iter().all(|text| {
+                    !text.or_missing
+                        && text.needle.bytes().all(|byte| {
+                            matches!(byte, b' '..=b'~') && !matches!(byte, b'"' | b'\\')
+                        })
+                });
+            if can_skip_extraction {
+                let candidates = literals
+                    .values()
+                    .map(|literal| sql.record_json_contains(literal))
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                conditions.push(format!(
+                    "(CASE WHEN {candidates} THEN ({alternatives}) ELSE FALSE END)"
+                ));
+            } else {
+                conditions.push(format!("({alternatives})"));
+            }
         }
         if !self.mistyped.is_empty() {
             let mistyped: Vec<String> = self

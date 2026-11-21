@@ -113,7 +113,7 @@ async fn per_row_reads_walk_every_record_on_turso() {
 async fn a_sparse_contains_filter_reads_only_catalog_matches() {
     let (state, bodies, _dir) = turso_cards("sparse-substring").await;
     let reader = install_reader(&state);
-    let query = "$filter=(Status eq 'Open' or Status eq 'Done' or Status eq 'Posted') and (contains(kind,'xxxxx') or contains(title,'ébony'))&$orderby=Status desc";
+    let query = "$filter=(Status eq 'Open' or Status eq 'Done' or Status eq 'Posted') and (contains(kind,'xxxxx') or contains(title,'xxxxx'))&$orderby=Status desc";
     let (want, count) = in_memory(&visible(&bodies), query);
     assert!(count > 0);
     let page = read(&state, &reader, &format!("{query}&$count=true&$top=3")).await;
@@ -129,6 +129,18 @@ async fn a_sparse_contains_filter_reads_only_catalog_matches() {
         page.telemetry.materialized_count < ROWS / 10,
         "a rare search must avoid materializing nonmatches: {}",
         page.telemetry.materialized_count,
+    );
+
+    let key_only = read(
+        &state,
+        &reader,
+        "$filter=contains(title,'title') or contains(kind,'title')&$top=3",
+    )
+    .await;
+    assert!(key_only.entities.is_empty());
+    assert_eq!(
+        key_only.telemetry.materialized_count, 0,
+        "a field name in the JSON is not a matching field value",
     );
 }
 

@@ -137,6 +137,9 @@ pub trait CatalogSql {
     /// True when the text value contains the literal byte for byte.
     /// Use the stored state's copy of the field when it has one.
     fn record_contains(&self, field: &str, literal: &str) -> String;
+    /// A substring candidate over the catalog's JSON text. The literal
+    /// consists of bytes the store writes without JSON escaping.
+    fn record_json_contains(&self, literal: &str) -> String;
     /// The row's status as a string compares it, under byte order.
     fn status(&self) -> String;
 }
@@ -195,6 +198,9 @@ impl CatalogSql for SketchSql {
     }
     fn record_contains(&self, field: &str, literal: &str) -> String {
         format!("contains({field}, {literal})")
+    }
+    fn record_json_contains(&self, literal: &str) -> String {
+        format!("json_contains({literal})")
     }
     fn status(&self) -> String {
         "status".to_string()

@@ -73,6 +73,10 @@ impl CatalogSql for TursoCatalogSql {
         )
     }
 
+    fn record_json_contains(&self, literal: &str) -> String {
+        format!("(instr(fields, {literal}) > 0 OR instr(state, {literal}) > 0)")
+    }
+
     /// The column, under its default `BINARY` collation: byte order.
     fn status(&self) -> String {
         "status".to_string()

@@ -80,6 +80,12 @@ impl CatalogSql for PostgresCatalogSql {
         )
     }
 
+    fn record_json_contains(&self, literal: &str) -> String {
+        format!(
+            "(strpos((fields::text COLLATE \"C\"), {literal}) > 0 OR +             strpos((state::text COLLATE \"C\"), {literal}) > 0)"
+        )
+    }
+
     fn status(&self) -> String {
         "(status COLLATE \"C\")".to_string()
     }
