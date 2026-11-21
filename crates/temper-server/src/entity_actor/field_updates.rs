@@ -102,7 +102,7 @@ fn state_variable_refusal(
     actor: &EntityActor,
     state: &EntityState,
     fields: &Value,
-) -> Option<String> {
+) -> Option<(String, String)> {
     let table = actor.table.read().expect("table lock poisoned");
     let declared = &table.initial_values;
     fields.as_object()?.iter().find_map(|(name, value)| {
@@ -119,9 +119,12 @@ fn state_variable_refusal(
             return None;
         };
         (!holds).then(|| {
-            format!(
-                "'{name}' is a state variable of {}: a move changes it, not a field update",
-                state.entity_type
+            (
+                name.clone(),
+                format!(
+                    "'{name}' is a state variable of {}: a move changes it, not a field update",
+                    state.entity_type
+                ),
             )
         })
     })
@@ -181,10 +184,15 @@ pub(super) async fn commit_field_update(
     // but the event written now must not carry a caller's forged `has_spec` or
     // `ctx_owner_status` into the journal in the first place.
     let fields = effects::sanitize_action_params(&fields).into_owned();
-    if let Some(reason) = state_variable_refusal(actor, state, &fields)
-        .or_else(|| crate::blobs::sent_field_reference(&fields, &state.fields))
+    // A field no field update may set is refused for good, not as a
+    // write that might land if tried again.
+    if let Some((field, reason)) = state_variable_refusal(actor, state, &fields)
+        .or_else(|| temper_jit::field_reference::sent_field_reference_in(&fields, &state.fields))
     {
-        return Err(NotUpdated::Failed(reason));
+        return Err(NotUpdated::Refused(
+            reason,
+            temper_jit::table::Refusal::FieldNotWritable { field },
+        ));
     }
 
     let action = if replace {

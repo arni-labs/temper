@@ -240,20 +240,42 @@ impl ServerState {
         // The integrations read the record as the move left it, at the
         // move's sequence, which names its calls' deadline rows, and at its
         // time, from which their tries and deadlines count.
-        let mut entity_state = match self
-            .get_tenant_entity_state(tenant, &fire.entity_type, &fire.entity_id)
-            .await
-        {
-            Ok(response) => response.state,
-            Err(error) => {
-                tracing::warn!(tenant = %tenant, entity_type = %fire.entity_type,
-                    entity_id = %fire.entity_id, %error,
-                    "record of owed integrations not readable; its row is kept for the next boot");
-                return false;
+        // A read the store fails is tried again here, while the row is
+        // held: left to the next boot, the integrations would wait for one.
+        let mut wait = FIRST_RETRY_WAIT;
+        let mut entity_state = loop {
+            match self
+                .get_tenant_entity_state(tenant, &fire.entity_type, &fire.entity_id)
+                .await
+            {
+                Ok(response) => break response.state,
+                // A record that is gone has nothing to run its integrations on.
+                Err(error) if !self.entity_exists(tenant, &fire.entity_type, &fire.entity_id) => {
+                    tracing::warn!(tenant = %tenant, entity_type = %fire.entity_type,
+                        entity_id = %fire.entity_id, %error,
+                        "record of owed integrations is gone; they are not sent");
+                    return true;
+                }
+                Err(error) => {
+                    tracing::warn!(tenant = %tenant, entity_type = %fire.entity_type,
+                        entity_id = %fire.entity_id, %error, retry_in_ms = wait.as_millis() as u64,
+                        "record of owed integrations not readable; trying again");
+                    tokio::time::sleep(wait).await; // determinism-ok: retry backoff
+                    wait = (wait * 2).min(LAST_RETRY_WAIT);
+                }
             }
         };
         entity_state.status = owed.status.clone();
         entity_state.fields = owed.fields.clone();
+        if let Some(counters) = &owed.counters {
+            entity_state.counters = counters.clone();
+        }
+        if let Some(booleans) = &owed.booleans {
+            entity_state.booleans = booleans.clone();
+        }
+        if let Some(lists) = &owed.lists {
+            entity_state.lists = lists.clone();
+        }
         // The record as the move left it reads at the move's sequence, so a
         // call checks the record is still there against that sequence, not
         // the newer count of a record that moved on since.

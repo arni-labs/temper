@@ -6,6 +6,7 @@
 //! Fire-and-forget: the source transition is already committed regardless of
 //! reaction outcome.
 
+use super::resolver::resolve_reaction_target;
 use std::sync::PoisonError;
 
 use futures_util::FutureExt;
@@ -216,7 +217,7 @@ impl crate::ServerState {
             }
 
             let target_entity_id =
-                match super::resolver::resolve_target_id(&rule.resolve_target, entity_id, fields) {
+                match resolve_reaction_target(&rule, entity_id, fields, invoking_ctx) {
                     Some(id) => id,
                     None => {
                         target_resolve_error_count += 1;

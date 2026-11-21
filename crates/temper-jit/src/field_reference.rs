@@ -37,10 +37,18 @@ fn holds_field_reference(value: &Value) -> bool {
 /// read), never a new one. Any object with the reference key counts, valid
 /// or not, so no shape a later reader accepts can get past this.
 pub fn sent_field_reference(sent: &Value, held: &Value) -> Option<String> {
+    sent_field_reference_in(sent, held).map(|(_, reason)| reason)
+}
+
+/// [`sent_field_reference`] with the name of the field that holds it.
+pub fn sent_field_reference_in(sent: &Value, held: &Value) -> Option<(String, String)> {
     sent.as_object()?.iter().find_map(|(name, value)| {
         (holds_field_reference(value) && held.get(name) != Some(value)).then(|| {
-            format!(
-                "'{name}' holds a stored-field reference ({FIELD_REFERENCE_KEY}): a write sends the value, and the kernel stores it"
+            (
+                name.clone(),
+                format!(
+                    "'{name}' holds a stored-field reference ({FIELD_REFERENCE_KEY}): a write sends the value, and the kernel stores it"
+                ),
             )
         })
     })

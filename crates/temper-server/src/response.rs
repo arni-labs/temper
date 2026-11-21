@@ -60,8 +60,11 @@ pub fn odata_refusal(
 /// caller retries; every other refusal is 409, a conflict with the record.
 pub fn refusal_status(refusal: Option<&temper_jit::table::Refusal>) -> StatusCode {
     use temper_jit::table::{ConstraintKind, Refusal};
-    let Some(Refusal::ConstraintViolation { details }) = refusal else {
-        return StatusCode::CONFLICT;
+    let details = match refusal {
+        Some(Refusal::ConstraintViolation { details }) => details,
+        // The request itself is wrong; sending it again is refused again.
+        Some(Refusal::FieldNotWritable { .. }) => return StatusCode::BAD_REQUEST,
+        _ => return StatusCode::CONFLICT,
     };
     match details.kind {
         ConstraintKind::RelationUnverified => StatusCode::SERVICE_UNAVAILABLE,

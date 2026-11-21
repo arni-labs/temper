@@ -150,7 +150,11 @@ pub(super) fn refused_by_rule(response: &crate::entity_actor::EntityResponse) ->
     use temper_jit::table::Refusal;
     matches!(
         response.refusal,
-        Some(Refusal::ConstraintViolation { .. } | Refusal::InvariantViolated { .. })
+        Some(
+            Refusal::ConstraintViolation { .. }
+                | Refusal::InvariantViolated { .. }
+                | Refusal::FieldNotWritable { .. }
+        )
     )
 }
 

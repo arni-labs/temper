@@ -62,6 +62,13 @@ pub enum Refusal {
     /// The record changed after the move was decided on it, so nothing was
     /// written. The move is decided again on the record as it is now.
     RecordChanged,
+    /// A field update set a field no field update may set: a state
+    /// variable's, which only a move changes, or a stored-field reference,
+    /// which only the kernel makes. Sending it again is refused again.
+    FieldNotWritable {
+        /// The field's name.
+        field: String,
+    },
     /// The request's Idempotency-Key was already used on this entity for a
     /// different request.
     IdempotencyKeyReused {
@@ -81,6 +88,7 @@ impl Refusal {
             Refusal::InvariantViolated { .. } => "InvariantViolated",
             Refusal::ConstraintViolation { .. } => "ConstraintViolation",
             Refusal::RecordChanged => "RecordChanged",
+            Refusal::FieldNotWritable { .. } => "FieldNotWritable",
             Refusal::IdempotencyKeyReused { .. } => "IdempotencyKeyReused",
         }
     }

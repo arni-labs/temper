@@ -37,6 +37,47 @@ pub(crate) fn resolve_target_id(
     }
 }
 
+/// The target id of `rule`'s reaction to a move made as `invoking`
+/// ([`resolve_reaction_target_id`], under the move's key).
+pub(crate) fn resolve_reaction_target(
+    rule: &super::types::ReactionRule,
+    source_entity_id: &str,
+    fields: &serde_json::Value,
+    invoking: &crate::request_context::AgentContext,
+) -> Option<String> {
+    resolve_reaction_target_id(
+        &rule.resolve_target,
+        source_entity_id,
+        fields,
+        invoking.idempotency_key.as_ref().map(|key| key.as_str()),
+        &rule.name,
+    )
+}
+
+/// [`resolve_target_id`] for a reaction of the move made under `move_key`:
+/// a `create` target's id is derived from that key and the rule, so the
+/// reaction sent again (a boot resends what a move owes) names the record
+/// it made the first time, and lands as a duplicate instead of making a
+/// second one. A move with no key mints a fresh id, as before.
+pub(crate) fn resolve_reaction_target_id(
+    resolver: &TargetResolver,
+    source_entity_id: &str,
+    fields: &serde_json::Value,
+    move_key: Option<&str>,
+    rule_name: &str,
+) -> Option<String> {
+    match (resolver, move_key) {
+        (TargetResolver::Create, Some(key)) => Some(
+            uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_OID,
+                format!("temper:reaction-target:{key}:{rule_name}").as_bytes(),
+            )
+            .to_string(),
+        ),
+        _ => resolve_target_id(resolver, source_entity_id, fields),
+    }
+}
+
 /// Whether [`resolve_target_id`] made the target's id up rather than reading
 /// it from the source: `create`, or `create_if_missing` with no id in the
 /// fields. The target is then an entity the reaction makes, new each time.
@@ -181,6 +222,20 @@ mod tests {
         assert_eq!(
             ids_run1, ids_run2,
             "Create resolver must produce the same id sequence under the same seed"
+        );
+    }
+
+    #[test]
+    fn a_reaction_sent_again_makes_no_second_record() {
+        let make = |key| {
+            resolve_reaction_target_id(&TargetResolver::Create, "s", &json!({}), key, "spawn_note")
+                .unwrap()
+        };
+        assert_eq!(make(Some("dispatch:k1")), make(Some("dispatch:k1")));
+        assert_ne!(make(Some("dispatch:k1")), make(Some("dispatch:k2")));
+        assert_ne!(
+            resolve_reaction_target_id(&TargetResolver::Create, "s", &json!({}), Some("k"), "a"),
+            resolve_reaction_target_id(&TargetResolver::Create, "s", &json!({}), Some("k"), "b"),
         );
     }
 }

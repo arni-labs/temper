@@ -72,6 +72,15 @@ pub(crate) struct OwedFollowOns {
     pub(crate) status: String,
     /// The record's fields after the move.
     pub(crate) fields: serde_json::Value,
+    /// The record's counters, booleans and lists after the move: the follow-ons
+    /// read the record as the move left it, not as later moves left it. A row
+    /// written before they were kept has none, and is read with the record's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) counters: Option<std::collections::BTreeMap<String, usize>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) booleans: Option<std::collections::BTreeMap<String, bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lists: Option<std::collections::BTreeMap<String, Vec<String>>>,
     /// The move's parameters.
     pub(crate) params: serde_json::Value,
     /// The reactions its action declared when it was sent; the status above

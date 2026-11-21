@@ -80,7 +80,15 @@ impl ServerState {
                     group.values = values;
                     readable.push(group);
                 }
-                Err(_) => unreadable += group.ids.len(),
+                // A value a rule reads that cannot be read back leaves the
+                // records it holds unchecked: the install is refused, not
+                // installed past them (review rv-c869b2838).
+                Err(error) => {
+                    return Err(format!(
+                        "a value {} of its records store out of line could not be read: {error}",
+                        group.ids.len()
+                    ));
+                }
             }
         }
         Ok((readable, unreadable))

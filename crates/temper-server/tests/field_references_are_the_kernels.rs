@@ -17,7 +17,7 @@ use common::CSDL_XML;
 use serde_json::json;
 use temper_runtime::ActorSystem;
 use temper_runtime::tenant::TenantId;
-use temper_server::registry::SpecRegistry;
+use temper_server::registry::{EntityVerificationResult, SpecRegistry, VerificationStatus};
 use temper_server::request_context::AgentContext;
 use temper_server::{ServerState, build_router};
 use temper_spec::csdl::parse_csdl;
@@ -130,7 +130,11 @@ async fn a_create_cannot_write_a_reference() {
         .extensions_mut()
         .insert(temper_authz::AuthenticatedRequestContext::new(
             TenantId::default(),
-            temper_authz::SecurityContext::from_resolved_identity("service", SERVICE, None),
+            temper_authz::SecurityContext::from_resolved_identity(
+                &format!("service:{SERVICE}"),
+                SERVICE,
+                None,
+            ),
         ));
     let response = build_router(state.clone()).oneshot(request).await.unwrap();
     let status = response.status();
@@ -160,4 +164,48 @@ async fn a_field_update_cannot_write_a_reference() {
         .expect_err("the update stored a reference the caller wrote");
     assert!(refused.contains("stored-field reference"), "{refused}");
     assert_eq!(note(&state, "o3").await, json!("first"));
+}
+
+/// Review rv-c869b2838: a field update that names a field no update may set
+/// was answered 409 ConcurrentModification, which tells a client to try
+/// again. It is now a permanent refusal: 400 FieldNotWritable.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_field_update_of_an_unwritable_field_is_refused_for_good() {
+    let state = state_with("field-reference-patch");
+    // The OData write routes serve a type once its verification is done.
+    state.registry.write().unwrap().set_verification_status(
+        &TenantId::default(),
+        "Order",
+        VerificationStatus::Completed(EntityVerificationResult {
+            all_passed: true,
+            levels: vec![],
+            verified_at: "2026-11-21T00:00:00Z".into(),
+        }),
+    );
+    let (stored, error) = send_note(&state, "o4", json!("first")).await;
+    assert!(stored, "{error}");
+    let mut request = Request::builder()
+        .method("PATCH")
+        .uri("/tdata/Orders('o4')")
+        .header("Content-Type", "application/json")
+        .body(Body::from(json!({"Notes": forged()}).to_string()))
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(temper_authz::AuthenticatedRequestContext::new(
+            TenantId::default(),
+            temper_authz::SecurityContext::from_resolved_identity(
+                &format!("service:{SERVICE}"),
+                SERVICE,
+                None,
+            ),
+        ));
+    let response = build_router(state.clone()).oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("FieldNotWritable"), "{body}");
 }
