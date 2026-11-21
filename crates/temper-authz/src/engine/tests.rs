@@ -1200,3 +1200,60 @@ fn http_endpoint_routes_are_managed_only_by_the_platform() {
         "the operator creates routes without an app permit"
     );
 }
+
+/// Review rv-058d4798a, P0: an update that removes an action and the denial
+/// that kept a broad permit off it. Loaded first, the new policy let a caller
+/// under the broad permit run the old action while the old spec was still
+/// live; loaded last, the old policy let a reaction the update adds make a
+/// write the new one forbids. While a version is installed, a request is
+/// allowed only when the policy before it and its own both allow it.
+#[test]
+fn an_install_is_decided_under_both_versions_until_its_specs_are_in() {
+    let engine = AuthzEngine::empty();
+    let old = r#"
+        permit(principal, action, resource is Doc);
+        forbid(principal, action == Action::"Purge", resource is Doc);
+    "#;
+    // The update drops Purge, and its denial with it, and forbids Archive.
+    let new = r#"
+        permit(principal, action, resource is Doc);
+        forbid(principal, action == Action::"Archive", resource is Doc);
+    "#;
+    engine.reload_tenant_policies("t", old).unwrap();
+    let ctx = customer_context("user-1");
+    let attrs = HashMap::from([("id".to_string(), serde_json::json!("doc-1"))]);
+    let allowed = |action: &str| {
+        engine
+            .authorize_for_tenant("t", &ctx, action, "Doc", &attrs)
+            .is_allowed()
+    };
+    assert!(!allowed("Purge"));
+    assert!(allowed("Archive"));
+
+    engine.reload_tenant_policies_for_install("t", new).unwrap();
+    assert!(
+        !allowed("Purge"),
+        "the old spec's Purge stays forbidden while it is live"
+    );
+    assert!(
+        !allowed("Archive"),
+        "what the new version forbids is forbidden at once"
+    );
+    assert!(allowed("Read"), "what both allow is allowed");
+
+    // A second install over one under way keeps the policy in force before both.
+    engine.reload_tenant_policies_for_install("t", new).unwrap();
+    assert!(!allowed("Purge"));
+
+    engine.end_install_overlap("t");
+    assert!(
+        allowed("Purge"),
+        "once its specs are in, only the new version decides"
+    );
+    assert!(!allowed("Archive"));
+
+    // An ordinary reload ends an overlap too: what was before is gone.
+    engine.reload_tenant_policies_for_install("t", old).unwrap();
+    engine.reload_tenant_policies("t", new).unwrap();
+    assert!(allowed("Purge"));
+}

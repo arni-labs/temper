@@ -21,6 +21,7 @@ use crate::error::{AuthzDenial, AuthzError};
 use crate::metrics::{CedarCheck, CedarDecisionMetric, CedarPhaseOutcome};
 
 mod candidates;
+mod install_overlap;
 mod list_read;
 mod list_uniformity;
 mod may;
@@ -104,6 +105,11 @@ impl CompiledPolicies {
 struct TenantPolicies {
     policies: CompiledPolicies,
     source_text: String,
+    /// While a version is installed, the policy in force before it
+    /// ([`AuthzEngine::reload_tenant_policies_for_install`]): a request is
+    /// allowed only when both allow it, until the version's specs are in
+    /// ([`AuthzEngine::end_install_overlap`]).
+    before: Option<CompiledPolicies>,
 }
 
 /// The authorization engine. Holds per-tenant compiled Cedar policies and
@@ -219,6 +225,7 @@ impl AuthzEngine {
             TenantPolicies {
                 policies: CompiledPolicies::new(new_policy_set),
                 source_text: policy_text.to_string(),
+                before: None,
             },
         );
         Ok(())
@@ -285,6 +292,7 @@ impl AuthzEngine {
             TenantPolicies {
                 policies: CompiledPolicies::new(combined_set),
                 source_text: combined_text,
+                before: None,
             },
         );
         Ok(())
@@ -457,7 +465,7 @@ impl AuthzEngine {
         };
 
         if let Some(tp) = tenants.get(tenant) {
-            return self.evaluate_request(
+            let decision = self.evaluate_request(
                 security_ctx,
                 action,
                 resource_type,
@@ -465,6 +473,24 @@ impl AuthzEngine {
                 &tp.policies,
                 check,
             );
+            // While a version is installed, what the policy before it
+            // forbids stays forbidden ([`Self::reload_tenant_policies_for_install`]).
+            return match (&decision, &tp.before) {
+                (AuthzDecision::Allow { .. }, Some(before)) => {
+                    match self.evaluate_request(
+                        security_ctx,
+                        action,
+                        resource_type,
+                        resource_attrs,
+                        before,
+                        check,
+                    ) {
+                        AuthzDecision::Allow { .. } => decision,
+                        denied => denied,
+                    }
+                }
+                _ => decision,
+            };
         }
 
         if Self::is_system(security_ctx) {

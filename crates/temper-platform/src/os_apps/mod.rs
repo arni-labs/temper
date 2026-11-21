@@ -1093,12 +1093,23 @@ async fn install_once(
     // naming the new version's types loads before them. If the specs then do
     // not load, the policy that was in force is put back.
     let previous_policy = state.server.authz.get_tenant_policy_text(tenant);
+    // When specs go in after it, the policy in force stays in force with the
+    // new one until they are in: a move is allowed only what both allow
+    // (`AuthzEngine::reload_tenant_policies_for_install`).
+    let specs_follow = plan.specs && !bundle.specs.is_empty();
     if let Some(ref policy_text) = combined_policy {
-        if let Err(e) = state
-            .server
-            .authz
-            .reload_tenant_policies(tenant, policy_text)
-        {
+        let loaded = if specs_follow {
+            state
+                .server
+                .authz
+                .reload_tenant_policies_for_install(tenant, policy_text)
+        } else {
+            state
+                .server
+                .authz
+                .reload_tenant_policies(tenant, policy_text)
+        };
+        if let Err(e) = loaded {
             return Err(format!("os-app '{app_name}' Cedar did not load: {e}"));
         }
         let mut policies = state.server.tenant_policies.write().unwrap(); // ci-ok: infallible lock
@@ -1157,6 +1168,8 @@ async fn install_once(
                 },
             )
             .inspect_err(|_| restore_policy(state))?;
+            // Its specs are in: only the new version's policy decides.
+            state.server.authz.end_install_overlap(tenant);
 
             if let Some(ps) = state
                 .server
@@ -1175,6 +1188,12 @@ async fn install_once(
                 .await;
             }
         }
+    }
+
+    // Every path out of Step 3 that kept the install ends the overlap, also
+    // one that bootstrapped no spec.
+    if specs_follow {
+        state.server.authz.end_install_overlap(tenant);
     }
 
     // ── Step 4: modules, when the specs went first (Swap::SpecsFirst). ──
