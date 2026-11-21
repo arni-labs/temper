@@ -13,7 +13,8 @@ mod secret;
 mod tombstone;
 pub use catalog_facet::{CatalogFacetQuery, FacetAfter, FacetKey};
 pub use catalog_field::{
-    CatalogSql, FieldClass, FieldComparison, FieldComparisonOp, FieldLiteral, field_comparison_sql,
+    CatalogSql, CatalogTextMatch, FieldClass, FieldComparison, FieldComparisonOp, FieldLiteral,
+    field_comparison_sql,
 };
 pub use catalog_group::CatalogGroupRow;
 pub use catalog_page::{

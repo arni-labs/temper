@@ -28,7 +28,9 @@ use super::types::{
 };
 use crate::query_eval::apply_query_options;
 use crate::storage::QueryFieldIndexOrder;
-use temper_runtime::persistence::{EventTimeBound, FieldClass, FieldComparison, KeysetValue};
+use temper_runtime::persistence::{
+    CatalogTextMatch, EventTimeBound, FieldClass, FieldComparison, KeysetValue,
+};
 
 #[derive(Clone, Debug)]
 pub(super) struct NativeCandidatePagePlan {
@@ -39,6 +41,7 @@ pub(super) struct NativeCandidatePagePlan {
     /// App-field conjuncts of the filter, compared on typed values in SQL
     /// (ADR-0188).
     pub(super) field_comparisons: Vec<FieldComparison>,
+    pub(super) text_matches: Vec<Vec<CatalogTextMatch>>,
     pub(super) order_by: Vec<QueryFieldIndexOrder>,
     /// The app fields `order_by` sorts by, each with the JSON type its order
     /// compares. SQL's order is the in-memory sort's only when no candidate

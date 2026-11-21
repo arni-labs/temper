@@ -62,6 +62,7 @@ pub(in crate::odata) fn is_record_property(name: &str) -> bool {
 #[derive(Debug, Default)]
 pub(in crate::odata) struct DeclaredFields {
     classes: BTreeMap<String, FieldClass>,
+    nullable_text: BTreeSet<String>,
     defaulted: BTreeSet<String>,
 }
 
@@ -81,6 +82,17 @@ impl DeclaredFields {
     /// The JSON type `name` compares as, when it may be compared.
     pub(in crate::odata) fn class_of(&self, name: &str) -> Option<FieldClass> {
         self.classes.get(name).copied()
+    }
+
+    /// Nullable text can narrow a substring search; it does not prove an order.
+    pub(in crate::odata) fn declare_nullable_text(&mut self, name: &str) {
+        if !is_record_property(name) {
+            self.nullable_text.insert(name.to_string());
+        }
+    }
+
+    pub(super) fn is_text(&self, name: &str) -> bool {
+        self.class_of(name) == Some(FieldClass::Text) || self.nullable_text.contains(name)
     }
 
     fn has_default(&self, name: &str) -> bool {

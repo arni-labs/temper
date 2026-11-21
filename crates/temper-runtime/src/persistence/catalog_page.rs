@@ -15,7 +15,7 @@
 
 use super::PersistenceError;
 use super::catalog_field::{
-    CatalogSql, FieldClass, FieldComparison, FieldLiteral, field_comparison_sql,
+    CatalogSql, CatalogTextMatch, FieldClass, FieldComparison, FieldLiteral, field_comparison_sql,
 };
 
 /// The length of an event-time sort key, `YYYY-MM-DDTHH:MM:SS.nnnnnnnnn`.
@@ -197,6 +197,8 @@ pub struct QueryFieldIndexPageQuery {
     /// App-field comparisons every row also meets, on its typed value
     /// (ADR-0188).
     pub field_comparisons: Vec<FieldComparison>,
+    /// Substring conjuncts every row also meets, any alternative per group.
+    pub text_matches: Vec<Vec<CatalogTextMatch>>,
     /// The order; `entity_id` ascending follows unless it ends with `entity_id`.
     pub order_by: Vec<QueryFieldIndexOrder>,
     /// Rows that also hold, for one of these fields, a value that is not of
@@ -285,6 +287,21 @@ impl QueryFieldIndexPageQuery {
         for comparison in &self.field_comparisons {
             let placeholder = next(comparison.literal.param(), &mut params);
             conditions.push(field_comparison_sql(sql, comparison, &placeholder));
+        }
+        for group in &self.text_matches {
+            let alternatives = group
+                .iter()
+                .map(|text| {
+                    let literal = next(text.needle.clone(), &mut params);
+                    let matched = sql.record_contains(&text.field, &literal);
+                    if text.or_missing {
+                        format!("({matched} OR NOT {})", sql.field_has_key(&text.field))
+                    } else {
+                        matched
+                    }
+                })
+                .collect::<Vec<_>>();
+            conditions.push(format!("({})", alternatives.join(" OR ")));
         }
         if !self.mistyped.is_empty() {
             let mistyped: Vec<String> = self

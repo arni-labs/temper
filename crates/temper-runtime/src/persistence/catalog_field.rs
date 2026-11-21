@@ -104,6 +104,17 @@ pub struct FieldComparison {
     pub or_missing: bool,
 }
 
+/// One alternative in a catalog substring predicate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogTextMatch {
+    /// The projected app field.
+    pub field: String,
+    /// The case-sensitive substring.
+    pub needle: String,
+    /// Keep records without a stored key when the read default might match.
+    pub or_missing: bool,
+}
+
 /// How one store writes the parts of a catalog condition in its SQL.
 /// Every expression reads the row of `entity_catalog` the statement is on.
 pub trait CatalogSql {
@@ -123,6 +134,9 @@ pub trait CatalogSql {
     /// The parameter `placeholder` as `class` compares it, from
     /// [`FieldLiteral::param`].
     fn literal(&self, placeholder: &str, class: FieldClass) -> String;
+    /// True when the text value contains the literal byte for byte.
+    /// Use the stored state's copy of the field when it has one.
+    fn record_contains(&self, field: &str, literal: &str) -> String;
     /// The row's status as a string compares it, under byte order.
     fn status(&self) -> String;
 }
@@ -178,6 +192,9 @@ impl CatalogSql for SketchSql {
     }
     fn literal(&self, placeholder: &str, class: FieldClass) -> String {
         format!("{class:?}({placeholder})")
+    }
+    fn record_contains(&self, field: &str, literal: &str) -> String {
+        format!("contains({field}, {literal})")
     }
     fn status(&self) -> String {
         "status".to_string()

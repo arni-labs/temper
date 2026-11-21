@@ -149,6 +149,7 @@ fn filter_plan(
         params: Vec::new(),
         event_time_bounds: Vec::new(),
         field_comparisons: Vec::new(),
+        text_matches: Vec::new(),
         order_by: Vec::new(),
         field_orders: Vec::new(),
         after: None,
@@ -172,11 +173,24 @@ fn filter_plan(
         request.entity_type,
     )
     .field_values(&serde_json::Value::Null);
-    let fields = filter_sql::split_field_comparisons(&rest, &declared_fields(request, &defaults));
+    let declared = declared_fields(request, &defaults);
+    let fields = filter_sql::split_field_comparisons(&rest, &declared);
     plan.filter_pushdown |= !fields.comparisons.is_empty();
     plan.field_comparisons = fields.comparisons;
     let mut missing_fields = fields.missing_default_fields;
     let Some(rest) = fields.rest else {
+        plan.filter_missing_fields = missing_fields.into_iter().collect();
+        return plan;
+    };
+    let text = filter_sql::split_text_matches(&rest, &declared, &defaults);
+    if !text.groups.is_empty() {
+        plan.filter_pushdown = true;
+        // The store may match non-text JSON or a row with a missing
+        // alternative. The OData evaluator still decides every candidate.
+        plan.filter_exact = false;
+        plan.text_matches = text.groups;
+    }
+    let Some(rest) = text.rest else {
         plan.filter_missing_fields = missing_fields.into_iter().collect();
         return plan;
     };
@@ -187,7 +201,7 @@ fn filter_plan(
             plan.where_clause = translated.where_clause;
             plan.params = translated.params;
             plan.filter_pushdown = true;
-            plan.filter_exact = filter_sql::candidate_filter_is_lossless(&rest);
+            plan.filter_exact &= filter_sql::candidate_filter_is_lossless(&rest);
             missing_fields.extend(translated.missing_default_fields);
         }
         None => plan.filter_exact = false,
@@ -204,7 +218,7 @@ fn declared_fields(
     defaults: &serde_json::Value,
 ) -> filter_sql::DeclaredFields {
     let mut declared = filter_sql::DeclaredFields::default();
-    let properties: Vec<(String, String)> = {
+    let properties: Vec<(String, String, bool)> = {
         let registry = request
             .state
             .registry
@@ -217,11 +231,16 @@ fn declared_fields(
             .flat_map(|schema| &schema.entity_types)
             .filter(|entity_type| entity_type.name == request.entity_type)
             .flat_map(|entity_type| &entity_type.properties)
-            .filter(|property| !property.nullable)
-            .map(|property| (property.name.clone(), property.type_name.clone()))
+            .map(|property| {
+                (
+                    property.name.clone(),
+                    property.type_name.clone(),
+                    property.nullable,
+                )
+            })
             .collect()
     };
-    for (name, type_name) in properties {
+    for (name, type_name, nullable) in properties {
         let indexed = request.state.query_projection_indexes_field(
             request.tenant,
             request.entity_type,
@@ -230,7 +249,11 @@ fn declared_fields(
         if let Some(class) = filter_sql::edm_class(&type_name)
             && indexed
         {
-            declared.declare(&name, class);
+            if !nullable {
+                declared.declare(&name, class);
+            } else if class == FieldClass::Text {
+                declared.declare_nullable_text(&name);
+            }
         }
     }
     for name in defaults

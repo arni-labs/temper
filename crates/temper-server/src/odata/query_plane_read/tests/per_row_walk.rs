@@ -7,14 +7,14 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use super::large_set::{
-    BUDGET, PostgresCards, assert_matches_memory, install_reader, read, sim_cards, turso_cards,
-    visible,
+    BUDGET, PostgresCards, ROWS, assert_matches_memory, in_memory, install_reader, read, sim_cards,
+    turso_cards, visible,
 };
 use super::*;
 
 /// Reads whose answers under the reader's policy must equal the evaluator's
 /// over the cards the reader may see.
-const PER_ROW_READS: [&str; 7] = [
+const PER_ROW_READS: [&str; 8] = [
     "",
     "$filter=kind ne 'steer'",
     "$filter=Status ne 'Open'",
@@ -22,6 +22,7 @@ const PER_ROW_READS: [&str; 7] = [
     "$filter=contains(title,'pp')",
     "$orderby=Status desc",
     "$filter=contains(title,'p')&$orderby=Status asc",
+    "$filter=(contains(title,'Apple') or contains(kind,'xxxx')) and contains(title,'p')&$orderby=Status asc",
 ];
 
 /// Reads past the old scan budget that every row is allowed for, with a
@@ -106,6 +107,29 @@ async fn per_row_reads_walk_every_record_on_turso() {
     let (state, bodies, _dir) = turso_cards("per-row-turso").await;
     assert_allowed_reads(&state, &bodies).await;
     assert_per_row_reads(&state, &bodies).await;
+}
+
+#[tokio::test]
+async fn a_sparse_contains_filter_reads_only_catalog_matches() {
+    let (state, bodies, _dir) = turso_cards("sparse-substring").await;
+    let reader = install_reader(&state);
+    let query = "$filter=(Status eq 'Open' or Status eq 'Done' or Status eq 'Posted') and (contains(kind,'xxxxx') or contains(title,'ébony'))&$orderby=Status desc";
+    let (want, count) = in_memory(&visible(&bodies), query);
+    assert!(count > 0);
+    let page = read(&state, &reader, &format!("{query}&$count=true&$top=3")).await;
+    assert_eq!(page.count, Some(count));
+    assert_eq!(
+        page.entities
+            .iter()
+            .map(listed_entity_id)
+            .collect::<Vec<_>>(),
+        want[..want.len().min(3)],
+    );
+    assert!(
+        page.telemetry.materialized_count < ROWS / 10,
+        "a rare search must avoid materializing nonmatches: {}",
+        page.telemetry.materialized_count,
+    );
 }
 
 #[tokio::test]

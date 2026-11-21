@@ -71,6 +71,7 @@ fn page_query(
         params: plan.params.clone(),
         event_time_bounds: plan.event_time_bounds.clone(),
         field_comparisons: plan.field_comparisons.clone(),
+        text_matches: plan.text_matches.clone(),
         mistyped: Vec::new(),
         order_by: plan.order_by.clone(),
         after: plan.after.clone(),

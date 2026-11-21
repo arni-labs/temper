@@ -73,6 +73,13 @@ impl CatalogSql for PostgresCatalogSql {
         }
     }
 
+    fn record_contains(&self, field: &str, literal: &str) -> String {
+        let key = postgres_string_literal(field);
+        format!(
+            "strpos((COALESCE(state -> 'fields' ->> {key}, fields ->> {key}) +             COLLATE \"C\"), {literal}) > 0"
+        )
+    }
+
     fn status(&self) -> String {
         "(status COLLATE \"C\")".to_string()
     }

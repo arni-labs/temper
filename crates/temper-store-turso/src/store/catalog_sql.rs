@@ -65,6 +65,14 @@ impl CatalogSql for TursoCatalogSql {
         }
     }
 
+    fn record_contains(&self, field: &str, literal: &str) -> String {
+        let field_path = turso_json_path_literal(field);
+        let state_path = field_path.replacen("'$.", "'$.fields.", 1);
+        format!(
+            "instr(COALESCE(json_extract(state, {state_path}), +             json_extract(fields, {field_path})), {literal}) > 0"
+        )
+    }
+
     /// The column, under its default `BINARY` collation: byte order.
     fn status(&self) -> String {
         "status".to_string()

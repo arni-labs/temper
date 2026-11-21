@@ -19,12 +19,14 @@ use temper_odata::query::types::{BinaryOperator, FilterExpr, ODataValue, UnaryOp
 mod equality;
 mod event_time;
 mod field_compare;
+mod text_match;
 
 pub(super) use equality::equality_field_predicates;
 pub(super) use event_time::split_event_time_bounds;
 pub(super) use field_compare::{
     DeclaredFields, edm_class, is_record_property, split_field_comparisons,
 };
+pub(super) use text_match::split_text_matches;
 
 const MAX_INDEXABLE_FIELD_VALUE_BYTES: usize = 2000;
 

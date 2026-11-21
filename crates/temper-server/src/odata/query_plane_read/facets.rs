@@ -191,6 +191,7 @@ async fn sql_groups(
             params: plan.params,
             event_time_bounds: plan.event_time_bounds,
             field_comparisons: plan.field_comparisons,
+            text_matches: plan.text_matches,
             ..QueryFieldIndexPageQuery::default()
         },
         key,
