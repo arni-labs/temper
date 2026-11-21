@@ -93,11 +93,24 @@ mod imp {
             .as_ref()
             .ok_or(HeapError::Unavailable(
                 "jemalloc was not started with prof:true",
-            ))?;
-        let mut ctl = ctl.lock().await;
+            ))?
+            .clone();
+        let ctl = ctl.lock_owned().await;
         if !ctl.activated() {
             return Err(HeapError::Unavailable("jemalloc profiling is not active"));
         }
+        // The dump writes a file, reads it back and symbolizes every frame
+        // from the binary's debug info: seconds of blocking work, which on an
+        // async worker stalls every task queued behind it (a boot stalled at
+        // its timer re-arm while one ran). It runs on a blocking thread.
+        tokio::task::spawn_blocking(move || dump(ctl))
+            .await
+            .map_err(|e| HeapError::Failed(format!("dump task: {e}")))?
+    }
+
+    fn dump(
+        mut ctl: tokio::sync::OwnedMutexGuard<jemalloc_pprof::JemallocProfCtl>,
+    ) -> Result<Vec<u8>, HeapError> {
         let gzipped = ctl
             .dump_pprof()
             .map_err(|e| HeapError::Failed(format!("dump: {e}")))?;
