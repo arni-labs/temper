@@ -60,6 +60,10 @@ const SOURCE: &str = r#"
 name = "Source"
 states = ["Open"]
 initial = "Open"
+[[state]]
+name = "note"
+type = "string"
+initial = ""
 [[action]]
 name = "Note"
 kind = "input"
