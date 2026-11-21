@@ -11,13 +11,14 @@ use std::sync::Arc;
 
 use temper_authz::SecurityContext;
 
+use crate::blobs::StoredReadError;
 use crate::entity_actor::EntityResponse;
 use crate::state::owed_writes::{Attempt, OwedKind, OwedMove, OwedTry};
 use crate::state::{DispatchError, ServerState};
 
 /// What one try of a reaction did.
 pub(crate) enum ReactionTry {
-    /// Its target could not be read to authorize the move on it.
+    /// Its target, or a value it copies, could not be read.
     Unread(DispatchError),
     /// Cedar refused the move on its target, in `target_status`.
     Denied {
@@ -93,13 +94,24 @@ async fn try_reaction(state: &ServerState, reaction: &Reaction) -> ReactionTry {
             target_status: snapshot.current_state.state.status,
         };
     }
+    // An arg that copies a field the source stores out of line sends its
+    // value (`blobs::resolve_copied_values`), read in this try so a store
+    // that does not answer keeps the reaction for another. One that can never
+    // be read stays a reference, which the target's move refuses.
+    let params = match state.copied_values(&sent.tenant, &sent.params).await {
+        Ok(params) => params,
+        Err(StoredReadError::Unavailable(error)) => {
+            return ReactionTry::Unread(DispatchError::StoreUnavailable(error));
+        }
+        Err(StoredReadError::Invalid(_)) => sent.params.clone(),
+    };
     let reply = state
         .dispatch_tenant_action_core(
             &sent.tenant,
             &sent.entity_type,
             &sent.entity_id,
             &sent.action,
-            sent.params.clone(),
+            params,
             &sent.agent_ctx,
             false,
             crate::state::write_record::WriteCaller::Kernel,

@@ -367,9 +367,25 @@ impl TransitionTable {
         counters: &BTreeMap<String, usize>,
         booleans: &BTreeMap<String, bool>,
     ) -> Result<(), ContractError> {
+        self.validate_action_params_on(action, params, fields, fields, counters, booleans)
+    }
+
+    /// [`Self::validate_action_params`] for a caller whose constraints read
+    /// `compared`, values resolved from the record, while `stored` is the
+    /// record's fields as stored: a stored-field reference is sent back
+    /// unchanged only when it equals the one `stored` holds.
+    pub fn validate_action_params_on(
+        &self,
+        action: &str,
+        params: &Value,
+        stored: &Value,
+        fields: &Value,
+        counters: &BTreeMap<String, usize>,
+        booleans: &BTreeMap<String, bool>,
+    ) -> Result<(), ContractError> {
         // Every move is checked here, whoever sends it and whichever runtime
         // holds the record.
-        if let Some(reason) = crate::field_reference::sent_field_reference(params, fields) {
+        if let Some(reason) = crate::field_reference::sent_field_reference(params, stored) {
             return Err(ContractError::message(reason));
         }
         let contract = self.action_contracts.get(action);

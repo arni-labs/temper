@@ -29,7 +29,7 @@ pub(crate) use hydration::{
 #[cfg(test)]
 pub(crate) use hydration::{hydrate_blob_refs_in_value, hydrate_blob_refs_in_value_with_ceiling};
 pub(crate) use read_source::BlobReadSource;
-pub(crate) use stored_fields::{resolve_copied_values, resolve_stored_fields};
+pub(crate) use stored_fields::{StoredReadError, resolve_stored_fields};
 pub(crate) use temper_jit::field_reference::sent_field_reference;
 
 pub(crate) const FIELD_OVERFLOW_BLOB_PREFIX: &str = "field-overflow/sha256/";

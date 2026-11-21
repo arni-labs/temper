@@ -143,10 +143,15 @@ impl ServerState {
         let Some((action, action_params)) = &plan.initializer else {
             return Ok(Some(child));
         };
+        // Sent as live dispatch sends it: with copied values read back. One
+        // that cannot be read now leaves the child as it is.
+        let Ok(action_params) = self.copied_values(tenant, action_params).await else {
+            return Ok(Some(child));
+        };
         let Ok(action_params) = crate::state::dispatch::bind_authenticated_params(
             &plan.table,
             action,
-            action_params.clone(),
+            action_params,
             agent_ctx,
         ) else {
             // Live dispatch refuses before applying an initializer whose

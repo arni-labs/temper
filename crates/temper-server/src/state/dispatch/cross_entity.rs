@@ -10,6 +10,9 @@ use temper_jit::table::{Related, RelatedMap, TransitionTable};
 use temper_runtime::tenant::TenantId;
 use tracing::Instrument;
 
+#[path = "cross_entity/child_initializer.rs"]
+mod child_initializer;
+
 impl crate::state::ServerState {
     /// Resolve the related entities a move of `action` reads: its guards, and
     /// the type's invariants, which every move is checked against.
@@ -320,9 +323,10 @@ impl crate::state::ServerState {
     /// landed goes on to the initial action.
     async fn spawn_child(&self, child: &ChildSpawn) -> Attempt {
         let (tenant, child_type, child_id) = (&child.tenant, &child.child_type, &child.child_id);
-        if let Err(attempt) = self.check_child_initializer(child).await {
-            return attempt;
-        }
+        let initializer = match self.child_initializer(child).await {
+            Ok(initializer) => initializer,
+            Err(attempt) => return attempt,
+        };
         // Its first state's timer keeps whether its creator could read it.
         let creator = match self
             .created_with_read_when_set(
@@ -344,7 +348,7 @@ impl crate::state::ServerState {
                 child_id,
                 child.initial_fields.clone(),
                 &creator,
-                child.initializer.as_ref(),
+                initializer.as_ref(),
             )
             .await
         {
@@ -370,7 +374,7 @@ impl crate::state::ServerState {
         };
         tracing::info!(parent_type = %child.parent_type, parent_id = %child.parent_id,
             %child_type, %child_id, "spawned child entity");
-        let Some((action, params)) = &child.initializer else {
+        let Some((action, params)) = &initializer else {
             // A child with no initial action stays in its first state: arm
             // that state's timer here.
             self.arm_state_timeouts_on_creation(tenant, child_type, child_id, &created, &creator)
@@ -401,57 +405,6 @@ impl crate::state::ServerState {
             self.record_generated_callback_refusal(child.parent(), action, error);
         }
         attempt
-    }
-
-    /// Check `child`'s initial action against the child it would be sent
-    /// to. Existing actors validate against their hydrated blob values and
-    /// execution-time state; only an absent child needs this check before
-    /// creation can persist anything. A read of the child the store failed
-    /// is tried again with the spawn; a refused check is final.
-    async fn check_child_initializer(&self, child: &ChildSpawn) -> Result<(), Attempt> {
-        let Some((action, params)) = &child.initializer else {
-            return Ok(());
-        };
-        let (tenant, child_type, child_id) = (&child.tenant, &child.child_type, &child.child_id);
-        let refused = match self
-            .load_authz_resource_snapshot(tenant, child_type, child_id)
-            .await
-        {
-            Ok(snapshot) if snapshot.exists => return Ok(()),
-            Ok(_) => {
-                let table = &child.table;
-                let prestate = crate::entity_actor::EntityActor::build_initial_state(
-                    child_type,
-                    child_id,
-                    table,
-                    &child.initial_fields,
-                );
-                match table.validate_action_params(
-                    action,
-                    params,
-                    &prestate.fields,
-                    &prestate.counters,
-                    &prestate.booleans,
-                ) {
-                    Ok(()) => return Ok(()),
-                    Err(error) => String::from(error),
-                }
-            }
-            Err(error) => match Attempt::of_error(&error) {
-                Attempt::Failed(refused) => refused,
-                attempt => return Err(attempt),
-            },
-        };
-        self.refuse_spawn(
-            tenant,
-            &child.parent_type,
-            &child.parent_id,
-            &child.request,
-            action,
-            &refused,
-        )
-        .await;
-        Err(Attempt::Failed(refused))
     }
 
     /// Run the initializers in order; a store failure holds the rest back.

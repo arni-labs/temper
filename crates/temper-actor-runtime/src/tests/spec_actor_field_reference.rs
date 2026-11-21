@@ -1,10 +1,11 @@
 //! A move on a Postgres-held record cannot write a stored-field reference.
 //!
-//! The Postgres runtime sends an action's body straight to the spec actor,
+//! The Postgres runtime sends an action to the spec actor as a SpecMessage,
 //! which copies its params into the record's fields. A reference written
 //! there would be read back as the blob it names by a property read, so the
 //! actor refuses one as every other runtime does (`temper_jit::field_reference`).
 use super::*;
+use prost::Message as _;
 use serde_json::json;
 
 const NOTED: &str = r#"
@@ -33,8 +34,8 @@ fn note(action: &str, params: serde_json::Value) -> Message {
         id: 1,
         from: None,
         to: ActorHandle::new("reference-test", "Process"),
-        message_type: action.into(),
-        payload: serde_json::to_vec(&params).unwrap(),
+        message_type: "SpecMessage".into(),
+        payload: SpecMessage::with_params(action, params).encode_to_vec(),
         correlation_id: None,
         created_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
     }
