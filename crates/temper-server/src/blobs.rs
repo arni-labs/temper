@@ -20,7 +20,7 @@ mod read_source;
 mod stored_fields;
 pub use descriptor::{
     FieldOverflowDescriptor, field_overflow_descriptor, field_overflow_sha256,
-    is_valid_field_overflow_key,
+    is_valid_field_overflow_key, sent_field_reference,
 };
 pub(crate) use hydration::{
     BlobHydrationBudget, WasmFieldBlobReader, hydrate_blob_refs_for_tenant,

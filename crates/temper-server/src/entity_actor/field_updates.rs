@@ -181,7 +181,9 @@ pub(super) async fn commit_field_update(
     // but the event written now must not carry a caller's forged `has_spec` or
     // `ctx_owner_status` into the journal in the first place.
     let fields = effects::sanitize_action_params(&fields).into_owned();
-    if let Some(reason) = state_variable_refusal(actor, state, &fields) {
+    if let Some(reason) = state_variable_refusal(actor, state, &fields)
+        .or_else(|| crate::blobs::sent_field_reference(&fields, &state.fields))
+    {
         return Err(NotUpdated::Failed(reason));
     }
 
