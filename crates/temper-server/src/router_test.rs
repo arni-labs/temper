@@ -2540,6 +2540,19 @@ async fn record_wait_matches_existing_and_wakes_on_a_readable_commit() {
         body["outcome"], "timed_out",
         "an unreadable existing record cannot match"
     );
+    let future = app.oneshot(
+        Request::get("/tdata/$wait?sets=Orders&timeout_ms=20&only_changes=true&$filter=customer%20eq%20%27Alice%27")
+            .body(Body::empty()).unwrap(),
+    ).await.unwrap();
+    assert_eq!(future.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(future.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["outcome"], "timed_out",
+        "only_changes starts at subscription time"
+    );
 }
 
 #[tokio::test]

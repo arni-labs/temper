@@ -35,6 +35,8 @@ pub(crate) struct SubscriptionQuery {
     timeout_ms: Option<u64>,
     #[serde(default)]
     observe: bool,
+    #[serde(default)]
+    only_changes: bool,
     #[serde(rename = "$filter")]
     filter: Option<String>,
 }
@@ -287,7 +289,9 @@ pub(crate) async fn handle_wait(
         Ok(subscription) => subscription,
         Err(response) => return response,
     };
-    if let Some(filter) = query.filter.take() {
+    if !query.only_changes
+        && let Some(filter) = query.filter.take()
+    {
         match timeout_at(subscription.deadline, subscription.existing(filter)).await {
             Ok(Ok(Some(record))) => return answer(json!({"outcome": "matched", "record": record})),
             Ok(Ok(None)) => {}
