@@ -220,6 +220,19 @@ pub struct OverdueTimerRows {
     pub scheduled_actions: Vec<OverdueTimerRow>,
 }
 
+/// The arm id prefix of a move's follow-on row: what a committed move still
+/// owes (its reactions, children and integrations), sent again by a boot
+/// until it settles. It is not a schedule. A store keeps these rows apart
+/// from scheduled actions (`follow_on_rows`), so a release from before
+/// follow-on rows, booted by a rollback, never reads one as a scheduled
+/// action and fires the move's own action again.
+pub const FOLLOW_ON_ARM_PREFIX: &str = "follow:";
+
+/// Whether `arm_id` names a move's follow-on row ([`FOLLOW_ON_ARM_PREFIX`]).
+pub fn is_follow_on_arm(arm_id: &str) -> bool {
+    arm_id.starts_with(FOLLOW_ON_ARM_PREFIX)
+}
+
 /// One pending `schedule(...)` or `schedule_at(...)` action, or the deadline
 /// of a background module call that names an `on_failure`, kept so that a
 /// restarted server arms it again. An entity can have many; each row is

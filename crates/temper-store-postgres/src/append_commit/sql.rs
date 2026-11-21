@@ -99,7 +99,15 @@ sched_add AS (
     SELECT $1, $2, $3, s.arm_id, s.action, s.due_at, s.armed_by
     FROM unnest($12::text[], $13::text[], $14::text[], $15::text[])
         AS s(arm_id, action, due_at, armed_by), w
-    WHERE s.arm_id IS DISTINCT FROM $16::text
+    WHERE s.arm_id IS DISTINCT FROM $16::text AND s.arm_id NOT LIKE 'follow:%'
+    ON CONFLICT (tenant, entity_type, entity_id, arm_id) DO NOTHING),
+follow_add AS (
+    INSERT INTO {schema}follow_on_rows
+        (tenant, entity_type, entity_id, arm_id, action, due_at, armed_by)
+    SELECT $1, $2, $3, s.arm_id, s.action, s.due_at, s.armed_by
+    FROM unnest($12::text[], $13::text[], $14::text[], $15::text[])
+        AS s(arm_id, action, due_at, armed_by), w
+    WHERE s.arm_id LIKE 'follow:%'
     ON CONFLICT (tenant, entity_type, entity_id, arm_id) DO NOTHING),
 sched_fire AS (
     DELETE FROM {schema}scheduled_actions s USING w

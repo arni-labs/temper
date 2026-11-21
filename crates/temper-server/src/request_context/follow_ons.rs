@@ -22,7 +22,7 @@ use crate::trigger::ReactionRule;
 /// What starts a follow-on row's arm id; the rest is the move's key. A
 /// schedule's id starts with its event's sequence and a digit, so the two
 /// never meet.
-const FOLLOW_ARM: &str = "follow:";
+use temper_runtime::persistence::FOLLOW_ON_ARM_PREFIX as FOLLOW_ARM;
 
 /// The arm id of the follow-on row of the move committed under `key`. A move
 /// sent again under its key names the same row.
@@ -32,7 +32,7 @@ pub(crate) fn follow_arm_id(key: &str) -> String {
 
 /// Whether a scheduled-action row is a move's follow-on row.
 pub(crate) fn is_follow_row(arm_id: &str) -> bool {
-    arm_id.starts_with(FOLLOW_ARM)
+    temper_runtime::persistence::is_follow_on_arm(arm_id)
 }
 
 /// Whether a move that spawns `spawn_requests` and emits `custom_effects`

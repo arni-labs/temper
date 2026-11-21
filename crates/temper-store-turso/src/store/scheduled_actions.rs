@@ -46,17 +46,29 @@ impl TursoEventStore {
         let conn = self
             .write_connection("turso.delete_scheduled_action", WritePriority::Low)
             .await?;
-        conn.execute(
-            "DELETE FROM scheduled_actions INDEXED BY sqlite_autoindex_scheduled_actions_1 \
-             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND arm_id = ?4",
-            params![tenant, entity_type, entity_id, arm_id],
-        )
-        .await
-        .map_err(storage_error)?;
+        // A follow-on row written before they were kept apart is in
+        // scheduled_actions; one written since, in follow_on_rows.
+        let tables: &[&str] = if temper_runtime::persistence::is_follow_on_arm(arm_id) {
+            &["scheduled_actions", "follow_on_rows"]
+        } else {
+            &["scheduled_actions"]
+        };
+        for table in tables {
+            conn.execute(
+                &format!(
+                    "DELETE FROM {table} \
+                     WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND arm_id = ?4"
+                ),
+                params![tenant, entity_type, entity_id, arm_id],
+            )
+            .await
+            .map_err(storage_error)?;
+        }
         Ok(())
     }
 
-    /// Every pending scheduled action for `tenant`.
+    /// Every pending scheduled action for `tenant`, with its moves'
+    /// follow-on rows.
     #[instrument(skip_all, fields(tenant, otel.name = "turso.list_scheduled_actions"))]
     pub(crate) async fn scheduled_action_rows(
         &self,
@@ -67,7 +79,10 @@ impl TursoEventStore {
         let mut rows = conn
             .query(
                 "SELECT entity_type, entity_id, arm_id, action, due_at, armed_by \
-                 FROM scheduled_actions WHERE tenant = ?1",
+                 FROM scheduled_actions WHERE tenant = ?1 \
+                 UNION ALL \
+                 SELECT entity_type, entity_id, arm_id, action, due_at, armed_by \
+                 FROM follow_on_rows WHERE tenant = ?1",
                 params![tenant],
             )
             .await
@@ -100,6 +115,9 @@ impl TursoEventStore {
         let mut rows = conn
             .query(
                 "SELECT arm_id, action, due_at, armed_by FROM scheduled_actions INDEXED BY sqlite_autoindex_scheduled_actions_1 \
+                 WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 \
+                 UNION ALL \
+                 SELECT arm_id, action, due_at, armed_by FROM follow_on_rows \
                  WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
                 params![tenant, entity_type, entity_id],
             )

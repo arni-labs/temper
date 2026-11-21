@@ -68,6 +68,22 @@ impl PostgresEventStore {
         .execute(&mut *conn)
         .await
         .map_err(storage_error)?;
+        // A follow-on row written since they were kept apart is in
+        // follow_on_rows; one written before, in scheduled_actions.
+        if temper_runtime::persistence::is_follow_on_arm(arm_id) {
+            crate::dbm::postgres_query!(
+                &self.schema,
+                "DELETE FROM {schema}follow_on_rows \
+                 WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 AND arm_id = $4",
+            )
+            .bind(tenant)
+            .bind(entity_type)
+            .bind(entity_id)
+            .bind(arm_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(storage_error)?;
+        }
         Ok(())
     }
 
@@ -79,7 +95,10 @@ impl PostgresEventStore {
         let rows: Vec<ScheduledActionColumns> = crate::dbm::postgres_query_as!(
             &self.schema,
             "SELECT entity_type, entity_id, arm_id, action, due_at, armed_by \
-             FROM {schema}scheduled_actions WHERE tenant = $1",
+             FROM {schema}scheduled_actions WHERE tenant = $1 \
+             UNION ALL \
+             SELECT entity_type, entity_id, arm_id, action, due_at, armed_by \
+             FROM {schema}follow_on_rows WHERE tenant = $1",
         )
         .bind(tenant)
         .fetch_all(self.pool())
@@ -113,6 +132,9 @@ impl PostgresEventStore {
         let rows: Vec<(String, String, String, String)> = crate::dbm::postgres_query_as!(
             &self.schema,
             "SELECT arm_id, action, due_at, armed_by FROM {schema}scheduled_actions \
+             WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 \
+             UNION ALL \
+             SELECT arm_id, action, due_at, armed_by FROM {schema}follow_on_rows \
              WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
         )
         .bind(tenant)

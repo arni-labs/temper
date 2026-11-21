@@ -455,6 +455,9 @@ impl TursoEventStore {
         conn.execute(schema::CREATE_SCHEDULED_ACTIONS_TABLE, ())
             .await
             .map_err(storage_error)?;
+        conn.execute(schema::CREATE_FOLLOW_ON_ROWS_TABLE, ())
+            .await
+            .map_err(storage_error)?;
         // SQLite refuses a column that is already there, so a failure here is
         // a store that has it.
         let _ = conn

@@ -169,3 +169,115 @@ async fn scheduled_action_rows_commit_with_their_events() {
         1
     );
 }
+
+/// The arm ids `table` holds for `tenant`, as a raw read of it sees them.
+async fn arm_ids_in(store: &crate::TursoEventStore, table: &str, tenant: &str) -> Vec<String> {
+    let conn = store
+        .write_connection("test", super::super::WritePriority::High)
+        .await
+        .unwrap();
+    let mut rows = conn
+        .query(
+            &format!("SELECT arm_id FROM {table} WHERE tenant = ?1 ORDER BY arm_id"),
+            crate::driver::params![tenant],
+        )
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        ids.push(row.get::<String>(0).unwrap());
+    }
+    ids
+}
+
+/// Review rv-6457ca865: a release from before follow-on rows reads only
+/// `scheduled_actions`, and would arm a follow-on row there as a scheduled
+/// action, firing the move's own action again, as the kernel, after a
+/// rollback. A follow-on row is kept in `follow_on_rows`, which such a
+/// release never reads; this release lists and removes it with the
+/// scheduled actions, and a follow-on row an earlier release left in
+/// `scheduled_actions` is still listed and removed.
+#[tokio::test]
+async fn a_follow_on_row_is_kept_where_an_older_release_never_reads_it() {
+    let store = make_store("follow-on-rows").await;
+    let follow = "follow:caller-key";
+    store
+        .append_with_rows(
+            "tenant-a:Job:job-1",
+            0,
+            &[test_envelope("Start", serde_json::json!({}))],
+            CommitRows {
+                scheduled_actions: &[
+                    row("tenant-a", "job-1", "1.0"),
+                    row("tenant-a", "job-1", follow),
+                ],
+                ..CommitRows::default()
+            },
+        )
+        .await
+        .expect("append");
+
+    assert_eq!(
+        arm_ids_in(&store, "scheduled_actions", "tenant-a").await,
+        ["1.0"],
+        "what a release from before follow-on rows reads holds no follow-on row"
+    );
+    assert_eq!(
+        arm_ids_in(&store, "follow_on_rows", "tenant-a").await,
+        [follow]
+    );
+    assert_eq!(
+        arm_ids(&store.list_scheduled_actions("tenant-a").await.unwrap()),
+        vec![
+            ("job-1".to_string(), "1.0".to_string()),
+            ("job-1".to_string(), follow.to_string()),
+        ]
+    );
+    assert_eq!(
+        store
+            .list_entity_scheduled_actions("tenant-a", "Job", "job-1")
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // A follow-on row an earlier release of this kernel left in
+    // scheduled_actions is still listed, and its removal takes it.
+    let legacy = "follow:left-by-6457ca865";
+    let conn = store
+        .write_connection("test", super::super::WritePriority::High)
+        .await
+        .unwrap();
+    conn.execute(
+        "INSERT INTO scheduled_actions (tenant, entity_type, entity_id, arm_id, action, due_at, armed_by) \
+         VALUES ('tenant-a', 'Job', 'job-1', ?1, 'Start', '2026-01-01T00:00:00+00:00', '{}')",
+        crate::driver::params![legacy],
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    assert_eq!(
+        store
+            .list_scheduled_actions("tenant-a")
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+
+    for arm_id in [follow, legacy] {
+        store
+            .delete_scheduled_action("tenant-a", "Job", "job-1", arm_id)
+            .await
+            .expect("removal");
+    }
+    assert_eq!(
+        arm_ids_in(&store, "follow_on_rows", "tenant-a").await,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        arm_ids_in(&store, "scheduled_actions", "tenant-a").await,
+        ["1.0"]
+    );
+}

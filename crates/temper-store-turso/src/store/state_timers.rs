@@ -190,6 +190,9 @@ impl TursoEventStore {
                  WHERE tenant = ?1 AND due_at <= ?2 \
                  UNION ALL \
                  SELECT 1, entity_type, entity_id, arm_id, due_at FROM scheduled_actions \
+                 WHERE tenant = ?1 AND due_at <= ?2 \
+                 UNION ALL \
+                 SELECT 1, entity_type, entity_id, arm_id, due_at FROM follow_on_rows \
                  WHERE tenant = ?1 AND due_at <= ?2",
                 params![tenant, now],
             )

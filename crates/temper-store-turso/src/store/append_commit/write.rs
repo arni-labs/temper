@@ -108,11 +108,21 @@ pub(super) async fn write_append(
     }
 
     for action in &append.scheduled_actions {
-        tx.execute(
+        // A follow-on row is kept apart, where a release from before them
+        // never reads it as a scheduled action.
+        let insert = if temper_runtime::persistence::is_follow_on_arm(&action.arm_id) {
+            "INSERT INTO follow_on_rows \
+                 (tenant, entity_type, entity_id, arm_id, action, due_at, armed_by) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT (tenant, entity_type, entity_id, arm_id) DO NOTHING"
+        } else {
             "INSERT INTO scheduled_actions \
                  (tenant, entity_type, entity_id, arm_id, action, due_at, armed_by) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-             ON CONFLICT (tenant, entity_type, entity_id, arm_id) DO NOTHING",
+             ON CONFLICT (tenant, entity_type, entity_id, arm_id) DO NOTHING"
+        };
+        tx.execute(
+            insert,
             params![
                 action.tenant.as_str(),
                 action.entity_type.as_str(),

@@ -566,6 +566,22 @@ CREATE TABLE IF NOT EXISTS scheduled_actions (
     PRIMARY KEY(tenant, entity_type, entity_id, arm_id)
 );";
 
+/// Moves' follow-on rows (`temper_runtime::persistence::FOLLOW_ON_ARM_PREFIX`),
+/// the same columns as `scheduled_actions` and apart from it: a release from
+/// before follow-on rows reads only `scheduled_actions`, so a rollback never
+/// fires a follow-on row as a scheduled action.
+pub const CREATE_FOLLOW_ON_ROWS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS follow_on_rows (
+    tenant TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    arm_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    due_at TEXT NOT NULL,
+    armed_by TEXT NOT NULL,
+    PRIMARY KEY(tenant, entity_type, entity_id, arm_id)
+);";
+
 /// A tenant's scheduled actions by due time, so the rows past due are one
 /// range read however many actions wait.
 pub const CREATE_SCHEDULED_ACTIONS_DUE_INDEX: &str =

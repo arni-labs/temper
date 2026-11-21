@@ -165,6 +165,9 @@ impl PostgresEventStore {
              WHERE tenant = $1 AND due_at COLLATE \"C\" <= $2 \
              UNION ALL \
              SELECT 1, entity_type, entity_id, arm_id, due_at FROM {schema}scheduled_actions \
+             WHERE tenant = $1 AND due_at COLLATE \"C\" <= $2 \
+             UNION ALL \
+             SELECT 1, entity_type, entity_id, arm_id, due_at FROM {schema}follow_on_rows \
              WHERE tenant = $1 AND due_at COLLATE \"C\" <= $2",
         )
         .bind(tenant)
