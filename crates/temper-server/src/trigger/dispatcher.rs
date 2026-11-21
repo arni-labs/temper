@@ -289,12 +289,9 @@ impl crate::ServerState {
                 "Dispatching reaction"
             );
 
-            let effective_params = super::params::build_effective_params(
-                &rule.then,
-                entity_id,
-                read.as_ref().unwrap_or(fields),
-                &rule.name,
-            );
+            let effective_params = state
+                .reaction_params(tenant, &rule, entity_id, read.as_ref().unwrap_or(fields))
+                .await;
 
             // ADR-0046: resolve the dispatch principal. If the rule declares
             // an explicit `principal`, build a synthetic service identity;

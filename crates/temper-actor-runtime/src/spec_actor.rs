@@ -490,3 +490,7 @@ mod strict_tests;
 #[cfg(test)]
 #[path = "tests/spec_actor_string_effect.rs"]
 mod string_effect_tests;
+
+#[cfg(test)]
+#[path = "tests/spec_actor_field_reference.rs"]
+mod field_reference_tests;

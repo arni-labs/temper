@@ -34,6 +34,36 @@ pub(crate) fn build_effective_params(
     serde_json::Value::Object(params)
 }
 
+impl crate::state::ServerState {
+    /// The params a production reaction of `rule` sends:
+    /// [`build_effective_params`], with each arg that copies a field the
+    /// source stores out of line read back as its value, since the target
+    /// holds none of the source's references
+    /// ([`crate::blobs::resolve_copied_values`]). One that cannot be read
+    /// stays a reference, which the target's move refuses.
+    pub(crate) async fn reaction_params(
+        &self,
+        tenant: &temper_runtime::tenant::TenantId,
+        rule: &super::types::ReactionRule,
+        source_entity_id: &str,
+        source_fields: &serde_json::Value,
+    ) -> serde_json::Value {
+        let params =
+            build_effective_params(&rule.then, source_entity_id, source_fields, &rule.name);
+        let source = crate::blobs::BlobReadSource::Tenant {
+            state: self,
+            tenant,
+        };
+        match crate::blobs::resolve_copied_values(&source, params.clone()).await {
+            Ok(params) => params,
+            Err(error) => {
+                tracing::warn!(rule = rule.name, %error, "reaction arg stored out of line could not be read");
+                params
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

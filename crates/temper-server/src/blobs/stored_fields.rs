@@ -52,6 +52,27 @@ pub(crate) async fn resolve_stored_fields(
     Ok(Some(resolved))
 }
 
+/// `copied` with every reference the kernel stored in it read back and
+/// verified, for the kernel's copy of one record's stored fields into a move
+/// on another: a spawn's copied fields, a reaction's args. The target holds
+/// none of the source's references, and a write may send only one its record
+/// holds (`temper_jit::field_reference`), so the copy sends the value, as a
+/// caller would, and the target stores it as its own. A copy of an inline
+/// field and of one stored out of line answer alike. Unreadable data fails
+/// closed.
+pub(crate) async fn resolve_copied_values(
+    source: &BlobReadSource<'_>,
+    copied: Value,
+) -> Result<Value, String> {
+    let names: BTreeSet<String> = copied
+        .as_object()
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_default();
+    Ok(resolve_stored_fields(source, &copied, &names)
+        .await?
+        .unwrap_or(copied))
+}
+
 fn collect_references(value: &Value, pointer: String, out: &mut Vec<(String, String, u64)>) {
     if let Some(descriptor) = field_overflow_descriptor(value) {
         out.push((
