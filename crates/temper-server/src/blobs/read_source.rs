@@ -40,6 +40,10 @@ pub(super) async fn read_blob_ref_bytes(
                     })
                 };
             }
+            // As `get_blob_with_legacy_fallback_bounded`: when the object
+            // store did not answer, the legacy DB not holding the blob is
+            // that error, not Missing.
+            let mut unanswered = None;
             if let Some(store) = store {
                 match store.get_bounded(key, max_bytes).await {
                     Ok(found @ (BlobReadBounded::Found(_) | BlobReadBounded::TooLarge { .. })) => {
@@ -47,16 +51,19 @@ pub(super) async fn read_blob_ref_bytes(
                     }
                     Ok(BlobReadBounded::Missing) => {}
                     Err(error) => {
-                        tracing::warn!(%key, %error, "bounded object blob read failed; trying legacy DB fallback")
+                        tracing::warn!(%key, %error, "bounded object blob read failed; trying legacy DB fallback");
+                        unanswered = Some(error);
                     }
                 }
             }
-            match legacy {
-                Some(legacy) => legacy
-                    .get_blob_if_size_at_most(key, max_bytes)
-                    .await
-                    .map(|bytes| bytes.map_or(BlobReadBounded::Missing, BlobReadBounded::Found)),
-                None => Ok(BlobReadBounded::Missing),
+            let found = match legacy {
+                Some(legacy) => legacy.get_blob_if_size_at_most(key, max_bytes).await?,
+                None => None,
+            };
+            match (found, unanswered) {
+                (Some(bytes), _) => Ok(BlobReadBounded::Found(bytes)),
+                (None, Some(error)) => Err(error),
+                (None, None) => Ok(BlobReadBounded::Missing),
             }
         }
         BlobReadSource::Tenant { state, tenant } => {

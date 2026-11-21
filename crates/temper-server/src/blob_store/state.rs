@@ -183,37 +183,40 @@ impl ServerState {
         key: &str,
         max_bytes: usize,
     ) -> Result<BlobReadBounded, String> {
-        match self.blob_store_for_tenant(tenant) {
+        // The object store's error, when it did not answer: the legacy DB
+        // not holding the blob then proves nothing, so the error is the
+        // answer, not Missing. Otherwise a store that failed once would read
+        // as a blob that is gone, and its reader would give up for good.
+        let unanswered = match self.blob_store_for_tenant(tenant) {
             Ok(store) => match store.get_bounded(key, max_bytes).await {
-                Ok(BlobReadBounded::Found(bytes)) => {
-                    return Ok(BlobReadBounded::Found(bytes));
+                Ok(found @ (BlobReadBounded::Found(_) | BlobReadBounded::TooLarge { .. })) => {
+                    return Ok(found);
                 }
-                Ok(BlobReadBounded::TooLarge { actual_bytes }) => {
-                    return Ok(BlobReadBounded::TooLarge { actual_bytes });
-                }
-                Ok(BlobReadBounded::Missing) => {}
+                Ok(BlobReadBounded::Missing) => None,
                 Err(error) => {
                     tracing::warn!(%key, %error, "bounded object blob read failed; trying legacy DB fallback");
+                    Some(error)
                 }
             },
             Err(error) => {
                 tracing::debug!(%key, %error, "object blob store unavailable; trying bounded legacy DB fallback");
+                None
             }
-        }
+        };
+        let missing = || unanswered.clone().map_or(Ok(BlobReadBounded::Missing), Err);
         if tenant != &TenantId::default() {
-            return Ok(BlobReadBounded::Missing);
+            return missing();
         }
         let Some(store) = self.metadata_store_for_tenant(tenant.as_str()).await else {
-            return Ok(BlobReadBounded::Missing);
+            return missing();
         };
-        store
-            .get_blob_if_size_at_most(key, max_bytes)
-            .await
-            .map(|bytes| match bytes {
-                Some(bytes) => BlobReadBounded::Found(bytes),
-                None => BlobReadBounded::Missing,
-            })
-            .map_err(|error| format!("bounded legacy DB blob read failed for '{key}': {error}"))
+        match store.get_blob_if_size_at_most(key, max_bytes).await {
+            Ok(Some(bytes)) => Ok(BlobReadBounded::Found(bytes)),
+            Ok(None) => missing(),
+            Err(error) => Err(format!(
+                "bounded legacy DB blob read failed for '{key}': {error}"
+            )),
+        }
     }
 
     /// Open a tenant-scoped object-store blob as a bounded stream.

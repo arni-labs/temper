@@ -318,7 +318,7 @@ async fn a_spawn_whose_copied_field_cannot_be_read_yet_lands_once_it_can() {
     move_on(
         &state,
         "Job",
-        "job",
+        "job-2",
         "Configure",
         json!({ "prompt": large() }),
     )
