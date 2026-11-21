@@ -203,9 +203,9 @@ impl Subscription {
     // condition. The receiver is already subscribed when the read begins.
     async fn existing(&self, filter: String) -> Result<Option<Value>, Response> {
         let Some(set) = self.types.values().next().filter(|_| self.types.len() == 1) else {
-            return Err(invalid_query(
-                "$filter on a wait requires exactly one entity set",
-            ));
+            return Err(
+                invalid_query("$filter on a wait requires exactly one entity set").into_response(),
+            );
         };
         let response = handle_odata_get_for_tenant(
             self.state.clone(),
