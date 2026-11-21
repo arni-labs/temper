@@ -248,6 +248,8 @@ impl ServerState {
             .or_else(|| self.transition_tables.get(entity_type).cloned())
             .ok_or_else(|| format!("No transition table for {tenant}/{entity_type}"))?;
             EntityResponse {
+                caller_holds: None,
+                reactions: Vec::new(),
                 success: true,
                 refusal: None,
                 state: EntityActor::build_initial_state(
@@ -1413,9 +1415,23 @@ impl ServerState {
         if table.invariants.is_empty() {
             return None;
         }
+        // The initializer runs after the spawning parent commits, with its
+        // guards reading the records the child's fields name (the parent
+        // among them) as stored: resolve them as its live dispatch does.
+        let related = match then {
+            Some((action, _)) => {
+                let fields = crate::entity_actor::effects::sanitize_action_params(initial_fields);
+                self.related_statuses_of(tenant, &table, table.related_refs(action), &fields)
+                    .await
+            }
+            None => temper_jit::table::RelatedMap::new(),
+        };
+        let then = then.map(|(action, params)| (action, params, &related));
         super::write_record::created_record(
-            self,
-            tenant,
+            &crate::blobs::BlobReadSource::Tenant {
+                state: self,
+                tenant,
+            },
             (entity_type, entity_id),
             &table,
             initial_fields,
@@ -1721,6 +1737,8 @@ impl ServerState {
         self.publish_entity_change(change, Some(&state));
 
         Ok(Some(EntityResponse {
+            caller_holds: None,
+            reactions: Vec::new(),
             success: true,
             refusal: None,
             state,

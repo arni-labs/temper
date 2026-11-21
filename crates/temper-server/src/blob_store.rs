@@ -37,7 +37,7 @@ pub use raw_ingest::BlobByteStream;
 #[cfg(test)]
 pub(crate) use raw_ingest::BlobIngestProgressPolicy;
 pub(crate) use raw_ingest::{
-    BlobIngestAdmissionError, BlobIngestBudget, BlobStageError, MAX_RAW_BLOB_BYTES,
+    BlobIngestAdmissionError, BlobIngestBudget, BlobStageError, MAX_RAW_BLOB_BYTES, StagedBlob,
 };
 pub(crate) use streaming::BlobReadBounded;
 pub use streaming::{BlobObjectStream, BlobStreamRead, decode_json_base64_stream};

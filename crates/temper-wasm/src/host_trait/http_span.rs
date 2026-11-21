@@ -61,13 +61,14 @@ fn without_keys(path: &str) -> String {
     kept
 }
 
-/// Record an outside call's HTTP status on its span: as `status_code`, and as
-/// `http.status_code`, which the trace view reads. A 5xx is the service's
-/// failure, so the span is marked an error, though the call returns to the
-/// module, which decides what to answer.
-pub(super) fn record_http_status(status: impl Into<u64>) {
+/// Record an outside call's HTTP status on `span`, the call's own: as
+/// `status_code`, and as `http.status_code`, which the trace view reads. A 5xx
+/// is the service's failure, so the span is marked an error, though the call
+/// returns to the module, which decides what to answer. Never the current
+/// span: a call's entered span stays entered across its awaits, so calls of
+/// one batch that overlap on a thread each see another's as current.
+pub(super) fn record_http_status(span: &tracing::Span, status: impl Into<u64>) {
     let status: u64 = status.into();
-    let span = tracing::Span::current();
     span.record("status_code", status);
     span.record("http.status_code", status);
     if status >= 500 {

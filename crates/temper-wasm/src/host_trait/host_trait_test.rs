@@ -380,6 +380,7 @@ fn internal_http_call_replaces_guest_authority_with_fresh_capability() {
             InternalHttpCapability::new("request-capability".to_string(), "tenant-a".to_string())
         }))
         .with_invocation_context(WasmInvocationContext {
+            delivery_key: None,
             tenant: "tenant-a".to_string(),
             entity_type: "Workspace".to_string(),
             entity_id: "ws-1".to_string(),
@@ -583,6 +584,7 @@ fn production_host_never_exposes_ambient_root_secret() {
 #[test]
 fn guest_log_span_attrs_include_message_and_invocation_context() {
     let context = WasmInvocationContext {
+        delivery_key: None,
         tenant: "tenant-a".to_string(),
         entity_type: "Session".to_string(),
         entity_id: "ss-1".to_string(),
@@ -651,6 +653,7 @@ fn guest_log_span_event_is_named_for_trace_export() {
     });
     let _subscriber_guard = tracing::subscriber::set_default(subscriber);
     let context = WasmInvocationContext {
+        delivery_key: None,
         tenant: "tenant-a".to_string(),
         entity_type: "Session".to_string(),
         entity_id: "ss-1".to_string(),

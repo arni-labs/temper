@@ -120,11 +120,17 @@ pub struct AgentContext {
     /// of the background call this context answers: the answer's commit
     /// removes it, on that record only.
     pub ends_call: Option<ScheduledFire>,
-    /// Runtime-owned; never populated from request headers. The reactions
-    /// this move's action declared when it was sent, which the caller that
-    /// sent it runs after the commit; its follow-on row keeps them
-    /// (`follow_ons`). Set only on the caller a move is sent to its actor
-    /// with; empty everywhere else.
+    /// Runtime-owned; never populated from request headers. Whether the
+    /// caller that sends this move runs its reactions after the commit: the
+    /// actor then takes them from the table it applies the move under, keeps
+    /// them in the move's follow-on row (`follow_ons`) and answers them
+    /// (`EntityResponse::reactions`). Set only on the caller a move is sent
+    /// to its actor with.
+    pub owes_reactions: bool,
+    /// Runtime-owned; never populated from request headers. The reactions a
+    /// move owes, as the actor took them ([`Self::owes_reactions`]), which
+    /// its follow-on row keeps. Set only by the actor, on the caller it
+    /// commits a move as; empty everywhere else.
     pub owed_reactions: Vec<crate::trigger::ReactionRule>,
     /// Runtime-owned; never populated from request headers. The follow-on
     /// row of the committed move whose follow-ons this context sends: each
@@ -260,6 +266,7 @@ impl AgentContext {
     /// dropping identity via `Default`.
     pub fn system() -> Self {
         Self {
+            owes_reactions: false,
             event_origin: None,
             inline_chain: InlineChain::default(),
             callback_hops: 0,
@@ -307,6 +314,7 @@ impl AgentContext {
         security_ctx.principal.role = Some("service".to_string());
 
         Self {
+            owes_reactions: false,
             event_origin: None,
             inline_chain: InlineChain::default(),
             callback_hops: 0,
@@ -455,6 +463,7 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
     let workflow_run_id = header_string(headers, "x-temper-workflow-run-id");
 
     AgentContext {
+        owes_reactions: false,
         event_origin: None,
         inline_chain: InlineChain::default(),
         callback_hops: 0,

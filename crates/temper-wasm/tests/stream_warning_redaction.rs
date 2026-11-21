@@ -74,6 +74,7 @@ async fn stream_setup_warning_keeps_host_and_path_without_secrets() {
             .invoke(
                 &hash,
                 &WasmInvocationContext {
+                    delivery_key: None,
                     tenant: "test".into(),
                     entity_type: "Test".into(),
                     entity_id: "1".into(),

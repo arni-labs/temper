@@ -94,6 +94,7 @@ async fn outbound_streaming_injects_internal_auth_headers() {
                 InternalHttpCapability::new("stream-capability".to_string(), "tenant-a".to_string())
             }))
             .with_invocation_context(WasmInvocationContext {
+                delivery_key: None,
                 tenant: "default".to_string(),
                 entity_type: "Workspace".to_string(),
                 entity_id: "ws-1".to_string(),

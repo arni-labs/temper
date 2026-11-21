@@ -32,6 +32,8 @@ pub(crate) struct CommittedMove<'a> {
     pub(crate) action: &'a str,
     pub(crate) to_state: &'a str,
     pub(crate) fields: &'a serde_json::Value,
+    /// How many reactions in from the move a person or the kernel sent.
+    pub(crate) depth: u32,
 }
 
 /// The action whose reactions one level of a chain runs, `depth` levels in.
@@ -114,7 +116,7 @@ impl crate::ServerState {
                 action: moved.action,
                 to_state: moved.to_state,
                 fields: moved.fields,
-                depth: 0,
+                depth: moved.depth,
             };
             self.dispatch_level(tenant, level, invoking_ctx).boxed()
         })
@@ -322,15 +324,16 @@ impl crate::ServerState {
             // read or send the store failed is kept and tried again, read and
             // authorization included (`owed_reactions`).
             let security_ctx = effective_trigger_security_context(&dispatch_ctx, &cause);
+            let sent = OwedMove {
+                tenant: tenant.clone(),
+                entity_type: rule.then.entity_type.clone(),
+                entity_id: target_entity_id.clone(),
+                action: rule.then.action.clone(),
+                params: effective_params,
+                agent_ctx: dispatch_ctx.clone(),
+            };
             let reaction = Reaction {
-                sent: OwedMove {
-                    tenant: tenant.clone(),
-                    entity_type: rule.then.entity_type.clone(),
-                    entity_id: target_entity_id.clone(),
-                    action: rule.then.action.clone(),
-                    params: effective_params,
-                    agent_ctx: dispatch_ctx.clone(),
-                },
+                sent: sent.clone(),
                 authorized_as: security_ctx.clone(),
             };
             let tried = state.dispatch_reaction(reaction, depth).await;
@@ -403,32 +406,12 @@ impl crate::ServerState {
                         depth,
                     });
 
-                    // Recurse if the target action succeeded. The cascade
-                    // fires under the same dispatch context as this rule —
-                    // elevation propagates down the chain — and knows the
-                    // children the action spawned as entities it made. A
-                    // chain is as deep as its data, so each level is polled
-                    // on a stack that grows.
+                    // Recurse if the target action succeeded, as the move
+                    // owes (`reaction_cascade`). A chain is as deep as its
+                    // data, so each level is polled on a stack that grows.
                     if response.success {
-                        let cascade_ctx =
-                            dispatch_ctx.having_made(response.spawn_requests.iter().map(|spawn| {
-                                (spawn.entity_type.as_str(), spawn.entity_id.as_str())
-                            }));
-                        let target_fields =
-                            serde_json::to_value(&response.state.fields).unwrap_or_default();
-                        let cascade_results = self
-                            .dispatch_reactions(
-                                tenant,
-                                &rule.then.entity_type,
-                                &target_entity_id,
-                                response.action(&rule.then.action),
-                                &target_status,
-                                &target_fields,
-                                depth + 1,
-                                &cascade_ctx,
-                            )
-                            .await;
-                        results.extend(cascade_results);
+                        results
+                            .extend(Box::pin(self.reaction_cascade(&sent, &response, depth)).await);
                     }
                 }
                 Err(e) => {

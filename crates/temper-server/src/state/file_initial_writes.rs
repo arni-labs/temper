@@ -228,6 +228,8 @@ impl ServerState {
         }
 
         let response = EntityResponse {
+            caller_holds: None,
+            reactions: Vec::new(),
             success: true,
             refusal: None,
             state,

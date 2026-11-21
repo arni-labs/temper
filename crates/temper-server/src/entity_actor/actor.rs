@@ -1585,6 +1585,24 @@ impl EntityActor {
                 // Snapshot the current table for this action dispatch.
                 // On the next action, any hot-swapped table will be picked up.
                 let table = self.table.read().expect("table lock poisoned").clone();
+                // The reactions this move owes are this table's, the one it is
+                // applied under: its follow-on row keeps them and its answer
+                // gives them to the caller that runs them.
+                let caller = caller.map(|caller| match caller.owes_reactions {
+                    true => Arc::new(AgentContext {
+                        owed_reactions: crate::registry::declared_reactions(
+                            &table,
+                            &state.entity_type,
+                            &name,
+                        ),
+                        ..(*caller).clone()
+                    }),
+                    false => caller,
+                });
+                let owed_reactions = caller
+                    .as_ref()
+                    .map(|caller| caller.owed_reactions.clone())
+                    .unwrap_or_default();
 
                 // ADR-0048 sub-decision 5: actor-side idempotency dedup.
                 // A dispatch-layer retry can produce a second `ask` after the
@@ -1669,6 +1687,11 @@ impl EntityActor {
                         prune_transient_action_fields_from_state(&mut response_state);
                     }
                     ctx.reply(EntityResponse {
+                        caller_holds: None,
+                        reactions: match answered_action {
+                            None => owed_reactions,
+                            Some(_) => Vec::new(),
+                        },
                         success: true,
                         refusal: None,
                         state: response_state,
@@ -1880,7 +1903,10 @@ impl EntityActor {
                         )
                     {
                         *state = state_before;
-                        let response = self.answer_unrecorded(state, result, &event);
+                        let response = EntityResponse {
+                            reactions: owed_reactions,
+                            ..self.answer_unrecorded(state, result, &event)
+                        };
                         if let (Some(key), Some(request), Some(cache)) = (
                             idempotency_key.as_ref(),
                             request.as_ref(),
@@ -2358,6 +2384,8 @@ impl EntityActor {
                     );
 
                     let response = EntityResponse {
+                        caller_holds: None,
+                        reactions: owed_reactions,
                         success: true,
                         refusal: None,
                         state: state.clone(),
@@ -2428,6 +2456,8 @@ impl EntityActor {
             }
             EntityMsg::GetState => {
                 ctx.reply(EntityResponse {
+                    caller_holds: None,
+                    reactions: Vec::new(),
                     success: true,
                     refusal: None,
                     state: state.clone(),
@@ -2474,6 +2504,8 @@ impl EntityActor {
                 .await;
                 ctx.reply(match outcome {
                     Ok(()) => EntityResponse {
+                        caller_holds: None,
+                        reactions: Vec::new(),
                         success: true,
                         refusal: None,
                         state: state.clone(),
@@ -2508,6 +2540,8 @@ impl EntityActor {
             EntityMsg::RecordSpawnRefusal { refusal } => {
                 let outcome = super::spawn_refusal::commit(self, state, &refusal).await;
                 ctx.reply(EntityResponse {
+                    caller_holds: None,
+                    reactions: Vec::new(),
                     success: outcome.is_ok(),
                     refusal: None,
                     state: state.clone(),
@@ -2530,6 +2564,8 @@ impl EntityActor {
                 // A record that moved since is refused, with nothing written.
                 let moved = outcome == Ok(super::timer_needs_person::Stop::Moved);
                 ctx.reply(EntityResponse {
+                    caller_holds: None,
+                    reactions: Vec::new(),
                     success: outcome.is_ok() && !moved,
                     refusal: None,
                     state: state.clone(),
@@ -2579,6 +2615,8 @@ impl EntityActor {
                 // one, and still takes a tombstone.
                 if state.is_tombstoned() {
                     ctx.reply(EntityResponse {
+                        caller_holds: None,
+                        reactions: Vec::new(),
                         success: true,
                         state: state.clone(),
                         error: None,
@@ -2637,6 +2675,8 @@ impl EntityActor {
                 state.record_tombstone(deleted);
 
                 ctx.reply(EntityResponse {
+                    caller_holds: None,
+                    reactions: Vec::new(),
                     success: true,
                     refusal: None,
                     state: state.clone(),

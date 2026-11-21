@@ -185,6 +185,7 @@ impl WasmHost for SlowHttpHost {
 
 pub(super) fn make_context() -> WasmInvocationContext {
     WasmInvocationContext {
+        delivery_key: None,
         tenant: "test".into(),
         entity_type: "Order".into(),
         entity_id: "1".into(),

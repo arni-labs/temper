@@ -24,6 +24,7 @@ pub(crate) const MAX_RAW_BLOB_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 mod admission;
 mod file_content;
+mod staged_read;
 pub(crate) use admission::{
     BlobIngestAdmissionError, BlobIngestBudget, BlobIngestPermit, BlobIngestProgressPolicy,
     BlobStageError,

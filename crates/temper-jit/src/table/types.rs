@@ -61,6 +61,11 @@ pub struct TransitionTable {
     /// checked against ([`super::invariant`]).
     #[serde(default)]
     pub invariants: Vec<super::invariant::MoveInvariant>,
+    /// Each action's declared `[[action.trigger]]`s. A move's reactions are
+    /// read from the table the move is applied under, so an install between
+    /// the move's send and its commit cannot give it another version's.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub action_triggers: BTreeMap<String, Vec<temper_spec::automaton::ActionTrigger>>,
     /// Pre-built index: action name → indices into `rules`.
     ///
     /// Eliminates the O(N) linear scan + Vec allocation in [`evaluate_ctx()`].
@@ -165,6 +170,8 @@ impl<'de> Deserialize<'de> for TransitionTable {
             keys: Vec<DeclaredKey>,
             #[serde(default)]
             invariants: Vec<super::invariant::MoveInvariant>,
+            #[serde(default)]
+            action_triggers: BTreeMap<String, Vec<temper_spec::automaton::ActionTrigger>>,
         }
 
         let raw = TransitionTableRaw::deserialize(deserializer)?;
@@ -180,6 +187,7 @@ impl<'de> Deserialize<'de> for TransitionTable {
             action_contracts: raw.action_contracts,
             initial_values: raw.initial_values,
             invariants: raw.invariants,
+            action_triggers: raw.action_triggers,
             rule_index: BTreeMap::new(),
         };
         table.rebuild_index();
@@ -333,6 +341,7 @@ mod tests {
     #[test]
     fn rebuild_index_groups_by_name() {
         let mut table = TransitionTable {
+            action_triggers: Default::default(),
             entity_name: "TestEntity".to_string(),
             states: vec!["Draft".to_string(), "Active".to_string()],
             initial_state: "Draft".to_string(),

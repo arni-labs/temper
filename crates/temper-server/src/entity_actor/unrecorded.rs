@@ -127,6 +127,8 @@ impl EntityActor {
             "move left its record unchanged; nothing written"
         );
         EntityResponse {
+            caller_holds: None,
+            reactions: Vec::new(),
             success: true,
             refusal: None,
             state: state.clone(),

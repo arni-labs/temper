@@ -59,6 +59,12 @@ pub struct WasmInvocationContext {
     /// next number here.
     #[serde(default = "first_attempt")]
     pub attempt: u32,
+    /// The same on every send of this call: each try, and a send again
+    /// after a restart. A module hands it to the service it calls (as an
+    /// idempotency key or a message nonce) so the service delivers the call
+    /// once. `None` when the move that set the call off had no key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_key: Option<String>,
 }
 
 /// A call's first try.

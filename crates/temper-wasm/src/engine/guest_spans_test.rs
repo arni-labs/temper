@@ -8,6 +8,7 @@ use super::*;
 
 fn context() -> WasmInvocationContext {
     WasmInvocationContext {
+        delivery_key: None,
         tenant: "test".to_string(),
         entity_type: "Session".to_string(),
         entity_id: "s-1".to_string(),

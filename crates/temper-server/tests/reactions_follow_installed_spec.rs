@@ -175,3 +175,37 @@ async fn a_reaction_an_installed_version_removes_no_longer_fires() {
         "a reaction the installed version no longer declares does not fire"
     );
 }
+
+/// An install can land between a move's send and its commit. The move's
+/// reactions are then those of the table its record applies it under, never
+/// rules read from another version: here the registry's declarations and the
+/// record's table disagree, as they do in that window, and the table decides.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_moves_reactions_are_those_of_the_table_it_is_applied_under() {
+    for (table, declared, expected) in [
+        (CONFIRM_AUTHORIZES, "", "Authorized"),
+        ("", CONFIRM_AUTHORIZES, "Pending"),
+    ] {
+        let state = serve(&order_ioa(table));
+        {
+            let mut registry = state.registry.write().unwrap();
+            let mut read_before = SpecRegistry::new();
+            install(&mut read_before, &order_ioa(declared));
+            let automaton = read_before
+                .get_spec(&TenantId::new(TENANT), "Order")
+                .expect("Order is declared")
+                .automaton
+                .clone();
+            registry
+                .get_spec_mut(&TenantId::new(TENANT), "Order")
+                .expect("Order is installed")
+                .automaton = automaton;
+        }
+        confirm(&state, "racing").await;
+        assert_eq!(
+            payment(&state, "racing").await,
+            expected,
+            "the reactions of the table Confirm is applied under (triggers {table:?})"
+        );
+    }
+}

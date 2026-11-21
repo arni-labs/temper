@@ -108,6 +108,8 @@ impl crate::state::ServerState {
             agent_ctx: composite_sub_write_agent(parent.agent_ctx, write)
                 .for_dispatch_root(&write.entity_type, &write.entity_id),
             response: EntityResponse {
+                caller_holds: None,
+                reactions: Vec::new(),
                 success: true,
                 refusal: None,
                 state: state.clone(),

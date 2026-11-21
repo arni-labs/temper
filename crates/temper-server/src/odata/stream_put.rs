@@ -254,6 +254,7 @@ pub(super) async fn handle_stream_put(
         }
 
         let inv_ctx = WasmInvocationContext {
+            delivery_key: None,
             tenant: tenant.to_string(),
             entity_type: entity_type.clone(),
             entity_id: key.clone(),

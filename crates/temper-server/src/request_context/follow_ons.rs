@@ -102,9 +102,41 @@ impl OwedFollowOns {
     }
 }
 
+/// The delivery key of the call `integration` makes for the move `caller`
+/// sent: the same on every send of that call, each try and each resend
+/// after a restart, whose caller the move's follow-on row keeps with its key
+/// ([`OwedFollowOns::caller`]). A module hands it to the service it calls (an
+/// idempotency key, a message nonce) so the service can tell a call sent
+/// again from a new one, and deliver it once. None for a move with no key,
+/// which no resend can tell apart either.
+pub(crate) fn delivery_key(caller: &super::AgentContext, integration: &str) -> Option<String> {
+    caller.idempotency_key.as_ref().map(|key| {
+        crate::idempotency::derived_idempotency_key(key.as_str(), "delivery", integration)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::idempotency::IdempotencyKey;
+
+    #[test]
+    fn a_calls_delivery_key_is_the_same_when_its_row_sends_it_again() {
+        let caller = super::super::AgentContext {
+            idempotency_key: Some(IdempotencyKey::Request("move-key".into())),
+            ..Default::default()
+        };
+        let resent = super::super::armed_by::encode_scheduled_armed_by(&caller)
+            .and_then(|row| super::super::armed_by::decode_armed_by(&row))
+            .expect("the row keeps the caller");
+        let sent = delivery_key(&caller, "send_reply").expect("a keyed move's call has one");
+        assert_eq!(delivery_key(&resent, "send_reply"), Some(sent.clone()));
+        assert_ne!(delivery_key(&caller, "other"), Some(sent));
+        assert_eq!(
+            delivery_key(&super::super::AgentContext::default(), "send_reply"),
+            None
+        );
+    }
 
     #[test]
     fn a_follow_row_is_never_a_schedule_or_a_call_deadline() {

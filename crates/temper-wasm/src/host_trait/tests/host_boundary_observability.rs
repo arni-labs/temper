@@ -147,6 +147,7 @@ fn capture_spans_and_events() -> (CapturedSpans, CapturedEvents, CaptureGuard) {
 
 fn session_invocation_context() -> WasmInvocationContext {
     WasmInvocationContext {
+        delivery_key: None,
         tenant: "tenant-a".to_string(),
         entity_type: "Session".to_string(),
         entity_id: "ss-1".to_string(),
@@ -523,4 +524,119 @@ async fn a_called_service_that_fails_marks_the_call_span_an_error() {
         "{:?}",
         calls[1]
     );
+}
+
+/// Serve one answer after `wait`: `status`, and a body that is `body` or, when
+/// `body` is `None`, one cut off before its declared length.
+async fn answering_after(
+    status: &'static str,
+    wait: std::time::Duration,
+    body: Option<&'static str>,
+) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let at = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await;
+        tokio::time::sleep(wait).await;
+        let answer = match body {
+            Some(body) => format!(
+                "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+            None => {
+                format!("HTTP/1.1 {status}\r\ncontent-length: 100\r\nconnection: close\r\n\r\nno")
+            }
+        };
+        let _ = socket.write_all(answer.as_bytes()).await;
+    });
+    format!("http://{at}/files")
+}
+
+fn call_spans(spans: &CapturedSpans) -> Vec<CapturedSpan> {
+    spans
+        .lock()
+        .expect("span capture lock poisoned")
+        .iter()
+        .filter(|span| span.name == "wasm.host.http_call")
+        .cloned()
+        .collect()
+}
+
+/// A 503 whose body cannot be read still marks its span: the status is
+/// recorded when the response head arrives.
+#[tokio::test]
+async fn a_failed_call_whose_body_cannot_be_read_keeps_its_status() {
+    let (spans, _events, _guard) = capture_spans_and_events();
+    let host = ProductionWasmHost::new(BTreeMap::new());
+    let url = answering_after("503 Service Unavailable", Default::default(), None).await;
+    host.http_call("GET", &url, &[], "")
+        .await
+        .expect_err("the body was cut off");
+    let calls = call_spans(&spans);
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(
+        calls[0].fields.get("http.status_code").map(String::as_str),
+        Some("503")
+    );
+    assert_eq!(
+        calls[0].fields.get("otel.status_code").map(String::as_str),
+        Some("ERROR")
+    );
+}
+
+/// Calls of one batch overlap on one task: each status lands on its own
+/// call's span, never on another call's that happens to be entered.
+#[tokio::test]
+async fn overlapping_batch_calls_each_keep_their_own_status() {
+    let (spans, _events, _guard) = capture_spans_and_events();
+    let host = ProductionWasmHost::new(BTreeMap::new());
+    let failing = answering_after("503 Service Unavailable", Default::default(), Some("no")).await;
+    let slow_ok =
+        answering_after("200 OK", std::time::Duration::from_millis(300), Some("ok")).await;
+    let request = |url: &str| crate::host_trait::HttpBatchRequest {
+        method: "GET".into(),
+        url: url.into(),
+        headers: Vec::new(),
+        body: String::new(),
+    };
+    let answers = host
+        .http_call_batch(&[request(&failing), request(&slow_ok)])
+        .await
+        .expect("both answered");
+    assert_eq!(
+        answers.iter().map(|a| a.status).collect::<Vec<_>>(),
+        [503, 200]
+    );
+    let calls = call_spans(&spans);
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    let by_url = |url: &str| {
+        calls
+            .iter()
+            .find(|span| {
+                span.fields
+                    .get("http.url")
+                    .is_some_and(|seen| url.ends_with(seen.as_str()))
+            })
+            .unwrap_or_else(|| panic!("no span for {url}: {calls:?}"))
+    };
+    let failed = by_url(&failing);
+    assert_eq!(
+        failed.fields.get("http.status_code").map(String::as_str),
+        Some("503")
+    );
+    assert_eq!(
+        failed.fields.get("otel.status_code").map(String::as_str),
+        Some("ERROR")
+    );
+    let ok = by_url(&slow_ok);
+    assert_eq!(
+        ok.fields.get("http.status_code").map(String::as_str),
+        Some("200")
+    );
+    assert_eq!(ok.fields.get("otel.status_code"), None, "{ok:?}");
 }

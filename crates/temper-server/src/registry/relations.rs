@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use temper_jit::table::TransitionTable;
 use temper_spec::automaton::{ActionTrigger, TriggerKind, Webhook};
 use temper_spec::cross_invariant::{CrossInvariantSpec, DeletePolicy};
 use temper_spec::csdl::CsdlDocument;
@@ -92,6 +93,22 @@ fn nav_target_entity(type_name: &str) -> String {
 // is now an `[[action.triggers]]` block with kind="entity"; auto-start-on-
 // Assign behavior lives on the target agent entity's own spec as a
 // self-trigger (see ADR-0046 Sub-Decision 7).
+
+/// The reactions a move of `action` owes under `table`: its declared
+/// entity-kind triggers, read from the table the move is applied under.
+pub(crate) fn declared_reactions(
+    table: &TransitionTable,
+    entity_type: &str,
+    action: &str,
+) -> Vec<ReactionRule> {
+    table
+        .action_triggers
+        .get(action)
+        .into_iter()
+        .flatten()
+        .filter_map(|trigger| synthesize_action_trigger_reaction(entity_type, action, trigger))
+        .collect()
+}
 
 /// Synthesize a `ReactionRule` from an `[[action.triggers]]` entry (ADR-0046).
 ///

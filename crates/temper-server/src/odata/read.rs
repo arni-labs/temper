@@ -1647,6 +1647,7 @@ async fn handle_stream_get(
     let streams = Arc::new(RwLock::new(StreamRegistry::default()));
 
     let inv_ctx = WasmInvocationContext {
+        delivery_key: None,
         tenant: tenant.to_string(),
         entity_type: entity_type.clone(),
         entity_id: key.clone(),

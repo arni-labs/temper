@@ -711,6 +711,10 @@ impl crate::state::ServerState {
                     http_request: None,
                     trigger_principal: trigger_principal::trigger_principal(ctx.agent_ctx),
                     attempt: ctx.attempt,
+                    delivery_key: crate::request_context::follow_ons::delivery_key(
+                        ctx.agent_ctx,
+                        &integration.name,
+                    ),
                 };
                 (authz_ctx, inv_ctx)
             },

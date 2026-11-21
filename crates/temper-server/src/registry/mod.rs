@@ -29,6 +29,7 @@ use temper_spec::csdl::{CsdlDocument, emit_csdl_xml, merge_csdl};
 use crate::trigger::ReactionRule;
 pub use types::*;
 
+pub(crate) use relations::declared_reactions;
 use relations::{build_relation_graph, build_webhook_routes, synthesize_action_trigger_reaction};
 
 /// Multi-tenant specification registry.

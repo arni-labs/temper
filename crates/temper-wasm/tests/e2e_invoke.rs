@@ -18,6 +18,7 @@ const SDK_CONTEXT_READER_WASM: &[u8] = include_bytes!("fixtures/sdk_context_read
 
 fn build_context() -> WasmInvocationContext {
     WasmInvocationContext {
+        delivery_key: None,
         tenant: "test".to_string(),
         entity_type: "EchoTest".to_string(),
         entity_id: "e1".to_string(),
@@ -209,6 +210,7 @@ async fn invoke_scm_ingest_pack_from_env() {
         "http://127.0.0.1:3000".to_string(),
     );
     let ctx = WasmInvocationContext {
+        delivery_key: None,
         tenant: "default".to_string(),
         entity_type: "Repository".to_string(),
         entity_id: "rp-temperpaw-paw-agent".to_string(),

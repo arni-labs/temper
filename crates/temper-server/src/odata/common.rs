@@ -210,6 +210,24 @@ pub(super) async fn created_record_or_refusal(
     entity_id: &str,
     initial_fields: &serde_json::Value,
 ) -> Result<serde_json::Value, Box<axum::response::Response>> {
+    created_record_read_from(
+        state,
+        &crate::blobs::BlobReadSource::Tenant { state, tenant },
+        tenant,
+        (entity_type, entity_id),
+        initial_fields,
+    )
+    .await
+}
+
+/// [`created_record_or_refusal`], with its stored values read from `source`.
+pub(super) async fn created_record_read_from(
+    state: &ServerState,
+    source: &crate::blobs::BlobReadSource<'_>,
+    tenant: &TenantId,
+    (entity_type, entity_id): (&str, &str),
+    initial_fields: &serde_json::Value,
+) -> Result<serde_json::Value, Box<axum::response::Response>> {
     let table = state
         .transition_table_for_dispatch(tenant, entity_type)
         .map_err(|error| {
@@ -223,8 +241,7 @@ pub(super) async fn created_record_or_refusal(
             )
         })?;
     crate::state::write_record::created_record(
-        state,
-        tenant,
+        source,
         (entity_type, entity_id),
         &table,
         initial_fields,

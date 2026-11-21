@@ -112,6 +112,7 @@ mod tests {
 
     fn base_table() -> TransitionTable {
         let mut table = TransitionTable {
+            action_triggers: Default::default(),
             entity_name: "Order".into(),
             states: vec!["Draft".into(), "Submitted".into(), "Cancelled".into()],
             initial_state: "Draft".into(),

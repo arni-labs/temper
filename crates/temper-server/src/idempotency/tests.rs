@@ -21,6 +21,8 @@ fn hit(cache: &IdempotencyCache, actor_key: &str, idem_key: &str) -> Option<Enti
 
 fn make_response(status: &str) -> EntityResponse {
     EntityResponse {
+        caller_holds: None,
+        reactions: Vec::new(),
         success: true,
         refusal: None,
         state: EntityState {

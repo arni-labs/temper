@@ -2,8 +2,8 @@
 //!
 //! Each try reads the target, authorizes the move on it as it is now, and
 //! sends the move through the core dispatch, without its own reaction
-//! cascade: [`ServerState::dispatch_reactions`](crate::ServerState::dispatch_reactions) runs the cascade of a move that
-//! lands at once. A try the store failed, in the read or the send, is kept
+//! cascade, which its follow-on row keeps: `ServerState::reaction_cascade`
+//! runs it once the move lands. A try the store failed, in the read or the send, is kept
 //! (`state::dispatch::owed_writes`) and tried again under the reaction's key
 //! until it lands or fails otherwise, and its cascade runs when it lands.
 
@@ -116,7 +116,9 @@ async fn try_reaction(state: &ServerState, reaction: &Reaction) -> ReactionTry {
             false,
             crate::state::write_record::WriteCaller::Kernel,
             None,
-            &[],
+            // Its follow-on row keeps the reactions it owes in turn, taken
+            // from the table it is applied under (`reaction_cascade`).
+            true,
         )
         .await;
     if let Ok(response) = &reply
@@ -128,35 +130,17 @@ async fn try_reaction(state: &ServerState, reaction: &Reaction) -> ReactionTry {
 }
 
 /// Try an owed reaction again; once it lands, run its cascade at the next
-/// depth, as the dispatcher does for a reaction that lands at once: under
-/// the reaction's context, which knows the children it spawned as made.
+/// depth, as the dispatcher does for a reaction that lands at once
+/// (`reaction_cascade`).
 fn react_again(state: ServerState, reaction: Arc<Reaction>, depth: u32) -> OwedTry {
     Box::pin(async move {
         let tried = try_reaction(&state, &reaction).await;
         let attempt = tried.attempt();
-        let sent = &reaction.sent;
         if let ReactionTry::Sent(reply) = tried
             && let Ok(response) = *reply
             && response.success
         {
-            let fields = serde_json::to_value(&response.state.fields).unwrap_or_default();
-            let cascade_ctx = sent.agent_ctx.clone().having_made(
-                response
-                    .spawn_requests
-                    .iter()
-                    .map(|spawn| (spawn.entity_type.as_str(), spawn.entity_id.as_str())),
-            );
-            Box::pin(state.dispatch_reactions(
-                &sent.tenant,
-                &sent.entity_type,
-                &sent.entity_id,
-                response.action(&sent.action),
-                &response.state.status,
-                &fields,
-                depth + 1,
-                &cascade_ctx,
-            ))
-            .await;
+            Box::pin(state.reaction_cascade(&reaction.sent, &response, depth)).await;
         }
         attempt
     })

@@ -83,6 +83,7 @@ mod tests {
 
     fn dummy_table(name: &str) -> TransitionTable {
         let mut table = TransitionTable {
+            action_triggers: Default::default(),
             entity_name: name.to_string(),
             states: vec!["A".into(), "B".into()],
             initial_state: "A".into(),

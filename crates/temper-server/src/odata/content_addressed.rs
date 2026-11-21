@@ -32,10 +32,11 @@ use super::authz::{
     CREATE_ACTION, MutationResource, apply_authenticated_context, authorize_mutation,
     require_authenticated_context,
 };
-use super::common::{created_record_or_refusal, run_write_prechecks};
+use super::common::{created_record_read_from, run_write_prechecks};
 use super::response::annotate_entity;
 use super::storage_guardrails::storage_cap_error_response;
 use crate::blob_store::{BlobByteStream, BlobIngestAdmissionError, MAX_RAW_BLOB_BYTES};
+use crate::blobs::BlobReadSource;
 use crate::blobs::{FIELD_OVERFLOW_BLOB_PREFIX, blob_ref_value};
 use crate::request_context::extract_agent_context;
 use crate::response::{ODataResponse, odata_error};
@@ -300,18 +301,6 @@ async fn ingest_raw_inner(
         "{FIELD_OVERFLOW_BLOB_PREFIX}{}.json",
         content_descriptor.sha256
     );
-    if let Err(error) = blob_store
-        .put_staged_base64_json(
-            &content_key,
-            &staged,
-            &[],
-            content_descriptor.serialized_len,
-        )
-        .await
-    {
-        return blob_store_error_response(&error);
-    }
-
     let canonical_descriptor = match staged
         .base64_json_descriptor(canonical_prefix.as_bytes())
         .await
@@ -323,17 +312,6 @@ async fn ingest_raw_inner(
         "{FIELD_OVERFLOW_BLOB_PREFIX}{}.json",
         canonical_descriptor.sha256
     );
-    if let Err(error) = blob_store
-        .put_staged_base64_json(
-            &canonical_key,
-            &staged,
-            canonical_prefix.as_bytes(),
-            canonical_descriptor.serialized_len,
-        )
-        .await
-    {
-        return blob_store_error_response(&error);
-    }
 
     let initial_fields = serde_json::json!({
         "Id": expected_object_id,
@@ -344,16 +322,40 @@ async fn ingest_raw_inner(
         "Status": "Durable",
         "CreatedAt": now,
     });
-    if let Err(response) = created_record_or_refusal(
+    // The record's rules are checked against the staged bytes before either
+    // representation is published: a refused upload leaves nothing stored.
+    let representations: [(&str, &[u8]); 2] = [
+        (&content_key, &[]),
+        (&canonical_key, canonical_prefix.as_bytes()),
+    ];
+    if let Err(response) = created_record_read_from(
         &state,
+        &BlobReadSource::Upload {
+            staged: &staged,
+            representations: &representations,
+            state: &state,
+            tenant: &tenant,
+        },
         &tenant,
-        entity_type,
-        &expected_object_id,
+        (entity_type, &expected_object_id),
         &initial_fields,
     )
     .await
     {
         return *response;
+    }
+
+    let lengths = [
+        content_descriptor.serialized_len,
+        canonical_descriptor.serialized_len,
+    ];
+    for ((key, prefix), len) in representations.into_iter().zip(lengths) {
+        if let Err(error) = blob_store
+            .put_staged_base64_json(key, &staged, prefix, len)
+            .await
+        {
+            return blob_store_error_response(&error);
+        }
     }
     let final_guard = state.acquire_commons_write_guardrail_lock(&tenant).await;
     // Convert the pending reservation back into a final cap check while the

@@ -1,5 +1,5 @@
 //! Bounded reads from staged bytes, object storage, or the permitted legacy DB.
-use crate::blob_store::{BlobReadBounded, BlobStore};
+use crate::blob_store::{BlobReadBounded, BlobStore, StagedBlob};
 use crate::state::ServerState;
 use temper_runtime::tenant::TenantId;
 
@@ -13,6 +13,15 @@ pub(crate) enum BlobReadSource<'a> {
         blobs: &'a [super::OverflowBlobWrite],
     },
     Tenant {
+        state: &'a ServerState,
+        tenant: &'a TenantId,
+    },
+    /// A raw upload not yet published: each representation (its key and the
+    /// prefix stored before the body) is read from the staging file, any
+    /// other key from the tenant.
+    Upload {
+        staged: &'a StagedBlob,
+        representations: &'a [(&'a str, &'a [u8])],
         state: &'a ServerState,
         tenant: &'a TenantId,
     },
@@ -71,5 +80,18 @@ pub(super) async fn read_blob_ref_bytes(
                 .get_blob_with_legacy_fallback_bounded(tenant, key, max_bytes)
                 .await
         }
+        BlobReadSource::Upload {
+            staged,
+            representations,
+            state,
+            tenant,
+        } => match representations.iter().find(|(stored, _)| *stored == key) {
+            Some((_, prefix)) => staged.base64_json_bounded(prefix, max_bytes).await,
+            None => {
+                state
+                    .get_blob_with_legacy_fallback_bounded(tenant, key, max_bytes)
+                    .await
+            }
+        },
     }
 }

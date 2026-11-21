@@ -62,6 +62,7 @@ fn guest_log_named_event_carries_datadog_trace_and_span_correlation() {
     let _subscriber_guard = tracing::subscriber::set_default(subscriber);
 
     let context = WasmInvocationContext {
+        delivery_key: None,
         tenant: "tenant-a".to_string(),
         entity_type: "Session".to_string(),
         entity_id: "ss-1".to_string(),
@@ -183,6 +184,7 @@ fn production_guest_log_does_not_emit_duplicate_uncorrelated_wasm_event() {
     let _subscriber_guard = tracing::subscriber::set_default(subscriber);
 
     let context = WasmInvocationContext {
+        delivery_key: None,
         tenant: "tenant-a".to_string(),
         entity_type: "Session".to_string(),
         entity_id: "ss-1".to_string(),

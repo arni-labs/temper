@@ -68,6 +68,7 @@ fn context(
     entity_state: serde_json::Value,
 ) -> WasmInvocationContext {
     WasmInvocationContext {
+        delivery_key: None,
         tenant: "default".to_string(),
         entity_type: "Item".to_string(),
         entity_id: "item-1".to_string(),

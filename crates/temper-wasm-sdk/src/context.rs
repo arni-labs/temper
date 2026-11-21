@@ -137,6 +137,12 @@ pub struct Context {
     /// retry (`set_retry_result`) is called again with the next number. 1 on
     /// a host that predates the field.
     pub attempt: u32,
+    /// The same on every send of this call: each try, and a send again
+    /// after a restart. Hand it to the service you call (as an idempotency
+    /// key or a message nonce) so it delivers the call once. `None` when the
+    /// move that set the call off had no key, and on a host that predates
+    /// the field.
+    pub delivery_key: Option<String>,
 }
 
 /// The principal a triggering move was made as.
@@ -316,6 +322,10 @@ impl Context {
             .and_then(Value::as_u64)
             .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(1);
+        let delivery_key = parsed
+            .get("delivery_key")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         Ok(Self {
             config,
@@ -329,6 +339,7 @@ impl Context {
             http_request,
             trigger_principal,
             attempt,
+            delivery_key,
         })
     }
 

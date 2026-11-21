@@ -82,6 +82,11 @@ enum Owed {
     BackgroundAnswer,
     /// `Note` counts itself on the record's `Ledger`: the `Count`.
     Reaction,
+    /// `Relay` passes the record's `Ledger`, whose `Pass` inits the `Child`
+    /// of the same id: the `Init`, a reaction owed by a reaction's move. The
+    /// tenant's policy allows `Pass` only on an open ledger, so once it has
+    /// landed it cannot be sent again: the `Init` is owed by the `Pass`.
+    ChainedReaction,
     /// `Spawn` creates a `Child`: its creation and its `Init`.
     ChildSpawn,
     /// `Hold` enters `Waiting`: the `Expire` its timer fires. Its row is
@@ -95,6 +100,7 @@ impl Owed {
         match self {
             Self::BackgroundAnswer => ("Ask", json!({})),
             Self::Reaction => ("Note", json!({})),
+            Self::ChainedReaction => ("Relay", json!({})),
             Self::ChildSpawn => ("Spawn", json!({ "child_id": CHILD })),
             Self::TimerFire => ("Hold", json!({})),
         }
@@ -106,8 +112,28 @@ impl Owed {
         match self {
             Self::BackgroundAnswer => (Record::new("Job", JOB), &["Answer"]),
             Self::Reaction => (Record::new("Ledger", JOB), &["Count"]),
+            Self::ChainedReaction => (Record::new("Child", JOB), &["Init"]),
             Self::ChildSpawn => (Record::new("Child", CHILD), &["Created", "Init"]),
             Self::TimerFire => (Record::new("Job", JOB), &["Expire"]),
+        }
+    }
+
+    /// The record whose write [`Stop::AfterOwedWrite`] stops after: the one
+    /// owing the write, or for a chain, the move that owes it.
+    fn stopped_after(self) -> Record {
+        match self {
+            Self::ChainedReaction => Record::new("Ledger", JOB),
+            _ => self.owing().0,
+        }
+    }
+
+    /// The records the move's writes land on, made before it.
+    fn records(self) -> Vec<Record> {
+        let job = Record::new("Job", JOB);
+        match self {
+            Self::Reaction => vec![job, self.owing().0],
+            Self::ChainedReaction => vec![job, Record::new("Ledger", JOB), self.owing().0],
+            _ => vec![job],
         }
     }
 }
@@ -215,7 +241,12 @@ impl Process {
             // own: with no tenant policy, Cedar refuses them.
             state
                 .authz
-                .reload_tenant_policies(TENANT, "permit(principal, action, resource);")
+                .reload_tenant_policies(
+                    TENANT,
+                    r#"permit(principal, action, resource);
+                    forbid(principal, action == Action::"Pass", resource)
+                        when { resource has status && resource.status == "Passed" };"#,
+                )
                 .expect("the tenant policy parses");
             let hash = state
                 .wasm_engine
@@ -284,11 +315,7 @@ fn run_seed(owed: Owed, stop: Option<Stop>, seed: u64) -> Result<(), String> {
     let first = Process::start(&world, &format!("first-{seed}"));
     let held = first.runtime.block_on(async {
         let tenant = TenantId::new(TENANT);
-        let mut records = vec![job];
-        if owed == Owed::Reaction {
-            records.push(owing);
-        }
-        for record in records {
+        for record in owed.records() {
             first
                 .state
                 .get_or_create_tenant_entity(
@@ -302,9 +329,9 @@ fn run_seed(owed: Owed, stop: Option<Stop>, seed: u64) -> Result<(), String> {
         }
         match stop {
             Some(Stop::AfterMove) => world.store.stop_writes_after_next_append(&job.journal()),
-            Some(Stop::AfterOwedWrite) => {
-                world.store.stop_writes_after_next_append(&owing.journal())
-            }
+            Some(Stop::AfterOwedWrite) => world
+                .store
+                .stop_writes_after_next_append(&owed.stopped_after().journal()),
             None => {}
         }
         let answer = set_off(&first.state, owed).await;
@@ -412,6 +439,14 @@ fn dst_a_reaction_owed_when_the_process_stops_lands_once_after_the_boot() {
 #[test]
 fn dst_a_reaction_that_landed_before_the_process_stopped_is_not_applied_again() {
     check_over_seeds(Owed::Reaction, Stop::AfterOwedWrite);
+}
+
+/// The `Pass` lands and the process stops before its own reaction does:
+/// the `Init` it owes lands once after the boot, though the `Pass` itself
+/// cannot be sent again.
+#[test]
+fn dst_a_reaction_a_landed_reaction_owes_lands_once_after_the_boot() {
+    check_over_seeds(Owed::ChainedReaction, Stop::AfterOwedWrite);
 }
 
 #[test]

@@ -39,6 +39,7 @@ const BUSY_GUEST: &str = r#"(module $busy_guest
 
 fn context() -> WasmInvocationContext {
     WasmInvocationContext {
+        delivery_key: None,
         tenant: "profiling".to_string(),
         entity_type: "Busy".to_string(),
         entity_id: "b1".to_string(),

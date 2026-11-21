@@ -35,6 +35,8 @@ pub(super) fn replay_copy(response: &EntityResponse) -> EntityResponse {
         })
         .collect();
     EntityResponse {
+        caller_holds: None,
+        reactions: response.reactions.clone(),
         success: response.success,
         refusal: response.refusal.clone(),
         state: EntityState {

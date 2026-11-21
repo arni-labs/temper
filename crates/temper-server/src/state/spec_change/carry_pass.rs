@@ -205,7 +205,7 @@ impl ServerState {
                 false,
                 crate::state::write_record::WriteCaller::Kernel,
                 None,
-                &[],
+                false,
             )
             .await;
         let error = match result {

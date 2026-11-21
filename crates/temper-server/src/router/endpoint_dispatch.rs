@@ -192,6 +192,7 @@ pub(super) async fn dispatch_matched_route(
         route.params.clone(),
     );
     let ctx = WasmInvocationContext {
+        delivery_key: None,
         tenant: tenant_id.as_str().to_string(),
         entity_type: "HttpEndpoint".to_string(),
         entity_id: route.route.id.clone(),

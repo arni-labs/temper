@@ -952,12 +952,7 @@ impl WasmHost for ProductionWasmHost {
         // but this runs in WasmHost (not simulation), so wall-clock/network access is fine.
 
         // The call carries this request's trace (with_trace_headers).
-        builder = with_trace_headers(
-            builder,
-            &outbound_headers,
-            &tracing::Span::current(),
-            self.trace_id.as_deref(),
-        );
+        builder = with_trace_headers(builder, &outbound_headers, &span, self.trace_id.as_deref());
 
         if !body.is_empty() {
             builder = builder.body(body.to_string());
@@ -978,6 +973,9 @@ impl WasmHost for ProductionWasmHost {
                 })
             })?;
         let status = resp.status().as_u16();
+        // Recorded as the head arrives, so a body that cannot be read still
+        // leaves the status on the span.
+        record_http_status(&span, status);
 
         // Loud auth failure logging for internal API calls (ADR-0043).
         if is_internal && (status == 401 || status == 403) {
@@ -1084,14 +1082,9 @@ impl WasmHost for ProductionWasmHost {
             })?
         };
         let duration_ms = started.elapsed().as_millis() as u64;
-        record_http_status(status);
-        tracing::Span::current().record("response_bytes", resp_body.len() as u64);
-        tracing::Span::current().record("duration_ms", duration_ms);
-        apply_response_captures(
-            &tracing::Span::current(),
-            &resp_body,
-            &span_hints.response_captures,
-        );
+        span.record("response_bytes", resp_body.len() as u64);
+        span.record("duration_ms", duration_ms);
+        apply_response_captures(&span, &resp_body, &span_hints.response_captures);
         metrics::record_host_http_call(
             method,
             "text",
@@ -1188,9 +1181,9 @@ impl WasmHost for ProductionWasmHost {
             let duration_ms = started.elapsed().as_millis() as u64;
             match result {
                 Ok((status, resp_bytes)) => {
-                    record_http_status(status);
-                    tracing::Span::current().record("response_bytes", resp_bytes.len() as u64);
-                    tracing::Span::current().record("duration_ms", duration_ms);
+                    record_http_status(&span, status);
+                    span.record("response_bytes", resp_bytes.len() as u64);
+                    span.record("duration_ms", duration_ms);
                     metrics::record_host_http_call(
                         method,
                         "binary",
@@ -1257,12 +1250,7 @@ impl WasmHost for ProductionWasmHost {
 
         builder = self.add_internal_temper_headers(builder, method, url, &outbound_headers)?;
 
-        builder = with_trace_headers(
-            builder,
-            &outbound_headers,
-            &tracing::Span::current(),
-            self.trace_id.as_deref(),
-        );
+        builder = with_trace_headers(builder, &outbound_headers, &span, self.trace_id.as_deref());
 
         if !body.is_empty() {
             builder = builder.body(body.to_vec());
@@ -1283,6 +1271,7 @@ impl WasmHost for ProductionWasmHost {
                 })
             })?;
         let status = resp.status().as_u16();
+        record_http_status(&span, status);
         let resp_bytes = resp.bytes().await.map_err(|e| {
             let e = e.without_url();
             tracing::warn!(
@@ -1295,9 +1284,8 @@ impl WasmHost for ProductionWasmHost {
         })?;
         let resp_bytes = resp_bytes.to_vec();
         let duration_ms = started.elapsed().as_millis() as u64;
-        record_http_status(status);
-        tracing::Span::current().record("response_bytes", resp_bytes.len() as u64);
-        tracing::Span::current().record("duration_ms", duration_ms);
+        span.record("response_bytes", resp_bytes.len() as u64);
+        span.record("duration_ms", duration_ms);
         metrics::record_host_http_call(
             method,
             "binary",
@@ -1364,12 +1352,7 @@ impl WasmHost for ProductionWasmHost {
             builder = builder.header(k.as_str(), v.as_str());
         }
         builder = self.add_internal_temper_headers(builder, "POST", url, &outbound_headers)?;
-        builder = with_trace_headers(
-            builder,
-            &outbound_headers,
-            &tracing::Span::current(),
-            self.trace_id.as_deref(),
-        );
+        builder = with_trace_headers(builder, &outbound_headers, &span, self.trace_id.as_deref());
 
         if !body.is_empty() {
             builder = builder.body(encode_connect_json_frame(body));
@@ -1380,17 +1363,16 @@ impl WasmHost for ProductionWasmHost {
             .send(client, builder, "connect_call")
             .await
             .map_err(|error| {
-                tracing::Span::current()
-                    .record("duration_ms", started.elapsed().as_millis() as u64);
+                span.record("duration_ms", started.elapsed().as_millis() as u64);
                 error.into_message(|e| format!("Connect call failed: {e}"))
             })?;
 
         let status = resp.status().as_u16();
-        record_http_status(status);
+        record_http_status(&span, status);
         if !(200..300).contains(&status) {
             let err_body = resp.text().await.unwrap_or_default();
-            tracing::Span::current().record("duration_ms", started.elapsed().as_millis() as u64);
-            tracing::Span::current().record("response_bytes", err_body.len() as u64);
+            span.record("duration_ms", started.elapsed().as_millis() as u64);
+            span.record("response_bytes", err_body.len() as u64);
             return Err(format!("Connect call failed (HTTP {status}): {err_body}"));
         }
 
@@ -1400,9 +1382,9 @@ impl WasmHost for ProductionWasmHost {
             .map_err(|e| format!("failed to read Connect response body: {}", e.without_url()))?;
 
         let frames = parse_connect_frames(&resp_bytes)?;
-        tracing::Span::current().record("response_frames", frames.len() as u64);
-        tracing::Span::current().record("response_bytes", resp_bytes.len() as u64);
-        tracing::Span::current().record("duration_ms", started.elapsed().as_millis() as u64);
+        span.record("response_frames", frames.len() as u64);
+        span.record("response_bytes", resp_bytes.len() as u64);
+        span.record("duration_ms", started.elapsed().as_millis() as u64);
         metrics::record_host_http_call(
             "POST",
             "connect",
@@ -1837,7 +1819,7 @@ impl WasmHost for ProductionWasmHost {
                 let resp = match send_result {
                     Ok(r) => r,
                     Err(e) => {
-                        record_http_status(0u64);
+                        record_http_status(&tracing::Span::current(), 0u64);
                         tracing::Span::current()
                             .record("duration_ms", started.elapsed().as_millis() as u64);
                         let _ = head_tx.send(crate::http_stream::HttpResponseHead {
@@ -1850,7 +1832,7 @@ impl WasmHost for ProductionWasmHost {
                 };
 
                 let status = resp.status().as_u16();
-                record_http_status(status);
+                record_http_status(&tracing::Span::current(), status);
                 let headers: Vec<(String, String)> = resp
                     .headers()
                     .iter()

@@ -418,6 +418,16 @@ pub struct EntityResponse {
     /// for every other answer, whose move, if any, is its newest event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unrecorded_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The reactions this committed move owes, taken from the table it was
+    /// applied under, when its caller runs them
+    /// (`AgentContext::owes_reactions`); empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<crate::trigger::ReactionRule>,
+    /// The follow-on row the core dispatch holds for its caller until the
+    /// caller has sent [`Self::reactions`]: the caller settles it. Set only
+    /// on the answer the core dispatch gives a caller that runs reactions.
+    #[serde(skip)]
+    pub(crate) caller_holds: Option<crate::request_context::ScheduledFire>,
 }
 
 impl EntityResponse {
@@ -477,6 +487,8 @@ impl EntityResponse {
     /// The answer to an action whose write failed, so it may have landed.
     pub(crate) fn write_failed(state: EntityState, error: String) -> Self {
         Self {
+            caller_holds: None,
+            reactions: Vec::new(),
             success: false,
             state,
             error: Some(error),

@@ -1488,6 +1488,7 @@ impl ServerState {
         let streams = Arc::new(RwLock::new(StreamRegistry::default()));
 
         let inv_ctx = WasmInvocationContext {
+            delivery_key: None,
             tenant: tenant.to_string(),
             entity_type: "File".to_string(),
             entity_id: file_id.to_string(),

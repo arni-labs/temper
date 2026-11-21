@@ -172,6 +172,8 @@ fn entity_response_spec_governed_skipped_when_true() {
         spawn_reservations: Default::default(),
     };
     let resp = EntityResponse {
+        caller_holds: None,
+        reactions: Vec::new(),
         success: true,
         refusal: None,
         state,

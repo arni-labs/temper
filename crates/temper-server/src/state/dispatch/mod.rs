@@ -23,6 +23,7 @@ mod detached;
 mod effects;
 mod error;
 mod follow_ons;
+mod reaction_cascade;
 pub use error::DispatchError;
 pub(crate) mod entity_rows;
 mod generated_callbacks;

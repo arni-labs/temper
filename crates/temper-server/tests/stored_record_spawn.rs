@@ -420,6 +420,9 @@ mod contracts;
 #[path = "stored_record_spawn/authenticated.rs"]
 mod authenticated;
 
+#[path = "stored_record_spawn/initializer_reads_parent.rs"]
+mod initializer_reads_parent;
+
 /// A child made before its spec declared `grade` stores none. The
 /// cross-invariant that reads it reads the declared initial value, as a
 /// guard does.

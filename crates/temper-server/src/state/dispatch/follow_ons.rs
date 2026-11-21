@@ -220,6 +220,7 @@ impl ServerState {
                 action,
                 to_state: &owed.status,
                 fields: &owed.fields,
+                depth: 0,
             };
             self.dispatch_declared_reactions(tenant, &moved, Some(&owed.reactions), caller)
                 .await;

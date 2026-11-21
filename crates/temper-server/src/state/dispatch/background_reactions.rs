@@ -77,6 +77,7 @@ impl crate::state::ServerState {
                 action: &action,
                 to_state: &to_state,
                 fields: &fields,
+                depth: 0,
             };
             let results = state
                 .dispatch_declared_reactions(&tenant, &moved, declared.as_deref(), &agent_ctx)

@@ -2,8 +2,9 @@
 //!
 //! Each move of a `Job` sets off one write the kernel owes: `Ask` a module's
 //! `Answer`, `Hold` the `Expire` its timer fires, `Note` a `Count` on the
-//! record's `Ledger` through a reaction, and `Spawn` a `Child` and its
-//! `Init`. Every owed move is also allowed from the state it leads to, so a
+//! record's `Ledger` through a reaction, `Relay` a `Pass` on the `Ledger`
+//! whose own reaction `Init`s the `Child` of the same id, and `Spawn` a
+//! `Child` and its `Init`. Every owed move is also allowed from the state it leads to, so a
 //! write applied twice lands twice and shows in the journal, rather than the
 //! second being refused.
 
@@ -13,7 +14,7 @@ pub const TIMER_SECS: u64 = 600;
 pub const JOB: &str = r#"
 [automaton]
 name = "Job"
-states = ["Idle", "Asked", "Answered", "Waiting", "Expired", "Noted", "Spawned"]
+states = ["Idle", "Asked", "Answered", "Waiting", "Expired", "Noted", "Relayed", "Spawned"]
 initial = "Idle"
 
 [[action]]
@@ -66,6 +67,19 @@ target_action = "Count"
 resolve_target = { kind = "same_id" }
 
 [[action]]
+name = "Relay"
+kind = "input"
+from = ["Idle"]
+to = "Relayed"
+
+[[action.triggers]]
+name = "relay_passes_on_ledger"
+kind = "entity"
+target_entity = "Ledger"
+target_action = "Pass"
+resolve_target = { kind = "same_id" }
+
+[[action]]
 name = "Spawn"
 kind = "input"
 from = ["Idle"]
@@ -77,7 +91,7 @@ effect = ["spawn('Child', 'Init', child_ref, params.child_id)"]
 pub const LEDGER: &str = r#"
 [automaton]
 name = "Ledger"
-states = ["Open"]
+states = ["Open", "Passed"]
 initial = "Open"
 
 [[state]]
@@ -90,6 +104,19 @@ name = "Count"
 kind = "internal"
 from = ["Open"]
 effect = ["notes += 1"]
+
+[[action]]
+name = "Pass"
+kind = "internal"
+from = ["Open"]
+to = "Passed"
+
+[[action.triggers]]
+name = "pass_inits_child"
+kind = "entity"
+target_entity = "Child"
+target_action = "Init"
+resolve_target = { kind = "same_id" }
 "#;
 
 pub const CHILD: &str = r#"

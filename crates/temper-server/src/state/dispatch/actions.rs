@@ -249,14 +249,6 @@ impl crate::state::ServerState {
             self.reject_action_supplied_sub_writes(entity_type, action, &params)?;
         }
 
-        // This dispatch runs the move's reactions after it commits: those its
-        // action declares now, as the move is sent. Its follow-on row keeps
-        // them, and they are the ones it runs, whatever is installed between.
-        let declared = self
-            .registry
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .action_reactions(tenant, entity_type, action);
         let mut response = self
             .dispatch_tenant_action_core(
                 tenant,
@@ -268,7 +260,7 @@ impl crate::state::ServerState {
                 await_integration,
                 caller,
                 expected_authorization_precondition,
-                &declared,
+                true,
             )
             .await?;
 
@@ -276,16 +268,7 @@ impl crate::state::ServerState {
         if response.success {
             // The core dispatch left this dispatch holding the follow-on row
             // its commit wrote, until the reactions are sent.
-            let follow = entered_ctx
-                .idempotency_key
-                .as_ref()
-                .filter(|_| {
-                    !declared.is_empty()
-                        && crate::request_context::follow_ons::wrote_follow_row(&response, true)
-                })
-                .map(|key| {
-                    super::follow_ons::follow_row(tenant, entity_type, entity_id, key.as_str())
-                });
+            let follow = response.caller_holds.take();
             // The children this action spawned are entities its chain made.
             let mut reaction_ctx = entered_ctx.having_made(
                 response
@@ -297,9 +280,11 @@ impl crate::state::ServerState {
             let agent_ctx = &reaction_ctx;
             {
                 let answered = response.action(action);
-                // A follow-up's retry answered by another recorded action has
-                // that action's reactions, read from its spec.
-                let declared = (answered == action).then_some(declared);
+                // The reactions the move owes, as the actor took them from the
+                // table it applied the move under, so an install before they
+                // run changes none of them. A follow-up's retry answered by
+                // another recorded action has that action's, read from its spec.
+                let declared = (answered == action).then(|| response.reactions.clone());
                 let action = answered;
                 let to_state = response.state.status.clone();
                 let fields = serde_json::to_value(&response.state.fields).unwrap_or_default();
@@ -310,6 +295,7 @@ impl crate::state::ServerState {
                         action,
                         to_state: &to_state,
                         fields: &fields,
+                        depth: 0,
                     };
                     // ADR-0046: thread the invoking context through so
                     // reactions without an explicit principal inherit the
@@ -342,6 +328,7 @@ impl crate::state::ServerState {
                         action,
                         to_state: &background.to_state,
                         fields: &background.fields,
+                        depth: 0,
                     };
                     self.dispatch_declared_reactions(
                         tenant,
@@ -411,7 +398,7 @@ impl crate::state::ServerState {
         await_integration: bool,
         caller: WriteCaller,
         mut expected_authorization_precondition: Option<String>,
-        owed_reactions: &[crate::trigger::ReactionRule],
+        owes_reactions: bool,
     ) -> Result<EntityResponse, DispatchError> {
         let params =
             match self.resolve_authenticated_params(tenant, entity_type, action, params, agent_ctx)
@@ -651,9 +638,9 @@ impl crate::state::ServerState {
         } else {
             self.background_calls(tenant, entity_type)
         };
-        // Its follow-on row keeps the reactions its caller runs after it.
-        actor_caller.owed_reactions = owed_reactions.to_vec();
-        let runs_reactions = !owed_reactions.is_empty();
+        // The actor takes the reactions its caller runs after it from the
+        // table it applies the move under; its follow-on row keeps them.
+        actor_caller.owes_reactions = owes_reactions;
         let actor_caller = Arc::new(actor_caller);
         let idempotency_key = agent_ctx.idempotency_key.clone();
         // W2 phase: ask_reply — round-trip through the retry layer to the
@@ -837,6 +824,10 @@ impl crate::state::ServerState {
         // action this retry named.
         let answered_action = response.answered_action.clone();
         let action = answered_action.as_deref().unwrap_or(action);
+        // The caller runs the reactions the actor answered; one answered by
+        // another recorded action runs that action's, read from its spec.
+        let runs_reactions =
+            owes_reactions && (!response.reactions.is_empty() || answered_action.is_some());
 
         let stale = super::outside_write::stale_refusal(
             caller,
@@ -886,6 +877,9 @@ impl crate::state::ServerState {
         // retry after they ran does not run them again. Either way the retry
         // answers at the state that dispatcher completed, never with the
         // actor's copy from before the effects ran.
+        // The effects claim can hand back another dispatcher's reply: the
+        // reactions are this reply's, as the actor took them.
+        let reactions = response.reactions.clone();
         let mut response = match idempotency_key.as_ref() {
             Some(idem_key) if response.success => {
                 let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
@@ -910,10 +904,11 @@ impl crate::state::ServerState {
         };
         // The reply the effects claim hands back may be another dispatcher's.
         response.answered_action = answered_action;
-        if let Some(row) = &follow
-            && (!runs_reactions || stale.is_some())
-        {
-            self.settle_follow_row(row);
+        response.reactions = reactions;
+        match follow {
+            Some(row) if runs_reactions && stale.is_none() => response.caller_holds = Some(row),
+            Some(row) => self.settle_follow_row(&row),
+            None => {}
         }
         if let Some(stale) = stale {
             tracing::Span::current().record("success", false);

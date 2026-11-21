@@ -208,6 +208,12 @@ impl TransitionTable {
                         .filter_map(super::invariant::MoveInvariant::from_field_invariant),
                 )
                 .collect(),
+            action_triggers: automaton
+                .actions
+                .iter()
+                .filter(|action| !action.triggers.is_empty())
+                .map(|action| (action.name.clone(), action.triggers.clone()))
+                .collect(),
             rule_index,
         }
     }
