@@ -13,7 +13,7 @@ use super::questions::{
     item_questions, line_key, line_questions, review_state, runners, runs_from, where_key,
     where_questions,
 };
-use super::source::{Line, Part, from_one, lines_of, parts_of, said, windows_of};
+use super::source::{Line, Part, calls_out, from_one, lines_of, parts_of, said, windows_of};
 use super::types::{
     Answers, Finding, Judge, JudgeUnavailable, ModuleReview, ModuleSource, SpecSource,
 };
@@ -69,7 +69,7 @@ pub async fn review_module(
             .map(|state| judge.ask(&module.module, state, &questions)),
     )
     .await?;
-    let found = found_items(&ratings);
+    let found = found_items(&ratings, calls_out(&module.source));
     let (placed, placing_tokens) = place(judge, &module.module, &windows, &states, &found).await;
 
     let runs = runs_from(&runners);
@@ -105,10 +105,14 @@ pub async fn review_module(
     })
 }
 
-/// Each item rated at or above [`FOUND_AT`] in a window, once for each such window, item by item.
-fn found_items(ratings: &[Answers]) -> Vec<Found> {
+/// Each item rated at or above [`FOUND_AT`] in a window, once for each such window, item by item. An item only an
+/// outside call can show is never found in a module that makes none: Jev reading a window of pure math has rated a
+/// bisection closure as several steps (Axia's value module, 21 Nov 2026), and no rating can make code that calls
+/// nothing call two services.
+fn found_items(ratings: &[Answers], calls_out: bool) -> Vec<Found> {
     ITEMS
         .iter()
+        .filter(|item| calls_out || !item.needs_a_call)
         .flat_map(|item| {
             ratings
                 .iter()

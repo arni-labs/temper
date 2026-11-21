@@ -142,6 +142,32 @@ pub fn lines_of(source: &str) -> Vec<Line> {
         .collect()
 }
 
+/// Whether a module's code can make an outside call: it names one of the SDK's calls (`http_get`, `http_post`,
+/// `http_call`, `http_call_batch`, `connect_call`, the `http_stream` calls, or the `host_` imports under them), or
+/// declares a `mod` in another file, which this review does not read. A wasm module reaches nothing outside but
+/// through these host calls, so code that names none computes a value and nothing more. Comments are left out, so a
+/// comment naming a call does not count; a string naming one does, which errs toward asking.
+pub fn calls_out(source: &str) -> bool {
+    let code = without_comments(source);
+    let names_a_call = code
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|word| {
+            let word = word.strip_prefix("host_").unwrap_or(word);
+            word.starts_with("http_") || word == "connect_call"
+        });
+    names_a_call || code.lines().any(declares_a_file_module)
+}
+
+/// `mod name;` (with any `pub`): a module whose code is in another file.
+fn declares_a_file_module(line: &str) -> bool {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let words = match words.first() {
+        Some(first) if first.starts_with("pub") => &words[1..],
+        _ => &words[..],
+    };
+    matches!(words, ["mod", name] if name.ends_with(';'))
+}
+
 /// A line cut at [`LINE_CHARS`].
 pub(super) fn cut(text: &str) -> String {
     match text.char_indices().nth(LINE_CHARS) {

@@ -632,3 +632,92 @@ async fn test_an_unchanged_window_is_asked_in_the_same_words() {
         "the second window is asked in the same words"
     );
 }
+
+/// Axia's value module (21 Nov 2026): pure math, no outside call, refused for "several steps" on its bisection
+/// closure and for "rules" on a Gordon clamp and a NaN check.
+const PURE_MATH: &str = r#"pub fn run(ctx: &Ctx) -> Value {
+    let m: Model = ctx.input();
+    let price = m.price;
+    let r = m.discount / 100.0;
+    let terminal = (m.tg / 100.0).min(r - 0.005);
+    let gap = |rate: f64| dcf(&m, rate, terminal).map(|d| d.per_share - price);
+    let (mut lo, mut hi) = (-0.5, 1.0);
+    for _ in 0..80 {
+        let mid = (lo + hi) / 2.0;
+        let (flo, fhi) = (gap(lo).unwrap_or(f64::NAN), gap(mid).unwrap_or(f64::NAN));
+        if flo.is_nan() || fhi.is_nan() {
+            break;
+        }
+        if flo * fhi <= 0.0 { hi = mid } else { lo = mid }
+    }
+    json!({ "implied_rate": (lo + hi) / 2.0 })
+}
+"#;
+
+#[test]
+fn test_calls_out_reads_the_sdk_calls_and_nothing_else() {
+    assert!(!source::calls_out(PURE_MATH));
+    assert!(!source::calls_out(
+        "// calls http_get later\nfn run() { /* connect_call */ }\n"
+    ));
+    for code in [
+        "fn run(ctx: &Ctx) { ctx.http_get(url); }",
+        "fn run(ctx: &Ctx) { ctx.http_post(url, body); }",
+        "fn run(ctx: &Ctx) { ctx.http_call_batch(&reqs); }",
+        "fn run(ctx: &Ctx) { ctx.connect_call(\"gmail\", op); }",
+        "fn run() { unsafe { host_http_call(0, 0) }; }",
+        "fn run() { unsafe { host_connect_call(0, 0) }; }",
+        "fn run(ctx: &Ctx) { let s = http_stream_begin(ctx); }",
+        "mod client;\nfn run() {}",
+        "pub(crate) mod client;\nfn run() {}",
+    ] {
+        assert!(source::calls_out(code), "{code}");
+    }
+    assert!(
+        !source::calls_out("mod math {\n    pub fn f() {}\n}\nfn run() {}"),
+        "a module written inline is read"
+    );
+}
+
+#[tokio::test]
+async fn test_pure_math_is_never_several_steps_or_waiting() {
+    for kind in ["several_steps", "waits"] {
+        let judge = Stub::finding(kind, "dcf(");
+        let review = review_module(
+            &judge,
+            &module("value", PURE_MATH),
+            &specs("value"),
+            &names(),
+        )
+        .await
+        .expect("the stub answers");
+        assert_eq!(review.findings, Vec::new(), "{kind} on pure math");
+    }
+}
+
+#[tokio::test]
+async fn test_a_module_that_calls_out_can_still_be_several_steps() {
+    let calls = PURE_MATH.replace(
+        "let m: Model = ctx.input();",
+        "let m: Model = ctx.http_get(&ctx.input::<String>())?.json();",
+    );
+    let judge = Stub::finding("several_steps", "dcf(");
+    let review = review_module(&judge, &module("value", &calls), &specs("value"), &names())
+        .await
+        .expect("the stub answers");
+    assert_eq!(review.findings.len(), 1);
+    assert_eq!(review.findings[0].kind, "several_steps");
+}
+
+#[test]
+fn test_rules_and_hidden_logic_say_a_numerical_guard_is_not_them() {
+    for kind in ["rules", "hidden_logic"] {
+        let item = ITEMS
+            .iter()
+            .find(|item| item.kind == kind)
+            .expect("an item");
+        for guard in ["clamp", "NaN", "infinity", "zero divisor"] {
+            assert!(item.shows.contains(guard), "{kind} names {guard}");
+        }
+    }
+}
