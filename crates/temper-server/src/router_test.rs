@@ -2489,7 +2489,7 @@ async fn record_wait_matches_existing_and_wakes_on_a_readable_commit() {
         )
     };
     let mut pending = std::pin::pin!(wait());
-    assert!(futures::poll!(&mut pending).is_pending());
+    assert!(futures_util::poll!(&mut pending).is_pending());
 
     for (id, customer) in [("other", "Bob"), ("matching", "Alice")] {
         let body = serde_json::json!({"id": id, "customer": customer});
@@ -2505,7 +2505,7 @@ async fn record_wait_matches_existing_and_wakes_on_a_readable_commit() {
             .unwrap();
         assert_eq!(created.status(), StatusCode::CREATED);
         if id == "other" {
-            assert!(futures::poll!(&mut pending).is_pending());
+            assert!(futures_util::poll!(&mut pending).is_pending());
         }
     }
 
