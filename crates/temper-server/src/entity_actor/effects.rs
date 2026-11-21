@@ -419,6 +419,11 @@ pub(crate) fn process_action_with_xref_and_field_mode(
     ) {
         return ProcessResult::refused_with(error.message, error.refusal);
     }
+    // Every move comes through here, whoever sends it: an outside call, a
+    // reaction, a timer, a module's answer.
+    if let Some(reason) = crate::blobs::sent_field_reference(params, &state.fields) {
+        return ProcessResult::refused(reason);
+    }
     // Every dispatch path comes through here: report, or drop, the keys the
     // action does not declare (nerdsane/temper#351).
     let screened = match super::undeclared_params::screen(table, &state.entity_type, action, params)
