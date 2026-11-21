@@ -428,9 +428,7 @@ impl ServerState {
             .ok_or_else(|| {
                 format!("No transition table for tenant '{tenant}', entity type '{entity_type}'")
             })?;
-        table.validate_initial_fields(fields)?;
-        // A new record holds no reference yet.
-        crate::blobs::sent_field_reference(fields, &serde_json::Value::Null).map_or(Ok(()), Err)
+        table.validate_initial_fields(fields)
     }
 
     /// Build trusted Cedar attributes for a durably absent create target.
@@ -1614,11 +1612,6 @@ impl ServerState {
             .expect("transition table lock poisoned")
             .clone();
         table.validate_initial_fields(&initial_fields)?;
-        if let Some(reason) =
-            crate::blobs::sent_field_reference(&initial_fields, &serde_json::Value::Null)
-        {
-            return Err(reason);
-        }
         if !table.rules.is_empty() {
             return Ok(None);
         }

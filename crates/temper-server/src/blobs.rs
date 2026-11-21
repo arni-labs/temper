@@ -20,7 +20,7 @@ mod read_source;
 mod stored_fields;
 pub use descriptor::{
     FieldOverflowDescriptor, field_overflow_descriptor, field_overflow_sha256,
-    is_valid_field_overflow_key, sent_field_reference,
+    is_valid_field_overflow_key,
 };
 pub(crate) use hydration::{
     BlobHydrationBudget, WasmFieldBlobReader, hydrate_blob_refs_for_tenant,
@@ -29,10 +29,11 @@ pub(crate) use hydration::{
 #[cfg(test)]
 pub(crate) use hydration::{hydrate_blob_refs_in_value, hydrate_blob_refs_in_value_with_ceiling};
 pub(crate) use read_source::BlobReadSource;
-pub(crate) use stored_fields::resolve_stored_fields;
+pub(crate) use stored_fields::{resolve_copied_values, resolve_stored_fields};
+pub(crate) use temper_jit::field_reference::sent_field_reference;
 
 pub(crate) const FIELD_OVERFLOW_BLOB_PREFIX: &str = "field-overflow/sha256/";
-pub(crate) const FIELD_OVERFLOW_REF_KEY: &str = "__temper_blob_ref";
+pub(crate) const FIELD_OVERFLOW_REF_KEY: &str = temper_jit::field_reference::FIELD_REFERENCE_KEY;
 pub(crate) const FIELD_OVERFLOW_SIZE_KEY: &str = "__temper_blob_size";
 pub(crate) const FIELD_OVERFLOW_ENCODING_KEY: &str = "__temper_blob_encoding";
 

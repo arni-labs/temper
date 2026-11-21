@@ -329,6 +329,10 @@ impl TransitionTable {
 
     /// Strict entities begin with identity only; data enters through declared actions.
     pub fn validate_initial_fields(&self, fields: &Value) -> Result<(), String> {
+        // A new record holds no reference yet.
+        if let Some(reason) = crate::field_reference::sent_field_reference(fields, &Value::Null) {
+            return Err(reason);
+        }
         if !self.strict_action_params {
             return Ok(());
         }
@@ -363,6 +367,11 @@ impl TransitionTable {
         counters: &BTreeMap<String, usize>,
         booleans: &BTreeMap<String, bool>,
     ) -> Result<(), ContractError> {
+        // Every move is checked here, whoever sends it and whichever runtime
+        // holds the record.
+        if let Some(reason) = crate::field_reference::sent_field_reference(params, fields) {
+            return Err(ContractError::message(reason));
+        }
         let contract = self.action_contracts.get(action);
         if !self.strict_action_params
             && contract.is_none_or(|contract| contract.constraints.is_empty())

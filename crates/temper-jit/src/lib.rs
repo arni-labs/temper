@@ -4,6 +4,7 @@
 //! Postgres actors and verify each have their own interpreter.
 
 pub mod audit;
+pub mod field_reference;
 pub mod params;
 pub mod shadow;
 pub mod swap;
