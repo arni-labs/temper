@@ -206,6 +206,10 @@ impl HttpCallAuthzDenialTracker {
         }
     }
 
+    fn has_denial(&self) -> bool {
+        self.denial_reason.lock().is_ok_and(|slot| slot.is_some())
+    }
+
     fn take_denial(&self) -> Option<String> {
         self.denial_reason
             .lock()

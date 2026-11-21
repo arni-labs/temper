@@ -131,6 +131,12 @@ pub struct AgentContext {
     /// one holds the row while it is in flight in this process, and the last
     /// to settle removes it (`state::dispatch::follow_ons`).
     pub follow_ons: Option<ScheduledFire>,
+    /// Runtime-owned; never populated from request headers. Whether the
+    /// background calls this context sends were started by an earlier
+    /// process: a boot sends them again from their move's follow-on row, and
+    /// each resumes where its schedule is, under its stored deadline
+    /// (`state::dispatch::wasm::call_again`).
+    pub resumed_calls: bool,
     /// Runtime-owned; never populated from request headers. The state timer
     /// this dispatch fires: the actor applies its action only while the
     /// record's journal is at the sequence the timer was armed at.
@@ -273,6 +279,7 @@ impl AgentContext {
             ends_call: None,
             owed_reactions: Vec::new(),
             follow_ons: None,
+            resumed_calls: false,
             fires_state_timer: None,
             read_when_set: None,
             read_when_set_for: None,
@@ -319,6 +326,7 @@ impl AgentContext {
             ends_call: None,
             owed_reactions: Vec::new(),
             follow_ons: None,
+            resumed_calls: false,
             fires_state_timer: None,
             read_when_set: None,
             read_when_set_for: None,
@@ -466,6 +474,7 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
         ends_call: None,
         owed_reactions: Vec::new(),
         follow_ons: None,
+        resumed_calls: false,
         fires_state_timer: None,
         read_when_set: None,
         read_when_set_for: None,

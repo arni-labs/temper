@@ -254,10 +254,18 @@ impl ServerState {
         };
         entity_state.status = owed.status.clone();
         entity_state.fields = owed.fields.clone();
+        // The record as the move left it reads at the move's sequence, so a
+        // call checks the record is still there against that sequence, not
+        // the newer count of a record that moved on since.
         entity_state.sequence_nr = owed.sequence;
+        entity_state.total_event_count = usize::try_from(owed.sequence).unwrap_or(usize::MAX);
         if moved_at.is_some() {
             entity_state.last_event.last_event_at = moved_at;
         }
+        let resumed = AgentContext {
+            resumed_calls: true,
+            ..caller.clone()
+        };
         self.dispatch_wasm_integrations(
             tenant,
             &fire.entity_type,
@@ -265,7 +273,7 @@ impl ServerState {
             action,
             &owed.custom_effects,
             &entity_state,
-            caller,
+            &resumed,
             &owed.params,
         );
         self.dispatch_adapter_integrations(super::adapter::AdapterDispatchInput {

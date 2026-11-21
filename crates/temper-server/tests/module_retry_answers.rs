@@ -518,3 +518,104 @@ fn a_call_retrying_across_a_restart_is_given_up_on_once_at_its_first_deadline() 
     });
     process.stop(&clock);
 }
+
+/// Send `Note`, which moves the record on from `Ask`, as the system.
+async fn note(state: &ServerState) {
+    let noted = state
+        .dispatch_tenant_action(
+            &TenantId::new(TENANT),
+            "Lookup",
+            ID,
+            "Note",
+            json!({}),
+            &AgentContext::system(),
+        )
+        .await
+        .expect("Note dispatches");
+    assert!(noted.success, "Note is taken: {:?}", noted.error);
+}
+
+/// Review rv-2d253a267: a resumed call read its record's newer event count as
+/// its move's, so it took a record that had moved on for one still at its
+/// move, and its first try after the restart was not checked at all. A
+/// restarted process now checks the record against the move's own sequence
+/// before every try, the first too.
+#[test]
+fn a_resumed_call_whose_record_moved_on_is_not_made_again() {
+    let clock = Arc::new(ProcessClock::new());
+    let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(16)));
+    let store = SimEventStore::no_faults(16);
+    let first = Process::start(
+        &store,
+        &clock,
+        &answering_when("never in a context", &json!({}), &retry()),
+    );
+    first.runtime.block_on(async {
+        ask(&first.state).await;
+        settle().await;
+        // Tries at 0 s, 1 s and 3 s; the next is due at 7 s.
+        pass(5).await;
+        note(&first.state).await;
+        settle().await;
+    });
+    // Stopped before the 7 s try could see the record moved on.
+    first.kill(&clock, Duration::from_secs(1));
+    // A module that would answer, and so send Finish, if it were called.
+    let answers = answering_when(
+        "never in a context",
+        &json!({}),
+        &json!({ "params": { "score": 1 } }),
+    );
+    let process = Process::start(&store, &clock, &answers);
+    process.runtime.block_on(async {
+        settle().await;
+        pass(4).await;
+        assert_eq!(
+            journal(&store).await,
+            ["Created", "Ask", "Note"],
+            "a call whose record moved on is not made again after a restart"
+        );
+        assert_eq!(status(&process.state).await, "Asked");
+    });
+    process.stop(&clock);
+}
+
+/// Review rv-2bd5c0b12: a call resumed after its deadline had passed was
+/// tried again at once. Its stored deadline row now settles it: the module
+/// is not called, and the call is given up on once.
+#[test]
+fn a_call_resumed_after_its_deadline_is_left_to_its_deadline_row() {
+    let clock = Arc::new(ProcessClock::new());
+    let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(17)));
+    let store = SimEventStore::no_faults(17);
+    let first = Process::start(
+        &store,
+        &clock,
+        &answering_when("never in a context", &json!({}), &retry()),
+    );
+    first.runtime.block_on(async {
+        ask(&first.state).await;
+        settle().await;
+        pass(10).await;
+    });
+    // Down past the 30 s deadline.
+    first.kill(&clock, Duration::from_secs(DEADLINE_SECS));
+    let answers = answering_when(
+        "never in a context",
+        &json!({}),
+        &json!({ "params": { "score": 1 } }),
+    );
+    let process = Process::start(&store, &clock, &answers);
+    process.runtime.block_on(async {
+        settle().await;
+        pass(4).await;
+        assert_eq!(
+            journal(&store).await,
+            ["Created", "Ask", "GiveUp"],
+            "the deadline row gives up on it once, and the module is not called"
+        );
+        pass(DEADLINE_SECS).await;
+        assert_eq!(journal(&store).await, ["Created", "Ask", "GiveUp"]);
+    });
+    process.stop(&clock);
+}

@@ -52,9 +52,70 @@ impl Called {
     }
 }
 
+/// How a call ended.
+pub(super) enum CallEnded {
+    /// The module answered, the call failed or was given up on, or its
+    /// record moved on: the call is over, and its deadline row can go.
+    Over(Option<Box<EntityResponse>>),
+    /// A resumed call whose deadline passed before this process could try it
+    /// again: its stored deadline row answers it, so it stays.
+    LeftToDeadlineRow,
+}
+
+/// The deadline a try runs under: it may run only until `due`, and one the
+/// deadline stops is given up with `given_up`, the module's last retry
+/// reason, when there was one.
+#[derive(Clone, Copy)]
+pub(super) struct TryDeadline<'a> {
+    pub(super) due: chrono::DateTime<chrono::Utc>,
+    pub(super) given_up: Option<&'a str>,
+}
+
+impl TryDeadline<'_> {
+    /// How long a try that starts now may run: what its module may take,
+    /// cut to what is left before the deadline.
+    pub(super) fn time_left(&self, limit: Duration) -> Duration {
+        (self.due - sim_now())
+            .to_std()
+            .unwrap_or(Duration::ZERO)
+            .min(limit)
+    }
+
+    /// Whether a try stopped by its time limit was stopped by the deadline.
+    pub(super) fn passed(&self) -> bool {
+        // The engine stops a module by the wall clock, a little after its
+        // limit: a second's slack.
+        sim_now() + chrono::Duration::seconds(1) >= self.due
+    }
+}
+
+/// Whether the record is still at the event of the move that set a call off.
+enum Still {
+    There,
+    MovedOn,
+    /// The record could not be read: no try runs on fields it cannot confirm.
+    Unread,
+}
+
+fn given_up_after(module: &str, tries: u32, reason: &str) -> String {
+    format!(
+        "{module} asked to be called again until its deadline passed, after {tries} tries: {reason}"
+    )
+}
+
 impl ServerState {
     /// Make the call `integration` names until its module answers, its
     /// deadline passes or its record moves on.
+    ///
+    /// A fresh call's first try is now, at attempt 1, and its deadline counts
+    /// from its move's event, where its deadline row is due; a move that
+    /// wrote no event leaves an older one, so a deadline that would already
+    /// have passed counts from now. A resumed call (a boot sends it again)
+    /// resumes at the try its schedule is at, under its stored deadline row's
+    /// due time, so an install that changed the trigger's timeout since does
+    /// not move it; it checks its record is still at its move before every
+    /// try, the first too. Every try runs only until the deadline, and the
+    /// next waits from the module's answer.
     pub(super) async fn call_until_answered(
         &self,
         ctx: &WasmDispatchCtx<'_>,
@@ -62,17 +123,95 @@ impl ServerState {
         entity_state: &EntityState,
         action_params: &serde_json::Value,
         base_gate: &std::sync::Arc<dyn WasmAuthzGate>,
-    ) -> Result<Option<EntityResponse>, String> {
-        let first_try = entity_state
-            .last_event
-            .last_event_at
-            .unwrap_or_else(sim_now);
-        let due = first_try + call_deadline(integration);
-        let mut tries = Tries::resumed(first_try);
+    ) -> Result<CallEnded, String> {
+        let timeout = call_deadline(integration);
+        let timeout_at = |from: chrono::DateTime<chrono::Utc>| {
+            from + chrono::Duration::from_std(timeout).unwrap_or(chrono::Duration::MAX)
+        };
+        let now = sim_now();
+        let resumed = ctx.agent_ctx.resumed_calls;
+        let moved_at = entity_state.last_event.last_event_at;
+        let stored = if resumed {
+            self.stored_deadline(ctx).await
+        } else {
+            None
+        };
+        let (mut tries, due) = if resumed {
+            let first = moved_at.unwrap_or(now);
+            (
+                Tries::resumed(first),
+                stored.unwrap_or_else(|| timeout_at(first)),
+            )
+        } else {
+            let from = moved_at.filter(|at| timeout_at(*at) > now).unwrap_or(now);
+            (Tries::starting(now), timeout_at(from))
+        };
+        let module_name = integration.module.as_deref().unwrap_or_default();
+        // Only a call with a deadline row (its trigger names an on_failure)
+        // has a deadline its tries must stop at. One without is made again
+        // after a restart however long the process was down, and its
+        // retries are given up on at its timeout, as a failed call.
+        let has_deadline_row = ctx.agent_ctx.ends_call.is_some();
+        let mut last_reason: Option<String> = None;
+        let mut check = resumed;
         loop {
-            let attempt = tries.attempt;
-            let try_ctx = WasmDispatchCtx { attempt, ..*ctx };
-            let reason = match self
+            if check {
+                match self.still_at(ctx, entity_state).await {
+                    Still::There => {}
+                    Still::MovedOn => {
+                        tracing::info!(
+                            tenant = %ctx.entity_ref.tenant,
+                            entity_type = ctx.entity_ref.entity_type,
+                            entity_id = ctx.entity_ref.entity_id,
+                            integration = %integration.name,
+                            attempt = tries.attempt,
+                            "the record moved on from the move that set this call off; the call is dropped"
+                        );
+                        return Ok(CallEnded::Over(None));
+                    }
+                    Still::Unread => {
+                        if sim_now() < due {
+                            wait_until(due, FIRST_RETRY_WAIT).await;
+                            continue;
+                        }
+                    }
+                }
+            }
+            check = true;
+            if sim_now() >= due && (has_deadline_row || last_reason.is_some()) {
+                let error = match &last_reason {
+                    Some(reason) => given_up_after(module_name, tries.attempt - 1, reason),
+                    // Its stored deadline row answers a resumed call whose
+                    // deadline passed while no process could make it.
+                    None if stored.is_some() => return Ok(CallEnded::LeftToDeadlineRow),
+                    None => format!(
+                        "{module_name}'s call passed its deadline before it could be made again"
+                    ),
+                };
+                return handle_wasm_failure_boxed(
+                    self,
+                    ctx,
+                    &integration.name,
+                    module_name,
+                    &integration.on_failure,
+                    error,
+                    0,
+                )
+                .await
+                .map(|response| CallEnded::Over(response.map(Box::new)));
+            }
+            let given_up = last_reason
+                .as_deref()
+                .map(|reason| given_up_after(module_name, tries.attempt, reason));
+            let try_ctx = WasmDispatchCtx {
+                attempt: tries.attempt,
+                deadline: has_deadline_row.then_some(TryDeadline {
+                    due,
+                    given_up: given_up.as_deref(),
+                }),
+                ..*ctx
+            };
+            match self
                 .dispatch_single_integration(
                     &try_ctx,
                     integration,
@@ -82,44 +221,34 @@ impl ServerState {
                 )
                 .await?
             {
-                Called::Answered(response) => return Ok(response.map(|response| *response)),
-                Called::Again(reason) => reason,
-            };
+                Called::Answered(response) => {
+                    return Ok(CallEnded::Over(response));
+                }
+                Called::Again(reason) => last_reason = Some(reason),
+            }
+            // The next try waits from this answer, however long the module took.
+            let wait = tries.wait;
             tries.next();
-            let wait = (tries.at.min(due) - sim_now())
-                .to_std()
-                .unwrap_or(Duration::ZERO);
-            if !wait.is_zero() {
-                tokio::time::sleep(wait).await; // determinism-ok: retry backoff on the paused clock in simulation
-            }
-            if !self.still_at(&try_ctx, entity_state).await {
-                tracing::info!(
-                    tenant = %ctx.entity_ref.tenant,
-                    entity_type = ctx.entity_ref.entity_type,
-                    entity_id = ctx.entity_ref.entity_id,
-                    integration = %integration.name,
-                    attempt,
-                    "the record moved on from the move that set this call off; the call is dropped"
-                );
-                return Ok(None);
-            }
-            if sim_now() >= due {
-                let module_name = integration.module.as_deref().unwrap_or_default();
-                let error = format!(
-                    "{module_name} asked to be called again until its deadline passed, after {attempt} tries: {reason}"
-                );
-                return handle_wasm_failure_boxed(
-                    self,
-                    &try_ctx,
-                    &integration.name,
-                    module_name,
-                    &integration.on_failure,
-                    error,
-                    0,
-                )
-                .await;
-            }
+            wait_until(due, wait).await;
         }
+    }
+
+    /// The due time of the deadline row of the call `ctx` makes, as stored:
+    /// None when it has none or it cannot be read.
+    async fn stored_deadline(
+        &self,
+        ctx: &WasmDispatchCtx<'_>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        let call = ctx.agent_ctx.ends_call.as_ref()?;
+        let (store, _) = self.event_journal()?;
+        let rows = store
+            .list_entity_scheduled_actions(&call.tenant, &call.entity_type, &call.entity_id)
+            .await
+            .ok()?;
+        let row = rows.into_iter().find(|row| row.arm_id == call.arm_id)?;
+        chrono::DateTime::parse_from_rfc3339(&row.due_at)
+            .ok()
+            .map(|at| at.with_timezone(&chrono::Utc))
     }
 
     /// Record a try the module answered `retry`, and return its reason.
@@ -157,9 +286,9 @@ impl ServerState {
     }
 
     /// Whether the record is still at the event of the move that set the call
-    /// off. A record that cannot be read is taken as still there: the next try
-    /// is made, and its answer is checked as any answer is.
-    async fn still_at(&self, ctx: &WasmDispatchCtx<'_>, entity_state: &EntityState) -> bool {
+    /// off, as `entity_state` holds it (a resumed call's is at its move's
+    /// sequence, `follow_ons`).
+    async fn still_at(&self, ctx: &WasmDispatchCtx<'_>, entity_state: &EntityState) -> Still {
         match self
             .get_tenant_entity_state(
                 ctx.entity_ref.tenant,
@@ -168,8 +297,9 @@ impl ServerState {
             )
             .await
         {
-            Ok(now) => now.state.event_sequence() == entity_state.event_sequence(),
-            Err(_) => true,
+            Ok(now) if now.state.event_sequence() == entity_state.event_sequence() => Still::There,
+            Ok(_) => Still::MovedOn,
+            Err(_) => Still::Unread,
         }
     }
 }
@@ -186,7 +316,25 @@ struct Tries {
     wait: Duration,
 }
 
+/// Wait `wait`, or until `due` if that comes first.
+async fn wait_until(due: chrono::DateTime<chrono::Utc>, wait: Duration) {
+    let left = (due - sim_now()).to_std().unwrap_or(Duration::ZERO);
+    let wait = wait.min(left);
+    if !wait.is_zero() {
+        tokio::time::sleep(wait).await; // determinism-ok: retry backoff on the paused clock in simulation
+    }
+}
+
 impl Tries {
+    /// A call's first try, made at `now`.
+    fn starting(now: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            attempt: 1,
+            at: now,
+            wait: FIRST_RETRY_WAIT,
+        }
+    }
+
     /// The try due last for a call whose first try was at `first`: the first
     /// for a call just made, a later one for a call a restart resumes.
     fn resumed(first: chrono::DateTime<chrono::Utc>) -> Self {

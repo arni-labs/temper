@@ -244,6 +244,9 @@ struct WasmDispatchCtx<'a> {
     mode: WasmDispatchMode,
     /// Which try of the call this is, from 1 (`call_again`).
     attempt: u32,
+    /// The deadline of the call this try belongs to, for a background call
+    /// made until answered (`call_again`): the try runs only until it.
+    deadline: Option<call_again::TryDeadline<'a>>,
 }
 
 fn agent_ctx_for_composite_wasm_result(
@@ -511,6 +514,7 @@ impl crate::state::ServerState {
             dispatch_idempotency_key: req.dispatch_idempotency_key,
             mode: req.mode,
             attempt: 1,
+            deadline: None,
         };
         let mut last_response: Option<EntityResponse> = None;
         // Triggers on one action are independent: one that fails is kept, and
@@ -547,8 +551,10 @@ impl crate::state::ServerState {
                 )
                 .await
             {
-                Ok(Some(resp)) => last_response = Some(resp),
-                Ok(None) => {}
+                Ok(call_again::CallEnded::Over(Some(resp))) => last_response = Some(*resp),
+                Ok(call_again::CallEnded::Over(None)) => {}
+                // Its stored deadline row answers it: the row stays.
+                Ok(call_again::CallEnded::LeftToDeadlineRow) => continue,
                 Err(error) => failures.push(error),
             }
             // The call has ended, answered or not.
@@ -792,6 +798,11 @@ impl crate::state::ServerState {
                 let explicit_timeout = super::call_deadlines::configured_timeout(integration);
                 let http_timeout =
                     explicit_timeout.unwrap_or_else(|| WasmResourceLimits::default().max_duration);
+                // A try of a call made until answered runs only until the
+                // call's deadline: an answer after it would be a second one.
+                let http_timeout = ctx
+                    .deadline
+                    .map_or(http_timeout, |deadline| deadline.time_left(http_timeout));
                 if explicit_timeout.is_some() {
                     active_span.record("wasm.timeout_source", "explicit");
                 } else {
@@ -1171,9 +1182,17 @@ impl crate::state::ServerState {
             // A background call that answers retry is made again
             // (`call_again`); nothing moves now. A call the asker waits on
             // takes it as a failure.
-            Ok(result) if result.retry && matches!(ctx.mode, WasmDispatchMode::Background) => Ok(
-                Called::Again(self.note_retry(ctx, module_name, &result).await),
-            ),
+            // A tracked Cedar denial of an outside call is answered as the
+            // denial, with its approval decision, whatever the module said.
+            Ok(result)
+                if result.retry
+                    && matches!(ctx.mode, WasmDispatchMode::Background)
+                    && !denial_tracker.has_denial() =>
+            {
+                Ok(Called::Again(
+                    self.note_retry(ctx, module_name, &result).await,
+                ))
+            }
             Ok(mut result) if result.success => {
                 if integration.llm {
                     let session_id = ctx
@@ -1562,6 +1581,15 @@ impl crate::state::ServerState {
                     },
                 );
                 let mut error_str = e.to_string();
+                // A try the call's deadline stopped is given up with the
+                // module's last retry reason.
+                if matches!(e, temper_wasm::WasmError::Timeout(_))
+                    && let Some(deadline) = ctx.deadline
+                    && deadline.passed()
+                    && let Some(given_up) = deadline.given_up
+                {
+                    error_str = given_up.to_string();
+                }
                 if let Some(reason) = denial_tracker.take_denial()
                     && !is_http_call_authz_denial(&error_str)
                 {
