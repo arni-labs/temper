@@ -352,11 +352,21 @@ pub(in crate::odata) async fn read_entity_set_from_query_plane(
     // A page order is only forced when the caller sorts (append the id tiebreaker
     // for a total order). Without `$orderby`, every backend already returns
     // entity_id-ascending, so leaving it unset keeps the cheap unsorted paths.
-    let effective_orderby = query_options.orderby.as_ref().map(|_| order.clone());
+    let effective_orderby = query_options
+        .orderby
+        .as_ref()
+        .filter(|_| page_size > 0)
+        .map(|_| order.clone());
     // Fetch one row past the page to detect truncation. `max_entities` is given
     // one row of headroom so the probe row fits a full page; the client's page
     // size (`page_size`) is unchanged.
-    let fetch_top = page_size.saturating_add(1);
+    // There is no continuation to discover for an empty page. Leave a count
+    // at top zero so the store can count directly without reading an entity.
+    let fetch_top = if page_size == 0 {
+        0
+    } else {
+        page_size.saturating_add(1)
+    };
     let page_budget = QueryPlaneReadBudget {
         default_page_size: request.budget.default_page_size,
         max_entities: request.budget.max_entities.saturating_add(1),

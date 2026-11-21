@@ -97,6 +97,37 @@ async fn sim_count_telemetry_includes_both_scans_without_double_counting_page_on
 }
 
 #[tokio::test]
+async fn a_count_only_read_fetches_no_page_rows() {
+    let dir = tempfile::tempdir().expect("isolated count database");
+    let url = format!("file:{}", dir.path().join("count.db").display());
+    let store = TursoEventStore::new(&url, None).await.unwrap();
+    let mut state = build_order_state("count-only-turso");
+    state.set_storage_stack(StorageStack::from_turso(store));
+    seed_orders(&state).await;
+    let tenant = TenantId::default();
+    let security_ctx = SecurityContext::system();
+    for query in [
+        "$filter=status eq 'Draft'&$top=0&$count=true",
+        "$filter=status eq 'Draft'&$orderby=Notes&$top=0&$count=true",
+    ] {
+        let options = parse_query_options(query).expect("valid query");
+        let result =
+            read_entity_set_from_query_plane(request(&state, &tenant, &security_ctx, &options))
+                .await
+                .unwrap_or_else(|_| panic!("{query}: count read failed"));
+        assert_eq!(result.count, Some(15));
+        assert!(result.entities.is_empty());
+        assert!(result.next_skiptoken.is_none());
+        assert_eq!(
+            result.telemetry.strategy,
+            QueryPlaneReadStrategy::NativePagePushdown
+        );
+        assert_eq!(result.telemetry.pushdown_page_count, 0);
+        assert_eq!(result.telemetry.materialized_count, 0);
+    }
+}
+
+#[tokio::test]
 async fn native_count_telemetry_preserves_source_page_metadata() {
     let dir = tempfile::tempdir().expect("isolated telemetry database");
     let url = format!("file:{}", dir.path().join("count.db").display());
