@@ -96,6 +96,12 @@ fn prepare_collection_create_fields(
         .as_object()
         .cloned()
         .ok_or_else(|| invalid_create_body("Entity create body must be a JSON object"))?;
+    // A caller's create sends values: a new record holds no reference yet,
+    // and only the kernel makes one (a raw ingest, an install). Every
+    // collection create, on either runtime, starts here.
+    if let Some(reason) = crate::blobs::sent_field_reference(body, &serde_json::Value::Null) {
+        return Err(invalid_create_body(&reason));
+    }
 
     let lower_id = match fields.get("id") {
         Some(value) => Some(

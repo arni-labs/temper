@@ -6,19 +6,22 @@
 //! `host_read_field`. A caller that wrote a reference into a field could name
 //! any blob of the tenant, a field of a record it may not read, and read it
 //! back through the record it writes. Every write now refuses a reference its
-//! record does not already hold: a move from any caller, a create, a field
-//! update. Sending back the reference the record holds still goes through.
+//! record does not already hold: a move from any caller, a caller's create, a
+//! field update. Sending back the reference the record holds still goes through.
 
 mod common;
 
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use common::CSDL_XML;
 use serde_json::json;
 use temper_runtime::ActorSystem;
 use temper_runtime::tenant::TenantId;
-use temper_server::ServerState;
 use temper_server::registry::SpecRegistry;
 use temper_server::request_context::AgentContext;
+use temper_server::{ServerState, build_router};
 use temper_spec::csdl::parse_csdl;
+use tower::ServiceExt;
 
 const SERVICE: &str = "field-reference-writes-test";
 
@@ -110,22 +113,33 @@ async fn a_move_cannot_write_a_reference() {
     assert_eq!(note(&state, "o1").await, json!("a plain note"));
 }
 
+/// A caller's create comes in as an OData collection create; the kernel's
+/// own creates (a raw ingest) store the references they have just made.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_create_cannot_write_a_reference() {
     let state = state_with("field-reference-create");
-    let refused = state
-        .get_or_create_tenant_entity(
-            &TenantId::default(),
-            "Order",
-            "o2",
-            json!({"note": forged()}),
-        )
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/tdata/Orders")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            json!({"id": "o2", "Notes": forged()}).to_string(),
+        ))
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(temper_authz::AuthenticatedRequestContext::new(
+            TenantId::default(),
+            temper_authz::SecurityContext::from_resolved_identity("service", SERVICE, None),
+        ));
+    let response = build_router(state.clone()).oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1_000_000)
         .await
-        .expect_err("the create stored a reference the caller wrote");
-    assert!(
-        refused.to_string().contains("stored-field reference"),
-        "{refused}"
-    );
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("stored-field reference"), "{body}");
     assert!(!state.entity_exists(&TenantId::default(), "Order", "o2"));
 }
 

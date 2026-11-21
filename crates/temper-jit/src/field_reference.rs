@@ -2,9 +2,11 @@
 //!
 //! A value too large to keep in its record is stored as a blob and the field
 //! holds a reference to it (`{"__temper_blob_ref": key, ...}`). The check
-//! lives with the transition table so every way of making a move or a record
-//! (the server's actors, the Postgres actor runtime, a spawn's initial
-//! action) refuses a forged one through the same validation.
+//! lives with the transition table, so every move (on the server's actors,
+//! the Postgres actor runtime, a spawn's initial action) refuses a forged one
+//! through the same validation. A create is checked where a caller's fields
+//! enter it, the OData collection create: the kernel's own creates (a raw
+//! ingest, an install) store references they have just made.
 
 use serde_json::Value;
 

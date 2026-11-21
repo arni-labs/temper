@@ -329,10 +329,6 @@ impl TransitionTable {
 
     /// Strict entities begin with identity only; data enters through declared actions.
     pub fn validate_initial_fields(&self, fields: &Value) -> Result<(), String> {
-        // A new record holds no reference yet.
-        if let Some(reason) = crate::field_reference::sent_field_reference(fields, &Value::Null) {
-            return Err(reason);
-        }
         if !self.strict_action_params {
             return Ok(());
         }

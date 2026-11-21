@@ -4,6 +4,8 @@
 //! which copies its params into the record's fields. A reference written
 //! there would be read back as the blob it names by a property read, so the
 //! actor refuses one as every other runtime does (`temper_jit::field_reference`).
+//! A create on this runtime is checked where its fields enter, the OData
+//! collection create, before it reaches the actor.
 use super::*;
 use prost::Message as _;
 use serde_json::json;
@@ -80,16 +82,4 @@ async fn a_move_cannot_write_a_reference() {
         .expect("a plain value is stored");
     let stored: SpecActorState = serde_json::from_slice(&state).unwrap();
     assert_eq!(stored.fields["note"], "plain");
-}
-
-#[test]
-fn a_create_cannot_write_a_reference() {
-    let actor = SpecDrivenActor::from_ioa(NOTED).unwrap();
-    assert!(matches!(
-        actor.validate_initial_fields(&json!({ "note": forged() })),
-        Err(ActorError::Rejected(_))
-    ));
-    actor
-        .validate_initial_fields(&json!({"note": "plain"}))
-        .expect("a plain value is created");
 }
