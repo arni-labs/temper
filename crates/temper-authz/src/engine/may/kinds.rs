@@ -19,7 +19,7 @@ use serde_json::Value as Json;
 
 use super::json::{entity_parts, single};
 use super::profile::{Asked, Fact, Kind, Profile, UNKNOWN};
-use super::request::{Request, TRUE};
+use super::request::{Leaves, TRUE};
 use super::{Asker, Cause, May, SendAnalysis, decide};
 use crate::platform_keys;
 
@@ -29,7 +29,7 @@ mod memory;
 mod split;
 mod tests_of;
 use alike::Alike;
-use forms::{Classes, Forms, Part, reads_of, reads_whole_sender};
+use forms::{Classes, Forms, Part, ask, reads_of, reads_whole_sender};
 use memory::Memory;
 
 /// A question a walk asks of each outside sender: whether it may send
@@ -113,8 +113,8 @@ impl Test {
 }
 
 /// What the policies test of a sender.
-#[derive(Default)]
-struct Tests {
+#[derive(Debug, Clone, Default)]
+pub(in crate::engine::may) struct Tests {
     /// Each policy's tests, in policy order.
     reads: Vec<BTreeSet<Test>>,
     /// The tests in each policy's principal scope.
@@ -169,7 +169,7 @@ impl SendAnalysis {
     ) -> Result<Vec<Answered>, String> {
         reserve(memory::tests_room(&self.policies, questions.len()))?;
         let asked = Arc::new(asked(questions));
-        let mut tests = Tests::read(&self.policies);
+        let mut tests = Tests::clone(&self.tests);
         let none = BTreeMap::new();
         let anyone = Asker::Outside;
         // Knowing more of the sender only rules policies out, so a policy
@@ -177,7 +177,7 @@ impl SendAnalysis {
         let candidates: Vec<Vec<usize>> = questions
             .iter()
             .map(|question| {
-                let request = ask(&anyone, &UNKNOWN, question, &none);
+                let request = ask((&anyone, &self.patterns), &UNKNOWN, question, &none);
                 (0..self.policies.len())
                     .filter(|&at| request.applies(&self.policies[at].1).can(TRUE))
                     .collect()
@@ -191,7 +191,7 @@ impl SendAnalysis {
             .iter()
             .zip(&candidates)
             .map(|(question, candidates)| {
-                let request = ask(&anyone, &UNKNOWN, question, &none);
+                let request = ask((&anyone, &self.patterns), &UNKNOWN, question, &none);
                 decide(
                     candidates
                         .iter()
@@ -208,7 +208,8 @@ impl SendAnalysis {
         let memory = Memory::new(&tests, &self.policies, &candidates, reserve);
         memory.reserve(4, 0)?;
         let forms = Forms::default();
-        let mut classes = Classes::read(&self.policies, questions, &candidates);
+        let printed = Leaves::default();
+        let mut classes = Classes::read((&self.policies, &self.patterns), questions, &candidates);
         // Questions that leave every candidate in the same class answer
         // alike for every kind and leave the same parts open: one of them
         // stands for the rest, and its answer is theirs.
@@ -248,7 +249,7 @@ impl SendAnalysis {
                 |parent| parent.known.iter().map(Part::stays).collect(),
             );
             for (at_question, question) in questions.iter().enumerate() {
-                let request = ask(&anyone, &profile, question, &none);
+                let request = ask((&anyone, &self.patterns), &profile, question, &none);
                 let of = &classes.of[at_question];
                 let mut decided = Vec::with_capacity(of.len());
                 for (&at, &class) in candidates[at_question].iter().zip(of) {
@@ -279,7 +280,8 @@ impl SendAnalysis {
                             false
                         };
                         let note = std::cell::RefCell::new(note);
-                        let residual = request.residual(policy, &|expr| (note.borrow_mut())(expr));
+                        let residual =
+                            request.residual(policy, &|expr| (note.borrow_mut())(expr), &printed);
                         reads.extend(tests.scopes[at].iter().cloned());
                         let residual = residual.as_deref().unwrap_or("null");
                         forms.text(&format!("{effect:?}{residual}"))
@@ -320,7 +322,7 @@ impl SendAnalysis {
             // and the result being assembled before allocating.
             memory.reserve(
                 4 * (open.len() + leaves.len() + memory.branches + 1),
-                forms.bytes() + seen.len() * memory.form + 2 * alike.bytes(),
+                forms.bytes() + printed.bytes() + seen.len() * memory.form + 2 * alike.bytes(),
             )?;
             let Some(test) = node.undecided.first() else {
                 leaves.push((at, node));
@@ -365,12 +367,12 @@ impl SendAnalysis {
         // Each leaf's others are at most a node's worth.
         memory.reserve(
             4 * (leaves.len() + memory.branches + 1) + leaves.len(),
-            forms.bytes() + seen.len() * memory.form + alike.bytes(),
+            forms.bytes() + printed.bytes() + seen.len() * memory.form + alike.bytes(),
         )?;
         let others = alike.others(&|bytes| {
             memory.reserve(
                 4 * (leaves.len() + memory.branches + 1) + leaves.len(),
-                forms.bytes() + seen.len() * memory.form + bytes,
+                forms.bytes() + printed.bytes() + seen.len() * memory.form + bytes,
             )
         })?;
         let mut kinds: Vec<(Vec<May>, Kind)> = Vec::new();
@@ -399,6 +401,7 @@ impl SendAnalysis {
         memory.reserve(
             4 * (kinds.len() + memory.branches + 1) + held,
             forms.bytes()
+                + printed.bytes()
                 + seen.len() * memory.form
                 + memory::asked_heap(&asked)
                 + kinds.len() * (size_of::<Answered>() + unknown.len() * size_of::<May>()),
@@ -420,22 +423,6 @@ impl SendAnalysis {
                     .collect(),
             })
             .collect())
-    }
-}
-
-fn ask<'a>(
-    asker: &'a Asker,
-    profile: &'a Profile,
-    question: &'a Question<'_>,
-    record: &'a BTreeMap<String, super::Attr>,
-) -> Request<'a> {
-    Request {
-        asker,
-        profile,
-        action: question.action,
-        resource_type: question.resource_type,
-        record,
-        cause: Some(&question.cause),
     }
 }
 

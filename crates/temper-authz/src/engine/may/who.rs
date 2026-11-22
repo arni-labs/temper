@@ -28,6 +28,7 @@ impl SendAnalysis {
             resource_type,
             record: &record,
             cause: None,
+            patterns: &self.patterns,
         };
         self.scoped(action, resource_type).iter().any(|&at| {
             let (_, policy) = &self.policies[at];

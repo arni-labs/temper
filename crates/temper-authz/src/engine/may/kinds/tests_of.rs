@@ -3,7 +3,7 @@
 use super::*;
 
 impl Tests {
-    pub(super) fn read(policies: &[(Effect, Json)]) -> Self {
+    pub(in crate::engine::may) fn read(policies: &[(Effect, Json)]) -> Self {
         let mut tests = Tests::default();
         for (_, policy) in policies {
             tests.policy(policy);
