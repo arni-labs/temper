@@ -85,6 +85,7 @@ pub(crate) async fn handle_health(State(state): State<ServerState>) -> Json<serd
         "event_store": event_store_type,
         "cross_invariant_enforce": state.cross_invariant_enforce,
         "cross_invariant_eventual_enforce": state.cross_invariant_eventual_enforce,
+        "flags_on": state.flags.names_on(),
     }))
 }
 
