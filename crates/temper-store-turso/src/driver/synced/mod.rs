@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use temper_runtime::persistence::{PersistenceError, storage_error};
@@ -93,8 +93,6 @@ struct Inner {
     /// committed anything. A file is behind when the remote has more.
     opened_at: AtomicI64,
     state: std::sync::Mutex<CopyState>,
-    /// Push attempts that ran out of time in a row.
-    timeouts: AtomicU32,
     /// Whether the remote may hold a push the engine never heard back from.
     unsure: AtomicBool,
     /// What the next trim batch deletes, planned from what the last one cost.
@@ -107,7 +105,9 @@ struct Inner {
 /// The sync engine's text for a statement the remote refused.
 const REMOTE_STATEMENT_FAILED: &str = "failed to execute sql";
 
-/// One push attempt. The engine's HTTP client has no timeout of its own.
+/// One push attempt, which can be more than one request. The engine gives each
+/// request 8 s for its answer (`vendor/turso/TEMPER.md`), so a request the
+/// remote never answers ends and the next push opens a fresh connection.
 const PUSH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl std::fmt::Debug for SyncCopy {
@@ -204,7 +204,6 @@ impl SyncCopy {
                 pool: ConnectionPool::default(),
                 in_use: Arc::new(tokio::sync::RwLock::new(())),
                 state: std::sync::Mutex::new(state),
-                timeouts: AtomicU32::new(0),
                 unsure: AtomicBool::new(true),
                 trim_plan: std::sync::Mutex::new(trim::FIRST_PLAN),
                 #[cfg(feature = "test-support")]
@@ -239,13 +238,6 @@ impl SyncCopy {
     /// Whether writes can be confirmed now, and if not, why.
     pub fn state(&self) -> CopyState {
         self.inner.state.lock().unwrap().clone()
-    }
-
-    /// Push attempts that ran out of time in a row. The engine sends its
-    /// requests one at a time, so a request the remote never answers holds
-    /// every later push until its connection fails; a restart clears it.
-    pub fn pushes_timed_out_in_a_row(&self) -> u32 {
-        self.inner.timeouts.load(Ordering::Acquire)
     }
 
     /// Record for monitoring whether writes are paused: the gauge
