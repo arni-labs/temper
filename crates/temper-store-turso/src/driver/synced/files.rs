@@ -36,7 +36,50 @@ pub(super) fn move_aside(path: &Path) -> Result<PathBuf, DriverError> {
             std::fs::rename(entry.path(), aside.join(&file)).map_err(failed)?;
         }
     }
+    drop_older_asides(dir, &name, &aside);
     Ok(aside)
+}
+
+/// Remove every earlier `<name>.behind-*` folder beside `kept`. Each holds what
+/// a set-aside held, a file behind its remote or part of one, so the newest is
+/// enough to look at and older ones only fill the disk: one drive held 86 of
+/// them, 101 GB against 7 GB of live databases (23 Nov 2026). A folder that
+/// cannot be removed is left and logged; the set-aside itself has succeeded.
+fn drop_older_asides(dir: &Path, name: &str, kept: &Path) {
+    let prefix = format!("{name}.behind-");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let older: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .filter(|folder| folder != kept)
+        .collect();
+    for folder in older {
+        if let Err(error) = remove_folder(&folder) {
+            tracing::warn!(folder = %folder.display(), %error, "turso.sync an older set-aside copy could not be removed");
+        }
+    }
+}
+
+/// Remove a folder and everything under it, each file by its full path once the
+/// folder's listing is closed. Tensorlake's volume program stops reclaiming its
+/// local store for the rest of a mount when a file is unlinked while its folder
+/// is open, as `remove_dir_all` does (katagami-control drive-rm.sh).
+fn remove_folder(folder: &Path) -> std::io::Result<()> {
+    let inside = std::fs::read_dir(folder)?
+        .map(|entry| entry.and_then(|entry| Ok((entry.path(), entry.file_type()?.is_dir()))))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    for (path, is_dir) in inside {
+        if is_dir {
+            remove_folder(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    std::fs::remove_dir(folder)
 }
 
 /// The directory that holds `path` and the files kept beside it. A bare file
@@ -301,6 +344,46 @@ mod tests {
         assert!(
             aside.join("app.db-sync-restoring").exists(),
             "the marker goes with the file it describes"
+        );
+    }
+
+    #[test]
+    fn a_set_aside_keeps_only_the_newest_earlier_copy_of_its_own_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.db");
+        for old in ["app.db.behind-1", "app.db.behind-2"] {
+            std::fs::create_dir_all(dir.path().join(old).join("nested")).expect("old aside");
+            std::fs::write(dir.path().join(old).join("app.db"), b"old").expect("old file");
+            std::fs::write(dir.path().join(old).join("nested/x"), b"x").expect("nested file");
+        }
+        std::fs::create_dir(dir.path().join("other.db.behind-1"))
+            .expect("another database's aside");
+        std::fs::write(&path, b"now").expect("write db");
+        std::fs::write(sidecar(&path, "-wal"), b"frames").expect("write wal");
+
+        let kept = move_aside(&path).expect("moved aside");
+
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        left.sort();
+        let kept_name = kept
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(left, vec![kept_name, "other.db.behind-1".to_string()]);
+        assert_eq!(std::fs::read(kept.join("app.db")).expect("kept"), b"now");
+        assert_eq!(
+            std::fs::read(kept.join("app.db-wal")).expect("kept"),
+            b"frames"
         );
     }
 
