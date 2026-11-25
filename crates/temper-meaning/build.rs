@@ -59,7 +59,10 @@ fn fetch(cache: &Path, (name, sha): (&str, &str)) -> PathBuf {
         return path;
     }
     let url = format!("https://huggingface.co/{REPO}/resolve/{REVISION}/{name}");
-    let partial = cache.join(format!("{name}.partial"));
+    // One partial file per build script: builds in separate target folders run this at the same time against one
+    // CARGO_HOME, and a shared partial was renamed away by the first to finish while the others still read it.
+    // The rename into place is atomic and every copy is checked against the same hash, so the last one wins harmlessly.
+    let partial = cache.join(format!("{name}.{}.partial", std::process::id()));
     let status = Command::new("curl")
         .args(["-fsSL", "--retry", "5", "--retry-all-errors", "-o"])
         .arg(&partial)
