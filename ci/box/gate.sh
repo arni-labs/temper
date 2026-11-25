@@ -273,6 +273,24 @@ run_job() { # <name>: its output to <name>.txt, ending `exit <code>`; a line to 
 # A lane that compiles yields the cores to the tests lane: some tests hold wall-clock budgets (.config/nextest.toml).
 lane_run() { local j nice=$1; shift; [ "$nice" = 0 ] || renice -n "$nice" "$BASHPID" >/dev/null; for j in "$@"; do run_job "$j"; done; }
 
+# Fail fast (ci-migration, 25 Nov): once a job fails the verdict is red, so the lanes still running stop then instead of
+# running to their end; each failed job's tail still goes in the log below. set -m gives each lane its own process
+# group, so the kill reaches every cargo, node and docker client it started. /proc, since a finished lane can linger
+# as a zombie until it is waited for.
+lanes_wait() {
+    local p alive
+    while :; do
+        alive=(); for p in "$@"; do [ -r "/proc/$p/status" ] && ! grep -q '^State:[[:space:]]*Z' "/proc/$p/status" && alive+=("$p"); done
+        [ ${#alive[@]} -gt 0 ] || break
+        if awk '$3 != 0 {f = 1} END {exit !f}' "$out/summary.txt"; then
+            echo "gate: a job failed, so the lanes still running stop" >&3
+            for p in "${alive[@]}"; do kill -TERM -- "-$p" 2>/dev/null; done; break
+        fi
+        sleep 2
+    done
+    wait "$@" 2>/dev/null
+}
+
 # The pinned nightly (rust-toolchain.toml) once, before the lanes share it.
 rustup show active-toolchain >/dev/null 2>&1 || rustup toolchain install >/dev/null || { echo "gate: the pinned toolchain did not install"; exit 1; }
 lint=() tests=() other=()
@@ -287,10 +305,12 @@ lint=() tests=() other=()
 done ) >/dev/null 2>&1 &
 sampler=$!
 touch "$out/summary.txt"
+set -m
 lane_run 10 "${lint[@]}" & l1=$!
 lane_run 0 "${tests[@]}" & l2=$!
 lane_run 10 "${other[@]}" & l3=$!
-wait $l1 $l2 $l3
+set +m
+lanes_wait $l1 $l2 $l3
 kill "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null
 echo "gate: peak memory in use $(cat "$out/peak-mem-mb.txt" 2>/dev/null || echo 0) MB of $(awk '/MemTotal/ {print int($2 / 1024)}' /proc/meminfo) MB"
 verdict=passed
