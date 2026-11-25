@@ -319,8 +319,8 @@ echo "gate: $(wc -l <"$out/summary.txt") jobs, verdict $verdict in $((SECONDS - 
 said=$(awk '$3 != 0 {printf "%s%s", sep, $1; sep=", "}' "$out/summary.txt")
 # A passed push is published when CI_PUBLISH=1, as linux-binary.yml published its release: to R2 bucket
 # temper-releases (ci/box/releases-keys.py), with keys/releases-write, a key for that bucket alone:
-#   releases/main-<sha12>/temper-x86_64-linux{,.sha256,.inputs}, then COMMIT (the full sha) last, so a release
-#   without COMMIT is unfinished; by-sha/<sha256> holds the first main-<sha12> that published those bytes.
+#   releases/main-<sha12>/temper-x86_64-linux{,.sha256,.inputs}, then COMMIT (the full sha), so a release without
+#   COMMIT is unfinished; then by-sha/<sha256>, naming the first finished main-<sha12> that holds those bytes.
 # Every put is If-None-Match: *, so nothing published is ever replaced; a release whose COMMIT is there stands. A
 # publish that fails fails the verdict, since the line needs the binary.
 if [ $verdict = passed ] && [ "${CI_PUBLISH:-0}" = 1 ]; then
@@ -334,11 +334,22 @@ if [ $verdict = passed ] && [ "${CI_PUBLISH:-0}" = 1 ]; then
           local c; c=$(r2 -o /dev/null -w '%{http_code}' -H 'If-None-Match: *' \
               -H "x-amz-content-sha256: $(sha256sum "$1" | cut -c1-64)" -T "$1" "$at/$2")
           case $c in 200) ;; 412) echo "$2 was already there, kept" ;; *) echo "put $2 answered $c"; return 1 ;; esac; }
-      [ "$(r2 -o /dev/null -w '%{http_code}' "$at/releases/$tag/COMMIT")" != 200 ] || { echo "$tag is already published"; exit 0; }
-      for f in temper-x86_64-linux temper-x86_64-linux.sha256 temper-x86_64-linux.inputs; do put "$out/$f" "releases/$tag/$f"; done
-      sha=$(cut -d' ' -f1 "$out/temper-x86_64-linux.sha256")
-      echo "$tag" >"$out/by-sha.txt" && put "$out/by-sha.txt" "by-sha/$sha"
-      echo "$commit" >"$out/COMMIT" && put "$out/COMMIT" "releases/$tag/COMMIT"
+      if [ "$(r2 -o /dev/null -w '%{http_code}' "$at/releases/$tag/COMMIT")" = 200 ]; then
+          sha=$(r2 -f "$at/releases/$tag/temper-x86_64-linux.sha256" | cut -d' ' -f1); echo "$tag is already published"
+      else
+          for f in temper-x86_64-linux temper-x86_64-linux.sha256 temper-x86_64-linux.inputs; do put "$out/$f" "releases/$tag/$f"; done
+          echo "$commit" >"$out/COMMIT" && put "$out/COMMIT" "releases/$tag/COMMIT"
+          sha=$(cut -d' ' -f1 "$out/temper-x86_64-linux.sha256")
+      fi
+      # by-sha after COMMIT, so it only ever names a finished release; a publish cut off between the two leaves none,
+      # and the next publish of this release adds it. One that names a release with no COMMIT (left by the order before
+      # 25 Nov) would point there for good, since puts never replace, so it is taken off and written again (rv-49a600b0b).
+      named=$(r2 -f "$at/by-sha/$sha" 2>/dev/null || true)
+      if [ -n "$named" ] && [ "$(r2 -o /dev/null -w '%{http_code}' "$at/releases/$named/COMMIT")" != 200 ]; then
+          r2 -f -o /dev/null -X DELETE "$at/by-sha/$sha" && echo "by-sha/$sha named $named, which never finished: taken off"
+          named=
+      fi
+      [ -n "$named" ] || { echo "$tag" >"$out/by-sha.txt" && put "$out/by-sha.txt" "by-sha/$sha"; }
       kept=$(cat "$out/kept-from.txt" 2>/dev/null || true)
       echo "published $at/releases/$tag/, sha256 $sha${kept:+ (the binary of $kept)}" ) \
         >"$out/publish.txt" 2>&1; c=$?
