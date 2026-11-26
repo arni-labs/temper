@@ -37,6 +37,9 @@ install -d -o "$T" -g "$T" -m 755 "$W" && install -d -o "$T" -g "$T" -m 700 "/ru
 # needs CAP_NET_ADMIN in its own namespace, so the usual 666 gives it nothing more.
 [ ! -c /dev/net/tun ] || chmod 666 /dev/net/tun
 publish=0; [ $mode = route ] && [ -s "$K/releases-write" ] && publish=1
+# The full lane (CI_ALL=1, the nightly) never publishes: it builds no binary, and the commit's push gate already put its
+# release. This wrapper decides it, not the commit's gate.sh (ci-migration, r_q73fhyliwa70s46b).
+[ "${CI_ALL:-0}" = 1 ] && publish=0
 
 # --- the commits, into root's repo.git ------------------------------------------------------------------------------
 R=$CI/repo.git
