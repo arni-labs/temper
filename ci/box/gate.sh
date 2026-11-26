@@ -251,7 +251,7 @@ job_linux_binary() {
         while [ "$d" != . ] && [ ! -f "$d/Cargo.toml" ]; do d=$(dirname "$d"); done; [ "$d" = . ] || echo "$d"
     done <"$dir/read" | sort -u >"$dir/crates"
     { cat "$dir/read"; tr '\n' '\0' <"$dir/crates" | xargs -0 -r git ls-files --
-      git ls-files '*Cargo.toml' Cargo.lock rust-toolchain.toml rust-toolchain .cargo .github/workflows/linux-binary.yml ci/box/gate.sh; } \
+      git ls-files '*Cargo.toml' Cargo.lock rust-toolchain.toml rust-toolchain .cargo ci/box/gate.sh; } \
       | sort -u >"$out/temper-x86_64-linux.inputs"
     echo "built: sha256 $(cut -d' ' -f1 "$out/temper-x86_64-linux.sha256"), $(wc -l <"$out/temper-x86_64-linux.inputs") inputs"
 }
