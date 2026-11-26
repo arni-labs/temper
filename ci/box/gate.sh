@@ -45,6 +45,12 @@ checkout "$tree" && checkout "$ws_tree" || exit 2
 # Disk: cargo's targets only grow, and the box's disk is 100 GB (the most Tensorlake gives a sandbox in this
 # namespace). Below 8 GB free, the tests' target (the biggest: 55 GB when every package is built, which leaves about
 # 16 GB) starts again, and this run builds it cold.
+# Those 16 GB went to what earlier runs left: their tests' files in /tmp (11 GB on 26 Nov, which filled the disk under
+# 80ee2bd0's tests) and runs/ (670 MB a commit, two copies of the binary). No ci-test process outlives a run (route.sh
+# kills them), so this run takes away ci-test's /tmp files and keeps the newest 5 runs: the base's, whose binary
+# job_linux_binary reuses, is among them.
+find /tmp -mindepth 1 -maxdepth 1 -user "$(id -u)" -exec rm -rf {} + 2>/dev/null
+ls -1dt "$CI"/runs/*/ 2>/dev/null | tail -n +6 | xargs -r rm -rf
 free=$(df -Pk "$CI" | awk 'NR == 2 {print int($4 / 1048576)}')
 [ "$free" -ge 8 ] || { echo "gate: $free GB free, so target/debug starts again"; rm -rf "$tree/target/debug"; }
 out=$CI/runs/$commit && rm -rf "$out" && mkdir -p "$out"
