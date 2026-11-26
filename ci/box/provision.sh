@@ -99,6 +99,8 @@ for d in /opt/ci/rustup:rustup /opt/ci/cargo:cargo "$CI/repo.git:test.git" "$CI/
     [ -e "${d%%:*}" ] && [ ! -e "$W/${d#*:}" ] && mv "${d%%:*}" "$W/${d#*:}"
 done
 rm -rf "$CI/gate.sh" "$CI"/gate-*.sh "$CI/pgrun" "$CI/docker.pid" "$CI/docker.sock" "$CI/.pgpw"
+# Tests from tl-user's gates left fixed-name paths in /tmp (/tmp/crucible_test_write, ...) that ci-test can't replace.
+find /tmp -mindepth 1 -maxdepth 1 -user tl-user -exec rm -rf {} +
 chown -R "$T:$T" "$W" "/home/$T"
 [ ! -d "$CI/repo.git" ] || chown -R root:root "$CI/repo.git"
 [ ! -e "$CI/box.lock" ] || chown root:root "$CI/box.lock"
