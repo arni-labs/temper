@@ -1,42 +1,27 @@
 #!/usr/bin/env bash
-# Runs on ci-temper, as tl-user: tests one commit as .github/workflows/ci.yml did on GitHub's runners for a push to
+# Runs on ci-temper, as ci-test: tests one commit as .github/workflows/ci.yml did on GitHub's runners for a push to
 # main, by the same steps and the commit's own scripts (scripts/ci/affected.py decides what the change reaches, exactly
 # as there), and builds the Linux binary as linux-binary.yml did:
 #   gate.sh <commit> <base>        a push to main from <base>; CI_ALL=1 runs the full lane (the nightly)
-# ci/box/box.sh uploads this file and the git bundle (/var/lib/ci/in.bundle) before it calls it. Warm by design: one
+# /opt/ci/route.sh (the fixed wrapper) runs it as ci-test, which holds no key and has no sudo, after it put the two
+# commits in /var/lib/ci/work/test.git (refs/ci/commit, refs/ci/base); it publishes and sends the verdict. Warm by design: one
 # worktree at one path, so a checkout keeps unchanged files' times and cargo rebuilds only what the commit changed;
 # target/ survives the clean between runs. Postgres 18 and Redis start fresh for each run, as ci.yml's services did.
 # Three lanes run side by side, each in its own cargo target so none waits on another's build lock: lint (Compile &
 # Lint), tests (shards, doctests, Postgres, DST, specs; the full lane's Tests) and other (other workspaces, the
-# TypeScript SDK, the Linux binary). Answers go to /var/lib/ci/runs/<commit>/ (<job>.txt ending `exit <code>`;
-# summary.txt; verdict.txt last; temper-x86_64-linux{,.sha256,.inputs} when built).
+# TypeScript SDK, the Linux binary). Answers go to /var/lib/ci/work/runs/<commit>/ (<job>.txt ending `exit <code>`;
+# summary.txt; verdict.txt last; temper-x86_64-linux{,.sha256,.inputs} when built). With CI_PUBLISH=1 a passed push's
+# binary and its inputs are also left in publish/ there, for route.sh to put in R2.
 # Left out on purpose: Focused tests (a dispatch with a nextest filter: run `cargo nextest` on the box) and
-# linux-binary.yml's GitHub release and downstream dispatch: a passed push's binary goes to R2 instead (below), and
+# linux-binary.yml's GitHub release and downstream dispatch: a passed push's binary goes to R2 instead (route.sh), and
 # the Factory, not the box, starts what installs it.
 # Exit 0 when every job the change needed passed, 1 when one failed, 2 on a usage error. Prints no key.
 set -uo pipefail
-# The Factory's command holds /var/lib/ci/box.lock on fd 9 for as long as this runs. Closed here, so no daemon this
-# starts (a server, Postgres, Redis, dockerd) inherits it and keeps the box locked after a run that was killed.
-exec 9>&-
 commit=${1:?usage: gate.sh <commit> <base>} base=${2:?usage: gate.sh <commit> <base>}
-CI=/var/lib/ci repo=/var/lib/ci/repo.git tree=/var/lib/ci/tree
+CI=/var/lib/ci/work repo=/var/lib/ci/work/test.git tree=/var/lib/ci/work/tree
 . /opt/ci/env.sh
-[ "$(id -u)" != 0 ] || { echo "gate: run as a user that is not root, as GitHub's runner is"; exit 2; }
+[ "$(id -u)" != 0 ] || { echo "gate: runs as ci-test, through /opt/ci/route.sh"; exit 2; }
 t0=$SECONDS
-if [ -s "$CI/in.bundle" ]; then
-    git -C "$repo" fetch -q "$CI/in.bundle" '+refs/ci/*:refs/ci/*' || { echo "gate: the bundle did not fetch"; exit 2; }
-    rm -f "$CI/in.bundle"
-fi
-# A commit the box lacks comes from origin (https://github.com/arni-labs/temper.git), as the Factory's route runs a gate: no bundle, only the
-# two commits. ci/box/box.sh's bundle carries them instead when it drives the box.
-keys=${CI_KEYS:-$CI/keys}
-git -C "$repo" remote get-url origin >/dev/null 2>&1 || git -C "$repo" remote add origin https://github.com/arni-labs/temper.git
-for c in "$commit" "$base"; do
-    # Whole history, never --depth: ci.yml's test jobs check out with fetch-depth 0 (temper-spec's
-    # migration_differential reads old commits), and a --depth fetch would make a full repo shallow again.
-    git -C "$repo" cat-file -e "$c^{commit}" 2>/dev/null || git -C "$repo" fetch -q origin "$c" \
-        || { echo "gate: $c is neither on the box nor fetched from origin"; exit 2; }
-done
 commit=$(git -C "$repo" rev-parse --verify "$commit^{commit}") || exit 2
 base=$(git -C "$repo" rev-parse --verify "$base^{commit}") || exit 2
 # Each tested commit keeps a ref, so its objects stay; the oldest beyond 50 go.
@@ -94,18 +79,18 @@ redis_fresh() {
     for _ in $(seq 50); do redis-cli -p 6379 ping >/dev/null 2>&1 && return; sleep 0.1; done; return 1
 }
 # Docker, for the tests that start their own Postgres with testcontainers (temper-actor-runtime's setup_test_pg), as
-# GitHub's runner has it. Only for the run's length (a process the run started dies with it); images stay in
-# /var/lib/docker.
+# GitHub's runner has it: ci-test's own rootless dockerd (rootlesskit), so a container is ci-test and no more. Only for
+# the run's length (route.sh stops every ci-test process after the gate); images stay in ~/.local/share/docker.
 docker_up() {
-    export DOCKER_HOST=unix://$CI/docker.sock
+    export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock
     docker info >/dev/null 2>&1 && return
-    sudo -n dockerd --group "$(id -gn)" -H "$DOCKER_HOST" --pidfile "$CI/docker.pid" >"$CI/dockerd.log" 2>&1 &
+    dockerd-rootless.sh >"$CI/dockerd.log" 2>&1 &
     for _ in $(seq 60); do docker info >/dev/null 2>&1 && return; sleep 1; done
     tail -20 "$CI/dockerd.log"; return 1
 }
 services_down() {
     pg_ctl -D "$PG" -m fast stop >/dev/null 2>&1; redis-cli -p 6379 shutdown nosave >/dev/null 2>&1
-    [ -s "$CI/docker.pid" ] && sudo -n kill "$(cat "$CI/docker.pid")" 2>/dev/null; true
+    pkill -u "$(id -u)" -x rootlesskit 2>/dev/null; true
 }
 trap services_down EXIT
 
@@ -316,59 +301,11 @@ echo "gate: peak memory in use $(cat "$out/peak-mem-mb.txt" 2>/dev/null || echo 
 verdict=passed
 for f in $(awk '$3 != 0 {print $1}' "$out/summary.txt"); do verdict=failed; echo "== $f (last 40 lines)"; tail -40 "$out/$f.txt"; done
 echo "gate: $(wc -l <"$out/summary.txt") jobs, verdict $verdict in $((SECONDS - t0)) s"
-said=$(awk '$3 != 0 {printf "%s%s", sep, $1; sep=", "}' "$out/summary.txt")
-# A passed push is published when CI_PUBLISH=1, as linux-binary.yml published its release: to R2 bucket
-# temper-releases (ci/box/releases-keys.py), with keys/releases-write, a key for that bucket alone:
-#   releases/main-<sha12>/temper-x86_64-linux{,.sha256,.inputs}, then COMMIT (the full sha), so a release without
-#   COMMIT is unfinished; then by-sha/<sha256>, naming the first finished main-<sha12> that holds those bytes.
-# Every put is If-None-Match: *, so nothing published is ever replaced; a release whose COMMIT is there stands. A
-# publish that fails fails the verdict, since the line needs the binary.
+# A passed push to publish (CI_PUBLISH=1, from route.sh): the binary and its inputs, which route.sh hashes and puts in
+# R2 temper-releases. A copy that fails fails the verdict, since the line needs the binary.
 if [ $verdict = passed ] && [ "${CI_PUBLISH:-0}" = 1 ]; then
-    s=$SECONDS
-    ( set -euo pipefail; [ -s "$keys/releases-write" ] || { echo "no releases-write in $keys"; exit 1; }
-      [ -s "$out/temper-x86_64-linux" ] || { echo "no binary was built or kept"; exit 1; }
-      at=https://075a5c0a617de3bdc08a44f9794b6f2f.r2.cloudflarestorage.com/temper-releases tag=main-${commit:0:12}
-      r2() { curl -sS --config <(printf 'user = "%s:%s"\n' "$(sed -n 1p "$keys/releases-write")" "$(sed -n 2p "$keys/releases-write")") \
-                 --aws-sigv4 aws:amz:auto:s3 "$@"; }
-      put() { # put <file> <key>: 200 made, 412 already there (kept)
-          local c; c=$(r2 -o /dev/null -w '%{http_code}' -H 'If-None-Match: *' \
-              -H "x-amz-content-sha256: $(sha256sum "$1" | cut -c1-64)" -T "$1" "$at/$2")
-          case $c in 200) ;; 412) echo "$2 was already there, kept" ;; *) echo "put $2 answered $c"; return 1 ;; esac; }
-      if [ "$(r2 -o /dev/null -w '%{http_code}' "$at/releases/$tag/COMMIT")" = 200 ]; then
-          sha=$(r2 -f "$at/releases/$tag/temper-x86_64-linux.sha256" | cut -d' ' -f1); echo "$tag is already published"
-      else
-          for f in temper-x86_64-linux temper-x86_64-linux.sha256 temper-x86_64-linux.inputs; do put "$out/$f" "releases/$tag/$f"; done
-          echo "$commit" >"$out/COMMIT" && put "$out/COMMIT" "releases/$tag/COMMIT"
-          sha=$(cut -d' ' -f1 "$out/temper-x86_64-linux.sha256")
-      fi
-      # by-sha after COMMIT, so it only ever names a finished release; a publish cut off between the two leaves none,
-      # and the next publish of this release adds it. One that names a release with no COMMIT (left by the order before
-      # 25 Nov) would point there for good, since puts never replace, so it is taken off and written again (rv-49a600b0b).
-      named=$(r2 -f "$at/by-sha/$sha" 2>/dev/null || true)
-      if [ -n "$named" ] && [ "$(r2 -o /dev/null -w '%{http_code}' "$at/releases/$named/COMMIT")" != 200 ]; then
-          r2 -f -o /dev/null -X DELETE "$at/by-sha/$sha" && echo "by-sha/$sha named $named, which never finished: taken off"
-          named=
-      fi
-      [ -n "$named" ] || { echo "$tag" >"$out/by-sha.txt" && put "$out/by-sha.txt" "by-sha/$sha"; }
-      kept=$(cat "$out/kept-from.txt" 2>/dev/null || true)
-      echo "published $at/releases/$tag/, sha256 $sha${kept:+ (the binary of $kept)}" ) \
-        >"$out/publish.txt" 2>&1; c=$?
-    echo "exit $c" >>"$out/publish.txt"
-    printf '%-24s exit %-3s %5s s\n' publish "$c" "$((SECONDS - s))" | tee -a "$out/summary.txt"
-    [ $c = 0 ] || { verdict=failed said="publish"; tail -30 "$out/publish.txt"; }
+    mkdir -p "$out/publish" && cp "$out"/temper-x86_64-linux{,.inputs} "$out/publish/" \
+        || { verdict=failed; echo "gate: no binary was built or kept to publish"; }
 fi
-
 echo "$verdict" >"$out/verdict.txt"
-# The verdict to the Factory's gate hook, as ci-temper-v2 and ci-katagami send it: {type, id, tests_url}, signed with
-# HMAC-SHA256 of the body under keys/hook-secret.
-if [ -n "${GATE_HOOK:-}" ]; then
-    if [ -s "$keys/hook-secret" ]; then
-        body=$(python3 -c 'import json,sys; print(json.dumps({"type": sys.argv[1], "id": sys.argv[2], "tests_url": sys.argv[3]}))' \
-            "$verdict" "$commit" "ci-temper box gate $verdict${said:+: $said}; $out on 6dsvy3tapklwfmi21udqg")
-        signature=$(printf '%s' "$body" | python3 -c 'import hmac,sys; print(hmac.new(open(sys.argv[1],"rb").read().strip(), sys.stdin.buffer.read(), "sha256").hexdigest())' "$keys/hook-secret")
-        curl -sS --fail-with-body --max-time 30 -X POST -H 'content-type: application/json' \
-            -H "x-katagami-signature: sha256=$signature" --data "$body" "$GATE_HOOK" && echo "gate: the gate hook took the verdict" ||
-            echo "gate: the Factory's gate hook did not take the verdict"
-    else echo "gate: no hook-secret in $keys, so the verdict went to no hook"; fi
-fi
 [ $verdict = passed ]
