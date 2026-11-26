@@ -112,10 +112,13 @@ fi
 echo "route: verdict $verdict (gate exit $code) in $((SECONDS - t0)) s"
 
 # --- the verdict, to the Factory's gate hook: {type, id, tests_url}, HMAC-SHA256 of the body under keys/hook-secret ----
+# A full-lane run (CI_ALL=1, the Factory's nightly) adds "lane": "full", so the hook files it on a Lane record and not on
+# the commit's Push, which its push gate already decided (ci-migration, r_e6hhkn3ytc3lprgo).
 if [ -n "$hook" ]; then
     [ -s "$K/hook-secret" ] || { echo "route: no hook-secret in $K, so the verdict went to no hook"; exit 1; }
-    body=$(python3 -c 'import json,sys; print(json.dumps({"type": sys.argv[1], "id": sys.argv[2], "tests_url": sys.argv[3]}))' \
-        "$verdict" "$commit" "$LABEL $verdict${said:+: $said}; $W/runs/$commit on $BOX_ID")
+    body=$(python3 -c 'import json,sys; v={"type": sys.argv[1], "id": sys.argv[2], "tests_url": sys.argv[3]}
+if sys.argv[4] == "1": v["lane"] = "full"
+print(json.dumps(v))' "$verdict" "$commit" "$LABEL $verdict${said:+: $said}; $W/runs/$commit on $BOX_ID" "${CI_ALL:-0}")
     signature=$(printf '%s' "$body" | python3 -c 'import hmac,sys; print(hmac.new(open(sys.argv[1],"rb").read().strip(), sys.stdin.buffer.read(), "sha256").hexdigest())' "$K/hook-secret")
     took=no
     for try in 1 2 3 4 5; do
