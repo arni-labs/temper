@@ -85,7 +85,14 @@ docker_up() {
     export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock
     docker info >/dev/null 2>&1 && return
     dockerd-rootless.sh >"$CI/dockerd.log" 2>&1 &
-    for _ in $(seq 60); do docker info >/dev/null 2>&1 && return; sleep 1; done
+    # Rootless dockerd picks published ports in its own network namespace, which can't see the host's sockets, from
+    # the same 32768-60999 the tests' own sockets take, so testcontainers met "bind: address already in use". Its
+    # ports come from above the host's range instead; dockerd reads the range at its first container, so before that.
+    for _ in $(seq 60); do
+        docker info >/dev/null 2>&1 && nsenter -U --preserve-credentials -n -t "$(cat "$XDG_RUNTIME_DIR/dockerd-rootless/child_pid")" \
+            sysctl -qw net.ipv4.ip_local_port_range="61000 65000" && return
+        sleep 1
+    done
     tail -20 "$CI/dockerd.log"; return 1
 }
 services_down() {
