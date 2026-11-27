@@ -1846,6 +1846,7 @@ impl WasmHost for ProductionWasmHost {
 
                 let mut body_stream = resp.bytes_stream();
                 let mut response_bytes = 0u64;
+                let mut broke_off = None;
                 while let Some(chunk) = body_stream.next().await {
                     match chunk {
                         Ok(bytes) => {
@@ -1854,14 +1855,22 @@ impl WasmHost for ProductionWasmHost {
                                 break; // guest hung up
                             }
                         }
-                        Err(_) => break,
+                        Err(e) => {
+                            broke_off =
+                                Some(format!("response body broke off: {}", e.without_url()));
+                            break;
+                        }
                     }
                 }
                 tracing::Span::current().record("response_bytes", response_bytes);
                 tracing::Span::current()
                     .record("duration_ms", started.elapsed().as_millis() as u64);
                 let _ = streams.close(bridge_req).await;
-                let _ = streams.close(bridge_resp).await;
+                // A body that broke off fails the guest's next read; only a complete body ends in a clean EOF.
+                let _ = match broke_off {
+                    Some(reason) => streams.fail(bridge_resp, reason).await,
+                    None => streams.close(bridge_resp).await,
+                };
             }
             .instrument(span),
         );

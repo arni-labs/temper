@@ -156,6 +156,7 @@ pub(super) async fn dispatch_matched_route(
     let pump_task = async move {
         use tokio_stream::StreamExt as _;
         let mut stream = body.into_data_stream();
+        let mut broke_off = None;
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
                 Ok(chunk) if chunk.is_empty() => {}
@@ -171,11 +172,16 @@ pub(super) async fn dispatch_matched_route(
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "axum body → stream pump failed");
+                    broke_off = Some(format!("request body broke off: {e}"));
                     break;
                 }
             }
         }
-        let _ = pump_streams.close(kernel_request_body).await;
+        // A body that broke off fails the guest's next read; only a complete body ends in a clean EOF.
+        let _ = match broke_off {
+            Some(reason) => pump_streams.fail(kernel_request_body, reason).await,
+            None => pump_streams.close(kernel_request_body).await,
+        };
     };
     // The pump records no spans and can wait on a guest that stops reading, so it holds no request span:
     // a span it held would stay open, and its trace would never be sent, for as long as the pump waits.

@@ -352,3 +352,59 @@ async fn outbound_streaming_body_continues_after_early_success_head() {
     }
     assert_eq!(echoed, b"written after the head");
 }
+
+/// A server that promises 100 body bytes, sends 10 and hangs up. The body broke off, so after the 10 bytes the
+/// guest's next read must fail, never report the clean end it would see for a body that was complete.
+#[tokio::test]
+async fn outbound_streaming_body_that_breaks_off_fails_the_next_read() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n0123456789")
+            .await
+            .unwrap();
+        socket.shutdown().await.unwrap();
+    });
+
+    let host = ProductionWasmHost::new(BTreeMap::new());
+    let handles = host
+        .http_stream_begin_outbound(HttpRequestHead {
+            method: "GET".into(),
+            url: format!("http://{addr}/table"),
+            headers: vec![],
+        })
+        .await
+        .unwrap();
+    host.http_stream_close(handles.request_body).await.unwrap();
+    let head = host
+        .http_stream_response_head(handles.response_body)
+        .await
+        .unwrap();
+    assert_eq!(head.status, 200);
+
+    let mut delivered = Vec::new();
+    let end = loop {
+        match host
+            .http_stream_read_bounded(handles.response_body, 4096)
+            .await
+        {
+            Ok(chunk) if chunk.is_empty() => break Ok(()),
+            Ok(chunk) => delivered.extend_from_slice(&chunk),
+            Err(error) => break Err(error),
+        }
+    };
+    assert_eq!(
+        delivered, b"0123456789",
+        "bytes sent before the break are delivered"
+    );
+    assert!(
+        matches!(end, Err(StreamError::Aborted(_))),
+        "a body that broke off must fail the next read, got {end:?}"
+    );
+}

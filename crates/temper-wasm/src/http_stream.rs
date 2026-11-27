@@ -13,15 +13,18 @@
 //! full, writes return [`StreamError::WouldBlock`] and the guest is
 //! expected to yield cooperatively. When a channel is closed (by
 //! explicit close, request completion, or timeout), reads/writes
-//! return [`StreamError::Closed`].
+//! return [`StreamError::Closed`]. A writer that ends the stream with
+//! [`HttpStreamRegistry::fail`] instead of `close` makes the reader's
+//! next read after the buffered chunks fail with
+//! [`StreamError::Aborted`], never the clean EOF of a complete body.
 //!
 //! Capacity: 64 chunks × 16 KiB = 1 MiB per handle for SDK-originated
 //! writes. Host-originated chunks can be larger; bounded reads split
 //! those chunks across guest buffers while preserving stream order.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 /// Chunk size used by SDK adapters when splitting writes. A single
@@ -157,11 +160,14 @@ impl std::error::Error for StreamError {}
 struct ChannelReceiver {
     read_lock: Mutex<()>,
     receiver: std::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+    /// Why the writer failed the stream, shared with the sender end. Set before the sender is dropped, so a read
+    /// that finds the channel closed sees it.
+    failure: Arc<OnceLock<String>>,
 }
 
 /// One end of a bounded stream channel.
 enum ChannelEnd {
-    Sender(mpsc::Sender<Vec<u8>>),
+    Sender(mpsc::Sender<Vec<u8>>, Arc<OnceLock<String>>),
     Receiver(Arc<ChannelReceiver>),
 }
 
@@ -219,12 +225,15 @@ impl HttpStreamRegistry {
     /// the other end reads from the second.
     pub async fn create_pair(&self) -> (StreamHandle, StreamHandle) {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(STREAM_CHANNEL_CAPACITY);
+        let failure = Arc::new(OnceLock::new());
         let mut state = self.inner.lock().await;
         let write_id = state.next_id;
         state.next_id += 1;
         let read_id = state.next_id;
         state.next_id += 1;
-        state.handles.insert(write_id, ChannelEnd::Sender(tx));
+        state
+            .handles
+            .insert(write_id, ChannelEnd::Sender(tx, failure.clone()));
         if let Some(held) = &self.held {
             held.fetch_add(2, Ordering::Relaxed);
         }
@@ -233,6 +242,7 @@ impl HttpStreamRegistry {
             ChannelEnd::Receiver(Arc::new(ChannelReceiver {
                 read_lock: Mutex::new(()),
                 receiver: std::sync::Mutex::new(rx),
+                failure,
             })),
         );
         (StreamHandle(write_id), StreamHandle(read_id))
@@ -265,7 +275,8 @@ impl HttpStreamRegistry {
 
     /// Read the next chunk from the handle's receiver. Returns
     /// `Ok(Vec::new())` for clean EOF (peer closed after sending
-    /// all data).
+    /// all data), or `Aborted` once the buffered chunks are drained
+    /// if the peer ended the stream with [`Self::fail`].
     pub async fn read(&self, handle: StreamHandle) -> Result<Vec<u8>, StreamError> {
         self.read_bounded(handle, usize::MAX).await
     }
@@ -301,7 +312,10 @@ impl HttpStreamRegistry {
         .await;
         match chunk {
             Some(chunk) => Ok(self.split_for_bounded_read(handle, chunk, max_bytes).await),
-            None => Ok(Vec::new()), // clean EOF
+            None => match receiver.failure.get() {
+                Some(reason) => Err(StreamError::Aborted(reason.clone())),
+                None => Ok(Vec::new()), // clean EOF
+            },
         }
     }
 
@@ -327,9 +341,25 @@ impl HttpStreamRegistry {
                     .close();
                 Ok(())
             }
-            Some(ChannelEnd::Sender(_)) => Ok(()),
+            Some(ChannelEnd::Sender(..)) => Ok(()),
             None => Err(StreamError::InvalidHandle),
         }
+    }
+
+    /// Close a write handle because what it carried broke off: the reader
+    /// still gets every chunk already written, then `Aborted(reason)` where
+    /// a [`Self::close`] would have given it a clean EOF.
+    pub async fn fail(&self, handle: StreamHandle, reason: String) -> Result<(), StreamError> {
+        {
+            let state = self.inner.lock().await;
+            match state.handles.get(&handle.0) {
+                Some(ChannelEnd::Sender(_, failure)) => {
+                    let _ = failure.set(reason);
+                }
+                Some(ChannelEnd::Receiver(_)) | None => return Err(StreamError::InvalidHandle),
+            }
+        }
+        self.close(handle).await
     }
 
     /// Open a full outbound exchange: request-body channel + response-
@@ -460,7 +490,7 @@ impl HttpStreamRegistry {
     async fn sender_for(&self, handle: StreamHandle) -> Result<mpsc::Sender<Vec<u8>>, StreamError> {
         let state = self.inner.lock().await;
         match state.handles.get(&handle.0) {
-            Some(ChannelEnd::Sender(tx)) => Ok(tx.clone()),
+            Some(ChannelEnd::Sender(tx, _)) => Ok(tx.clone()),
             Some(ChannelEnd::Receiver(_)) => Err(StreamError::InvalidHandle),
             None => Err(StreamError::InvalidHandle),
         }
@@ -473,7 +503,7 @@ impl HttpStreamRegistry {
         let state = self.inner.lock().await;
         match state.handles.get(&handle.0) {
             Some(ChannelEnd::Receiver(rx)) => Ok(rx.clone()),
-            Some(ChannelEnd::Sender(_)) => Err(StreamError::InvalidHandle),
+            Some(ChannelEnd::Sender(..)) => Err(StreamError::InvalidHandle),
             None => Err(StreamError::InvalidHandle),
         }
     }
@@ -637,6 +667,24 @@ mod tests {
         assert_eq!(&first, b"first");
         let eof = reg.read(r).await.unwrap();
         assert!(eof.is_empty(), "expected EOF, got {:?}", eof);
+    }
+
+    #[tokio::test]
+    async fn fail_sender_delivers_buffered_chunks_then_errors() {
+        let reg = HttpStreamRegistry::new();
+        let (w, r) = reg.create_pair().await;
+        reg.write(w, b"abcdef".to_vec()).await.unwrap();
+        reg.fail(w, "broke off".into()).await.unwrap();
+        assert_eq!(reg.read_bounded(r, 4).await.unwrap(), b"abcd");
+        assert_eq!(reg.read_bounded(r, 4).await.unwrap(), b"ef");
+        assert_eq!(
+            reg.read(r).await,
+            Err(StreamError::Aborted("broke off".into()))
+        );
+        assert_eq!(
+            reg.fail(r, "x".into()).await,
+            Err(StreamError::InvalidHandle)
+        );
     }
 
     #[tokio::test]
