@@ -329,7 +329,8 @@ pub(crate) fn resolve_field_bytes(
         .and_then(|k| k.as_str())
     {
         return match blob_cache.get(blob_key) {
-            Some(bytes) => FieldResolution::Bytes(bytes.clone()),
+            Some(stored) => blob_guest_bytes(&field_value, stored)
+                .map_or(FieldResolution::HostError, FieldResolution::Bytes),
             None => FieldResolution::BlobRefMissing {
                 key: blob_key.to_string(),
                 reference: field_value.clone(),
@@ -337,15 +338,32 @@ pub(crate) fn resolve_field_bytes(
         };
     }
 
-    let bytes = match &field_value {
-        serde_json::Value::String(s) => s.as_bytes().to_vec(),
-        serde_json::Value::Null => Vec::new(),
-        _ => match serde_json::to_vec(&field_value) {
-            Ok(b) => b,
-            Err(_) => return FieldResolution::HostError,
-        },
-    };
-    FieldResolution::Bytes(bytes)
+    value_guest_bytes(&field_value).map_or(FieldResolution::HostError, FieldResolution::Bytes)
+}
+
+/// What the guest reads of a field's value (temper-wasm-sdk `read_field_bytes`): a string's UTF-8 text, unquoted;
+/// nothing for null; any other value's JSON serialization.
+fn value_guest_bytes(value: &serde_json::Value) -> Option<Vec<u8>> {
+    match value {
+        serde_json::Value::String(s) => Some(s.as_bytes().to_vec()),
+        serde_json::Value::Null => Some(Vec::new()),
+        _ => serde_json::to_vec(value).ok(),
+    }
+}
+
+/// What the guest reads of an overflowed field: the value it stood for, as `value_guest_bytes` gives an inline one.
+/// A blob keeps the field's JSON serialization (`__temper_blob_encoding` "json", temper-server blobs.rs), so a string
+/// field's blob holds its text in quotes; handing those bytes over as they are gave a module the quoted, escaped text
+/// (UniKon, 27 Nov 2026: a 389,797-byte bundle reached its builder as 399,958 bytes that hashed to another bundle).
+/// A "raw" blob is its bytes.
+fn blob_guest_bytes(reference: &serde_json::Value, stored: &[u8]) -> Option<Vec<u8>> {
+    match reference
+        .get("__temper_blob_encoding")
+        .and_then(|e| e.as_str())
+    {
+        Some("raw") => Some(stored.to_vec()),
+        _ => value_guest_bytes(&serde_json::from_slice::<serde_json::Value>(stored).ok()?),
+    }
 }
 
 /// Fetch an overflowed field the guest asked for through the call's field reader, and keep it for the rest of the
@@ -1481,7 +1499,8 @@ pub(super) fn link_host_functions(linker: &mut Linker<HostState>) -> Result<(), 
                 ) {
                     FieldResolution::BlobRefMissing { key, reference } => {
                         match read_field_blob(&mut caller, &key, &reference) {
-                            Some(bytes) => FieldResolution::Bytes(bytes),
+                            Some(stored) => blob_guest_bytes(&reference, &stored)
+                                .map_or(FieldResolution::HostError, FieldResolution::Bytes),
                             None => FieldResolution::BlobRefMissing { key, reference },
                         }
                     }
@@ -2460,12 +2479,50 @@ mod tests {
             }
         }));
         let mut cache = BTreeMap::new();
-        let payload = br#""the big value""#.to_vec();
-        cache.insert(blob_key.to_string(), payload.clone());
+        // The blob keeps the string's JSON serialization; the guest reads the string itself, as it would inline.
+        cache.insert(
+            blob_key.to_string(),
+            br#""the big value\nline two""#.to_vec(),
+        );
 
         assert_eq!(
             resolve_field_bytes(&ctx, &cache, "big_field"),
-            FieldResolution::Bytes(payload)
+            FieldResolution::Bytes(b"the big value\nline two".to_vec())
+        );
+    }
+
+    #[test]
+    fn an_overflowed_field_reads_as_the_value_it_stood_for() {
+        let field = |key: &str, encoding: &str| serde_json::json!({ "__temper_blob_ref": key, "__temper_blob_size": 64, "__temper_blob_encoding": encoding });
+        let ctx = ctx_json_with_fields(serde_json::json!({
+            "list": field("field-overflow/sha256/l.json", "json"),
+            "bytes": field("field-overflow/sha256/r.bin", "raw"),
+            "broken": field("field-overflow/sha256/b.json", "json"),
+        }));
+        let mut cache = BTreeMap::new();
+        cache.insert(
+            "field-overflow/sha256/l.json".to_string(),
+            br#"["a","b"]"#.to_vec(),
+        );
+        cache.insert(
+            "field-overflow/sha256/r.bin".to_string(),
+            br#""kept as is""#.to_vec(),
+        );
+        cache.insert(
+            "field-overflow/sha256/b.json".to_string(),
+            b"not json".to_vec(),
+        );
+        assert_eq!(
+            resolve_field_bytes(&ctx, &cache, "list"),
+            FieldResolution::Bytes(br#"["a","b"]"#.to_vec())
+        );
+        assert_eq!(
+            resolve_field_bytes(&ctx, &cache, "bytes"),
+            FieldResolution::Bytes(br#""kept as is""#.to_vec())
+        );
+        assert_eq!(
+            resolve_field_bytes(&ctx, &cache, "broken"),
+            FieldResolution::HostError
         );
     }
 
